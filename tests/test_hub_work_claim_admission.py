@@ -8,14 +8,18 @@ from engineering_hub.work_queue import ClosedClaimPolicy, WorkAction, WorkQueue,
 from engineering_hub.work_queue_config import configured_work_queue
 
 
+def reviewed_target(repo, commit='a' * 40):
+    task = repo.create_task('human:42', 'engineering-hub', 'Mock reviewed admission test', str(uuid4()))
+    task = repo.claim_task('codex', task['id'], task['revision'])
+    task = repo.set_candidate('codex', task['id'], task['revision'], commit)
+    task = repo.review_task('claude', task['id'], task['revision'], commit, 'approve')
+    return WorkTarget(task['id'], commit, 'sha256:' + 'b' * 64)
+
+
 @pytest.fixture
 def rig(tmp_path):
     repo = HubRepository(tmp_path / 'hub.sqlite3')
-    task = repo.create_task('human:42', 'engineering-hub', 'Mock reviewed admission test', str(uuid4()))
-    task = repo.claim_task('codex', task['id'], task['revision'])
-    task = repo.set_candidate('codex', task['id'], task['revision'], 'a' * 40)
-    task = repo.review_task('claude', task['id'], task['revision'], 'a' * 40, 'approve')
-    target = WorkTarget(task['id'], 'a' * 40, 'sha256:' + 'b' * 64)
+    target = reviewed_target(repo)
     worker = WorkWorker('codex', str(uuid4()))
     return repo, target, worker
 
@@ -95,8 +99,10 @@ def test_action_filter_and_worker_local_denial_cannot_bypass_global_production_p
     queue = WorkQueue(repo, actions, target_verifier=lambda *args: True,
                       approval_verifier=lambda *args: True,
                       claim_verifier=lambda actual, action, *args: actual == worker and action == 'second')
-    submit(queue, target, action='first', environment='production', approval_id='synthetic')
-    stage = submit(queue, target, request='two', action='second')
+    production = submit(queue, target, action='first', environment='production', approval_id='synthetic')
+    stage_target = reviewed_target(repo)
+    assert stage_target.task_id != target.task_id
+    stage = submit(queue, stage_target, request='two', action='second')
     assert queue.claim(worker=worker, action_keys=('first',)) is None
     assert queue.claim(worker=WorkWorker('claude', str(uuid4())), action_keys=('second',)) is None
     # A worker-local refusal of the production action does not establish that
@@ -104,6 +110,8 @@ def test_action_filter_and_worker_local_denial_cannot_bypass_global_production_p
     # its same-machine priority barrier rather than starting staging here.
     assert queue.claim(worker=worker, action_keys=('second',)) is None
     assert queue.get_job(stage['id'])['state'] == 'queued'
+    assert queue.cancel_unclaimed(actor='codex', job_id=production['id'])['state'] == 'cancelled'
+    assert queue.claim(worker=worker, action_keys=('second',))['id'] == stage['id']
 
 
 @pytest.mark.parametrize('action_keys', [(), [], ['engineering-hub.validate'],
@@ -139,9 +147,11 @@ def test_fixed_worker_enrollment_does_not_claim_other_target_or_future_commit(ri
                       target_verifier=lambda *args: True,
                       claim_verifier=lambda actual, action, env, machine, enrolled:
                           actual == worker and enrolled == target)
+    future = reviewed_target(repo, 'c' * 40)
+    other_artifact = reviewed_target(repo)
     variants = (WorkTarget(str(uuid4()), target.source_commit, target.artifact_digest),
-                WorkTarget(target.task_id, 'c' * 40, target.artifact_digest),
-                WorkTarget(target.task_id, target.source_commit, 'sha256:' + 'd' * 64))
+                future,
+                WorkTarget(other_artifact.task_id, other_artifact.source_commit, 'sha256:' + 'd' * 64))
     for position, other in enumerate(variants):
         submit(queue, other, request='different-' + str(position), action='validate')
     assert queue.claim(worker=worker) is None
