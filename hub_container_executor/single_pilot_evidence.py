@@ -5,11 +5,13 @@ are not one atomic snapshot and hostile same-UID writers are out of scope.
 """
 import time
 import uuid
+import os
 from .backend import BaselineIdentity, StateGeneration
 from .daemon_backend import DockerEngineBackend, TrustedEffectBindingProvider
 from .operation_journal import SQLiteOperationJournal
 from .state_provider import FrozenSQLiteStateProvisioner
 from .runtime_profile import probe_set_digest
+from .ledger import SQLiteLedger
 
 
 def require_resources(backend, state):
@@ -29,10 +31,20 @@ def require_journal_ready(adapter):
     guard = getattr(adapter, 'effect_context_guard', None)
     if (type(backend) is not DockerEngineBackend or type(provider) is not TrustedEffectBindingProvider
             or type(guard) is not TrustedEffectContextGuard
+            or type(getattr(adapter, 'ledger', None)) is not SQLiteLedger
+            or provider.source_ledger is not adapter.ledger
             or getattr(guard.scope, '__self__', None) is not backend
             or getattr(guard.scope, '__func__', None) is not DockerEngineBackend.effect_context_scope
             or not all(callable(x) for x in (provider.compare_actual, provider.recheck, provider.verify_completed))):
         raise ValueError('bound single pilot requires explicit guarded admission')
+    adapter.ledger._check_open()
+    try:
+        held = os.fstat(adapter.ledger._lock_fd)
+        named = os.stat(adapter.ledger.lock_path, follow_symlinks=False)
+        if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+            raise ValueError('ledger owner identity changed')
+    except OSError:
+        raise ValueError('ledger owner identity unavailable') from None
     backend.operation_journal.require_no_pending(allow_bound=True)
     return True
 

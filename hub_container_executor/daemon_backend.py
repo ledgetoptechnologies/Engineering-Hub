@@ -239,6 +239,7 @@ class TrustedEffectBindingProvider:
     compare_actual: Callable | None = None
     recheck: Callable | None = None
     verify_completed: Callable | None = None
+    source_ledger: object | None = None
 
     def __post_init__(self):
         if not callable(self.create):

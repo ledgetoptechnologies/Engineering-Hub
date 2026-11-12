@@ -142,4 +142,4 @@ def enrolled_effect_provider(journal, key, effects, *, verify_generation, source
         return (snapshot is not None and snapshot[0].state == 'completed'
                 and snapshot[0].kind == kind and snapshot[0].container_id == container_id)
 
-    return TrustedEffectBindingProvider(create, compare, recheck, verify_completed)
+    return TrustedEffectBindingProvider(create, compare, recheck, verify_completed, source_ledger)

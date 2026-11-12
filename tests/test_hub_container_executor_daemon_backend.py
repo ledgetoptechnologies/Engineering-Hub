@@ -65,24 +65,40 @@ def test_single_pilot_bound_admission_requires_actual_backend_scope(tmp_path):
     from types import SimpleNamespace
     from hub_container_executor.adapter import TrustedEffectContextGuard
     from hub_container_executor.single_pilot_evidence import require_journal_ready
+    from hub_container_executor.ledger import SQLiteLedger
+    pytest.importorskip('fcntl', reason='actual Linux owner required')
     manifest, _, _ = verified_image()
     calls = []
     class Journal:
         def require_no_pending(self, **kwargs): calls.append(kwargs)
-    provider = TrustedEffectBindingProvider(lambda *_: None, lambda _: True, lambda _: True, lambda *_: True)
+    root = tmp_path / 'ledgers'
+    root.mkdir(mode=0o700)
+    options = dict(manifest_digest=manifest.digest(), candidate_commit=manifest.candidate.source_commit,
+                   policy_revision=manifest.policy_revision)
+    ledger = SQLiteLedger(root / 'ledger.sqlite', **options)
+    other = SQLiteLedger(root / 'other.sqlite', **options)
+    provider = TrustedEffectBindingProvider(lambda *_: None, lambda _: True, lambda _: True, lambda *_: True, ledger)
     backend = DockerEngineBackend(binding(manifest, tmp_path), operation_journal=Journal(),
                                  effect_binding_provider=provider,
                                  test_transport=httpx.MockTransport(lambda _: pytest.fail('unexpected effect')))
     try:
-        subject = SimpleNamespace(backend=backend, effect_context_guard=None)
+        subject = SimpleNamespace(backend=backend, effect_context_guard=None, ledger=ledger)
         with pytest.raises(ValueError): require_journal_ready(subject)
         subject.effect_context_guard = TrustedEffectContextGuard(lambda _: True, lambda _: None)
         with pytest.raises(ValueError): require_journal_ready(subject)
         subject.effect_context_guard = TrustedEffectContextGuard(lambda _: True, backend.effect_context_scope)
+        subject.ledger = other
+        with pytest.raises(ValueError): require_journal_ready(subject)
+        assert calls == []
+        subject.ledger = ledger
         assert require_journal_ready(subject) is True
         assert calls == [{'allow_bound': True}]
+        ledger.close()
+        with pytest.raises(Exception): require_journal_ready(subject)
     finally:
         backend.close()
+        ledger.close()
+        other.close()
 
 
 def test_enrolled_actual_projection_rejects_mismatch_and_unverified_generation(tmp_path):
