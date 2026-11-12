@@ -48,6 +48,7 @@ from .configuration_commitment import configuration_commitment
 _HEX = re.compile(r'[0-9a-f]{64}\Z')
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
 CURRENT_REQUEST_PROTOCOL = 'engineering-hub.executor-current-observation-request.v1'
+PROPOSAL_REQUEST_PROTOCOL = 'engineering-hub.launch-proposal-request.v1'
 APPROVAL_PROPOSAL_DOMAIN = b'engineering-hub-launch-approval-proposal-v1\x00'
 _TARGETS = {
     'engine_socket': '/run/engineering-hub/docker.sock',
@@ -1258,7 +1259,7 @@ class LaunchSupervisor:
             finally:
                 peer.close()
 
-    def wait_for_stop_with_observations(self, *, timeout_ms, stop_requested):
+    def wait_for_stop_with_observations(self, *, timeout_ms, stop_requested, proposal_socket=None):
         """Owned bounded wait, serving fresh observations after the one receipt.
 
         No new listener/thread/service. Approval expiry stops observation service,
@@ -1268,6 +1269,12 @@ class LaunchSupervisor:
         _require(type(timeout_ms) is int and 1 <= timeout_ms <= 3_600_000
                  and callable(stop_requested))
         deadline = time.monotonic() + timeout_ms / 1000
+        if proposal_socket is not None:
+            with self._proposal_listener(proposal_socket) as listener:
+                return self._wait_for_stop_with_proposals(deadline, stop_requested, listener)
+        return self._wait_for_stop_with_proposals(deadline, stop_requested, None)
+
+    def _wait_for_stop_with_proposals(self, deadline, stop_requested, proposal_listener):
         while True:
             requested = stop_requested()
             _require(type(requested) is bool)
@@ -1286,6 +1293,8 @@ class LaunchSupervisor:
                         read = [self._consumer.fd]
                         if active:
                             read.append(self._listener)
+                            if proposal_listener is not None:
+                                read.append(proposal_listener)
                         remaining = deadline - time.monotonic()
                         _require(math.isfinite(remaining))
                         if remaining <= 0:
@@ -1293,14 +1302,89 @@ class LaunchSupervisor:
                         ready, _, _ = select.select(read, [], [], min(.1, remaining))
                         _require(self._consumer.fd not in ready)
                         pending = active and self._listener in ready
+                        proposal_pending = active and proposal_listener is not None and proposal_listener in ready
                     except BaseException:
                         self._hold()
                         raise LaunchSupervisorError() from None
             except _ObservationWaitExpired:
                 return False
+            if proposal_pending:
+                self._serve_proposal_request(proposal_listener, min(
+                    deadline, time.monotonic() + self._request_ms / 1000))
             if pending:
                 self._serve_current_until(min(
                     deadline, time.monotonic() + self._request_ms / 1000))
+
+    @contextmanager
+    def _proposal_listener(self, path):
+        """One explicit root-only request socket, removed only by identity."""
+        path = _path(path)
+        parent = _root_parent(path, private=True)
+        listener = None
+        identity = None
+        try:
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.set_inheritable(False)
+            pinned = f'/proc/self/fd/{parent}/{path.name}'
+            _require(len(pinned.encode()) <= 107)
+            listener.bind(pinned)  # Existing entries are never replaced.
+            info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            identity = _identity(info)
+            os.chmod(pinned, 0o600, follow_symlinks=False)
+            listener.listen(1)
+            self._proposal_output_parent = path.parent
+            yield listener
+        finally:
+            self._proposal_output_parent = None
+            if listener is not None:
+                listener.close()
+            try:
+                if identity is not None:
+                    info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+                    _require(_identity(info) == identity and stat.S_ISSOCK(info.st_mode)
+                             and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o600
+                             and _identity(os.stat(path.parent, follow_symlinks=False))
+                                 == _identity(os.fstat(parent)))
+                    os.unlink(path.name, dir_fd=parent)
+                    os.fsync(parent)
+            finally:
+                os.close(parent)
+
+    def _serve_proposal_request(self, listener, deadline):
+        """Accept a closed, root-authenticated request for this exact launch.
+
+        Each request names a fresh nonce-derived file in the private socket
+        directory. A proposal is not an approval and never extends authority.
+        """
+        peer = None
+        try:
+            listener.settimeout(_remaining(deadline))
+            peer, _ = listener.accept()
+            pid, uid, gid = struct.unpack('=iII', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            _require(pid > 0 and uid == 0)
+            size = struct.unpack('!I', self._receive(peer, 4, deadline))[0]
+            _require(0 < size <= MAX_REQUEST_BYTES)
+            request = _strict(self._receive(peer, size, deadline), MAX_REQUEST_BYTES)
+            _require(type(request) is dict and set(request) == {'protocol', 'launch_id', 'nonce'}
+                     and request['protocol'] == PROPOSAL_REQUEST_PROTOCOL
+                     and request['launch_id'] == self._launch_id
+                     and type(request['nonce']) is str and _HEX.fullmatch(request['nonce']))
+            peer.settimeout(_remaining(deadline))
+            _require(peer.recv(1) == b'')
+            # This path is generated by the server, never supplied by the peer.
+            _require(self._proposal_output_parent is not None)
+            output = self._proposal_output_parent / ('proposal-' + request['nonce'] + '.json')
+            remaining_ms = min(10000, int(_remaining(deadline) * 1000))
+            _require(remaining_ms >= 100)
+            self.write_approval_proposal(str(output), timeout_ms=remaining_ms)
+            _remaining(deadline)
+            peer.sendall(b'OK')
+        except Exception:
+            return False
+        finally:
+            if peer is not None:
+                peer.close()
+        return True
 
     def graceful_stop(self):
         """Explicit SIGTERM only. Timeout is held, never permission for SIGKILL."""

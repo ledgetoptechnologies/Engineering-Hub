@@ -145,8 +145,12 @@ def _execute(options):
                             print('approval_proposal_ready', flush=True)
                     elif not stop.requested:
                         raise RuntimeError('receipt readiness unavailable')
+                wait_options = {}
+                if options.proposal_refresh_socket is not None:
+                    wait_options['proposal_socket'] = options.proposal_refresh_socket
                 requested = stop.requested or supervisor.wait_for_stop_with_observations(
-                    timeout_ms=options.wait_seconds * 1000, stop_requested=lambda: stop.requested)
+                    timeout_ms=options.wait_seconds * 1000, stop_requested=lambda: stop.requested,
+                    **wait_options)
                 if requested:
                     # Explicit signal only. Caller must already have drained.
                     supervisor.graceful_stop()
@@ -177,6 +181,7 @@ def main(argv=None):
     parser.add_argument('--signing-key-file', required=True)
     parser.add_argument('--journal-file', required=True)
     parser.add_argument('--approval-proposal-file', help='new root-private signed proposal, not an approval')
+    parser.add_argument('--proposal-refresh-socket', help='new private root-only proposal request socket')
     parser.add_argument('--wait-seconds', required=True, type=int,
                         help='post-receipt stop-request waiting bound, 1..3600; expiry does not stop')
     parser.add_argument('--execute', action='store_true')
@@ -188,6 +193,9 @@ def main(argv=None):
         if (not all(_path(value) for value in paths) or len(set(paths)) != 3
                 or options.approval_proposal_file is not None and (
                     not _path(options.approval_proposal_file) or options.approval_proposal_file in paths)
+                or options.proposal_refresh_socket is not None and (
+                    not _path(options.proposal_refresh_socket) or options.proposal_refresh_socket in paths
+                    or options.proposal_refresh_socket == options.approval_proposal_file)
                 or not 1 <= options.wait_seconds <= 3600):
             raise _UsageError()
         if not options.execute:

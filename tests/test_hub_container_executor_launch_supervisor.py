@@ -6,6 +6,7 @@ build approval are synthetic; no Docker socket, host mount, real signing key,
 service, image or permission change outside disposable fixtures is used.
 """
 import asyncio
+import base64
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict
@@ -1394,3 +1395,83 @@ def test_graceful_stop_exact_sigterm_quiescence_or_timeout_never_forces_cleanup(
             child.terminate()  # Fixture teardown, NOT supervisor timeout escalation.
             child.wait(timeout=3)
         authority.close()
+
+
+def test_root_requested_proposal_refresh_retains_launch_and_ceiling(synthetic_issuer, short_root, monkeypatch):
+    """Real socket/peer and fresh signed evidence; Engine observation is synthetic."""
+    from hub_container_executor import postlaunch_approval
+    authority, path, _ = synthetic_issuer
+    thread, result = serve_fixture(authority)
+    transport = UnixLaunchReceiptTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                           expected_issuer_gid=os.getgid())
+    verifier = LaunchReceiptIdentityVerifier(enrollment=authority.release, issuer_transport=transport,
+        max_receipt_lifetime_seconds=30, exchange_timeout_ms=1000)
+    receipt = verifier.accepted_launch_receipt()
+    transport.close()
+    thread.join(5)
+    assert not thread.is_alive() and result == [receipt[0]]
+    first = authority.approval_proposal(timeout_ms=1000)
+    release, pin = current_pins(authority)
+    first_verified = postlaunch_approval.verify_launch_proposal(first, release=release,
+                                                               expected_engine_id='synthetic-engine')
+    original_clock = postlaunch_approval.time
+    monkeypatch.setattr(postlaunch_approval, 'time', SimpleNamespace(time=lambda: original_clock.time() + 6))
+    with pytest.raises(Exception):
+        postlaunch_approval.verify_launch_proposal(first, release=release, expected_engine_id='synthetic-engine')
+    monkeypatch.setattr(postlaunch_approval, 'time', original_clock)
+    socket_path = short_root / 'proposal.sock'
+    stop = threading.Event()
+    served = []
+    worker = threading.Thread(target=lambda: served.append(authority.wait_for_stop_with_observations(
+        timeout_ms=5000, stop_requested=stop.is_set, proposal_socket=str(socket_path))))
+    worker.start()
+    try:
+        until = time.monotonic() + 3
+        while not socket_path.exists() and time.monotonic() < until:
+            time.sleep(.01)
+        assert socket_path.exists()
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run([sys.executable, '-m', 'hub_container_executor.proposal_request',
+                                 '--socket', str(socket_path), '--launch-id', authority._launch_id],
+                                env=env, text=True, capture_output=True, timeout=4, check=True)
+        output = Path(result.stdout.strip())
+    finally:
+        stop.set()
+        worker.join(5)
+    assert not worker.is_alive() and served == [True]
+    assert not socket_path.exists()
+    assert output.parent == short_root and output.name.startswith('proposal-')
+    fresh = postlaunch_approval.verify_launch_proposal(output.read_bytes(), release=release,
+                                                       expected_engine_id='synthetic-engine')
+    assert fresh.receipt_id == first_verified.receipt_id == receipt[0]
+    assert fresh.launch == first_verified.launch == pin
+    assert fresh.launch.approval_expires_at_ms == pin.approval_expires_at_ms
+    approver = Ed25519PrivateKey.generate()
+    approved = {'schema': 'engineering-hub.independent-launch-approval.v1',
+                'approval_id': str(uuid4()), 'receipt_id': fresh.receipt_id,
+                'launch': asdict(fresh.launch), 'approved_at_ms': int(time.time() * 1000),
+                'expires_at_ms': min(receipt[7], fresh.launch.approval_expires_at_ms)}
+    signature = base64.urlsafe_b64encode(approver.sign(
+        postlaunch_approval.DOMAIN + launch._canonical(approved))).rstrip(b'=').decode()
+    raw_approval = launch._canonical({'payload': approved, 'signature': signature})
+    approver_public = approver.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    accepted = postlaunch_approval.verify_postlaunch_approval(raw_approval, verifier=verifier,
+        release=release, approver_public_key=approver_public, expected_engine_id='synthetic-engine')
+    assert accepted.launch == pin
+    with pytest.raises(postlaunch_approval.PostLaunchApprovalError):
+        postlaunch_approval.verify_postlaunch_approval(raw_approval, verifier=verifier,
+            release=release, approver_public_key=release.public_key, expected_engine_id='synthetic-engine')
+    verifier.close()
+    with pytest.raises(FileExistsError):
+        authority.write_approval_proposal(str(output), timeout_ms=1000)
+
+
+def test_proposal_request_denies_nonroot_peer_before_read(synthetic_issuer):
+    authority, _, _ = synthetic_issuer
+    class Peer:
+        def getsockopt(self, *args): return struct.pack('=iII', 42, 1234, 1234)
+        def close(self): pass
+    class Listener:
+        def settimeout(self, value): pass
+        def accept(self): return Peer(), None
+    assert authority._serve_proposal_request(Listener(), time.monotonic() + 1) is False
