@@ -231,7 +231,13 @@ async def test_owner_loss_and_private_permit_and_changed_review_still_deny(rig):
     claimed = rig.queue.claim(worker=rig.bridge.worker, action_keys=(ACTION,))
     assert rig.queue.completion_verifier(claimed, job['id'], 'succeeded') is False
     current = rig.repo.get_task(task['id'])
-    rig.repo.set_candidate('codex', task['id'], current['revision'], 'f' * 40)
+    with pytest.raises(HubError, match='active_work_job'):
+        rig.repo.set_candidate('codex', task['id'], current['revision'], 'f' * 40)
+    # Simulate stale persisted review independently of the public guard.
+    with rig.repo._transaction() as db:
+        changed = rig.repo._get(db, task['id'], 'task')
+        changed.update(candidate_commit='f' * 40, review=None, status='in_review')
+        rig.repo._save(db, 'codex', 'task.candidate', 'task', changed)
     with rig.bridge._scope(job['id'], 'execute'):
         with pytest.raises(HubError):
             rig.bridge._intent(claimed)
