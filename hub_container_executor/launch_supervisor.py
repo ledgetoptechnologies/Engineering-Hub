@@ -581,6 +581,17 @@ class _Journal:
             _require(db.execute('UPDATE launch SET state=?,data=? WHERE id=?',
                 (state, _canonical(data).decode(), identity)).rowcount == 1)
 
+    def record_empty_daemon_scope(self, identity, expected_record, observation):
+        """Retain one post-stop scope snapshot; it grants no recovery authority."""
+        with self.transaction() as db:
+            row = db.execute('SELECT state,data FROM launch WHERE id=?', (identity,)).fetchone()
+            _require(row is not None and row[0] == 'stopped')
+            data = _strict(row[1].encode('utf-8'), 65536)
+            _require(type(data) is dict and data == expected_record and 'daemon_scope_observation' not in data)
+            data['daemon_scope_observation'] = observation
+            _require(db.execute('UPDATE launch SET data=? WHERE id=? AND state=? AND data=?',
+                (_canonical(data).decode(), identity, 'stopped', row[1])).rowcount == 1)
+
     def reserve_issuance(self, identity, nonce):
         with self.transaction() as db:
             _require(db.execute('SELECT state FROM launch WHERE id=?', (identity,)).fetchone() == ('running',))
@@ -1406,6 +1417,69 @@ class LaunchSupervisor:
                 self._remove_owned_socket()
             except BaseException:
                 self._hold()
+                raise LaunchSupervisorError() from None
+
+    def enroll_daemon_scope(self, scope_path, *, timeout_ms):
+        """Retain a root-controlled daemon-only scope while its identity is live.
+
+        The caller owns the returned observation handle and must close it.
+        Enrollment and later emptiness prove no Docker operation outcome.
+        """
+        from .cgroup_scope_evidence import EnrolledCgroupScope
+        _require(self._pid == os.getpid() and type(timeout_ms) is int and 1 <= timeout_ms <= 10000)
+        with self._mutex:
+            scope = None
+            try:
+                self._guard()
+                _require(self._launch_id is not None and self._consumer is not None and self._engine is not None
+                         and type(self._engine.process) is _Process
+                         and self._engine.process.pid == self._daemon_pin.pid
+                         and self._engine.process.start == self._daemon_pin.start_ticks)
+                deadline = time.monotonic() + timeout_ms / 1000
+                self._validate_live(deadline)
+                scope = EnrolledCgroupScope(scope_path, processes=(self._engine.process,))
+                self._validate_live(deadline)
+                _remaining(deadline)
+                return scope
+            except BaseException:
+                if scope is not None: scope.close()
+                raise LaunchSupervisorError() from None
+
+    def record_daemon_scope_emptiness(self, scope):
+        """Record an already-stopped daemon scope without resolving any effect.
+
+        The scope must have been enrolled while the exact daemon was alive,
+        with the supervisor's retained daemon pidfd among its original members.
+        The caller independently stops the daemon; this method sends no signal
+        and never clears a journal/ledger hold or infers an Engine outcome.
+        """
+        from .cgroup_scope_evidence import EnrolledCgroupScope, EmptyScopeObservation
+        _require(self._pid == os.getpid())
+        with self._mutex:
+            try:
+                self._guard(allow_held=True)
+                _require(type(scope) is EnrolledCgroupScope and scope._pid == self._pid
+                         and self._launch_id is not None and self._consumer is not None
+                         and self._consumer.fd is not None
+                         and bool(select.select([self._consumer.fd], [], [], 0)[0])
+                         and self._engine is not None and type(self._engine.process) is _Process
+                         and any(item is self._engine.process for item in scope._processes)
+                         and self._engine.process.pid == self._daemon_pin.pid
+                         and self._engine.process.start == self._daemon_pin.start_ticks)
+                evidence = scope.observe_empty()
+                _require(type(evidence) is EmptyScopeObservation and evidence.effect_outcome_proven is False
+                         and evidence.boot_id == self._engine.process.boot
+                         and (self._daemon_pin.pid, self._daemon_pin.start_ticks) in evidence.original_members)
+                record = {'boot_id': evidence.boot_id, 'scope_device': evidence.scope_device,
+                    'scope_inode': evidence.scope_inode, 'original_members': [list(p) for p in evidence.original_members],
+                    'observed_monotonic_ns': int(evidence.observed_monotonic * 1_000_000_000),
+                    'effect_outcome_proven': False}
+                self._journal.record_empty_daemon_scope(self._launch_id, self._record(), record)
+                # This second check detects common changes around persistence;
+                # neither check is atomic with kernel state or external effects.
+                scope.observe_empty()
+                return evidence
+            except Exception:
                 raise LaunchSupervisorError() from None
 
     def _remove_owned_socket(self):

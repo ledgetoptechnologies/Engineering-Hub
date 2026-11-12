@@ -1624,3 +1624,73 @@ def test_separate_consumer_receives_supervisor_proposal_and_operator_approval(sy
         child.stdin.close()
         child.stdout.close()
         child.stderr.close()
+
+
+def test_supervisor_records_empty_daemon_scope_without_claiming_effect_outcome(
+        synthetic_issuer, monkeypatch):
+    """Synthetic cgroup/Engine; real owned pidfds and real journal transaction."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from hub_container_executor import cgroup_scope_evidence as cgroups
+    authority, _, _ = synthetic_issuer
+    root = authority._socket_path.parent
+    fake_root = root / 'cgroup'
+    fake_root.mkdir(mode=0o700)
+    scope_path = fake_root / 'daemon'
+    scope_path.mkdir(mode=0o700)
+    for base, names in ((fake_root, {'cgroup.procs': '', 'cgroup.threads': ''}),
+        (scope_path, {'cgroup.max.depth': '0\n', 'cgroup.max.descendants': '0\n',
+                      'cgroup.procs': '', 'cgroup.threads': '', 'cgroup.subtree_control': '',
+                      'cgroup.events': 'populated 1\nfrozen 0\n'})):
+        for name, value in names.items():
+            (base / name).write_text(value)
+            (base / name).chmod(0o600)
+    monkeypatch.setattr(cgroups, '_CGROUP_ROOT', fake_root)
+    monkeypatch.setattr(cgroups, '_filesystem', lambda fd: None)
+    monkeypatch.setattr(cgroups, '_mount_root', lambda: None)
+    monkeypatch.setattr(cgroups, '_membership', lambda process, expected: None)
+    daemon = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    consumer = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    scope = None
+    daemon_process = launch._Process(daemon.pid)
+    try:
+        authority._consumer.close()
+        authority._consumer = launch._Process(consumer.pid)
+        authority._daemon_pin = replace(authority._daemon_pin, pid=daemon.pid, start_ticks=daemon_process.start)
+        authority._engine = SimpleNamespace(process=daemon_process, close=lambda: None)
+        (scope_path / 'cgroup.procs').write_text(str(daemon.pid) + '\n')
+        scope = authority.enroll_daemon_scope('daemon', timeout_ms=1000)
+        with pytest.raises(launch.LaunchSupervisorError):
+            authority.record_daemon_scope_emptiness(scope)  # consumer not drained
+        consumer.terminate()
+        consumer.wait(timeout=3)
+        authority._journal.state(authority._launch_id, 'stopped', authority._record())
+        with pytest.raises(launch.LaunchSupervisorError):
+            authority.record_daemon_scope_emptiness(scope)  # daemon still alive
+        with authority._journal.transaction() as db:
+            assert 'daemon_scope_observation' not in json.loads(db.execute('SELECT data FROM launch').fetchone()[0])
+        daemon.terminate()
+        daemon.wait(timeout=3)
+        (scope_path / 'cgroup.procs').write_text('')
+        (scope_path / 'cgroup.events').write_text('populated 0\nfrozen 0\n')
+        observed = authority.record_daemon_scope_emptiness(scope)
+        assert observed.effect_outcome_proven is False
+        with authority._journal.transaction() as db:
+            state, raw = db.execute('SELECT state,data FROM launch').fetchone()
+        record = json.loads(raw)['daemon_scope_observation']
+        assert state == 'stopped' and record['effect_outcome_proven'] is False
+        assert record['original_members'] == [[daemon.pid, daemon_process.start]]
+        with pytest.raises(launch.LaunchSupervisorError):
+            authority.record_daemon_scope_emptiness(scope)  # no overwrite or replay
+    finally:
+        if scope is not None: scope.close()
+        daemon_process.close()
+        for child in (consumer, daemon):
+            if child.poll() is None:
+                child.terminate()
+                try: child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=2)
