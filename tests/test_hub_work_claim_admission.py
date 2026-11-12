@@ -161,3 +161,35 @@ def test_fixed_worker_enrollment_does_not_claim_other_target_or_future_commit(ri
     queue.claim_verifier = lambda actual, action, env, machine, enrolled: enrolled == variants[0]
     with pytest.raises(HubError, match='work_admission_changed'):
         queue.live_claim(job_id=claim['id'], worker=worker, fence=claim['fence'])
+
+
+@pytest.mark.parametrize('field', ['task', 'commit', 'artifact'])
+def test_fixed_worker_enrollment_rejects_each_single_field_change(rig, field):
+    repo, target, worker = rig
+    queue = WorkQueue(repo, {'validate': WorkAction('staging-pc', project='engineering-hub')},
+                      target_verifier=lambda *args: True,
+                      claim_verifier=lambda actual, action, env, machine, enrolled:
+                          actual == worker and enrolled == target)
+    if field == 'task':
+        other = reviewed_target(repo)
+        variant = WorkTarget(other.task_id, target.source_commit, target.artifact_digest)
+    elif field == 'commit':
+        current = repo.get_task(target.task_id)
+        changed = repo.set_candidate('codex', current['id'], current['revision'], 'c' * 40)
+        repo.review_task('claude', changed['id'], changed['revision'], 'c' * 40, 'approve')
+        variant = WorkTarget(target.task_id, 'c' * 40, target.artifact_digest)
+    else:
+        variant = WorkTarget(target.task_id, target.source_commit, 'sha256:' + 'd' * 64)
+    assert sum(a != b for a, b in zip(
+        (variant.task_id, variant.source_commit, variant.artifact_digest),
+        (target.task_id, target.source_commit, target.artifact_digest))) == 1
+    rejected = submit(queue, variant, request='changed-' + field, action='validate')
+    assert queue.claim(worker=worker) is None
+    assert queue.get_job(rejected['id'])['state'] == 'queued'
+    assert queue.cancel_unclaimed(actor='codex', job_id=rejected['id'])['state'] == 'cancelled'
+    if field == 'commit':
+        current = repo.get_task(target.task_id)
+        restored = repo.set_candidate('codex', current['id'], current['revision'], target.source_commit)
+        repo.review_task('claude', restored['id'], restored['revision'], target.source_commit, 'approve')
+    exact = submit(queue, target, request='exact-' + field, action='validate')
+    assert queue.claim(worker=worker)['id'] == exact['id']
