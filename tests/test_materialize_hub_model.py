@@ -2,6 +2,11 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import http.server
+import subprocess
+import sys
+import threading
+import time
 
 import pytest
 import yaml
@@ -65,3 +70,42 @@ def test_main_workflow_uses_same_pinned_context_in_both_jobs():
         configs.append(config['build-args'])
     assert configs[0] == configs[1]
     assert subject.MANIFEST_SHA in configs[0]
+
+
+def test_supervisor_times_out_before_slow_headers(monkeypatch, tmp_path):
+    manifest, _ = _fixture(monkeypatch, tmp_path)
+    class SlowHeaders(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            time.sleep(1)
+        def log_message(self, *args):
+            pass
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), SlowHeaders)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    # The worker uses a real HTTP connection to a server that accepts the
+    # request but does not deliver response headers before the deadline.
+    root = Path(__file__).resolve().parents[1]
+    code = ("import sys;sys.path.insert(0,sys.argv[1]);"
+            "from scripts import materialize_hub_model as m;"
+            "m.BASE=sys.argv[2];m.MANIFEST_SHA=sys.argv[3];"
+            "m.materialize(m.Path(sys.argv[4]),m.Path(sys.argv[5]))")
+    args = [sys.executable, '-I', '-c', code, str(root),
+            f'http://127.0.0.1:{server.server_port}/', subject.MANIFEST_SHA,
+            str(manifest), str(tmp_path / 'slow-context')]
+    started = time.monotonic()
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            subject.run_bounded(args, timeout=0.4)
+        assert time.monotonic() - started < 2
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_supervisor_does_not_inherit_runner_token(monkeypatch, tmp_path):
+    monkeypatch.setenv('GITHUB_TOKEN', 'synthetic-token')
+    output = tmp_path / 'environment.json'
+    code = "import json,os,sys;open(sys.argv[1],'w').write(json.dumps('GITHUB_TOKEN' in os.environ))"
+    subject.run_bounded([sys.executable, '-I', '-c', code, str(output)], timeout=5)
+    assert json.loads(output.read_text()) is False

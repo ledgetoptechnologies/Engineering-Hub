@@ -5,7 +5,10 @@ No credentials are sent. An unavailable or changed upstream fails the build.
 """
 import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import time
 from urllib.request import Request, urlopen
 
@@ -56,8 +59,23 @@ def materialize(manifest: Path, destination: Path):
     print('Reviewed model snapshot materialized and hashed')
 
 
+def run_bounded(argv, timeout=MAX_SECONDS):
+    """Bound the whole worker, including DNS, redirects and response headers.
+
+    subprocess.run kills and reaps the worker on timeout. The destination is
+    retained as incomplete and must never be reused after an uncertain result.
+    The worker receives no GitHub token or other inherited credentials.
+    """
+    allowed = ('SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP')
+    clean_env = {name: os.environ[name] for name in allowed if name in os.environ}
+    return subprocess.run(argv, env=clean_env, timeout=timeout, check=True)
+
+
 if __name__ == '__main__':
-    import sys
-    if len(sys.argv) != 3:
+    if len(sys.argv) == 4 and sys.argv[1] == '--worker':
+        materialize(Path(sys.argv[2]), Path(sys.argv[3]))
+    elif len(sys.argv) == 3:
+        run_bounded([sys.executable, '-I', str(Path(__file__).resolve()),
+                     '--worker', *sys.argv[1:]])
+    else:
         raise SystemExit('usage: materialize_hub_model.py MANIFEST NEW_DESTINATION')
-    materialize(Path(sys.argv[1]), Path(sys.argv[2]))

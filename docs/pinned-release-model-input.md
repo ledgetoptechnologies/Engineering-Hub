@@ -7,7 +7,10 @@ reference pin the bytes used by `Dockerfile.hub-control.pinned`. The build fails
 if the public source is unavailable or any file differs. Each GitHub-hosted job
 downloads approximately 67 MB into its own temporary directory; no GitHub token
 is sent to the model source. The Dockerfile repeats verification and performs
-model loading without network access.
+model loading without network access. A clean-environment worker is terminated
+and reaped if the overall download exceeds its deadline, including DNS,
+redirects, and response headers. Partial contexts are retained as incomplete
+and cannot be reused by a later attempt.
 
 The file digests were originally checked against metadata from the same upstream
 provider. They establish byte consistency, not independently authenticated
