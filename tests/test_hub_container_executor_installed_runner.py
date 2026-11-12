@@ -451,3 +451,22 @@ async def test_bound_signal_during_approval_cancels_and_closes_owned_resources(l
     assert drained.is_set()
     assert events[-3:] == ['observation-close', 'identity-close', 'transport-close']
     assert all(signal.getsignal(n) == previous[n] for n in previous)
+
+
+def test_bound_profile_app_cgroup_pins_are_closed_and_independent():
+    from tests.test_hub_container_effect_binding_canonical import fixture
+    source = configuration()
+    source['schema'] = module.SCHEMA_BOUND_PILOT
+    source['resources']['single_pilot_protocol'] = True
+    source['resources']['journal_create'] = False
+    binding = asdict(fixture())
+    binding.pop('owner_epoch')
+    binding['environment_names'] = list(binding['environment_names'])
+    source['bound_profile'] = dict(key_id=digest('b'), approval_path='/fixture/approval.json',
+        approver_public_key_hex='e'*64, approval_wait_ms=30000,
+        effects=[dict(binding=binding, create_command_id=None)],
+        app_cgroup=dict(parent='parent.slice', device=1, inode=2, namespace_device=3, namespace_inode=4))
+    parsed = module.parse_configuration(canonical(source))
+    assert parsed.bound_profile.app_cgroup.parent == 'parent.slice'
+    source['bound_profile']['app_cgroup']['extra'] = True
+    with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(source))

@@ -2045,3 +2045,53 @@ def test_adapter_with_v2_journal_holds_before_create_and_cannot_replay(tmp_path,
         adapter.close()
         driver.close()
         journal.close()
+
+
+def test_app_evidence_expiring_during_effect_recheck_blocks_probe_post(tmp_path, monkeypatch):
+    from hub_container_executor.app_cgroup_observation import AppCgroupObservation
+    from hub_container_executor import daemon_backend as module
+    backend, manifest, image, plan, requests = create_transcript(tmp_path)
+    clock = [10.0]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(module.time, 'time', lambda: 1000.0)
+    monkeypatch.setattr(backend, '_assert_runner', lambda deadline: None)
+    monkeypatch.setattr(backend, '_verify_app_cgroup', lambda container, deadline:
+        AppCgroupObservation(container, 1005000, 10.2))
+    monkeypatch.setattr(backend, '_recheck_effect', lambda admitted, deadline: clock.__setitem__(0, 10.3))
+    try:
+        with pytest.raises(module.DaemonBackendError, match='app cgroup observation expired'):
+            backend._one_probe('a'*64, manifest.probes.candidate[0], 1000, 20.0, image.source_commit)
+        assert requests == []
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize('operation', ['start', 'stop'])
+def test_app_membership_denial_never_reports_success_or_repeats_effect(tmp_path, monkeypatch, operation):
+    from dataclasses import replace
+    from hub_container_executor.backend import ContainerObservation, ActualImageSelection
+    from hub_container_executor import daemon_backend as module
+    backend, manifest, image, plan, requests = create_transcript(tmp_path)
+    selection = ActualImageSelection(image.runnable_reference, image.platform_manifest_digest,
+                                     image.image_config_id, image.platform)
+    before = ContainerObservation('a'*64, selection, plan.profile, plan.profile.state_generation_id,
+                                  'created' if operation == 'start' else 'running')
+    after = replace(before, status='running')
+    effects = []
+    monkeypatch.setattr(backend, '_known_container', lambda *args: before)
+    monkeypatch.setattr(backend, '_journal_begin', lambda *args, **kwargs: None)
+    monkeypatch.setattr(backend, '_journal_complete', lambda *args, **kwargs: None)
+    monkeypatch.setattr(backend, '_assert_runner', lambda *args: None)
+    monkeypatch.setattr(backend, '_recheck_effect', lambda *args: None)
+    monkeypatch.setattr(backend, '_read_response', lambda method, path, *args, **kwargs: effects.append((method,path)) or b'')
+    monkeypatch.setattr(backend, 'inspect_container', lambda *args: after)
+    def denied(*args): raise module.DaemonBackendError('synthetic membership denial')
+    monkeypatch.setattr(backend, '_verify_app_cgroup', denied)
+    try:
+        with pytest.raises(module.DaemonBackendError):
+            getattr(backend, operation + '_container')('a'*64, str(uuid4()), 1000)
+        # Start must precede any process membership check; stop must not POST.
+        assert len(effects) == (1 if operation == 'start' else 0)
+        assert requests == []
+    finally:
+        backend.close()

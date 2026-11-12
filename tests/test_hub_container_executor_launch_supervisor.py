@@ -1932,3 +1932,42 @@ def test_launcher_rejects_unenrolled_cgroup_namespace_before_engine_post(root_jo
         assert authority._engine.effect_calls == []
     finally:
         authority.close()
+
+
+def test_authenticated_app_cgroup_observation_round_trip(synthetic_issuer):
+    """Real issuer UDS/signature/pidfd; Engine and parent containment are synthetic."""
+    from hub_container_executor.app_cgroup_observation import AppCgroupPins, AppCgroupObserver
+    from hub_container_executor.launch_transport import UnixCurrentObservationTransport
+    authority, path, _ = synthetic_issuer
+    current_ready(authority)
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    authority.profile = SimpleNamespace(cgroup_parent='parent.slice',
+        cgroup_host_ns_device=3, cgroup_host_ns_inode=4)
+    authority._cgroup_parent_identity = (1, 2)
+    authority._check_cgroup_parent_membership = lambda relative: None  # explicitly synthetic
+    authority._engine = SimpleNamespace(namespace=launch._identity(os.stat('/proc/self/ns/pid')),
+        json=lambda method, route, deadline: (200, {'Id':'a'*64, 'HostConfig':{'CgroupParent':'parent.slice'},
+                                                   'State':{'Running':True,'Pid':child.pid}}),
+        close=lambda: None)
+    release, pin = current_pins(authority)
+    transport = UnixCurrentObservationTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                                expected_issuer_gid=os.getgid())
+    observer = AppCgroupObserver(transport=transport, release=release, launch=pin,
+                                 pins=AppCgroupPins('parent.slice',1,2,3,4), timeout_ms=2000)
+    results = []
+    worker = threading.Thread(target=lambda: results.append(authority.serve_one_current_observation(timeout_ms=3000)))
+    try:
+        worker.start()
+        observed = observer.verify('a'*64, deadline=time.monotonic()+3)
+        assert observed.container_id == 'a'*64
+        worker.join(4)
+        assert not worker.is_alive() and results == [True]
+    finally:
+        transport.close()
+        if child.poll() is None:
+            child.terminate()
+            try: child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                child.kill(); child.wait(timeout=2)
+        worker.join(4)

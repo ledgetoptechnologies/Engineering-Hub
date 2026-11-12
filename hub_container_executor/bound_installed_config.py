@@ -18,10 +18,13 @@ class InstalledBoundProfile:
     approver_public_key: bytes
     approval_wait_ms: int
     effects: tuple
+    app_cgroup: object = None
 
 
 def parse_bound_profile(value):
-    if type(value) is not dict or set(value) != {'key_id', 'approval_path', 'approver_public_key_hex', 'approval_wait_ms', 'effects'}:
+    if (type(value) is not dict or set(value) not in (
+            {'key_id', 'approval_path', 'approver_public_key_hex', 'approval_wait_ms', 'effects'},
+            {'key_id', 'approval_path', 'approver_public_key_hex', 'approval_wait_ms', 'effects', 'app_cgroup'})):
         raise ValueError('closed bound profile required')
     if type(value['key_id']) is not str or not re.fullmatch(r'sha256:[a-f0-9]{64}', value['key_id']):
         raise ValueError('independent key identity required')
@@ -61,4 +64,11 @@ def parse_bound_profile(value):
             result.append(DeferredTargetEffect(effect, origin))
     if len({(x.template if type(x) is DeferredTargetEffect else x).operation_id for x in result}) != len(result):
         raise ValueError('duplicate effect identity')
-    return InstalledBoundProfile(value['key_id'], path, bytes.fromhex(public_hex), wait_ms, tuple(result))
+    app_cgroup = None
+    if 'app_cgroup' in value:
+        from .app_cgroup_observation import AppCgroupPins
+        item = value['app_cgroup']
+        if type(item) is not dict or set(item) != {'parent', 'device', 'inode', 'namespace_device', 'namespace_inode'}:
+            raise ValueError('closed app cgroup pins required')
+        app_cgroup = AppCgroupPins(**item)
+    return InstalledBoundProfile(value['key_id'], path, bytes.fromhex(public_hex), wait_ms, tuple(result), app_cgroup)

@@ -85,3 +85,25 @@ containerd/shims, or establish application-container membership. In particular,
 the app backend runs in a separate PID namespace and needs an independently
 trusted host-side membership observer before application containment can be
 claimed. These checks provide no effect-outcome or recovery authority.
+
+### Opt-in app membership observation
+
+A v3 bound runner profile may independently pin `app_cgroup` with exactly
+`parent`, `device`, `inode`, `namespace_device`, and `namespace_inode`. These
+values must match the root launcher's separately enrolled parent and namespace.
+The backend sets Docker `CgroupParent` on create. The root supervisor accepts
+an app-container ID and fresh nonce only from its exact retained runner peer;
+it inspects the daemon's exact container, obtains a host PID and pidfd, checks
+its actual cgroup membership and parent inode, rechecks the daemon's PID, and
+signs a short-lived observation bound to that container, daemon generation,
+launcher generation, parent, namespace, and nonce. The runner verifies all
+pins and the signature before using that observation.
+
+The initial application start is necessarily issued before a process PID exists.
+The backend checks host membership immediately after start and holds uncertain
+results. It obtains fresh membership evidence before stop and each probe exec
+POST, checks that evidence remains live after the independent effect guard,
+and fails closed on mismatch or expiry. These are point-in-time checks, not an
+atomic kernel fence. They do not prove uninterrupted containment, all worker
+closure, or recovery of a held effect. The profile is opt-in; legacy profiles
+retain their prior behavior. No installation or staging acceptance is implied.

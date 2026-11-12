@@ -336,6 +336,12 @@ async def run_installed_executor(config):
                 owned.callback(observer.close)
                 bound_options = dict(bound_profile=config.bound_profile, bound_observer=observer,
                                      bound_release=pins, bound_approval_lease=lease)
+                if getattr(config.bound_profile, 'app_cgroup', None) is not None:
+                    from .app_cgroup_observation import AppCgroupObserver
+                    app_observer = AppCgroupObserver(transport=observations, release=pins,
+                        launch=lease.approval.launch, pins=config.bound_profile.app_cgroup, timeout_ms=config.timeout_ms)
+                    owned.callback(app_observer.close)
+                    bound_options['bound_app_cgroup_observer'] = app_observer
                 # The same handlers now request a graceful service drain. No
                 # remove/reinstall window exists between these two phases.
                 signal_state.serving = True

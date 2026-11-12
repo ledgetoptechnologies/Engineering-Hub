@@ -95,7 +95,8 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
         baseline_receipt_root, secret_root, secret_bindings, build_enrollments,
         baseline_receipt_digest, baseline_runtime_profile_digest, frozen_backup,
         reservation_root, state_reservations_create, driver_identity_verifier, single_pilot_protocol=False,
-        bound_profile=None, bound_observer=None, bound_release=None, bound_approval_lease=None):
+        bound_profile=None, bound_observer=None, bound_release=None, bound_approval_lease=None,
+        bound_app_cgroup_observer=None):
     """Yield one freshly constructed exact HostAdapter with concrete providers.
 
     All directories must already exist, be canonical and pairwise nonnested;
@@ -136,7 +137,8 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
                 or not callable(getattr(driver_identity_verifier, "implementation_commit", None))):
             raise LocalResourcesError("Explicit private Linux resource configuration required")
         if bound_profile is None:
-            if bound_observer is not None or bound_release is not None or bound_approval_lease is not None:
+            if (bound_observer is not None or bound_release is not None or bound_approval_lease is not None
+                    or bound_app_cgroup_observer is not None):
                 raise LocalResourcesError('Unexpected bound runtime input')
         elif (type(bound_profile) is not InstalledBoundProfile or type(bound_observer) is not CurrentExecutorObserver
               or type(bound_approval_lease) is not ProtectedApprovalLease
@@ -212,6 +214,18 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
                 resources.callback(key.close)
             backend = DockerEngineBackend(binding, operation_journal=journal)
             resources.callback(backend.close)
+            if bound_profile is not None:
+                from .app_cgroup_observation import AppCgroupObserver
+                if bound_profile.app_cgroup is None:
+                    if bound_app_cgroup_observer is not None:
+                        raise LocalResourcesError('unexpected app cgroup observer')
+                elif (type(bound_app_cgroup_observer) is not AppCgroupObserver
+                      or bound_app_cgroup_observer._pins != bound_profile.app_cgroup
+                      or bound_app_cgroup_observer._release != bound_release
+                      or bound_app_cgroup_observer._launch != bound_approval_lease.check().launch):
+                    raise LocalResourcesError('pinned app cgroup observer required')
+                else:
+                    backend.app_cgroup_observer = bound_app_cgroup_observer
             adapter = HostAdapter(
                 adapter_path, manifest, record_store=records, metadata_store=metadata,
                 provenance_verifier=verifier, backend=backend,

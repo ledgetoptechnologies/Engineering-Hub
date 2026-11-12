@@ -48,6 +48,8 @@ from .configuration_commitment import configuration_commitment
 _HEX = re.compile(r'[0-9a-f]{64}\Z')
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
 CURRENT_REQUEST_PROTOCOL = 'engineering-hub.executor-current-observation-request.v1'
+APP_CGROUP_REQUEST_PROTOCOL = 'engineering-hub.app-cgroup-observation-request.v1'
+APP_CGROUP_SIGNATURE_DOMAIN = b'engineering-hub-app-cgroup-observation-v1\x00'
 PROPOSAL_REQUEST_PROTOCOL = 'engineering-hub.launch-proposal-request.v1'
 _CGROUPFS_ROOT = Path('/sys/fs/cgroup')
 APPROVAL_PROPOSAL_DOMAIN = b'engineering-hub-launch-approval-proposal-v1\x00'
@@ -1257,6 +1259,71 @@ class LaunchSupervisor:
             self._hold()
             raise LaunchSupervisorError() from None
 
+    def _observe_app_cgroup_locked(self, nonce, container_id, deadline):
+        """Observe exact running app membership from the root host, not Docker alone."""
+        try:
+            _require(self.profile.cgroup_parent is not None and self._receipt_served
+                     and not self._issuance_open and type(container_id) is str and _HEX.fullmatch(container_id)
+                     and type(nonce) is str and _HEX.fullmatch(nonce))
+            deadline = min(deadline, self._expires)
+            self._validate_live(deadline)
+            # Engine-reported PID is interpreted only in the same PID namespace.
+            _require(self._engine.namespace == _identity(os.stat('/proc/self/ns/pid')))
+            _, info = self._engine.json('GET', '/containers/' + container_id + '/json', deadline)
+            _require(type(info) is dict and info.get('Id') == container_id
+                     and type(info.get('HostConfig')) is dict
+                     and info['HostConfig'].get('CgroupParent') == self.profile.cgroup_parent
+                     and type(info.get('State')) is dict and info['State'].get('Running') is True
+                     and type(info['State'].get('Pid')) is int and info['State']['Pid'] > 1)
+            pid = info['State']['Pid']
+            _require(pid != self._consumer.pid and pid != self._daemon_pin.pid)
+            process = _Process(pid)
+            try:
+                rows = Path(f'/proc/{pid}/cgroup').read_text(encoding='ascii').splitlines()
+                _require(len(rows) == 1 and rows[0].startswith('0::/'))
+                relative = rows[0][3:]
+                _require(os.path.normpath(relative) == relative and '..' not in Path(relative).parts)
+                self._check_cgroup_parent_membership(relative)
+                group = _CGROUPFS_ROOT / relative.lstrip('/')
+                _require(str(pid) in (group / 'cgroup.procs').read_text(encoding='ascii').splitlines())
+                process.check()
+                now = int(time.time() * 1000)
+                expires = min(now + min(5000, int(_remaining(self._expires) * 1000)),
+                              self._approval_expires_at_ms)
+                _require(now < expires)
+                payload = {'protocol': 'engineering-hub.app-cgroup-observation.v1', 'nonce': nonce,
+                    'launch_id': self._launch_id, 'boot_id': process.boot, 'engine_id': self._daemon_pin.daemon_id,
+                    'engine_pid': self._daemon_pin.pid, 'engine_start_ticks': self._daemon_pin.start_ticks,
+                    'container_id': container_id, 'host_pid': process.pid, 'host_start_ticks': process.start,
+                    'cgroup_parent': self.profile.cgroup_parent, 'cgroup_device': self._cgroup_parent_identity[0],
+                    'cgroup_inode': self._cgroup_parent_identity[1],
+                    'namespace_device': self.profile.cgroup_host_ns_device,
+                    'namespace_inode': self.profile.cgroup_host_ns_inode,
+                    'observed_at_ms': now, 'expires_at_ms': expires}
+                signature = base64.urlsafe_b64encode(self._signer.sign(
+                    APP_CGROUP_SIGNATURE_DOMAIN + _canonical(payload))).rstrip(b'=').decode()
+                result = _canonical({'payload': payload, 'signature': signature})
+                process.check()
+                self._check_cgroup_parent_membership(relative)
+                _, final = self._engine.json('GET', '/containers/' + container_id + '/json', deadline)
+                _require(type(final) is dict and final.get('Id') == container_id
+                         and type(final.get('HostConfig')) is dict
+                         and final['HostConfig'].get('CgroupParent') == self.profile.cgroup_parent
+                         and type(final.get('State')) is dict and final['State'].get('Running') is True
+                         and type(final['State'].get('Pid')) is int and final['State']['Pid'] == pid)
+                process.check()
+                _require(Path(f'/proc/{pid}/cgroup').read_text(encoding='ascii').splitlines() == rows
+                         and str(pid) in (group / 'cgroup.procs').read_text(encoding='ascii').splitlines())
+                self._validate_live(deadline)
+                _require(int(time.time() * 1000) < expires)
+                _remaining(deadline)
+                return result
+            finally:
+                process.close()
+        except BaseException:
+            self._hold()
+            raise LaunchSupervisorError() from None
+
     def approval_proposal(self, *, timeout_ms):
         """Return a fresh issuer-signed proposal, never an independent approval.
 
@@ -1357,9 +1424,13 @@ class LaunchSupervisor:
                 size = struct.unpack('!I', self._receive(peer, 4, deadline))[0]
                 _require(0 < size <= MAX_REQUEST_BYTES)
                 request = _strict(self._receive(peer, size, deadline), MAX_REQUEST_BYTES)
-                _require(type(request) is dict and set(request) == {'protocol', 'nonce'}
-                         and request['protocol'] == CURRENT_REQUEST_PROTOCOL
-                         and type(request['nonce']) is str and _HEX.fullmatch(request['nonce']))
+                _require(type(request) is dict and type(request.get('nonce')) is str
+                         and _HEX.fullmatch(request['nonce']))
+                is_current = set(request) == {'protocol', 'nonce'} and request['protocol'] == CURRENT_REQUEST_PROTOCOL
+                is_app = (set(request) == {'protocol', 'nonce', 'container_id'}
+                          and request['protocol'] == APP_CGROUP_REQUEST_PROTOCOL
+                          and type(request['container_id']) is str and _HEX.fullmatch(request['container_id']))
+                _require(is_current or is_app)
                 peer.settimeout(_remaining(deadline))
                 _require(peer.recv(1) == b'')
             except Exception:
@@ -1371,7 +1442,8 @@ class LaunchSupervisor:
                     peer.close()
                 raise
             try:
-                raw = self._observe_current_launch_locked(request['nonce'], deadline)
+                raw = (self._observe_current_launch_locked(request['nonce'], deadline) if is_current else
+                       self._observe_app_cgroup_locked(request['nonce'], request['container_id'], deadline))
                 # A disconnected requester is not proof of a broken launch.
                 try:
                     peer.settimeout(_remaining(deadline))

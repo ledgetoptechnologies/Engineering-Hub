@@ -618,6 +618,7 @@ class DockerEngineBackend:
         self.binding = binding
         self.operation_journal = operation_journal
         self.effect_binding_provider = effect_binding_provider
+        self.app_cgroup_observer = None
         self._using_test_transport = test_transport is not None
         transport = (test_transport if test_transport is not None
                      else httpx.HTTPTransport(uds=binding.unix_socket_path))
@@ -1102,7 +1103,7 @@ class DockerEngineBackend:
     def _create_body(self, plan, source, environment):
         profile = plan.profile
         tmp_size, tmp_mode = profile.tmpfs[0][1], profile.tmpfs[0][2]
-        return {
+        body = {
             "Image": plan.immutable_reference,
             "User": "10001:10001",
             "Env": [f"{key}={value}" for key, value in environment],
@@ -1127,6 +1128,32 @@ class DockerEngineBackend:
                 "AutoRemove": False,
             },
         }
+        if self.app_cgroup_observer is not None:
+            from .app_cgroup_observation import AppCgroupObserver
+            if type(self.app_cgroup_observer) is not AppCgroupObserver:
+                raise DaemonBackendError('app cgroup observer unavailable')
+            body["HostConfig"]["CgroupParent"] = self.app_cgroup_observer._pins.parent
+        return body
+
+    def _verify_app_cgroup(self, container_id, deadline):
+        if self.app_cgroup_observer is None:
+            return None
+        from .app_cgroup_observation import AppCgroupObserver, AppCgroupObservation
+        if type(self.app_cgroup_observer) is not AppCgroupObserver:
+            raise DaemonBackendError('app cgroup observation unavailable')
+        result = self.app_cgroup_observer.verify(container_id, deadline=deadline)
+        if type(result) is not AppCgroupObservation or result.container_id != container_id:
+            raise DaemonBackendError('app cgroup observation unavailable')
+        self._remaining(deadline)
+        return result
+
+    def _recheck_contained_effect(self, admitted, container_id, deadline):
+        evidence = self._verify_app_cgroup(container_id, deadline)
+        self._recheck_effect(admitted, deadline)
+        if evidence is not None and (time.monotonic() >= evidence.expires_monotonic
+                or int(time.time() * 1000) >= evidence.expires_wall_ms):
+            raise DaemonBackendError('app cgroup observation expired')
+        self._remaining(deadline)
 
     def create_container(self, plan: ContainerPlan, operation_id: str, timeout_ms: int) -> str:
         deadline = self._deadline(timeout_ms)
@@ -1383,6 +1410,9 @@ class DockerEngineBackend:
                 or not 16 <= host.get("PidsLimit") <= 256
                 or host.get("AutoRemove") is not False):
             raise DaemonBackendError("container host security profile differs")
+        if (self.app_cgroup_observer is not None
+                and host.get("CgroupParent") != self.app_cgroup_observer._pins.parent):
+            raise DaemonBackendError("container cgroup parent differs")
         for key in ("GroupAdd", "Binds", "Devices", "DeviceRequests", "DeviceCgroupRules",
                     "ExtraHosts", "Links", "VolumesFrom"):
             if host.get(key) not in (None, []):
@@ -1468,6 +1498,7 @@ class DockerEngineBackend:
         if (type(after) is not ContainerObservation or after.status != "running"
                 or after.selected_image != before.selected_image or after.profile != before.profile):
             raise DaemonBackendError("started container state is not verified")
+        self._verify_app_cgroup(container_id, deadline)
         self._remaining(deadline)
 
     def stop_container(self, container_id: str, operation_id: str, timeout_ms: int) -> None:
@@ -1478,7 +1509,7 @@ class DockerEngineBackend:
                             image=self._container_images.get(container_id))
         self._assert_runner(deadline)
         route = self._route("/containers/" + container_id + "/stop")
-        self._recheck_effect(admitted, deadline)
+        self._recheck_contained_effect(admitted, container_id, deadline)
         self._read_response("POST", route, deadline, expected_status=204,
                             params={"t": "5"})
         self._journal_complete(operation_id, "stop", container_id)
@@ -1545,7 +1576,9 @@ class DockerEngineBackend:
         # Once admitted, that exact attempt retains its ordinary request budget.
         if readiness_deadline is not None and time.monotonic() >= readiness_deadline:
             raise DaemonBackendError("health readiness admission deadline exceeded")
-        self._recheck_effect(admitted, probe_deadline)
+        self._recheck_contained_effect(admitted, container_id, probe_deadline)
+        if readiness_deadline is not None and time.monotonic() >= readiness_deadline:
+            raise DaemonBackendError("health readiness admission deadline exceeded")
         raw_create = self._read_response(
             "POST", self._route("/containers/" + container_id + "/exec"),
             probe_deadline, expected_status=201, json_body=create_body,
@@ -1556,7 +1589,7 @@ class DockerEngineBackend:
             raise DaemonBackendError("compiled probe execution identity is invalid")
         exec_id = created["Id"]
         self._assert_runner(probe_deadline)
-        self._recheck_effect(admitted, probe_deadline)
+        self._recheck_contained_effect(admitted, container_id, probe_deadline)
         raw_stream = self._read_response(
             "POST", self._route("/exec/" + exec_id + "/start"),
             probe_deadline, expected_status=200,
