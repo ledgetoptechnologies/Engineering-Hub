@@ -782,6 +782,20 @@ class HubRepository:
             raise HubError('invalid_replacement')
         with self._transaction() as db:
             item = self._get(db, identity, kind)
+            def authorized_replacement():
+                # Check scope before inspecting replacement state.  Both the
+                # original request and an idempotent retry must keep foreign
+                # entity existence and status private from session agents.
+                try:
+                    replacement = self._get(db, superseded_by, kind)
+                    if session_context.actor_allowed(actor):
+                        self._project(replacement['project'], db)
+                except HubError as error:
+                    if (session_context.actor_allowed(actor) and error.code in
+                            {'not_found', 'hub_project_forbidden', 'project_archived'}):
+                        raise HubError('hub_replacement_unavailable', 404) from None
+                    raise
+                return replacement
             # Archived projects keep their records; retiring a stale one there is allowed.
             self._project(item['project'], db, require_active=False)
             if (actor in AGENTS or session_context.actor_allowed(actor)) and self._creator(db, kind, identity) != actor:
@@ -793,8 +807,7 @@ class HubRepository:
                 if (item.get('withdrawn_by') == actor and item.get('withdrawn_reason') == reason
                         and item.get('superseded_by') == superseded_by):
                     if session_context.actor_allowed(actor) and superseded_by is not None:
-                        replacement = self._get(db, superseded_by, kind)
-                        self._project(replacement['project'], db)
+                        authorized_replacement()
                     return item
                 raise HubError('withdrawn', 409)
             self._cas(item, expected_revision)
@@ -812,10 +825,11 @@ class HubRepository:
                 if self._open_work_job(db, identity):
                     raise HubError('task_in_progress', 409)
             if superseded_by is not None:
-                replacement = self._get(db, superseded_by, kind)
+                replacement = authorized_replacement()
                 if replacement['status'] == 'withdrawn':
                     raise HubError('invalid_replacement')
-                self._project(replacement['project'], db)
+                if not session_context.actor_allowed(actor):
+                    self._project(replacement['project'], db)
             if session_context.actor_allowed(actor):
                 principal = session_context.current.get().principal
                 item.update(withdrawn_family=principal.family, withdrawn_session_id=principal.session_id)

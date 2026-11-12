@@ -506,6 +506,67 @@ def test_session_id_tools_do_not_disclose_unavailable_entities(unified):
     assert bad['isError'] and 'invalid_kind' in bad['content'][0]['text']
 
 
+@pytest.mark.parametrize('kind', ['task', 'decision'])
+def test_withdraw_replacement_does_not_disclose_foreign_status(unified, kind):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, projects=(PROJECT, '3d-viewer'))
+    invoke, _ = sdk(client, token)
+    repo = app.state.repository
+    def create(project, label):
+        if kind == 'task':
+            return repo.create_task(OWNER, project, label, 'replace-' + label)
+        return repo.create_decision(OWNER, project, label, ['A', 'B'])
+    private = create('project-alpha', 'private')
+    private_withdrawn = create('project-alpha', 'private-withdrawn')
+    repo.withdraw(OWNER, kind, private_withdrawn['id'], 1, 'old')
+    archived = create('3d-viewer', 'archived')
+    own_replacement = create(PROJECT, 'own-replacement')
+    own_withdrawn = create(PROJECT, 'own-withdrawn')
+    repo.withdraw(OWNER, kind, own_withdrawn['id'], 1, 'old')
+    if kind == 'task':
+        own = data(invoke('hub_staging_task_propose', {'project': PROJECT, 'title': 'Own',
+            'client_request_id': 'withdraw-source'}))
+    else:
+        own = data(invoke('hub_decision_request', {'project': PROJECT, 'title': 'Own', 'options': ['A', 'B'],
+            'client_request_id': 'withdraw-source'}))
+    env.bridge.projects.archive_project(OWNER, '3d-viewer', 1)
+    missing = '00000000-0000-4000-8000-000000000000'
+    args = {'kind': kind, 'entity_id': own['id'], 'expected_revision': 1, 'reason': 'Replaced'}
+    errors = [invoke('hub_entity_withdraw', {**args, 'superseded_by': identity}) for identity in
+              (private['id'], private_withdrawn['id'], archived['id'], missing)]
+    assert all(result['isError'] for result in errors)
+    assert len({result['content'][0]['text'] for result in errors}) == 1
+    assert 'hub_replacement_unavailable' in errors[0]['content'][0]['text']
+    assert repo._read(own['id'], kind)['status'] != 'withdrawn'
+    invalid = invoke('hub_entity_withdraw', {**args, 'superseded_by': own_withdrawn['id']})
+    assert invalid['isError'] and 'invalid_replacement' in invalid['content'][0]['text']
+    invalid = invoke('hub_entity_withdraw', {**args, 'superseded_by': 'invalid'})
+    assert invalid['isError'] and 'invalid_replacement' in invalid['content'][0]['text']
+    valid = {**args, 'superseded_by': own_replacement['id']}
+    result = data(invoke('hub_entity_withdraw', valid))
+    assert result['status'] == 'withdrawn' and result['superseded_by'] == own_replacement['id']
+    assert data(invoke('hub_entity_withdraw', valid)) == result
+
+
+def test_withdraw_retry_rechecks_replacement_grant(unified):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, projects=(PROJECT, '3d-viewer'))
+    invoke, _ = sdk(client, token)
+    original = data(invoke('hub_staging_task_propose', {'project': PROJECT, 'title': 'Original',
+        'client_request_id': 'retry-source'}))
+    replacement = app.state.repository.create_task(OWNER, '3d-viewer', 'Replacement', 'retry-replacement')
+    args = {'kind': 'task', 'entity_id': original['id'], 'expected_revision': 1,
+            'reason': 'Replaced', 'superseded_by': replacement['id']}
+    result = data(invoke('hub_entity_withdraw', args))
+    assert data(invoke('hub_entity_withdraw', args)) == result
+    env.bridge.grant_put(OWNER, installation, 1, [PROJECT], list(CAPABILITIES))
+    denied = invoke('hub_entity_withdraw', args)
+    assert denied['isError'] and 'hub_replacement_unavailable' in denied['content'][0]['text']
+    assert app.state.repository._read(original['id'], 'task')['revision'] == result['revision']
+
+
 def test_session_decision_read_cross_surface_and_project_grants(unified):
     client, app, bus, csrf = unified
     env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
