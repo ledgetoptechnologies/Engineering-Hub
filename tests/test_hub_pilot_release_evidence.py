@@ -13,7 +13,7 @@ from engineering_hub.pilot_release_evidence import pilot_release_evidence
 from engineering_hub.container_pilot import ContainerPilotTarget
 from engineering_hub.container_pilot_manifest import PilotManifest
 from engineering_hub.repository import HubError, HubRepository
-from tests.test_hub_container_pilot import FakeClient, IMAGE, PRINCIPAL, pilot_manifest, ready_run
+from tests.test_hub_container_pilot import FakeClient, IMAGE, PRINCIPAL, pilot_manifest, ready_run, reviewed_task
 from tests.test_hub_container_pilot_manifest import make_manifest_data
 
 pytestmark = pytest.mark.skipif(sys.platform != 'linux', reason='Real Linux PilotOwner fencing')
@@ -51,7 +51,52 @@ async def test_release_evidence_binds_successful_candidate_and_rollback_records(
     assert evidence.candidate_deploy.journal_verified is True
     assert evidence.candidate_health_check.reported_health == 'healthy'
     assert evidence.rollback_deploy.state == 'not_started'
+    assert evidence.candidate_cleanup is None and evidence.rollback_cleanup is None
     assert evidence.evidence_basis == 'authenticated_worker_report'
+    assert evidence.independently_verified is False
+
+
+@pytest.mark.asyncio
+async def test_ack_pending_remains_distinct_from_completed_ack(repo, target):
+    class LostAckClient(FakeClient):
+        single_pilot_protocol = True
+        async def acknowledge_command(self, command, digest):
+            raise TimeoutError('ack response lost')
+    from engineering_hub.container_pilot import ContainerPilotWorkflow
+    workflow = ContainerPilotWorkflow(repo, LostAckClient(), [target], single_pilot_protocol=True)
+    task = reviewed_task(repo)
+    run = workflow.create_run('codex', task['id'], task['revision'], IMAGE, target.target_id)
+    assert await workflow._command(run, target, 'deploy_container') == 'held'
+    evidence = pilot_release_evidence(repo, workflow, run['id'])
+    assert evidence.candidate_deploy.state == 'ack_pending'
+    assert evidence.candidate_deploy.protocol_verified and evidence.candidate_deploy.journal_verified
+    with repo._connection() as db:
+        assert db.execute('SELECT count(*) FROM hub_single_pilot_ack_receipts WHERE run_id=?', (run['id'],)).fetchone()[0] == 0
+    assert evidence.independently_verified is False
+
+
+@pytest.mark.asyncio
+async def test_disposable_cleanup_is_visible_while_run_remains_held(repo):
+    class Client(FakeClient):
+        single_pilot_protocol = True
+        def response(self, command):
+            result = super().response(command)
+            if command.action == 'cleanup_candidate':
+                return result.model_copy(update={'evidence': result.evidence.model_copy(update={'health': 'unknown'})})
+            return result
+        async def acknowledge_command(self, command, digest):
+            return self.response(command)
+    from engineering_hub.container_pilot import ContainerPilotWorkflow
+    value = json.loads(pilot_manifest().canonical_bytes()); value['disposable_final_cleanup'] = True
+    target = ContainerPilotTarget.from_manifest(PilotManifest.from_bytes(json.dumps(value).encode()))
+    workflow = ContainerPilotWorkflow(repo, Client(), [target], single_pilot_protocol=True)
+    task = reviewed_task(repo)
+    run = workflow.create_run('codex', task['id'], task['revision'], IMAGE, target.target_id)
+    assert (await workflow.advance(run['id']))['status'] == 'held'
+    evidence = pilot_release_evidence(repo, workflow, run['id'])
+    assert evidence.run_status == 'held'
+    assert evidence.candidate_cleanup.state == 'succeeded'
+    assert evidence.rollback_cleanup.state == 'not_started'
     assert evidence.independently_verified is False
 
 

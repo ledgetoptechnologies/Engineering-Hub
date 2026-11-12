@@ -11,11 +11,13 @@ import { Badge } from "./ui";
 type Reader = (runId: string, signal: AbortSignal) => Promise<ReleaseEvidence>;
 type Load = "loading" | "loaded" | "failed" | "hidden";
 
-const STEPS: { key: "candidate_deploy" | "candidate_health_check" | "rollback_deploy" | "rollback_health_check"; label: string }[] = [
+const STEPS: { key: "candidate_deploy" | "candidate_health_check" | "rollback_deploy" | "rollback_health_check" | "candidate_cleanup" | "rollback_cleanup"; label: string }[] = [
   { key: "candidate_deploy", label: "Deploy the new version" },
   { key: "candidate_health_check", label: "Health check of the new version" },
   { key: "rollback_deploy", label: "Roll back to the previous version" },
   { key: "rollback_health_check", label: "Health check after rollback" },
+  { key: "candidate_cleanup", label: "Stop disposable candidate" },
+  { key: "rollback_cleanup", label: "Stop disposable rollback" },
 ];
 
 const short = (value: string) => value.startsWith("sha256:") ? value.slice(7, 19) : value.slice(0, 7);
@@ -33,6 +35,7 @@ function ImageCell({ step }: { step: StepEvidence }) {
 function checks(step: StepEvidence): string {
   if (step.state === "not_started") return "No request sent";
   if (!step.protocol_verified) return step.state === "inconsistent" ? "Receipt doesn't match the request" : "No receipt yet";
+  if (step.state === "ack_pending") return "Response retained; acknowledgment not confirmed";
   return step.journal_verified ? "Receipt matches the request and the Hub's journal" : "Receipt doesn't match the Hub's journal";
 }
 
@@ -50,6 +53,8 @@ export function ReleaseEvidenceView({ evidence }: { evidence: ReleaseEvidence })
       <p>These results come from the staging worker's authenticated reports. The Hub checks that each report answers the exact
         request it sent and agrees with its own journal, but it doesn't look at the staging machine itself.</p>
       <p>This view does not verify a successful CI run or establish that the tested source produced the new image.</p>
+      <p>Run, manifest and step records are read separately and may change during refresh; this is not an atomic snapshot.</p>
+      {evidence.run_status === "held" && <p>The run is on hold. A reported cleanup does not prove quiescence or release the reservation.</p>}
     </div>
     <dl className="release-evidence-facts">
       <dt>Project</dt><dd>{evidence.project}</dd>
@@ -65,6 +70,7 @@ export function ReleaseEvidenceView({ evidence }: { evidence: ReleaseEvidence })
       <thead><tr><th scope="col">Step</th><th scope="col">Result</th><th scope="col">Image</th><th scope="col">Health</th><th scope="col">Hub checks</th></tr></thead>
       <tbody>{STEPS.map(({ key, label }) => {
         const step = evidence[key];
+        if (!step) return null; // Cleanup is only present for explicitly disposable pilots.
         const text = stepStateText[step.state];
         return <tr key={key}>
           <th scope="row">{label}</th>

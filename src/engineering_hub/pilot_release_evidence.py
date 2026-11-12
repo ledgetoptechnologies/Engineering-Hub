@@ -8,6 +8,7 @@ from .repository import HubError
 _ACTIONS = (
     'deploy_container', 'smoke_container',
     'rollback_container', 'smoke_container_rollback',
+    'cleanup_candidate', 'cleanup_rollback',
 )
 
 
@@ -25,7 +26,7 @@ def release_evidence_owner_allowed(principal, auth_config, owner_actor):
 
 
 def _command_evidence(repo, workflow, run, target, action):
-    rollback = action in {'rollback_container', 'smoke_container_rollback'}
+    rollback = action in {'rollback_container', 'smoke_container_rollback', 'cleanup_rollback'}
     expected_image = target.rollback_image_config_id if rollback else target.artifact_digest
     expected = workflow._request(run, target, action)
     result = dict(
@@ -49,7 +50,7 @@ def _command_evidence(repo, workflow, run, target, action):
     if row is None:
         return result
 
-    allowed_states = {'unknown', 'held', 'succeeded', 'failed'}
+    allowed_states = {'unknown', 'held', 'succeeded', 'failed', 'ack_pending'}
     if row['state'] not in allowed_states:
         result['state'] = 'inconsistent'
         return result
@@ -65,7 +66,7 @@ def _command_evidence(repo, workflow, run, target, action):
 
     if row['response_json'] is None:
         # A missing receipt is never reconstructed from the run's phase or status.
-        if row['state'] in {'succeeded', 'failed'}:
+        if row['state'] in {'succeeded', 'failed', 'ack_pending'}:
             result['state'] = 'inconsistent'
         return result
     try:
@@ -85,7 +86,14 @@ def _command_evidence(repo, workflow, run, target, action):
     result['reported_image_config_id'] = response.evidence.image_config_id
     result['reported_health'] = response.evidence.health
     result['reason'] = response.reason
-    result['journal_verified'] = workflow._verified_state(response, expected, target) == row['state']
+    verified_state = workflow._verified_state(response, expected, target)
+    # ack_pending means that the response was retained but the ACK outcome is
+    # not established. Never treat response persistence as an ACK receipt.
+    ack_eligible = (verified_state == 'succeeded' or (verified_state == 'failed'
+        and response.reason == 'health_failed' and response.evidence.health == 'unhealthy'
+        and response.evidence.evidence_verified is True))
+    result['journal_verified'] = (ack_eligible if row['state'] == 'ack_pending'
+                                  else verified_state == row['state'])
     if not result['journal_verified']:
         result['state'] = 'inconsistent'
     return result
@@ -102,7 +110,9 @@ def pilot_release_evidence(repo, workflow, run_id):
     workflow._assert_pilot_owner()
     run = repo.get_run(run_id)
     target = workflow._historical_target(run)
-    details = {action: _command_evidence(repo, workflow, run, target, action)
+    disposable = target.validated_manifest().disposable_final_cleanup is True
+    details = {action: (_command_evidence(repo, workflow, run, target, action)
+                        if disposable or not action.startswith('cleanup_') else None)
                for action in _ACTIONS}
     return PilotReleaseEvidenceDTO(
         run_id=run['id'],
@@ -118,6 +128,8 @@ def pilot_release_evidence(repo, workflow, run_id):
         candidate_health_check=details['smoke_container'],
         rollback_deploy=details['rollback_container'],
         rollback_health_check=details['smoke_container_rollback'],
+        candidate_cleanup=details['cleanup_candidate'],
+        rollback_cleanup=details['cleanup_rollback'],
         evidence_basis='authenticated_worker_report',
         independently_verified=False,
     )

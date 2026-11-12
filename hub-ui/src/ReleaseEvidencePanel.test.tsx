@@ -46,4 +46,16 @@ describe("release evidence presentation", () => {
     expect(html).toContain("Show release evidence");
     expect(html).not.toContain("Reading release evidence");
   });
+  it("shows cleanup and retained response without claiming ACK or release", () => {
+    const body = evidenceBody();
+    body.run_status = "held";
+    body.candidate_deploy.state = "ack_pending";
+    body.candidate_cleanup = { ...body.rollback_deploy, action: "cleanup_candidate", state: "succeeded" };
+    body.rollback_cleanup = { ...body.rollback_deploy, action: "cleanup_rollback" };
+    const html = renderToStaticMarkup(<ReleaseEvidenceView evidence={parseReleaseEvidence(body)} />);
+    expect(html).toContain("acknowledgment not confirmed");
+    expect(html).toContain("Stop disposable candidate");
+    expect(html).toContain("does not prove quiescence or release the reservation");
+    expect(html).toContain("not an atomic snapshot");
+  });
 });

@@ -173,9 +173,9 @@ class RunDTO(EntityDTO):
 
 
 class PilotCommandEvidenceDTO(ResponseDTO):
-    action: Literal['deploy_container', 'smoke_container', 'rollback_container', 'smoke_container_rollback']
+    action: Literal['deploy_container', 'smoke_container', 'rollback_container', 'smoke_container_rollback', 'cleanup_candidate', 'cleanup_rollback']
     command_id: str
-    state: Literal['not_started', 'unknown', 'held', 'succeeded', 'failed', 'inconsistent']
+    state: Literal['not_started', 'unknown', 'held', 'succeeded', 'failed', 'ack_pending', 'inconsistent']
     expected_image_config_id: Digest
     reported_image_config_id: Digest | None
     reported_health: Literal['unknown', 'healthy', 'unhealthy'] | None
@@ -205,6 +205,8 @@ class PilotReleaseEvidenceDTO(ResponseDTO):
     candidate_health_check: PilotCommandEvidenceDTO
     rollback_deploy: PilotCommandEvidenceDTO
     rollback_health_check: PilotCommandEvidenceDTO
+    candidate_cleanup: PilotCommandEvidenceDTO | None
+    rollback_cleanup: PilotCommandEvidenceDTO | None
     evidence_basis: Literal['authenticated_worker_report']
     independently_verified: Literal[False]
 

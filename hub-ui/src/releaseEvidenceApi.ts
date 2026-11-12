@@ -6,9 +6,9 @@
  */
 import { HubApiError, isMissingRoute } from "./api";
 
-export const STEP_ACTIONS = ["deploy_container", "smoke_container", "rollback_container", "smoke_container_rollback"] as const;
+export const STEP_ACTIONS = ["deploy_container", "smoke_container", "rollback_container", "smoke_container_rollback", "cleanup_candidate", "cleanup_rollback"] as const;
 export type StepAction = typeof STEP_ACTIONS[number];
-export const STEP_STATES = ["not_started", "unknown", "held", "succeeded", "failed", "inconsistent"] as const;
+export const STEP_STATES = ["not_started", "unknown", "held", "succeeded", "failed", "ack_pending", "inconsistent"] as const;
 export type StepState = typeof STEP_STATES[number];
 const HEALTH = ["unknown", "healthy", "unhealthy"] as const;
 const WORKER_STATES = ["pending", "running", "succeeded", "failed", "held"] as const;
@@ -46,6 +46,8 @@ export interface ReleaseEvidence {
   candidate_health_check: StepEvidence;
   rollback_deploy: StepEvidence;
   rollback_health_check: StepEvidence;
+  candidate_cleanup: StepEvidence | null;
+  rollback_cleanup: StepEvidence | null;
   evidence_basis: "authenticated_worker_report";
   independently_verified: false;
 }
@@ -91,7 +93,7 @@ function parseStep(value: unknown, action: StepAction): StepEvidence {
   return step;
 }
 
-const EVIDENCE_KEYS = ["candidate_deploy", "candidate_health_check", "candidate_image_config_id", "evidence_basis",
+const EVIDENCE_KEYS = ["candidate_cleanup", "rollback_cleanup", "candidate_deploy", "candidate_health_check", "candidate_image_config_id", "evidence_basis",
   "independently_verified", "pilot_manifest_digest", "project", "review", "rollback_deploy", "rollback_health_check",
   "rollback_image_config_id", "run_id", "run_status", "source_commit", "task_id"].sort().join();
 export function parseReleaseEvidence(value: unknown): ReleaseEvidence {
@@ -115,6 +117,8 @@ export function parseReleaseEvidence(value: unknown): ReleaseEvidence {
     candidate_health_check: parseStep(row.candidate_health_check, "smoke_container"),
     rollback_deploy: parseStep(row.rollback_deploy, "rollback_container"),
     rollback_health_check: parseStep(row.rollback_health_check, "smoke_container_rollback"),
+    candidate_cleanup: orNull(row.candidate_cleanup, value => parseStep(value, "cleanup_candidate")),
+    rollback_cleanup: orNull(row.rollback_cleanup, value => parseStep(value, "cleanup_rollback")),
     evidence_basis: "authenticated_worker_report",
     independently_verified: false,
   };
@@ -162,6 +166,7 @@ export const stepStateText: Record<StepState, { title: string; tone: "forest" | 
   not_started: { title: "Not started", tone: "neutral" },
   unknown: { title: "Outcome unknown", tone: "amber" },
   held: { title: "On hold", tone: "amber" },
+  ack_pending: { title: "Worker response retained; acknowledgment pending", tone: "amber" },
   succeeded: { title: "Worker reports success", tone: "forest" },
   failed: { title: "Worker reports failure", tone: "amber" },
   inconsistent: { title: "Doesn't match the Hub's records", tone: "amber" },

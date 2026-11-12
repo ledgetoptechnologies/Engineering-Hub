@@ -37,6 +37,8 @@ export function evidenceBody(): ReleaseEvidence {
     },
     rollback_deploy: step("rollback_container"),
     rollback_health_check: step("smoke_container_rollback"),
+    candidate_cleanup: null,
+    rollback_cleanup: null,
     evidence_basis: "authenticated_worker_report",
     independently_verified: false,
   };
