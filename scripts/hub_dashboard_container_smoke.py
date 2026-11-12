@@ -76,7 +76,9 @@ assert get('/api/hub/v1/auth/login')[0] == 503
 for path in ['/overview', '/tasks', '/decisions', '/runs', '/events', '/topics/topic/peers']:
     assert get('/api/hub/v1' + path)[0] == 401, path
 assert get('/not-an-app-route')[0] == 404
-expected_tools = {'hub_overview', 'hub_task_get', 'hub_task_claim', 'hub_task_candidate',
+expected_tools = {'hub_overview', 'hub_project_tasks', 'hub_tracking_task_propose',
+                  'hub_tracking_task_update', 'hub_tracking_task_list', 'hub_tracking_task_review',
+                  'hub_task_get', 'hub_task_claim', 'hub_task_candidate',
                   'hub_task_review', 'hub_decision_request', 'hub_decision_get', 'hub_run_list',
                   'hub_topic_peers', 'hub_topic_preflight', 'hub_staging_task_propose',
                   'hub_planning_list', 'hub_planning_get', 'hub_planning_put',

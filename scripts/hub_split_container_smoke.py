@@ -64,7 +64,9 @@ for token in (None, 'synthetic-invalid-token'):
     headers = {} if token is None else {'Authorization': 'Bearer ' + token}
     assert request(8770, '/api/hub/v1/overview', headers=headers)[0] == 401
 
-expected_tools = {'hub_overview', 'hub_task_get', 'hub_task_claim', 'hub_task_candidate',
+expected_tools = {'hub_overview', 'hub_project_tasks', 'hub_tracking_task_propose',
+                  'hub_tracking_task_update', 'hub_tracking_task_list', 'hub_tracking_task_review',
+                  'hub_task_get', 'hub_task_claim', 'hub_task_candidate',
                   'hub_task_review', 'hub_decision_request', 'hub_decision_get', 'hub_run_list',
                   'hub_topic_peers', 'hub_topic_preflight', 'hub_staging_task_propose',
                   'hub_planning_list', 'hub_planning_get', 'hub_planning_put',
@@ -262,7 +264,7 @@ def smoke(image, commit):
             _verify_profile(name, volume)
             report = json.loads(run("docker", "exec", name, "python", "-c", PROBE, commit, timeout=110))
             assert report["split_image_smoke"] == "passed" and report["build_commit"] == commit
-            assert report["authenticated_agents"] == 3 and report["mcp_tools"] == 30
+            assert report["authenticated_agents"] == 3 and report["mcp_tools"] == 36
             assert report["agent_bind"] == "0.0.0.0:8770" and report["browser_bind"] == "127.0.0.1:8771"
             if iteration == 0:
                 run("docker", "exec", name, "python", "-c", SEED_RECORDS)
