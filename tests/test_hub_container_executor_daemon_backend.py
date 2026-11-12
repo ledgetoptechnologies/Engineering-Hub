@@ -44,7 +44,7 @@ def test_opt_in_bound_journal_matches_exact_target_before_effect(tmp_path):
         return OperationBinding('2b201b1d-2327-437e-8705-135b9ccf128b', 50, 60,
                                 None, target, 'hmac-sha256:' + 'a' * 64, 1)
     backend = DockerEngineBackend(binding(manifest, tmp_path), operation_journal=Journal(),
-                                 effect_binding_provider=TrustedEffectBindingProvider(provider, lambda actual: True),
+                                 effect_binding_provider=TrustedEffectBindingProvider(provider, lambda actual: True, lambda actual: True),
                                  test_transport=httpx.MockTransport(lambda _: pytest.fail('unexpected effect')))
     try:
         context = EffectCallContext(ContainerPilotRequest.model_construct(run_id=str(uuid4()), fencing_generation=1), operation, 'stop')
@@ -53,7 +53,7 @@ def test_opt_in_bound_journal_matches_exact_target_before_effect(tmp_path):
         assert len(calls) == 1 and calls[0][:2] == (operation, 'stop')
         backend.effect_binding_provider = TrustedEffectBindingProvider(
             lambda *_: OperationBinding('2b201b1d-2327-437e-8705-135b9ccf128b', 50, 60,
-                                         None, 'b' * 64, 'hmac-sha256:' + 'a' * 64, 1), lambda actual: True)
+                                         None, 'b' * 64, 'hmac-sha256:' + 'a' * 64, 1), lambda actual: True, lambda actual: True)
         with backend.effect_context_scope(context), pytest.raises(DaemonBackendError):
             backend._journal_begin(operation, 'stop', target_id=target, image=image)
         assert len(calls) == 1
@@ -1551,7 +1551,7 @@ def test_bound_create_is_durable_before_post_and_failures_never_post(tmp_path, m
                 return OperationBinding('2b201b1d-2327-437e-8705-135b9ccf128b', 50, 60,
                     'wrong-name' if failure == 'mismatch' else name, None,
                     'hmac-sha256:' + 'a' * 64, 1)
-            backend.effect_binding_provider = TrustedEffectBindingProvider(provider, lambda actual: True)
+            backend.effect_binding_provider = TrustedEffectBindingProvider(provider, lambda actual: True, lambda actual: True)
             original = backend._read_response
             def checked(method, route, *args, **kwargs):
                 if method == 'POST' and route.endswith('/containers/create'):

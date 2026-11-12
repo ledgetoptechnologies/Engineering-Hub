@@ -8,6 +8,7 @@ This module never migrates a journal or clears a held operation.
 from .daemon_backend import TrustedEffectBindingProvider, compare_enrolled_effect
 from .effect_binding_canonical import NonsecretEffectBinding, canonical_nonsecret_binding
 from .effect_mac_key import EffectMacKey
+from .effect_binding_verify import verify_retained_binding
 from .operation_journal import OperationBinding, SQLiteOperationJournal
 
 
@@ -54,4 +55,17 @@ def enrolled_effect_provider(journal, key, effects, *, verify_generation):
         pair = by_id.get(actual.context.operation_id)
         return pair is not None and compare_enrolled_effect(actual, pair[0], verify_generation)
 
-    return TrustedEffectBindingProvider(create, compare)
+    def recheck(actual):
+        pair = by_id.get(actual.context.operation_id)
+        if pair is None:
+            return False
+        record = journal.inspect_record(actual.context.operation_id)
+        if record is None or record.state != 'pending':
+            return False
+        verify_retained_binding(journal, key, pair[0])
+        # The independent live-generation/fence verification is deliberately
+        # last, after key custody and durable intent checks. Its observation and
+        # the subsequent socket request are not an atomic host fence.
+        return compare_enrolled_effect(actual, pair[0], verify_generation)
+
+    return TrustedEffectBindingProvider(create, compare, recheck)

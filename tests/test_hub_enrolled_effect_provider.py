@@ -17,7 +17,8 @@ from tests.test_hub_container_executor_adapter import make_fixture, command
 
 
 @pytest.mark.parametrize('kind', ['create_candidate', 'probe'])
-@pytest.mark.parametrize('failure', ['none', 'profile', 'context', 'generation', 'probe'])
+@pytest.mark.parametrize('failure', ['none', 'profile', 'context', 'generation', 'probe',
+                                     'revoked_after_journal', 'revoked_on_name', 'revoked_after_probe_create'])
 def test_adapter_through_bound_journal_to_fake_engine(tmp_path, monkeypatch, kind, failure):
     private = tmp_path / 'private'
     private.mkdir(mode=0o700)
@@ -59,29 +60,51 @@ def test_adapter_through_bound_journal_to_fake_engine(tmp_path, monkeypatch, kin
             try:
                 effect = replace(effect, owner_epoch=journal._owner.epoch)
                 backend.operation_journal = journal
+                live = {'verified': True}
                 backend.effect_binding_provider = enrolled_effect_provider(journal, key, (effect,),
-                    verify_generation=lambda actual, expected: failure != 'generation')
+                    verify_generation=lambda actual, expected: failure != 'generation' and live['verified'])
                 adapter.effect_context_guard = TrustedEffectContextGuard(lambda _: True, backend.effect_context_scope)
                 monkeypatch.setattr(adapter.ledger, 'begin_operation', lambda *_: operation)
                 monkeypatch.setattr(adapter.ledger, 'complete_operation', lambda *_: None)
+                original_begin = journal.begin_bound
+                def begin_then_revoke(*args):
+                    original_begin(*args)
+                    if failure == 'revoked_after_journal': live['verified'] = False
+                monkeypatch.setattr(journal, 'begin_bound', begin_then_revoke)
+                original_bytes = backend._response_bytes
+                def read_then_revoke(method, route, *args, **kwargs):
+                    result = original_bytes(method, route, *args, **kwargs)
+                    if failure == 'revoked_on_name' and plan and method == 'GET' and plan.resource_name in route:
+                        live['verified'] = False
+                    return result
+                monkeypatch.setattr(backend, '_response_bytes', read_then_revoke)
                 original = backend._read_response
                 def check_before_effect(method, route, *args, **kwargs):
                     if method == 'POST':
                         assert journal.inspect_record(operation).state == 'pending'
                         verify_retained_binding(journal, key, effect)
-                    return original(method, route, *args, **kwargs)
+                    result = original(method, route, *args, **kwargs)
+                    if failure == 'revoked_after_probe_create' and kind == 'probe' and method == 'POST' and route.endswith('/exec'):
+                        live['verified'] = False
+                    return result
                 monkeypatch.setattr(backend, '_read_response', check_before_effect)
                 before = sum(item[0] == 'POST' for item in requests)
                 callback = (lambda op, timeout: run_readiness(backend, manifest.probes.candidate)) if kind == 'probe' else (lambda op, timeout: backend.create_container(plan, op, timeout))
-                if failure == 'none':
+                # Name lookup is create-specific; exec creation is probe-specific.
+                succeeds = (failure == 'none' or failure == 'revoked_on_name' and kind == 'probe'
+                            or failure == 'revoked_after_probe_create' and kind != 'probe')
+                if succeeds:
                     adapter._effect(request, kind, callback, 30000, time.monotonic() + 30, lambda _: {})
                     assert journal.inspect_record(operation).state == 'completed'
                     assert sum(item[0] == 'POST' for item in requests) > before
                 else:
                     with pytest.raises(_Held):
                         adapter._effect(request, kind, callback, 30000, time.monotonic() + 30, lambda _: {})
-                    assert journal.inspect_record(operation) is None
-                    assert sum(item[0] == 'POST' for item in requests) == before
+                    row = journal.inspect_record(operation)
+                    post_admission = failure in {'revoked_after_journal', 'revoked_on_name', 'revoked_after_probe_create'}
+                    assert (row is not None and row.state == 'pending') if post_admission else row is None
+                    expected_posts = 1 if failure == 'revoked_after_probe_create' and kind == 'probe' else 0
+                    assert sum(item[0] == 'POST' for item in requests) == before + expected_posts
             finally:
                 key.close()
     finally:

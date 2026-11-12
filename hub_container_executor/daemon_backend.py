@@ -237,12 +237,15 @@ class TrustedEffectBindingProvider:
     """
     create: Callable
     compare_actual: Callable | None = None
+    recheck: Callable | None = None
 
     def __post_init__(self):
         if not callable(self.create):
             raise TypeError("binding factory required")
         if self.compare_actual is not None and not callable(self.compare_actual):
             raise TypeError("actual effect comparator must be callable")
+        if self.recheck is not None and not callable(self.recheck):
+            raise TypeError("effect recheck must be callable")
 
 
 @dataclass(frozen=True)
@@ -856,6 +859,7 @@ class DockerEngineBackend:
                 if (selected is None or selected[0] is not self
                         or selected[1].operation_id != operation_id
                         or self.effect_binding_provider.compare_actual is None
+                        or self.effect_binding_provider.recheck is None
                         or type(image) is not VerifiedImage):
                     raise ValueError('verified effect context unavailable')
                 context = selected[1]
@@ -873,8 +877,25 @@ class DockerEngineBackend:
                         or bound.resource_name != resource_name or bound.target_id != target_id):
                     raise ValueError("effect binding differs from actual target")
                 self.operation_journal.begin_bound(operation_id, kind, bound)
+                return actual
         except Exception:
             raise DaemonBackendError("private operation journal unavailable") from None
+
+    def _recheck_effect(self, actual, deadline):
+        """Recheck retained intent and independent generation immediately before POST."""
+        if self.effect_binding_provider is None:
+            self._remaining(deadline)
+            return
+        try:
+            selected = _effect_context.get()
+            if (type(actual) is not ActualEffectInputs or selected is None
+                    or selected[0] is not self or selected[1] is not actual.context
+                    or self.effect_binding_provider.recheck is None
+                    or self.effect_binding_provider.recheck(actual) is not True):
+                raise ValueError('effect admission no longer valid')
+            self._remaining(deadline)
+        except Exception:
+            raise DaemonBackendError('effect admission unavailable') from None
 
     def _journal_complete(self, operation_id, kind, container_id=None):
         if self.operation_journal is None:
@@ -1122,7 +1143,7 @@ class DockerEngineBackend:
              "Volumes": (cached[1].get("config") or {}).get("Volumes")},
         )
         self._remaining(deadline)
-        self._journal_begin(operation_id, "create_" + plan.image.role, resource_name=plan.resource_name,
+        admitted = self._journal_begin(operation_id, "create_" + plan.image.role, resource_name=plan.resource_name,
                             plan=plan, image=plan.image)
         name_route = self._route("/containers/" + quote(plan.resource_name, safe="") + "/json")
         status, _ = self._response_bytes("GET", name_route, deadline,
@@ -1134,6 +1155,7 @@ class DockerEngineBackend:
         self._assert_runner(deadline)
         body = self._create_body(plan, source, environment)
         route = self._route("/containers/create")
+        self._recheck_effect(admitted, deadline)
         raw = self._read_response("POST", route, deadline, expected_status=201,
                                   json_body=body, params={"name": plan.resource_name})
         result = _strict_json(raw)
@@ -1430,10 +1452,11 @@ class DockerEngineBackend:
         deadline = self._deadline(timeout_ms)
         self._operation_id(operation_id)
         before = self._known_container(container_id, "created", deadline)
-        self._journal_begin(operation_id, "start", target_id=container_id, observation=before,
+        admitted = self._journal_begin(operation_id, "start", target_id=container_id, observation=before,
                             image=self._container_images.get(container_id))
         self._assert_runner(deadline)
         route = self._route("/containers/" + container_id + "/start")
+        self._recheck_effect(admitted, deadline)
         self._read_response("POST", route, deadline, expected_status=204)
         self._journal_complete(operation_id, "start", container_id)
         self._assert_runner(deadline)
@@ -1447,10 +1470,11 @@ class DockerEngineBackend:
         deadline = self._deadline(timeout_ms)
         self._operation_id(operation_id)
         before = self._known_container(container_id, "running", deadline)
-        self._journal_begin(operation_id, "stop", target_id=container_id, observation=before,
+        admitted = self._journal_begin(operation_id, "stop", target_id=container_id, observation=before,
                             image=self._container_images.get(container_id))
         self._assert_runner(deadline)
         route = self._route("/containers/" + container_id + "/stop")
+        self._recheck_effect(admitted, deadline)
         self._read_response("POST", route, deadline, expected_status=204,
                             params={"t": "5"})
         self._journal_complete(operation_id, "stop", container_id)
@@ -1493,7 +1517,7 @@ class DockerEngineBackend:
         return bytes(output)
 
     def _one_probe(self, container_id, probe, budget_ms, deadline, source_commit, *, readiness=False,
-                   readiness_deadline=None):
+                   readiness_deadline=None, admitted=None):
         if type(readiness) is not bool or readiness and probe.kind != "health_json":
             raise DaemonBackendError("invalid health readiness classification")
         if readiness_deadline is not None and (not readiness
@@ -1517,6 +1541,7 @@ class DockerEngineBackend:
         # Once admitted, that exact attempt retains its ordinary request budget.
         if readiness_deadline is not None and time.monotonic() >= readiness_deadline:
             raise DaemonBackendError("health readiness admission deadline exceeded")
+        self._recheck_effect(admitted, probe_deadline)
         raw_create = self._read_response(
             "POST", self._route("/containers/" + container_id + "/exec"),
             probe_deadline, expected_status=201, json_body=create_body,
@@ -1527,6 +1552,7 @@ class DockerEngineBackend:
             raise DaemonBackendError("compiled probe execution identity is invalid")
         exec_id = created["Id"]
         self._assert_runner(probe_deadline)
+        self._recheck_effect(admitted, probe_deadline)
         raw_stream = self._read_response(
             "POST", self._route("/exec/" + exec_id + "/start"),
             probe_deadline, expected_status=200,
@@ -1604,7 +1630,7 @@ class DockerEngineBackend:
                 or self._container_images.get(container_id, image) != image):
             raise DaemonBackendError("probe target lacks a verified source-image binding")
         self._remaining(deadline)
-        self._journal_begin(operation_id, "probe", target_id=container_id, observation=observation,
+        admitted = self._journal_begin(operation_id, "probe", target_id=container_id, observation=observation,
                             image=image, probes=probes)
         health_ok = True
         for index, (probe, budget) in enumerate(zip(probes, timeout_ms, strict=True)):
@@ -1618,7 +1644,7 @@ class DockerEngineBackend:
                 while True:
                     healthy = self._one_probe(container_id, probe, budget, health_deadline,
                                               image.source_commit, readiness=True,
-                                              readiness_deadline=grace_deadline)
+                                              readiness_deadline=grace_deadline, admitted=admitted)
                     if healthy is not None:
                         break
                     remaining_grace = grace_deadline - time.monotonic()
@@ -1638,7 +1664,7 @@ class DockerEngineBackend:
                         healthy = False
                         break
             else:
-                healthy = self._one_probe(container_id, probe, budget, deadline, image.source_commit)
+                healthy = self._one_probe(container_id, probe, budget, deadline, image.source_commit, admitted=admitted)
             health_ok = health_ok and healthy
             self._remaining(deadline)
         self._journal_complete(operation_id, "probe", container_id)
