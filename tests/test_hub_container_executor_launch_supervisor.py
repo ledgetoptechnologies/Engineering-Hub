@@ -1548,3 +1548,66 @@ def test_separate_operator_signer_publishes_reviewed_launch(synthetic_issuer, sh
     assert output.read_bytes() == raw
     verifier.close()
     transport.close()
+
+
+def test_separate_consumer_receives_supervisor_proposal_and_operator_approval(synthetic_issuer, short_root):
+    """Separate receipt consumer and signer with kernel peer checks, synthetic Engine."""
+    authority, path, _ = synthetic_issuer
+    signer = Ed25519PrivateKey.generate()
+    public = signer.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    key_file = short_root / 'approver.key'
+    key_file.write_bytes(signer.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                                               serialization.NoEncryption()))
+    key_file.chmod(0o600)
+    delivery = short_root / 'delivery'
+    delivery.mkdir(mode=0o700)
+    os.chown(delivery, 12345, 12345)
+    release = {name: getattr(authority.release, name) for name in authority.release.__dataclass_fields__}
+    release['public_key'] = release['public_key'].hex()
+    release['platform'] = authority.release.platform.model_dump(mode='json')
+    script = '''import json,sys\nfrom hub_container_executor.launch_transport import UnixLaunchReceiptTransport\nfrom hub_container_executor.runtime_identity import ExecutorReleaseEnrollment,LaunchReceiptIdentityVerifier\nfrom hub_container_executor.postlaunch_approval import verify_postlaunch_approval\nfrom engineering_hub.current_executor_observation import CurrentExecutorReleasePins\nfrom engineering_hub.container_pilot_manifest import Platform\nv=json.loads(input()); r=v['release']; r['public_key']=bytes.fromhex(r['public_key']); r['platform']=Platform(**r['platform']); e=ExecutorReleaseEnrollment(**r)\nprint('ready',flush=True); input()\nt=UnixLaunchReceiptTransport(socket_path=v['socket'],expected_issuer_uid=0,expected_issuer_gid=0)\nx=LaunchReceiptIdentityVerifier(enrollment=e,issuer_transport=t,max_receipt_lifetime_seconds=30,exchange_timeout_ms=1000); receipt=x.accepted_launch_receipt(); print(json.dumps([receipt[0],receipt[7]]),flush=True)\npath=input(); p=CurrentExecutorReleasePins(**{n:getattr(e,n) for n in CurrentExecutorReleasePins.__dataclass_fields__}); a=verify_postlaunch_approval(open(path,'rb').read(),verifier=x,release=p,approver_public_key=bytes.fromhex(v['approver']),expected_engine_id='synthetic-engine'); print(a.launch.launch_id,flush=True); x.close(); t.close()\n'''
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+    child = subprocess.Popen([sys.executable, '-u', '-c', script], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    try:
+        child.stdin.write(json.dumps({'release': release, 'socket': str(path), 'approver': public.hex()}) + '\n')
+        child.stdin.flush()
+        assert child.stdout.readline().strip() == 'ready'
+        authority._consumer.close()
+        authority._consumer = launch._Process(child.pid)
+        thread, served = serve_fixture(authority)
+        child.stdin.write('go\n')
+        child.stdin.flush()
+        receipt_id, receipt_expiry = json.loads(child.stdout.readline())
+        thread.join(5)
+        assert not thread.is_alive() and served == [receipt_id]
+        proposal_file = short_root / 'proposal2.json'
+        authority.write_approval_proposal(str(proposal_file), timeout_ms=1000)
+        release_pin, launch_pin = current_pins(authority)
+        from hub_container_executor.postlaunch_approval import verify_launch_proposal
+        proposal = verify_launch_proposal(proposal_file.read_bytes(), release=release_pin,
+                                           expected_engine_id='synthetic-engine')
+        policy = {'schema': 'engineering-hub.operator-approval-policy.v1', 'release': release,
+                  'expected_engine_id': 'synthetic-engine', 'approver_public_key': public.hex(),
+                  'receipt_id': receipt_id, 'receipt_sha256': proposal.receipt_sha256,
+                  'launch_sha256': hashlib.sha256(launch._canonical(asdict(launch_pin))).hexdigest(),
+                  'receipt_expires_at_ms': receipt_expiry, 'approval_expires_at_ms': receipt_expiry,
+                  'output_path': str(delivery / 'approval.json'), 'output_uid': 12345, 'output_gid': 12345}
+        policy_file = short_root / 'policy2.json'
+        policy_file.write_bytes(launch._canonical(policy))
+        policy_file.chmod(0o600)
+        cmd = [sys.executable, '-m', 'hub_container_executor.operator_approval', '--execute',
+               '--policy', str(policy_file), '--proposal', str(proposal_file), '--signing-key', str(key_file)]
+        result = subprocess.run(cmd, text=True, capture_output=True, env=env, timeout=8)
+        assert result.returncode == 0, result.stderr
+        child.stdin.write(str(delivery / 'approval.json') + '\n')
+        child.stdin.flush()
+        assert child.stdout.readline().strip() == authority._launch_id
+        assert child.wait(timeout=5) == 0, child.stderr.read()
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            child.wait(timeout=5)
+        child.stdin.close()
+        child.stdout.close()
+        child.stderr.close()
