@@ -521,6 +521,9 @@ class HostAdapter:
                 if self.effect_context_guard.verify(context) is not True:
                     raise PermissionError('effect context denied')
                 with self.effect_context_guard.scope(context):
+                    # Verification and scope acquisition may block. Never pass
+                    # a stale pre-verification budget to the effect callback.
+                    timeout = self._timeout(deadline, phase_limit)
                     result = callback(operation_id, timeout)
             # A deadline detects an overrun; it is not cancellation. Keep the
             # intent held so no later effect can run after an untrusted worker returns.

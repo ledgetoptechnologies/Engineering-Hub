@@ -300,6 +300,38 @@ def test_explicit_effect_context_denial_holds_without_any_effect(tmp_path):
         adapter.close()
 
 
+@pytest.mark.parametrize('slow_stage', ['verify', 'scope'])
+def test_effect_context_delay_exhausts_deadline_before_callback(tmp_path, monkeypatch, slow_stage):
+    adapter, backend, state, manifest = make_fixture(tmp_path)
+    request = command(manifest, 'deploy_container')
+    status = {'expired': False, 'callbacks': 0, 'begun': 0}
+    def begin(*args):
+        status['begun'] += 1
+        return str(uuid.uuid4())
+    def timeout(*args):
+        if status['expired']:
+            raise adapter_module._Held('inspect_required')
+        return 100
+    def verify(context):
+        if slow_stage == 'verify': status['expired'] = True
+        return True
+    @contextmanager
+    def scope(context):
+        if slow_stage == 'scope': status['expired'] = True
+        yield
+    def effect(*args):
+        status['callbacks'] += 1
+    monkeypatch.setattr(adapter.ledger, 'begin_operation', begin)
+    monkeypatch.setattr(adapter, '_timeout', timeout)
+    adapter.effect_context_guard = TrustedEffectContextGuard(verify, scope)
+    try:
+        with pytest.raises(adapter_module._Held):
+            adapter._effect(request, 'create_candidate', effect, 100, 1.0, lambda value: {})
+        assert status['begun'] == 1 and status['callbacks'] == 0
+    finally:
+        adapter.close()
+
+
 def test_default_missing_trusted_verifier_fails_before_any_effect(tmp_path):
     adapter, backend, state, manifest = make_fixture(tmp_path, include_verifier=False)
     response = adapter.submit(command(manifest, "deploy_container"))
