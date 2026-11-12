@@ -14,14 +14,14 @@ const topic = (name: string | null, values: Partial<TopicActivity> = {}): TopicA
   pending_by_agent: {}, claimed_by_agent: {}, oldest_pending_at: null, last_activity_at: ago(5), ...values });
 
 describe("agent load", () => {
-  it("counts a claimed message or task as working, even with no stream", () => {
-    expect(agentLoad(false, 0, 1, 0)).toBe("working");
-    expect(agentLoad(true, 3, 0, 1)).toBe("working");
+  it("reports a claim without asserting execution", () => {
+    expect(agentLoad(false, 0, 1, 0)).toBe("claimed");
+    expect(agentLoad(true, 3, 0, 1)).toBe("claimed");
   });
   it("separates unread work from idle and missing streams", () => {
     expect(agentLoad(true, 2, 0, 0)).toBe("waiting");
-    expect(agentLoad(true, 0, 0, 0)).toBe("idle");
-    expect(agentLoad(false, 2, 0, 0)).toBe("offline");
+    expect(agentLoad(true, 0, 0, 0)).toBe("stream");
+    expect(agentLoad(false, 2, 0, 0)).toBe("no_stream");
   });
   it("only counts claimed tasks owned by that family", () => {
     const agents = buildAgents(demoActivity(NOW), () => true, [task({ status: "in_review" }), task({ owner: "installation:x", owner_family: "hermes" })]);
@@ -40,10 +40,10 @@ describe("sessions", () => {
   it("ties a task to its exact session and ranks working first", () => {
     const rows = buildSessions([installation()], { i1: [session({ id: "s1", label: "a", last_used_at: ago(60) }), session({ id: "s2", label: "b" })] },
       [task({ owner_session_id: "s1", owner_family: "claude" })], NOW);
-    expect(rows.map(item => [item.id, item.load])).toEqual([["s1", "working"], ["s2", "active"]]);
+    expect(rows.map(item => [item.id, item.load])).toEqual([["s1", "claimed"], ["s2", "recent"]]);
   });
   it("calls an unused session quiet", () => {
-    expect(buildSessions([installation()], { i1: [session({ last_used_at: null })] }, [], NOW)[0].load).toBe("quiet");
+    expect(buildSessions([installation()], { i1: [session({ last_used_at: null })] }, [], NOW)[0].load).toBe("credential");
   });
 });
 
@@ -107,6 +107,12 @@ describe("activity parsing", () => {
   it("accepts the demo shape", () => {
     const snapshot = demoActivity(NOW);
     expect(parseActivity(JSON.parse(JSON.stringify(snapshot)))).toEqual(snapshot);
+  });
+  it("does not claim coverage when the server omits the flags", () => {
+    const { open_counts_truncated, recent_links_truncated, topics_truncated, ...older } = demoActivity(NOW);
+    expect(parseActivity(older).open_counts_truncated).toBeNull();
+    expect(parseActivity(older).recent_links_truncated).toBeNull();
+    expect(parseActivity(older).topics_truncated).toBeNull();
   });
   it("refuses an unknown agent or a bad count", () => {
     const snapshot = JSON.parse(JSON.stringify(demoActivity(NOW)));

@@ -23,6 +23,7 @@ export interface OpenMessage {
 }
 export interface ActivitySnapshot {
   observed_at: string; window_hours: number; agents: AgentActivity[]; topics: TopicActivity[]; open: OpenMessage[]; open_total: number;
+  open_counts_truncated: boolean | null; recent_links_truncated: boolean | null; topics_truncated: boolean | null;
 }
 
 const invalid = (): never => { throw new HubApiError(502, "invalid_agent_activity"); };
@@ -45,6 +46,9 @@ export function parseActivity(value: unknown): ActivitySnapshot {
     observed_at: text(root.observed_at),
     window_hours: count(root.window_hours),
     open_total: count(root.open_total),
+    open_counts_truncated: coverage(root.open_counts_truncated),
+    recent_links_truncated: coverage(root.recent_links_truncated),
+    topics_truncated: coverage(root.topics_truncated),
     agents: list(root.agents).map(raw => {
       const row = object(raw);
       return { agent: agent(row.agent), pending: count(row.pending), claimed: count(row.claimed),
@@ -64,6 +68,11 @@ export function parseActivity(value: unknown): ActivitySnapshot {
         priority: row.priority as OpenMessage["priority"], status: row.status, topic: orNull(row.topic, text), created_at: text(row.created_at) };
     }),
   };
+}
+
+// Older servers do not report coverage. Never treat an absent flag as complete.
+function coverage(value: unknown): boolean | null {
+  return value === undefined ? null : typeof value === 'boolean' ? value : invalid();
 }
 
 export const OWNER_REQUIRED = "agent_activity_owner_required";
@@ -96,6 +105,7 @@ export function demoActivity(now = Date.now()): ActivitySnapshot {
   ];
   return {
     observed_at: ago(0), window_hours: 24, open, open_total: open.length,
+    open_counts_truncated: false, recent_links_truncated: false, topics_truncated: false,
     agents: [
       { agent: "hermes", pending: 2, claimed: 0, oldest_pending_at: ago(190) },
       { agent: "codex", pending: 1, claimed: 0, oldest_pending_at: ago(75) },

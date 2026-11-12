@@ -4663,7 +4663,7 @@ button.primary.danger:disabled {
 .map-title { fill: var(--ink); font-size: 13px; font-weight: 600; }
 .map-sub { fill: var(--ink-3); font-size: 11px; }
 .map-dot { fill: var(--line-strong); }
-.map-dot.working, .map-dot.active { fill: var(--ok); }
+.map-dot.claimed, .map-dot.recent { fill: var(--ok); }
 .map-dot.waiting { fill: var(--warn); }
 .map-line { transition: opacity 120ms ease; }
 .map-line path { fill: none; stroke: var(--line-strong); stroke-width: 1.5; }

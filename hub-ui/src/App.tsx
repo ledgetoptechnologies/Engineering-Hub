@@ -773,7 +773,7 @@ export function HubApp() {
             {route.page === "review" && <ReviewPage hub={hub} project={route.project} id={route.id} actions={actions} />}
             {route.page === "agents" && <AgentsPage hub={hub} actions={actions} />}
             {route.page === "agent-installations" && <AgentsPage hub={hub} actions={actions} view="installations" />}
-            {route.page === "agent-map" && <AgentMapPage hub={hub} actions={actions} />}
+            {route.page === "agent-map" && <AgentMapPage key={hub.session?.actor ?? (hub.demo ? "demo" : "signed-out")} hub={hub} actions={actions} />}
             {route.page === "planning" && (
               <>
                 <PageHeader eyebrow="PLANNING" title="Plans & ideas">{actions}</PageHeader>

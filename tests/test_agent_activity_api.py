@@ -110,6 +110,10 @@ def test_scans_are_bounded_but_the_total_stays_true(repo):
     assert sum(row['total'] for row in raw['open_counts']) == 2
     assert sum(row['total'] for row in raw['links']) == 2
     assert raw['open_total'] == 3
+    result = project_activity(raw, observed_at='now')
+    assert result['open_counts_truncated'] is True
+    assert result['recent_links_truncated'] is True
+    assert result['topics_truncated'] is False
 
 
 def test_busy_topics_survive_the_topic_cap():
@@ -118,6 +122,7 @@ def test_busy_topics_survive_the_topic_cap():
     counts = [dict(recipient='claude', topic='zz-busy', status='pending', total=1, oldest='t')]
     result = project_activity(dict(open_counts=counts, links=links, open=[], open_total=1), observed_at='now')
     assert len(result['topics']) == 200 and result['topics'][0]['topic'] == 'zz-busy'
+    assert result['topics_truncated'] is True
 
 
 def test_route_is_human_only_and_needs_the_bus(tmp_path):

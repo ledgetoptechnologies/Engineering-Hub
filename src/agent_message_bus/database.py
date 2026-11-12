@@ -419,6 +419,8 @@ class MessageRepository:
         topic = ("CASE WHEN json_valid(body_json) AND json_type(body_json, '$.topic') = 'text' "
                  "THEN json_extract(body_json, '$.topic') END")
         with self._connection() as conn:
+            # The totals, samples and truncation flags must describe one snapshot.
+            conn.execute('BEGIN')
             open_counts = conn.execute(
                 f"SELECT recipient, {topic} AS topic, status, COUNT(*) AS total, MIN(created_at) AS oldest "
                 "FROM (SELECT recipient, status, created_at, body_json FROM messages "
@@ -429,12 +431,16 @@ class MessageRepository:
                 f"SELECT sender, recipient, {topic} AS topic, COUNT(*) AS total, MAX(created_at) AS latest "
                 "FROM (SELECT sender, recipient, created_at, body_json FROM messages WHERE created_at >= ? "
                 "ORDER BY created_at DESC LIMIT ?) GROUP BY sender, recipient, topic", (since, scan_limit)).fetchall()
+            links_truncated = conn.execute(
+                'SELECT 1 FROM messages WHERE created_at >= ? ORDER BY created_at DESC LIMIT 1 OFFSET ?',
+                (since, scan_limit)).fetchone() is not None
             waiting = conn.execute(
                 f"SELECT id, sender, recipient, message_type, priority, status, created_at, {topic} AS topic "
                 "FROM messages WHERE status IN ('pending', 'claimed') ORDER BY created_at LIMIT ?",
                 (min(max(1, int(open_limit)), 100),)).fetchall()
         return {"open_counts": [dict(row) for row in open_counts], "links": [dict(row) for row in links],
-                "open": [dict(row) for row in waiting], "open_total": open_total}
+                "open": [dict(row) for row in waiting], "open_total": open_total,
+                "open_counts_truncated": open_total > scan_limit, "recent_links_truncated": links_truncated}
 
     @staticmethod
     def _delivery_head(conn: sqlite3.Connection) -> int:

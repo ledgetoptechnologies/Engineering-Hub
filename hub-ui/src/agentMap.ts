@@ -1,10 +1,10 @@
-/** Pure model behind the Agents map: who is working, and where each node and line goes. */
+/** Pure model behind the Agents map: claims and credentials, not execution. */
 import { AGENTS, type ActivitySnapshot, type AgentName, type TopicActivity } from "./agentActivityApi";
 import type { Installation, Session } from "./agentConnectionsApi";
 import type { Task } from "./types";
 
-export type AgentLoad = "working" | "waiting" | "idle" | "offline";
-export type SessionLoad = "working" | "active" | "quiet";
+export type AgentLoad = "claimed" | "waiting" | "stream" | "no_stream";
+export type SessionLoad = "claimed" | "recent" | "credential";
 
 export const ACTIVE_WINDOW_MS = 10 * 60_000;
 export const MAX_TOPICS_SHOWN = 12;
@@ -32,9 +32,9 @@ export const sessionKey = (session: string) => `session:${session}`;
 const familyOf = (task: Task): string | null => task.owner_family ?? task.owner;
 
 export function agentLoad(connected: boolean, pending: number, claimed: number, tasks: number): AgentLoad {
-  if (claimed > 0 || tasks > 0) return "working";
-  if (!connected) return "offline";
-  return pending > 0 ? "waiting" : "idle";
+  if (claimed > 0 || tasks > 0) return "claimed";
+  if (!connected) return "no_stream";
+  return pending > 0 ? "waiting" : "stream";
 }
 
 export function buildAgents(activity: ActivitySnapshot, connected: (agent: AgentName) => boolean, tasks: Task[],
@@ -49,7 +49,7 @@ export function buildAgents(activity: ActivitySnapshot, connected: (agent: Agent
   });
 }
 
-/** Live sessions only. A task links to its session by owner_session_id, so this is exact, not inferred. */
+/** Unexpired credentials only. An owner_session_id links a claim, not a live chat. */
 export function buildSessions(installations: Installation[], sessions: Record<string, Session[]>, tasks: Task[], now: number): MapSession[] {
   const rows: MapSession[] = [];
   for (const installation of installations) {
@@ -59,10 +59,10 @@ export function buildSessions(installations: Installation[], sessions: Record<st
       const task = tasks.find(item => item.status === "claimed" && item.owner_session_id === session.id) ?? null;
       const used = session.last_used_at ? Date.parse(session.last_used_at) : NaN;
       rows.push({ id: session.id, family: installation.family, label: session.label || installation.name, host: installation.host_label,
-        lastUsedAt: session.last_used_at, task, load: task ? "working" : now - used < ACTIVE_WINDOW_MS ? "active" : "quiet" });
+        lastUsedAt: session.last_used_at, task, load: task ? "claimed" : now - used < ACTIVE_WINDOW_MS ? "recent" : "credential" });
     }
   }
-  const rank = (load: SessionLoad) => ["working", "active", "quiet"].indexOf(load);
+  const rank = (load: SessionLoad) => ["claimed", "recent", "credential"].indexOf(load);
   return rows.sort((a, b) => AGENTS.indexOf(a.family) - AGENTS.indexOf(b.family) || rank(a.load) - rank(b.load) || a.label.localeCompare(b.label));
 }
 
@@ -94,7 +94,7 @@ export function layoutMap(agents: MapAgent[], sessions: MapSession[], topics: To
   const line = (from: string, to: string, x1: number, y1: number, x2: number, y2: number, waiting = 0, handling = false) =>
     lines.push({ from, to, x1, x2, y1: y1 + NODE / 2, y2: y2 + NODE / 2, waiting, handling });
   for (const { item, y } of placedSessions)
-    line(sessionKey(item.id), agentKey(item.family), COLUMNS.session.x + COLUMNS.session.width, y, COLUMNS.agent.x, agentY.get(item.family) ?? y, 0, item.load === "working");
+    line(sessionKey(item.id), agentKey(item.family), COLUMNS.session.x + COLUMNS.session.width, y, COLUMNS.agent.x, agentY.get(item.family) ?? y, 0, item.load === "claimed");
   for (const { item, y } of placedTopics) for (const agent of item.agents)
     line(agentKey(agent), topicKey(item.topic), COLUMNS.agent.x + COLUMNS.agent.width, agentY.get(agent) ?? y, COLUMNS.topic.x, y,
       item.pending_by_agent[agent] ?? 0, (item.claimed_by_agent[agent] ?? 0) > 0);

@@ -60,6 +60,9 @@ class AgentActivityDTO(ResponseDTO):
     topics: list[TopicActivityItem] = Field(max_length=MAX_TOPICS + 1)
     open: list[OpenMessageItem] = Field(max_length=100)
     open_total: int = Field(ge=0)
+    open_counts_truncated: bool
+    recent_links_truncated: bool
+    topics_truncated: bool
 
 
 def _topic(value):
@@ -104,7 +107,8 @@ def project_activity(raw, *, observed_at, window_hours=WINDOW_HOURS):
                 open=[{**row, 'topic': _topic(row['topic']),
                        'message_type': row['message_type'] if _TYPE.fullmatch(row['message_type']) else 'other'}
                       for row in raw['open']],
-                open_total=raw['open_total'])
+                open_total=raw['open_total'], open_counts_truncated=raw.get('open_counts_truncated', True),
+                recent_links_truncated=raw.get('recent_links_truncated', True), topics_truncated=len(kept) < len(ordered))
 
 
 def attach_agent_activity_route(app, *, bus_service, sessions, human):

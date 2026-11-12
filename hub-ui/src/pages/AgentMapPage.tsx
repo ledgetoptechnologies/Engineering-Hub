@@ -1,4 +1,4 @@
-/** Agents map: live sessions, the agents behind them, the topics they talk on, and what nobody has picked up. */
+/** Claims and credential metadata; neither proves an active chat or execution. */
 import { useEffect, useMemo, useState, type KeyboardEvent, type ReactNode } from "react";
 import { OWNER_REQUIRED, demoActivity, readActivity, type ActivitySnapshot, type OpenMessage } from "../agentActivityApi";
 import { demoAgentConnections, httpAgentConnections, type Installation, type Session } from "../agentConnectionsApi";
@@ -13,10 +13,10 @@ import { Badge, PageHeader, PanelTitle, names } from "../ui";
 const REFRESH_MS = 15_000;
 const NO_TOPIC = "No topic";
 const AGENT_LOAD: Record<AgentLoad, { label: string; tone: string }> = {
-  working: { label: "Working", tone: "forest" }, waiting: { label: "Not picked up", tone: "amber" },
-  idle: { label: "Idle", tone: "neutral" }, offline: { label: "No stream", tone: "neutral" },
+  claimed: { label: "Claim recorded", tone: "forest" }, waiting: { label: "Not picked up", tone: "amber" },
+  stream: { label: "Stream observed", tone: "neutral" }, no_stream: { label: "No stream observed", tone: "neutral" },
 };
-const SESSION_LOAD: Record<SessionLoad, string> = { working: "Working", active: "Active", quiet: "Quiet" };
+const SESSION_LOAD: Record<SessionLoad, string> = { claimed: "Claim recorded", recent: "Recently used credential", credential: "Credential active" };
 
 interface Directory { installations: Installation[]; sessions: Record<string, Session[]> }
 
@@ -37,8 +37,11 @@ function useActivity(hub: Hub) {
         setState(value ? "loaded" : "unsupported");
       }).catch(error => {
         if (signal.aborted) return;
-        if (error instanceof HubApiError && error.code === OWNER_REQUIRED) setState("not_owner");
-        else if (error instanceof HubApiError && [401, 403].includes(error.status)) hub.clearPrivateWorkspace();
+        if (error instanceof HubApiError && [401, 403].includes(error.status)) {
+          setActivity(null);
+          if (error.code === OWNER_REQUIRED) setState("not_owner");
+          else { setState("failed"); hub.clearPrivateWorkspace(); }
+        }
         else setState("failed");
       });
     };
@@ -51,9 +54,10 @@ function useActivity(hub: Hub) {
 }
 
 /** Sessions are read separately, so a failure here leaves the agents and topics showing. */
-function useDirectory(hub: Hub) {
+function useDirectory(hub: Hub, authorized: boolean) {
   const [directory, setDirectory] = useState<Directory | null>(null);
   useEffect(() => {
+    if (!authorized) { setDirectory(null); return; }
     if (hub.demo) { setDirectory(demoAgentConnections()); return; }
     const controller = new AbortController();
     const client = httpAgentConnections();
@@ -67,8 +71,8 @@ function useDirectory(hub: Hub) {
     run();
     const timer = window.setInterval(run, REFRESH_MS * 4);
     return () => { controller.abort(); window.clearInterval(timer); };
-  }, [hub.demo]);
-  return directory;
+  }, [hub.demo, authorized]);
+  return authorized ? directory : null;
 }
 
 function Node({ x, y, width, id, selected, dim, label, onSelect, children }: {
@@ -116,7 +120,7 @@ function OpenMessages({ messages, total, selected, now }: { messages: OpenMessag
         <td>{names[item.sender]}</td>
         <td>{item.topic ? <code>{item.topic}</code> : <span className="muted">{NO_TOPIC}</span>}</td>
         <td>{item.message_type}{item.priority === "high" || item.priority === "urgent" ? <Badge tone="amber">{item.priority}</Badge> : null}</td>
-        <td>{item.status === "pending" ? <Badge tone="amber">Not picked up</Badge> : <Badge tone="forest">Being handled</Badge>}</td>
+        <td>{item.status === "pending" ? <Badge tone="amber">Not picked up</Badge> : <Badge tone="forest">Claimed</Badge>}</td>
       </tr>)}</tbody>
     </table></div>}
     {total > messages.length && <p className="panel-footnote">Oldest {messages.length} of {total} shown.</p>}
@@ -125,7 +129,7 @@ function OpenMessages({ messages, total, selected, now }: { messages: OpenMessag
 
 export function AgentMapPage({ hub, actions }: { hub: Hub; actions: ReactNode }) {
   const { activity, state } = useActivity(hub);
-  const directory = useDirectory(hub);
+  const directory = useDirectory(hub, state === "loaded");
   const [selected, setSelected] = useState<string | null>(null);
   const [allTopics, setAllTopics] = useState(false);
   const now = activity ? Date.parse(activity.observed_at) : Date.now();
@@ -144,26 +148,29 @@ export function AgentMapPage({ hub, actions }: { hub: Hub; actions: ReactNode })
   const lit = layout ? connectedTo(selected, layout.lines) : null;
   const dim = (id: string) => lit !== null && !lit.has(id);
   const select = (id: string) => setSelected(current => current === id ? null : id);
-  const working = layout?.agents.filter(({ item }) => item.load === "working").length ?? 0;
+  const claimed = layout?.agents.filter(({ item }) => item.load === "claimed").length ?? 0;
   const unclaimed = activity?.agents.reduce((sum, item) => sum + item.pending, 0) ?? 0;
 
   return <>
     <PageHeader eyebrow="AGENTS" title="Map">{actions}</PageHeader>
     <div className="agents-page">
       {hub.demo && <p className="notice">Demo: these sessions and messages are examples.</p>}
+      <p className="panel-footnote">Claims and credential activity do not establish that an agent is executing work or that a particular chat is live.</p>
       {state === "loading" && <p role="status">Reading activity…</p>}
       {state === "unsupported" && <p className="notice">This Hub needs an update before it can show the map.</p>}
       {state === "not_owner" && <p className="notice">Only the Hub owner can see the map.</p>}
       {state === "failed" && <p role="alert" className="notice error">{activity ? "Couldn't refresh. Showing the last reading." : "Activity couldn't be read."}</p>}
       {activity && layout && <>
         <dl className="map-stats">
-          <div><dt>Working</dt><dd>{working}<small> of {layout.agents.length}</small></dd></div>
+          <div><dt>Agents with claims</dt><dd>{claimed}<small> of {layout.agents.length}</small></dd></div>
           <div className={unclaimed > 0 ? "attention" : undefined}><dt>Not picked up</dt><dd>{unclaimed}</dd></div>
-          <div><dt>Live sessions</dt><dd>{directory ? layout.sessions.length : "–"}</dd></div>
+          <div><dt>Active credentials</dt><dd>{directory ? layout.sessions.length : "–"}</dd></div>
           <div><dt>Topics</dt><dd>{activity.topics.filter(item => item.topic !== null).length}</dd></div>
         </dl>
+        {(activity.open_counts_truncated !== false || activity.recent_links_truncated !== false || activity.topics_truncated !== false) &&
+          <p className="notice">Activity coverage is incomplete or unavailable: message counts and topic links may omit records.</p>}
         <section className="panel agent-map" aria-label="Agent map">
-          <svg viewBox={`0 0 ${MAP_WIDTH} ${layout.height}`} role="group" aria-label="Sessions, agents and topics">
+          <svg viewBox={`0 0 ${MAP_WIDTH} ${layout.height}`} role="group" aria-label="Session credentials, agents and topics">
             {layout.lines.map(line => <Line key={`${line.from}>${line.to}`} line={line} dim={lit !== null && !(lit.has(line.from) && lit.has(line.to))} />)}
             {layout.sessions.map(({ item, y }) => {
               const id = sessionKey(item.id);
@@ -198,7 +205,7 @@ export function AgentMapPage({ hub, actions }: { hub: Hub; actions: ReactNode })
             })}
           </svg>
           <div className="map-foot">
-            <span>Topic lines: last {activity.window_hours} hours of messages. Sessions don't report their topic to the Hub yet.</span>
+            <span>Topic lines use message metadata from the last {activity.window_hours} hours. Credentials do not identify an active chat or prove its topic.</span>
             {(layout.hiddenTopics > 0 || allTopics) && <button type="button" className="secondary small" onClick={() => setAllTopics(value => !value)}>
               {allTopics ? "Fewer topics" : `${layout.hiddenTopics} more topics`}</button>}
           </div>
