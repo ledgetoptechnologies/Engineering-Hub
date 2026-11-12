@@ -154,3 +154,28 @@ def test_worker_tree_rejects_unlisted_members_and_delegated_boundary(fixture, mo
     (scope / 'cgroup.procs').chmod(0o666)
     with pytest.raises(module.ScopeEvidenceError):
         module.EnrolledCgroupScope('scope', processes=(process,), allow_descendants=True)
+
+
+def test_scope_and_process_checks_accept_high_numbered_real_pidfd(fixture):
+    import fcntl, resource
+    limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    if limit != resource.RLIM_INFINITY and limit <= 1100:
+        pytest.skip('descriptor limit does not allow high-fd regression')
+    scope_dir, child, process = fixture
+    original = process.fd
+    high = fcntl.fcntl(original, fcntl.F_DUPFD_CLOEXEC, 1100)
+    process.fd = high
+    os.close(original)
+    assert process.fd >= 1100
+    process.check()
+    enrolled = module.EnrolledCgroupScope('scope', processes=(process,))
+    try:
+        with pytest.raises(module.ScopeEvidenceError): enrolled.observe_empty()
+        child.terminate()
+        child.wait(timeout=3)
+        (scope_dir/'cgroup.procs').write_text('')
+        (scope_dir/'cgroup.events').write_text('populated 0\nfrozen 0\n')
+        assert enrolled.observe_empty().effect_outcome_proven is False
+        with pytest.raises(Exception): process.check()
+    finally:
+        enrolled.close()

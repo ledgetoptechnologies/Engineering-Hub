@@ -578,18 +578,18 @@ def test_owned_wait_request_handoff_keeps_absolute_deadline(synthetic_issuer, mo
     now = [origin]
     deadlines = []
     serve = authority._serve_current_peer_until
-    select_ready = launch.select.select
-    def delayed_ready(read, write, errors, timeout):
+    poll_ready = launch._poll_ready
+    def delayed_ready(read, timeout):
         if authority._listener not in read:
-            return select_ready(read, write, errors, timeout)
+            return poll_ready(read, timeout)
         now[0] = origin + .1  # Scheduling consumes the original 50 ms window.
-        return [authority._listener], [], []
+        return [authority._listener]
     def capture(deadline):
         deadlines.append(deadline)
         return serve(deadline)  # Must decline before socket admission.
     with monkeypatch.context() as patch:
         patch.setattr(launch.time, 'monotonic', lambda: now[0])
-        patch.setattr(launch.select, 'select', delayed_ready)
+        patch.setattr(launch, '_poll_ready', delayed_ready)
         patch.setattr(authority, '_serve_current_peer_until', capture)
         assert authority.wait_for_stop_with_observations(
             timeout_ms=50, stop_requested=lambda: False) is False
@@ -2021,3 +2021,13 @@ def test_supervisor_worker_scope_requires_exact_prelaunch_process_inventory(root
                 except subprocess.TimeoutExpired:
                     child.kill(); child.wait(timeout=2)
         authority.close()
+
+
+def test_invalid_polled_descriptor_fails_closed():
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    try:
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch._poll_ready([read_fd], 0)
+    finally:
+        os.close(write_fd)

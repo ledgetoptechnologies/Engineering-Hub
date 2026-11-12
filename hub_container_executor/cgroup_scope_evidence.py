@@ -12,12 +12,11 @@ import math
 import os
 from pathlib import Path
 import re
-import select
 import stat
 import sys
 import time
 
-from .launch_supervisor import _Process, _boot_id
+from .launch_supervisor import _Process, _boot_id, _poll_ready
 
 _CGROUP_ROOT = Path('/sys/fs/cgroup')
 _CGROUP2_MAGIC = 0x63677270
@@ -275,7 +274,7 @@ class EnrolledCgroupScope:
         try:
             self._check_scope()
             for item in self._processes:
-                _require(item.fd is not None and bool(select.select([item.fd], [], [], 0)[0]))
+                _require(item.fd is not None and bool(_poll_ready([item.fd], 0)))
             _require(_events(_read(self._fd, 'cgroup.events'))['populated'] == 0
                      and not _members(_read(self._fd, 'cgroup.procs')))
             self._check_scope()

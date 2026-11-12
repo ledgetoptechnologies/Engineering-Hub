@@ -185,6 +185,26 @@ def _proc_start(pid):
     return ticks
 
 
+def _poll_ready(sources, timeout):
+    """Bounded descriptor readiness without select()'s descriptor limit."""
+    _require(type(sources) in (list, tuple) and sources
+             and type(timeout) in (int, float) and math.isfinite(timeout) and 0 <= timeout <= 3600)
+    mapping = {}
+    poller = select.poll()
+    for source in sources:
+        fd = source if type(source) is int else source.fileno()
+        _require(type(fd) is int and fd >= 0 and fd not in mapping)
+        mapping[fd] = source
+        poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    events = poller.poll(math.ceil(timeout * 1000))
+    ready = []
+    for fd, event in events:
+        _require(fd in mapping and not event & select.POLLNVAL
+                 and bool(event & (select.POLLIN | select.POLLHUP)))
+        ready.append(mapping[fd])
+    return ready
+
+
 class _Process:
     def __init__(self, pid, *, expected_start=None):
         _require(type(pid) is int and pid > 0 and hasattr(os, 'pidfd_open'))
@@ -201,7 +221,7 @@ class _Process:
             raise
 
     def check(self):
-        _require(self.fd is not None and not select.select([self.fd], [], [], 0)[0]
+        _require(self.fd is not None and not _poll_ready([self.fd], 0)
                  and _boot_id() == self.boot and _proc_start(self.pid) == self.start)
 
     def close(self):
@@ -1115,8 +1135,7 @@ class LaunchSupervisor:
                         return False
                     deadline = min(deadline, self._expires)
                     _remaining(deadline)
-                    ready, _, _ = select.select([self._listener, self._consumer.fd], [], [],
-                        min(0.1, _remaining(deadline)))
+                    ready = _poll_ready([self._listener, self._consumer.fd], min(0.1, _remaining(deadline)))
                     _remaining(deadline)
                     _require(self._consumer.fd not in ready)
                     if self._listener in ready:
@@ -1496,7 +1515,7 @@ class LaunchSupervisor:
                         _require(math.isfinite(remaining))
                         if remaining <= 0:
                             return False
-                        ready, _, _ = select.select(read, [], [], min(.1, remaining))
+                        ready = _poll_ready(read, min(.1, remaining))
                         _require(self._consumer.fd not in ready)
                         pending = active and self._listener in ready
                         proposal_pending = active and proposal_listener is not None and proposal_listener in ready
@@ -1595,7 +1614,7 @@ class LaunchSupervisor:
                 self._journal.state(self._launch_id, 'term_reserved', self._record())
                 self._engine.json('POST', '/containers/' + self._container_id + '/kill?signal=SIGTERM',
                                   deadline, statuses=(204,))
-                _require(bool(select.select([self._consumer.fd], [], [], _remaining(deadline))[0]))
+                _require(bool(_poll_ready([self._consumer.fd], _remaining(deadline))))
                 self._wait_stopped(deadline)
                 self._journal.state(self._launch_id, 'stopped', self._record())
                 self._remove_owned_socket()
@@ -1717,7 +1736,7 @@ class LaunchSupervisor:
                 _require(type(scope) is EnrolledCgroupScope and scope._pid == self._pid
                          and self._launch_id is not None and self._consumer is not None
                          and self._consumer.fd is not None
-                         and bool(select.select([self._consumer.fd], [], [], 0)[0])
+                         and bool(_poll_ready([self._consumer.fd], 0))
                          and self._engine is not None and type(self._engine.process) is _Process
                          and any(item is self._engine.process for item in scope._processes)
                          and self._engine.process.pid == self._daemon_pin.pid
