@@ -481,7 +481,7 @@ def test_bound_resources_reopen_only_with_real_signed_observer_and_existing_key(
         old_observer.close()
 
 
-def _attach_synthetic_engine(adapter, params):
+def _attach_synthetic_engine(adapter, params, *, lose_stop=False):
     from tests.test_hub_container_executor_daemon_backend import container_inspect, docker_config, oci_archive, json_bytes
     backend=adapter.backend; manifest=adapter.manifest
     images={role:adapter._verified_image(role) for role in ('candidate','rollback')}
@@ -492,6 +492,8 @@ def _attach_synthetic_engine(adapter, params):
     profile=adapter._profile(images['rollback'],defaults,baseline.state_generation_id,secrets)
     containers={baseline.container_id:container_inspect(images['rollback'],profile,
         str(params['binding'].generation_root + '/' + baseline.state_generation_id),baseline.container_id,'running')}
+    if backend.app_cgroup_observer is not None:
+        containers[baseline.container_id]['HostConfig']['CgroupParent'] = backend.app_cgroup_observer._pins.parent
     executions={}; posts=[]; counter=0
     def handler(request):
         nonlocal counter
@@ -514,7 +516,14 @@ def _attach_synthetic_engine(adapter, params):
             source=body['HostConfig']['Mounts'][0]['Source']; generation=source.rsplit('/',1)[1]
             active=adapter._profile(image,adapter._defaults_from_record(image),generation,secrets)
             containers[cid]=container_inspect(image,active,source,cid,'created')
+            if backend.app_cgroup_observer is not None:
+                containers[cid]['HostConfig']['CgroupParent'] = backend.app_cgroup_observer._pins.parent
             return httpx.Response(201,json={'Id':cid,'Warnings':[]})
+        if path.endswith('/stop') and '/containers/' in path:
+            cid=path.split('/containers/',1)[1].removesuffix('/stop')
+            if lose_stop: raise httpx.ReadTimeout('synthetic lost stop response', request=request)
+            containers[cid]['State']['Status']='exited'
+            return httpx.Response(204)
         if path.endswith('/start') and '/containers/' in path:
             cid=path.split('/containers/',1)[1].removesuffix('/start'); containers[cid]['State']['Status']='running'
             return httpx.Response(204)
@@ -677,3 +686,86 @@ async def test_concrete_controller_asgi_recovers_lost_response_without_effect_re
             assert sum(path.endswith('/containers/create') for path in posts)==2
         finally:
             owner.close(); await client.aclose()
+
+@pytest.mark.parametrize('lose_stop', [False, True])
+def test_bound_v3_rollback_stops_candidate_before_replacement(rig, monkeypatch, lose_stop):
+    """Real local journals, fake Engine and synthetic verifier; no host assurance."""
+    import time
+    from uuid import UUID, uuid5
+    from engineering_hub.container_pilot_client import single_pilot_outcome_digest
+    from hub_container_executor.adapter import TrustedEffectContextGuard
+    from hub_container_executor.app_cgroup_observation import AppCgroupObserver, AppCgroupPins, AppCgroupObservation
+    from hub_container_executor.effect_response_recorder import DurableEffectResponseRecorder
+    from hub_container_executor.effect_mac_key import create_for_new_journal, EffectMacKey
+    from hub_container_executor.enrolled_effect_provider import enrolled_effect_provider, DeferredTargetEffect
+    from tests.test_hub_container_effect_binding_canonical import fixture
+    from tests.test_hub_container_executor_adapter import command
+    class Driver:
+        def implementation_commit(self): return rig.params['manifest'].driver.implementation_commit
+    journal_path=rig.params['journal_database']
+    key_id=create_for_new_journal(journal_path.parent,journal_path.name)
+    params=dict(rig.params,single_pilot_protocol=True,driver_identity_verifier=Driver())
+    with module.local_host_adapter_resources(**params) as adapter:
+        journal=adapter.backend.operation_journal; journal.enable_bindings(); journal.enable_response_records()
+        key=EffectMacKey(journal_path.parent,journal_path.name,expected_key_id=key_id)
+        try:
+            observer=object.__new__(AppCgroupObserver)
+            observer._pins=AppCgroupPins('test.slice',1,2,3,4)
+            monkeypatch.setattr(AppCgroupObserver, 'verify', lambda self, cid, *, deadline:
+                AppCgroupObservation(cid,int(time.time()*1000)+5000,min(deadline,time.monotonic()+5)))
+            adapter.backend.app_cgroup_observer=observer
+            adapter.backend.effect_response_recorder=DurableEffectResponseRecorder(journal,key)
+            adapter._stop_failed_candidate_before_rollback=True
+            posts=_attach_synthetic_engine(adapter,params,lose_stop=lose_stop)
+            run=str(uuid4())
+            deploy=command(adapter.manifest,'deploy_container',run_id=run)
+            smoke=command(adapter.manifest,'smoke_container',run_id=run)
+            rollback=command(adapter.manifest,'rollback_container',run_id=run)
+            smoke_rollback=command(adapter.manifest,'smoke_container_rollback',run_id=run)
+            effects=[]
+            for req,role,probe_req in ((deploy,'candidate',smoke),(rollback,'rollback',smoke_rollback)):
+                state_kind='state_copy' if role=='candidate' else 'rollback_state'
+                generation=adapter.state_provisioner._generation(run,str(uuid5(UUID(req.command_id),state_kind)),role)
+                image=adapter._verified_image(role)
+                profile=adapter._profile(image,adapter._defaults_from_record(image),generation,adapter._resolve_secrets())
+                create=replace(fixture(),operation_id=str(uuid5(UUID(req.command_id),'create_'+role)),run_id=run,
+                    kind='create_'+role,fence=req.fencing_generation,owner_epoch=journal._owner.epoch,
+                    resource_name=f'{adapter.manifest.runtime.resource_name_prefix}-{run[:12]}-{role}',
+                    container_id=None,image_index_digest=image.runnable_reference,
+                    platform_manifest_digest=image.platform_manifest_digest,image_config_id=image.image_config_id,
+                    state_generation_id=generation,environment_names=tuple(n for n,_ in profile.environment),
+                    memory_bytes=profile.memory_bytes,cpu_millicores=profile.cpu_millicores,
+                    pids_limit=profile.pids_limit,tmpfs_bytes=profile.tmpfs[0][1])
+                start=replace(create,operation_id=str(uuid5(UUID(req.command_id),'start_'+role)),kind='start',resource_name=None)
+                probes=adapter.manifest.probes.candidate if role=='candidate' else adapter.manifest.probes.rollback
+                probe=replace(create,operation_id=str(uuid5(UUID(probe_req.command_id),'probe')),kind='probe',
+                    resource_name=None,probe_set_digest=adapter._probe_digest(probes))
+                effects.extend((create,DeferredTargetEffect(start,req.command_id),DeferredTargetEffect(probe,req.command_id)))
+                if role=='candidate':
+                    stop=replace(create,operation_id=str(uuid5(UUID(rollback.command_id),'stop')),kind='stop',resource_name=None)
+                    effects.append(DeferredTargetEffect(stop,req.command_id))
+            adapter.backend.effect_binding_provider=enrolled_effect_provider(journal,key,tuple(effects),
+                source_ledger=adapter.ledger,verify_generation=lambda actual, _: True)
+            adapter.effect_context_guard=TrustedEffectContextGuard(lambda _: True,adapter.backend.effect_context_scope)
+            for req,expected in ((deploy,'succeeded'),(smoke,'failed')):
+                result=adapter.submit(req)
+                assert result.state==expected, result
+                adapter.acknowledge_single_pilot(req,single_pilot_outcome_digest(result))
+            result=adapter.submit(rollback)
+            if lose_stop:
+                assert result.state=='held',result
+                assert adapter.ledger.target_snapshot(rollback.target_id)['container_id']=='d'*64
+                before=list(posts)
+                assert adapter.submit(rollback).state=='held'
+                assert posts==before
+                assert sum(p.endswith('/containers/create') for p in posts)==1
+            else:
+                assert result.state=='succeeded',result
+                stop_index=next(i for i,p in enumerate(posts) if p.endswith('/stop'))
+                creates=[i for i,p in enumerate(posts) if p.endswith('/containers/create')]
+                assert len(creates)==2 and creates[0]<stop_index<creates[1]
+                assert '/'+('d'*64)+'/stop' in posts[stop_index]
+                adapter.acknowledge_single_pilot(rollback,single_pilot_outcome_digest(result))
+                assert adapter.submit(smoke_rollback).state=='succeeded'
+        finally:
+            key.close()
