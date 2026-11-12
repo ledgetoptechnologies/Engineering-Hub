@@ -546,11 +546,32 @@ class QueuedContainerPilot:
             pass
         return self.queue.get_job(job['id'])
 
+    def _preclaim_guard(self):
+        """Allow only an exact stopped runtime task to abandon a pre-claim veto."""
+        try:
+            self._guard(admission=True)
+        except HubError as error:
+            # Shutdown can close shared admission after the runtime schedules
+            # its active task but before this first, pre-claim guard executes.
+            # Check the original runtime and binding again without admitting work.
+            from .queued_pilot_runtime import QueuedPilotRuntime
+            runtime = self._runtime
+            if (error.code != 'execution_policy_admission_closed'
+                    or type(runtime) is not QueuedPilotRuntime):
+                raise
+            runtime._identity()
+            self._guard()
+            if not (runtime._claims_suspended and runtime._active is asyncio.current_task()):
+                raise
+            return False
+        return True
+
     async def run_once(self):
         """Claim one eligible staging job; no worker loop or implicit retry."""
         if self.async_admission_required:
             return await self._run_once_async()
-        self._guard(admission=True)
+        if not self._preclaim_guard():
+            return None
         self._runtime_admission()
         job = self.queue.claim(worker=self.worker, lease_seconds=600, action_keys=(self.action_key,))
         if job is None:
@@ -574,7 +595,8 @@ class QueuedContainerPilot:
                 return self._hold(job)
 
     async def _run_once_async(self):
-        self._guard(admission=True)
+        if not self._preclaim_guard():
+            return None
         self._runtime_admission()
         preview = self._claim_preview.set(asyncio.current_task())
         try:
@@ -608,7 +630,8 @@ class QueuedContainerPilot:
         job = None
         try:
             with self._consume(prepared, subject):
-                self._guard(admission=True)
+                if not self._preclaim_guard():
+                    return None
                 self._runtime_admission()
                 if claim_subject() != subject:
                     return None
