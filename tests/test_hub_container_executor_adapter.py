@@ -764,7 +764,7 @@ def test_opt_in_candidate_stop_checks_exact_target_before_effect(invalid):
     adapter._inspect_container = lambda *args: calls.append(('inspect', args[0]))
     def effect(request, kind, callback, limit, deadline, receipt):
         calls.append(('admit', kind))
-        assert receipt(None) == {'container_id':'d'*64, 'stopped':True}
+        assert receipt(None) == {'container_id':'d'*64, 'generation_id':'candidate', 'stopped':True}
         callback('op', limit)
     adapter._effect = effect
     req = SimpleNamespace(target_id='target', run_id='run', fencing_generation=3)

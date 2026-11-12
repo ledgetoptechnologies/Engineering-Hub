@@ -115,10 +115,12 @@ def verify_phase(adapter, request, response, deadline):
         if cleanup and request.action == 'rollback_container':
             stop = by_kind['stop']
             receipt = stop['receipt']
-            if (not bound or type(receipt) is not dict or set(receipt) != {'container_id','stopped'}
+            if (not bound or type(receipt) is not dict or set(receipt) != {'container_id','generation_id','stopped'}
                     or type(receipt['container_id']) is not str
                     or not re.fullmatch(r'[a-f0-9]{64}', receipt['container_id'])
                     or receipt['container_id'] in (evidence.container_id, baseline.container_id)
+                    or type(receipt['generation_id']) is not str or not receipt['generation_id']
+                    or receipt['generation_id'] in (state.generation_id, baseline.state_generation_id)
                     or receipt['stopped'] is not True):
                 raise ValueError('candidate stop receipt mismatch')
             record = journal.inspect_record(stop['operation_id'])
@@ -127,6 +129,11 @@ def verify_phase(adapter, request, response, deadline):
                     or adapter.backend.effect_binding_provider.verify_completed(
                         stop['operation_id'], 'stop', request, receipt['container_id']) is not True):
                 raise ValueError('bound candidate stop evidence unavailable')
+            candidate = adapter._verified_image('candidate')
+            defaults = adapter._image_defaults(candidate, deadline)
+            profile = adapter._profile(candidate, defaults, receipt['generation_id'], adapter._resolve_secrets())
+            adapter._inspect_container(receipt['container_id'], candidate, profile,
+                                       receipt['generation_id'], {'exited'}, deadline)
         pairs = ((create,'create_'+role), (start,'start'))
     else:
         if (evidence.evidence_verified is not True or not

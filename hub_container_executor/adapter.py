@@ -374,7 +374,7 @@ class HostAdapter:
         return self.ledger.finish(request.command_id, state="succeeded", reason=None, evidence=evidence)
 
     def _stop_same_run_candidate(self, request, baseline, secrets, deadline):
-        """One pre-enrolled stop of the exact current candidate; never the baseline."""
+        """Stop a running failed candidate; other rollback cases remain held."""
         from .app_cgroup_observation import AppCgroupObserver
         from .effect_response_recorder import DurableEffectResponseRecorder
         if (not self._single_pilot_protocol or type(self.effect_context_guard) is not TrustedEffectContextGuard
@@ -398,7 +398,8 @@ class HostAdapter:
         self._effect(request, 'stop',
             lambda operation_id, timeout: self.backend.stop_container(target['container_id'], operation_id, timeout),
             self.manifest.timeouts.stop_ms, deadline,
-            lambda _value: {'container_id': target['container_id'], 'stopped': True})
+            lambda _value: {'container_id': target['container_id'],
+                            'generation_id': target['generation_id'], 'stopped': True})
 
     def _verified_image(self, role: str) -> VerifiedImage:
         return verify_image_record(self.manifest, role, self.record_store, self.metadata_store,

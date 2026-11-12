@@ -830,10 +830,11 @@ class SQLiteLedger:
                 raise PermissionError('pilot ledger evidence incomplete')
             if candidate_stop:
                 receipt = next(item['receipt'] for item in parsed if item['kind'] == 'stop')
-                if (type(receipt) is not dict or set(receipt) != {'container_id', 'stopped'}
+                if (type(receipt) is not dict or set(receipt) != {'container_id', 'generation_id', 'stopped'}
                         or type(receipt['container_id']) is not str
                         or not re.fullmatch(r'[a-f0-9]{64}', receipt['container_id'])
                         or receipt['container_id'] == outcome.evidence.container_id
+                        or type(receipt['generation_id']) is not str or not receipt['generation_id']
                         or receipt['stopped'] is not True):
                     raise PermissionError('candidate stop receipt mismatch')
             db.execute("UPDATE control SET value=? WHERE key='single_pilot_gate'", (next_text,))

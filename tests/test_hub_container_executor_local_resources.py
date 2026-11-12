@@ -481,7 +481,7 @@ def test_bound_resources_reopen_only_with_real_signed_observer_and_existing_key(
         old_observer.close()
 
 
-def _attach_synthetic_engine(adapter, params, *, lose_stop=False):
+def _attach_synthetic_engine(adapter, params, *, lose_stop=False, resurrect_candidate=False):
     from tests.test_hub_container_executor_daemon_backend import container_inspect, docker_config, oci_archive, json_bytes
     backend=adapter.backend; manifest=adapter.manifest
     images={role:adapter._verified_image(role) for role in ('candidate','rollback')}
@@ -515,6 +515,8 @@ def _attach_synthetic_engine(adapter, params, *, lose_stop=False):
             cid='d'*64 if image.role=='candidate' else 'e'*64
             source=body['HostConfig']['Mounts'][0]['Source']; generation=source.rsplit('/',1)[1]
             active=adapter._profile(image,adapter._defaults_from_record(image),generation,secrets)
+            if resurrect_candidate and image.role == 'rollback':
+                containers['d'*64]['State']['Status']='running'
             containers[cid]=container_inspect(image,active,source,cid,'created')
             if backend.app_cgroup_observer is not None:
                 containers[cid]['HostConfig']['CgroupParent'] = backend.app_cgroup_observer._pins.parent
@@ -687,8 +689,8 @@ async def test_concrete_controller_asgi_recovers_lost_response_without_effect_re
         finally:
             owner.close(); await client.aclose()
 
-@pytest.mark.parametrize('lose_stop', [False, True])
-def test_bound_v3_rollback_stops_candidate_before_replacement(rig, monkeypatch, lose_stop):
+@pytest.mark.parametrize('scenario', ['success', 'lost_stop', 'restarted_candidate'])
+def test_bound_v3_rollback_stops_candidate_before_replacement(rig, monkeypatch, scenario):
     """Real local journals, fake Engine and synthetic verifier; no host assurance."""
     import time
     from uuid import UUID, uuid5
@@ -716,7 +718,8 @@ def test_bound_v3_rollback_stops_candidate_before_replacement(rig, monkeypatch, 
             adapter.backend.app_cgroup_observer=observer
             adapter.backend.effect_response_recorder=DurableEffectResponseRecorder(journal,key)
             adapter._stop_failed_candidate_before_rollback=True
-            posts=_attach_synthetic_engine(adapter,params,lose_stop=lose_stop)
+            posts=_attach_synthetic_engine(adapter,params,lose_stop=(scenario=='lost_stop'),
+                                           resurrect_candidate=(scenario=='restarted_candidate'))
             run=str(uuid4())
             deploy=command(adapter.manifest,'deploy_container',run_id=run)
             smoke=command(adapter.manifest,'smoke_container',run_id=run)
@@ -752,13 +755,18 @@ def test_bound_v3_rollback_stops_candidate_before_replacement(rig, monkeypatch, 
                 assert result.state==expected, result
                 adapter.acknowledge_single_pilot(req,single_pilot_outcome_digest(result))
             result=adapter.submit(rollback)
-            if lose_stop:
+            if scenario=='lost_stop':
                 assert result.state=='held',result
                 assert adapter.ledger.target_snapshot(rollback.target_id)['container_id']=='d'*64
                 before=list(posts)
                 assert adapter.submit(rollback).state=='held'
                 assert posts==before
                 assert sum(p.endswith('/containers/create') for p in posts)==1
+            elif scenario=='restarted_candidate':
+                assert result.state=='held',result
+                before=list(posts)
+                assert adapter.submit(rollback).state=='held'
+                assert posts==before
             else:
                 assert result.state=='succeeded',result
                 stop_index=next(i for i,p in enumerate(posts) if p.endswith('/stop'))
