@@ -1032,7 +1032,7 @@ def test_withdrawal_replay_reauthorizes_secondary_project_after_grant_narrowing(
     with env.repo._connection() as db:
         assert db.execute('SELECT count(*) FROM hub_audit').fetchone()[0] == count
     env.bridge.grant_put(OWNER, installation, 1, [PROJECT], list(CAPABILITIES))
-    with pytest.raises(HubError, match='hub_project_forbidden'):
+    with pytest.raises(HubError, match='hub_replacement_unavailable'):
         call(env, token, 'hub_entity_withdraw', withdraw)
     assert env.repo._read(first['id'], 'decision') == withdrawn
     with env.repo._connection() as db:
