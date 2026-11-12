@@ -63,14 +63,16 @@ parent; it cannot adopt an existing directory or a live ledger:
 
 ```sh
 python -m engineering_hub.staging_state_init --new-state-dir <new-private-child>
-python -m engineering_hub.owned_inactive_hub --config <isolated-settings.json>
+python -m engineering_hub.owned_inactive_hub --config <isolated-settings.json> \
+  --loopback-ports <unused-agent-port> <unused-browser-port>
 ```
 
-These are entrypoint shapes, not a complete launch recipe. The second command
-uses the image environment and paired agent/browser listeners; source defaults
-bind container ports 8770 and 8771 on all container interfaces. Do not run it
-unisolated on a shared host or assume it is loopback-only. Use independently
-verified isolated port mappings, no host network, no Engine socket or executor,
+These are entrypoint shapes, not a complete launch recipe. The explicit option
+binds both native listeners to 127.0.0.1 on distinct nonzero ports. It does not
+protect them from other local users, provide HTTPS, or make them reachable from
+a router in another container/network namespace. Omitting the option retains
+the existing all-interface defaults. Use independently verified network
+placement and port mappings, no Engine socket or executor,
 no shared mounts, bounded resources and a task-owned lifecycle. Follow the
 initializer and paired-listener conditions in the staging service document.
 This plan creates no settings, state, credentials, router or running service.
