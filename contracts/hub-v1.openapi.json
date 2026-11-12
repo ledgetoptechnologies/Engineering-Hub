@@ -6748,7 +6748,9 @@
                   "rollback_failed",
                   "rollback_outcome_uncertain",
                   "rollback_smoke_failed",
-                  "rollback_smoke_outcome_uncertain"
+                  "rollback_smoke_outcome_uncertain",
+                  "disposable_cleanup_requires_quiescence",
+                  "disposable_cleanup_outcome_uncertain"
                 ]
               },
               {

@@ -131,7 +131,8 @@ class RunEventDTO(ResponseDTO):
     event_id: str | None = None
     reason: Literal['candidate_outcome_uncertain', 'staging_paused', 'rollback_failed',
                     'rollback_outcome_uncertain', 'rollback_smoke_failed',
-                    'rollback_smoke_outcome_uncertain'] | None = None
+                    'rollback_smoke_outcome_uncertain', 'disposable_cleanup_requires_quiescence',
+                    'disposable_cleanup_outcome_uncertain'] | None = None
 
     @model_validator(mode='after')
     def held_reason_only(self):

@@ -29,7 +29,7 @@ class ContainerPilotRequest(_WireModel):
     command_id: str
     run_id: str
     target_id: Literal["engineering-hub:staging"]
-    action: Literal["deploy_container", "smoke_container", "rollback_container", "smoke_container_rollback"]
+    action: Literal["deploy_container", "smoke_container", "rollback_container", "smoke_container_rollback", "cleanup_candidate", "cleanup_rollback"]
     manifest_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     candidate_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
     policy_revision: int = Field(gt=0)

@@ -144,7 +144,10 @@ class ContainerPilotWorkflow:
         if not isinstance(targets, (list, tuple)) or any(type(t) is not ContainerPilotTarget for t in targets):
             raise ValueError('invalid_pilot_targets')
         for target in targets:
-            self._validate_client_deadline(client, target.validated_manifest())
+            manifest = target.validated_manifest()
+            if manifest.disposable_final_cleanup and not single_pilot_protocol:
+                raise ValueError('disposable_cleanup_requires_single_pilot')
+            self._validate_client_deadline(client, manifest)
         self.repo, self.client = repo, client
         self.pilot_owner = pilot_owner
         self._assert_pilot_owner()
@@ -245,7 +248,7 @@ class ContainerPilotWorkflow:
 
     def _event(self, run, event, *, phase, reason=None):
         self._assert_pilot_owner()
-        if phase not in {'deploy_container', 'smoke_container', 'rollback_container', 'smoke_container_rollback'}:
+        if phase not in {'deploy_container', 'smoke_container', 'rollback_container', 'smoke_container_rollback', 'cleanup_candidate', 'cleanup_rollback'}:
             raise ValueError('invalid_pilot_phase')
         event_id = str(uuid.uuid5(uuid.UUID(run['id']), 'container_pilot_v1:event:' + phase + ':' + event))
         return self.repo.append_run_event(self.repo.execution_principal, run['id'], event,
@@ -286,12 +289,14 @@ class ContainerPilotWorkflow:
         if state == 'failed':
             return 'failed'
         evidence = response.evidence
-        rollback = command.action in {'rollback_container', 'smoke_container_rollback'}
+        rollback = command.action in {'rollback_container', 'smoke_container_rollback', 'cleanup_rollback'}
         expected = target.rollback_image_config_id if rollback else target.artifact_digest
         if (not evidence.evidence_verified or evidence.image_config_id != expected
                 or not evidence.container_id):
             return 'held'
         if command.action in {'smoke_container', 'smoke_container_rollback'} and evidence.health != 'healthy':
+            return 'held'
+        if command.action in {'cleanup_candidate', 'cleanup_rollback'} and evidence.health != 'unknown':
             return 'held'
         return 'succeeded'
 
@@ -507,6 +512,12 @@ class ContainerPilotWorkflow:
                         run = self._event(run, 'failed', phase=action)
                         break
                 else:
+                    if target.validated_manifest().disposable_final_cleanup:
+                        if self.repo.get_paused():
+                            raise HubError('paused', 423)
+                        state = await self._command(run, target, 'cleanup_candidate')
+                        return self._hold(run, 'disposable_cleanup_requires_quiescence' if state == 'succeeded'
+                                          else 'disposable_cleanup_outcome_uncertain', phase='cleanup_candidate')
                     return self._event(run, 'succeeded', phase='smoke_container')
             if run['status'] == 'failed':
                 for action in ('rollback_container', 'smoke_container_rollback'):
@@ -517,6 +528,12 @@ class ContainerPilotWorkflow:
                         phase = 'rollback' if action == 'rollback_container' else 'rollback_smoke'
                         reason = phase + ('_failed' if state == 'failed' else '_outcome_uncertain')
                         return self._hold(run, reason, phase=action)
+                if target.validated_manifest().disposable_final_cleanup:
+                    if self.repo.get_paused():
+                        raise HubError('paused', 423)
+                    state = await self._command(run, target, 'cleanup_rollback')
+                    return self._hold(run, 'disposable_cleanup_requires_quiescence' if state == 'succeeded'
+                                      else 'disposable_cleanup_outcome_uncertain', phase='cleanup_rollback')
                 return self._event(run, 'rolled_back', phase='smoke_container_rollback')
             return run
         finally:

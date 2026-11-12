@@ -13,6 +13,7 @@ from .repository import AGENTS, HubError
 
 
 ACTIONS = ('deploy_container', 'smoke_container', 'rollback_container', 'smoke_container_rollback')
+CLEANUP_ACTIONS = ('cleanup_candidate', 'cleanup_rollback')
 RECOVERY_TRANSITIONS = {
     'pending': frozenset({'running', 'held'}),
     'running': frozenset({'running', 'succeeded', 'failed', 'held'}),
@@ -103,6 +104,10 @@ class PilotRecovery:
     def _derive(evidence):
         """Only contiguous, phase-consistent historical terminal evidence."""
         phases = {item['action']: item for item in evidence}
+        # Even a verified stop response does not prove quiescence or authorize
+        # release. Recovery may inspect the original ID, but cannot promote it.
+        if any(action in phases for action in CLEANUP_ACTIONS):
+            return 'held'
         if any(item['state'] not in {'succeeded', 'failed'} for item in evidence):
             return 'held'
         deploy, smoke, rollback, rollback_smoke = (phases.get(action) for action in ACTIONS)
@@ -178,9 +183,9 @@ class PilotRecovery:
         target = self.workflow._target(run, pin=False)
         evidence = []
         by_action = {row['action']: row for row in original_rows}
-        if any(action not in ACTIONS for action in by_action):
+        if any(action not in ACTIONS + CLEANUP_ACTIONS for action in by_action):
             evidence.append(dict(action='invalid', state='held', response=None, container_id=None))
-        for action in ACTIONS:
+        for action in ACTIONS + CLEANUP_ACTIONS:
             if action not in by_action:
                 continue
             saved = by_action[action]
@@ -250,6 +255,10 @@ class PilotRecovery:
             self._guard()
             evidence.append(item)
         derived = self._derive(evidence)
+        if target.validated_manifest().disposable_final_cleanup:
+            # This recovery path has no independent quiescence evidence and
+            # cannot authorize reservation release for disposable campaigns.
+            derived = 'held'
         if not original_rows and run['status'] not in {'pending', 'running'}:
             derived = 'held'
         # Missing durable phases must not erase already recorded progress or

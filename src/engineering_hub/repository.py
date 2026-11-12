@@ -26,7 +26,8 @@ CREATION_ACTIONS = {'task': ('task.created', 'task.proposed'), 'decision': ('dec
 WITHDRAWABLE_TASK_STATUSES = frozenset({'assigned', 'claimed'})
 _UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 HELD_REASONS = frozenset({'candidate_outcome_uncertain', 'staging_paused', 'rollback_failed',
-                         'rollback_outcome_uncertain', 'rollback_smoke_failed', 'rollback_smoke_outcome_uncertain'})
+                         'rollback_outcome_uncertain', 'rollback_smoke_failed', 'rollback_smoke_outcome_uncertain',
+                         'disposable_cleanup_requires_quiescence', 'disposable_cleanup_outcome_uncertain'})
 
 
 class HubError(Exception):

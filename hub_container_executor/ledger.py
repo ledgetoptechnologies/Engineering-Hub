@@ -114,7 +114,10 @@ class SQLiteLedger:
     """
 
     def __init__(self, database_path, *, manifest_digest: str,
-                 candidate_commit: str, policy_revision: int):
+                 candidate_commit: str, policy_revision: int, disposable_final_cleanup=False):
+        if type(disposable_final_cleanup) is not bool:
+            raise TypeError('explicit cleanup mode required')
+        self._disposable_final_cleanup = disposable_final_cleanup
         self.path = Path(database_path)
         self._owner_pid = os.getpid()
         self._lifecycle = threading.Condition()
@@ -463,8 +466,16 @@ class SQLiteLedger:
         except Exception:
             raise PermissionError('single pilot denial evidence is invalid') from None
 
-    @staticmethod
-    def _phase_denial(db, request) -> str | None:
+    def _phase_denial(self, db, request) -> str | None:
+        if request.action in {'cleanup_candidate', 'cleanup_rollback'}:
+            if not self._disposable_final_cleanup:
+                return 'identity_conflict'
+            prior = db.execute("SELECT action,state FROM phases WHERE run_id=?", (request.run_id,)).fetchall()
+            found = {row['action']:row['state'] for row in prior}
+            candidate = found.get('smoke_container') == 'succeeded' and 'rollback_container' not in found
+            rollback = found.get('smoke_container_rollback') == 'succeeded'
+            expected = 'cleanup_candidate' if candidate and not rollback else 'cleanup_rollback' if rollback and not candidate else None
+            return None if request.action == expected else 'identity_conflict'
         index = _ACTION_INDEX[request.action]
         prior = db.execute("SELECT action,state FROM phases WHERE run_id=?",
                            (request.run_id,)).fetchall()
@@ -482,6 +493,20 @@ class SQLiteLedger:
         if found.get(PHASES[2]) == "running":
             return "target_busy"
         return None if found.get(PHASES[2]) == "succeeded" else "identity_conflict"
+
+    def disposable_cleanup_role(self, run_id):
+        """Derive the cleanup target solely from this run's durable phases."""
+        self._check_open()
+        if not self._disposable_final_cleanup:
+            raise PermissionError('disposable cleanup is not enrolled')
+        with self._connection() as db:
+            rows = db.execute('SELECT action,state FROM phases WHERE run_id=?', (run_id,)).fetchall()
+        phases = {row['action']:row['state'] for row in rows}
+        candidate = phases.get('smoke_container') == 'succeeded' and 'rollback_container' not in phases
+        rollback = phases.get('smoke_container_rollback') == 'succeeded'
+        if candidate == rollback:
+            raise PermissionError('cleanup role unavailable')
+        return 'candidate' if candidate else 'rollback'
 
     def begin_operation(self, command_id: str, kind: str) -> str:
         self._check_open()
@@ -640,8 +665,12 @@ class SQLiteLedger:
                 run_state = target_state = "held"
             elif state == "failed":
                 run_state = target_state = "failed"
-            elif old.action == "smoke_container" or old.action == "smoke_container_rollback":
-                run_state = target_state = "active"
+            elif old.action in {"smoke_container", "smoke_container_rollback"}:
+                run_state = target_state = "cleanup_pending" if self._disposable_final_cleanup else "active"
+            elif old.action in {'cleanup_candidate', 'cleanup_rollback'}:
+                # An exited container alone does not prove quiescence or grant
+                # reservation release. A separate recovery policy is required.
+                run_state = target_state = 'held'
             db.execute("UPDATE runs SET state=? WHERE run_id=?", (run_state, row["run_id"]))
             db.execute("UPDATE targets SET state=? WHERE target_id=? AND current_run_id=?",
                        (target_state, row["target_id"], row["run_id"]))
@@ -800,16 +829,20 @@ class SQLiteLedger:
         if type(candidate_stop) is not bool or (candidate_stop and request.action != 'rollback_container'):
             raise ValueError('invalid candidate stop policy')
         deploy = request.action in {'deploy_container','rollback_container'}
+        cleanup = request.action in {'cleanup_candidate', 'cleanup_rollback'}
         eligible = ((deploy and outcome.state == 'succeeded' and outcome.reason is None
                      and outcome.evidence.health == 'unknown' and outcome.evidence.evidence_verified is True)
-                    or (not deploy and outcome.evidence.evidence_verified is True
+                    or (cleanup and self._disposable_final_cleanup and outcome.state == 'succeeded'
+                        and outcome.reason is None and outcome.evidence.health == 'unknown'
+                        and outcome.evidence.evidence_verified is True)
+                    or (not deploy and not cleanup and outcome.evidence.evidence_verified is True
                         and ((outcome.state == 'succeeded' and outcome.reason is None and outcome.evidence.health == 'healthy')
                              or (outcome.state == 'failed' and outcome.reason == 'health_failed' and outcome.evidence.health == 'unhealthy'))))
         if not eligible or outcome.replayed:
             raise PermissionError('pilot outcome not eligible')
-        role = 'rollback' if request.action in {'rollback_container','smoke_container_rollback'} else 'candidate'
+        role = 'rollback' if request.action in {'rollback_container','smoke_container_rollback','cleanup_rollback'} else 'candidate'
         expected = ({'state_copy' if role == 'candidate' else 'rollback_state', 'create_'+role, 'start_'+role}
-                    if request.action in {'deploy_container','rollback_container'} else {'probe'})
+                    if deploy else {'stop'} if cleanup else {'probe'})
         if candidate_stop:
             expected.add('stop')
         gate_text = _canonical({'state':'effect_held', 'request':request.model_dump(mode='json')})

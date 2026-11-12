@@ -478,6 +478,10 @@ class QueuedContainerPilot:
                 or str(uuid.UUID(attempt['advance_owner'])) != attempt['advance_owner']):
             return None
         target = self.workflow._target(run, pin=False)
+        if target.validated_manifest().disposable_final_cleanup:
+            # A successful stop/empty scope is not independent quiescence.
+            # Keep physical capacity held until an explicit release policy exists.
+            return None
         rows = PilotRecovery._rows(db, run['id'])
         evidence = []
         for saved in rows:

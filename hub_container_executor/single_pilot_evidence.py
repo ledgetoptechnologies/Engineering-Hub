@@ -66,14 +66,18 @@ def verify_phase(adapter, request, response, deadline):
     adapter.state_provisioner.require_complete_reservations(deadline_monotonic=deadline)
     if response.replayed or response.model_dump(include=set(type(request).model_fields)) != request.model_dump():
         raise ValueError('phase identity mismatch')
-    role = 'rollback' if request.action in ('rollback_container', 'smoke_container_rollback') else 'candidate'
+    cleanup = request.action in {'cleanup_candidate', 'cleanup_rollback'}
+    role = (adapter.ledger.disposable_cleanup_role(request.run_id) if cleanup else
+            'rollback' if request.action in ('rollback_container', 'smoke_container_rollback') else 'candidate')
+    if cleanup and request.action != 'cleanup_' + role:
+        raise ValueError('cleanup role mismatch')
     deploy = request.action in ('deploy_container', 'rollback_container')
     expected = ({'state_copy' if role == 'candidate' else 'rollback_state', 'create_'+role, 'start_'+role}
-                if deploy else {'probe'})
-    cleanup = getattr(adapter, '_stop_failed_candidate_before_rollback', False)
-    if type(cleanup) is not bool:
+                if deploy else {'stop'} if cleanup else {'probe'})
+    candidate_stop = getattr(adapter, '_stop_failed_candidate_before_rollback', False)
+    if type(candidate_stop) is not bool:
         raise ValueError('invalid candidate stop policy')
-    if cleanup and request.action == 'rollback_container':
+    if candidate_stop and request.action == 'rollback_container':
         expected.add('stop')
     rows = adapter.ledger.operation_rows(request.command_id)
     if len(rows) != len(expected) or {row['kind'] for row in rows} != expected:
@@ -112,7 +116,7 @@ def verify_phase(adapter, request, response, deadline):
         create, start = by_kind['create_'+role], by_kind['start_'+role]
         if create['receipt'] != {'container_id':evidence.container_id} or start['receipt'] != {'container_id':evidence.container_id,'started':True}:
             raise ValueError('container receipt mismatch')
-        if cleanup and request.action == 'rollback_container':
+        if candidate_stop and request.action == 'rollback_container':
             stop = by_kind['stop']
             receipt = stop['receipt']
             if (not bound or type(receipt) is not dict or set(receipt) != {'container_id','generation_id','stopped'}
@@ -135,6 +139,19 @@ def verify_phase(adapter, request, response, deadline):
             adapter._inspect_container(receipt['container_id'], candidate, profile,
                                        receipt['generation_id'], {'exited'}, deadline)
         pairs = ((create,'create_'+role), (start,'start'))
+    elif cleanup:
+        if (not bound or response.state != 'succeeded' or response.reason is not None
+                or evidence.health != 'unknown' or evidence.evidence_verified is not True):
+            raise ValueError('cleanup outcome not verified')
+        stop = by_kind['stop']
+        if stop['receipt'] != {'container_id':evidence.container_id,'stopped':True}:
+            raise ValueError('stop receipt mismatch')
+        image_record = adapter._verified_image(role)
+        defaults = adapter._image_defaults(image_record, deadline)
+        profile = adapter._profile(image_record, defaults, target['generation_id'], adapter._resolve_secrets())
+        adapter._inspect_container(evidence.container_id, image_record, profile,
+                                   target['generation_id'], {'exited'}, deadline)
+        pairs = ((stop,'stop'),)
     else:
         if (evidence.evidence_verified is not True or not
                 ((response.state == 'succeeded' and response.reason is None and evidence.health == 'healthy')

@@ -111,6 +111,8 @@ class HostAdapter:
         if (type(stop_failed_candidate_before_rollback) is not bool
                 or stop_failed_candidate_before_rollback and not single_pilot_protocol):
             raise TypeError('explicit single-pilot candidate cleanup required')
+        if manifest.disposable_final_cleanup and (not single_pilot_protocol or not stop_failed_candidate_before_rollback):
+            raise ValueError('disposable cleanup requires guarded candidate stop and single pilot protocol')
         if effect_context_guard is not None and type(effect_context_guard) is not TrustedEffectContextGuard:
             raise TypeError('explicit trusted effect context guard required')
         if single_pilot_protocol:
@@ -143,6 +145,7 @@ class HostAdapter:
             manifest_digest=self.manifest_digest,
             candidate_commit=self.manifest.candidate.source_commit,
             policy_revision=self.manifest.policy_revision,
+            disposable_final_cleanup=self.manifest.disposable_final_cleanup is True,
         )
         try:
             enrolled = self.ledger.single_pilot_enabled()
@@ -150,6 +153,12 @@ class HostAdapter:
                 raise PermissionError('single pilot protocol required for enrolled ledger')
             if single_pilot_protocol and not enrolled:
                 self.ledger.enable_single_pilot_protocol()
+            if self.manifest.disposable_final_cleanup:
+                from .app_cgroup_observation import AppCgroupObserver
+                from .effect_response_recorder import DurableEffectResponseRecorder
+                if (type(getattr(backend, 'app_cgroup_observer', None)) is not AppCgroupObserver
+                        or type(getattr(backend, 'effect_response_recorder', None)) is not DurableEffectResponseRecorder):
+                    raise ValueError('disposable cleanup requires guarded response and containment evidence')
         except BaseException:
             self.ledger.close()
             raise
@@ -264,7 +273,9 @@ class HostAdapter:
                     self.ledger.arm_single_pilot(request)
                     deadline = time.monotonic() + self.manifest.timeouts.total_command_ms / 1000
                     from .single_pilot_evidence import require_journal_ready
-                    require_journal_ready(self)
+                    bound = require_journal_ready(self)
+                    if self.manifest.disposable_final_cleanup and bound is not True:
+                        raise ValueError('disposable cleanup requires bound effect guard')
                     self.state_provisioner.require_complete_reservations(deadline_monotonic=deadline)
                     return self._submit_active(request)
                 except Exception:
@@ -308,7 +319,8 @@ class HostAdapter:
                 self.baseline_provider is None or self.state_provisioner is None):
             raise _Held("recovery_required")
 
-        role = "rollback" if request.action in {"rollback_container", "smoke_container_rollback"} else "candidate"
+        role = (self.ledger.disposable_cleanup_role(request.run_id) if request.action in {'cleanup_candidate', 'cleanup_rollback'}
+                else "rollback" if request.action in {"rollback_container", "smoke_container_rollback"} else "candidate")
         image = self._verified_image(role)
         self._check_runner(deadline)
         defaults = self._image_defaults(image, deadline)
@@ -349,6 +361,16 @@ class HostAdapter:
         profile = self._profile(image, defaults, generation_id, secrets)
         observation = self._inspect_container(container_id, image, profile, generation_id,
                                               {"running"}, deadline)
+        if request.action in {'cleanup_candidate', 'cleanup_rollback'}:
+            if request.action != 'cleanup_' + role:
+                raise _Held('identity_conflict')
+            self._effect(request, 'stop',
+                lambda operation_id, timeout: self.backend.stop_container(container_id, operation_id, timeout),
+                self.manifest.timeouts.stop_ms, deadline,
+                lambda _value: {'container_id': container_id, 'stopped': True})
+            self._inspect_container(container_id, image, profile, generation_id, {'exited'}, deadline)
+            evidence = self._evidence(container_id, image.image_config_id, 'unknown', True)
+            return self.ledger.finish(request.command_id, state='succeeded', reason=None, evidence=evidence)
         probes = self.manifest.probes.candidate if role == "candidate" else self.manifest.probes.rollback
         expected_probe_digest = self._probe_digest(probes)
         outcome = self._effect(

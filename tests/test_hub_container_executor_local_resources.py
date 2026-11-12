@@ -481,7 +481,8 @@ def test_bound_resources_reopen_only_with_real_signed_observer_and_existing_key(
         old_observer.close()
 
 
-def _attach_synthetic_engine(adapter, params, *, lose_stop=False, resurrect_candidate=False):
+def _attach_synthetic_engine(adapter, params, *, lose_stop=False, resurrect_candidate=False, resurrect_final=False,
+                             candidate_unhealthy=True):
     from tests.test_hub_container_executor_daemon_backend import container_inspect, docker_config, oci_archive, json_bytes
     backend=adapter.backend; manifest=adapter.manifest
     images={role:adapter._verified_image(role) for role in ('candidate','rollback')}
@@ -494,9 +495,9 @@ def _attach_synthetic_engine(adapter, params, *, lose_stop=False, resurrect_cand
         str(params['binding'].generation_root + '/' + baseline.state_generation_id),baseline.container_id,'running')}
     if backend.app_cgroup_observer is not None:
         containers[baseline.container_id]['HostConfig']['CgroupParent'] = backend.app_cgroup_observer._pins.parent
-    executions={}; posts=[]; counter=0
+    executions={}; posts=[]; counter=0; stopped_rollback_inspections=0
     def handler(request):
-        nonlocal counter
+        nonlocal counter, stopped_rollback_inspections
         path=request.url.raw_path.decode('ascii').split('?',1)[0]
         if request.method == 'POST': posts.append(path)
         if path.endswith('/info'):
@@ -509,6 +510,10 @@ def _attach_synthetic_engine(adapter, params, *, lose_stop=False, resurrect_cand
             return httpx.Response(200,content=oci_archive(image,blobs))
         if '/containers/' in path and path.endswith('/json'):
             cid=path.split('/containers/',1)[1].removesuffix('/json')
+            if resurrect_final and cid == ('d' if resurrect_final == 'candidate' else 'e')*64 and cid in containers and containers[cid]['State']['Status'] == 'exited':
+                stopped_rollback_inspections += 1
+                if stopped_rollback_inspections >= 3:
+                    containers[cid]['State']['Status'] = 'running'
             return httpx.Response(200,json=containers[cid]) if cid in containers else httpx.Response(404,json={'message':'absent'})
         if path.endswith('/containers/create'):
             body=json.loads(request.content); image=image_by_ref[body['Image']]
@@ -523,7 +528,8 @@ def _attach_synthetic_engine(adapter, params, *, lose_stop=False, resurrect_cand
             return httpx.Response(201,json={'Id':cid,'Warnings':[]})
         if path.endswith('/stop') and '/containers/' in path:
             cid=path.split('/containers/',1)[1].removesuffix('/stop')
-            if lose_stop: raise httpx.ReadTimeout('synthetic lost stop response', request=request)
+            if lose_stop is True or (lose_stop == 'rollback' and cid == 'e'*64):
+                raise httpx.ReadTimeout('synthetic lost stop response', request=request)
             containers[cid]['State']['Status']='exited'
             return httpx.Response(204)
         if path.endswith('/start') and '/containers/' in path:
@@ -531,7 +537,7 @@ def _attach_synthetic_engine(adapter, params, *, lose_stop=False, resurrect_cand
             return httpx.Response(204)
         if path.endswith('/exec') and '/containers/' in path:
             cid=path.split('/containers/',1)[1].removesuffix('/exec'); counter+=1; eid=f'{counter:064x}'
-            argv=json.loads(request.content)['Cmd']; failed=cid=='d'*64 and argv[4]=='health_json'
+            argv=json.loads(request.content)['Cmd']; failed=candidate_unhealthy and cid=='d'*64 and argv[4]=='health_json'
             executions[eid]={'report':{'expectation_id':argv[7],'ok':not failed,'status':503 if failed else int(argv[6])},'exit':1 if failed else 0}
             return httpx.Response(201,json={'Id':eid})
         if path.endswith('/start') and '/exec/' in path:
@@ -778,5 +784,92 @@ def test_bound_v3_rollback_stops_candidate_before_replacement(rig, monkeypatch, 
                 assert '/'+('d'*64)+'/stop' in posts[stop_index]
                 adapter.acknowledge_single_pilot(rollback,single_pilot_outcome_digest(result))
                 assert adapter.submit(smoke_rollback).state=='succeeded'
+        finally:
+            key.close()
+
+
+@pytest.mark.parametrize('scenario', ['success', 'revoked', 'lost_response', 'restarted'])
+@pytest.mark.parametrize('final_role', ['candidate', 'rollback'])
+def test_bound_v3_disposable_final_stop(rig, monkeypatch, scenario, final_role):
+    """Real journals and fake Engine; this is not a host or quiescence proof."""
+    import time
+    from uuid import UUID, uuid5
+    from engineering_hub.container_pilot_client import single_pilot_outcome_digest
+    from hub_container_executor.adapter import TrustedEffectContextGuard
+    from hub_container_executor.app_cgroup_observation import AppCgroupObserver, AppCgroupPins, AppCgroupObservation
+    from hub_container_executor.effect_response_recorder import DurableEffectResponseRecorder
+    from hub_container_executor.effect_mac_key import create_for_new_journal, EffectMacKey
+    from hub_container_executor.enrolled_effect_provider import enrolled_effect_provider, DeferredTargetEffect
+    from tests.test_hub_container_effect_binding_canonical import fixture
+    from tests.test_hub_container_executor_adapter import command
+
+    class Driver:
+        def implementation_commit(self): return rig.params['manifest'].driver.implementation_commit
+
+    journal_path = rig.params['journal_database']
+    key_id = create_for_new_journal(journal_path.parent, journal_path.name)
+    params = dict(rig.params, single_pilot_protocol=True, driver_identity_verifier=Driver())
+    with module.local_host_adapter_resources(**params) as adapter:
+        journal = adapter.backend.operation_journal
+        journal.enable_bindings(); journal.enable_response_records()
+        key = EffectMacKey(journal_path.parent, journal_path.name, expected_key_id=key_id)
+        try:
+            observer = object.__new__(AppCgroupObserver); observer._pins = AppCgroupPins('test.slice',1,2,3,4)
+            monkeypatch.setattr(AppCgroupObserver, 'verify', lambda self, cid, *, deadline:
+                AppCgroupObservation(cid,int(time.time()*1000)+5000,min(deadline,time.monotonic()+5)))
+            adapter.backend.app_cgroup_observer = observer
+            adapter.backend.effect_response_recorder = DurableEffectResponseRecorder(journal,key)
+            adapter._stop_failed_candidate_before_rollback = True
+            # Exercise the guarded stop path with the existing historical rig;
+            # separate manifest tests cover explicit digest-bound opt in.
+            adapter.ledger._disposable_final_cleanup = True
+            posts = _attach_synthetic_engine(adapter,params,lose_stop=(True if final_role == 'candidate' else 'rollback')
+                                             if scenario == 'lost_response' else False,
+                                             resurrect_final=final_role if scenario == 'restarted' else False,
+                                             candidate_unhealthy=final_role == 'rollback')
+            run = str(uuid4())
+            deploy, smoke, rollback, smoke_rollback, cleanup = [command(adapter.manifest, action, run_id=run)
+                for action in ('deploy_container','smoke_container','rollback_container',
+                               'smoke_container_rollback','cleanup_'+final_role)]
+            effects = []
+            for req, role, probe_req in ((deploy,'candidate',smoke),(rollback,'rollback',smoke_rollback)):
+                state_kind = 'state_copy' if role == 'candidate' else 'rollback_state'
+                generation = adapter.state_provisioner._generation(run,str(uuid5(UUID(req.command_id),state_kind)),role)
+                image = adapter._verified_image(role)
+                profile = adapter._profile(image,adapter._defaults_from_record(image),generation,adapter._resolve_secrets())
+                create = replace(fixture(),operation_id=str(uuid5(UUID(req.command_id),'create_'+role)),run_id=run,
+                    kind='create_'+role,fence=req.fencing_generation,owner_epoch=journal._owner.epoch,
+                    resource_name=f'{adapter.manifest.runtime.resource_name_prefix}-{run[:12]}-{role}',
+                    container_id=None,image_index_digest=image.runnable_reference,platform_manifest_digest=image.platform_manifest_digest,
+                    image_config_id=image.image_config_id,state_generation_id=generation,
+                    environment_names=tuple(n for n,_ in profile.environment),memory_bytes=profile.memory_bytes,
+                    cpu_millicores=profile.cpu_millicores,pids_limit=profile.pids_limit,tmpfs_bytes=profile.tmpfs[0][1])
+                start = replace(create,operation_id=str(uuid5(UUID(req.command_id),'start_'+role)),kind='start',resource_name=None)
+                probes = adapter.manifest.probes.candidate if role == 'candidate' else adapter.manifest.probes.rollback
+                probe = replace(create,operation_id=str(uuid5(UUID(probe_req.command_id),'probe')),kind='probe',
+                    resource_name=None,probe_set_digest=adapter._probe_digest(probes))
+                stop_req = cleanup if role == final_role else rollback
+                stop = replace(create,operation_id=str(uuid5(UUID(stop_req.command_id),'stop')),kind='stop',resource_name=None)
+                effects.extend((create,DeferredTargetEffect(start,req.command_id),
+                                DeferredTargetEffect(probe,req.command_id),DeferredTargetEffect(stop,req.command_id)))
+            adapter.backend.effect_binding_provider = enrolled_effect_provider(journal,key,tuple(effects),
+                source_ledger=adapter.ledger,verify_generation=lambda actual, _: not (
+                    scenario == 'revoked' and actual.context.request.action == 'cleanup_'+final_role))
+            adapter.effect_context_guard = TrustedEffectContextGuard(lambda _: True,adapter.backend.effect_context_scope)
+            sequence = ((deploy,'succeeded'),(smoke,'succeeded')) if final_role == 'candidate' else (
+                (deploy,'succeeded'),(smoke,'failed'),(rollback,'succeeded'),(smoke_rollback,'succeeded'))
+            for req, expected in sequence:
+                result = adapter.submit(req); assert result.state == expected, result
+                adapter.acknowledge_single_pilot(req,single_pilot_outcome_digest(result))
+            assert adapter.ledger.target_snapshot(cleanup.target_id)['state'] == 'cleanup_pending'
+            result = adapter.submit(cleanup)
+            if scenario != 'success':
+                assert result.state == 'held'
+                before = tuple(posts); assert adapter.submit(cleanup).state == 'held'; assert tuple(posts) == before
+            else:
+                assert result.state == 'succeeded', result
+                assert adapter.ledger.target_snapshot(cleanup.target_id)['state'] == 'held'
+                adapter.acknowledge_single_pilot(cleanup,single_pilot_outcome_digest(result))
+                assert sum(path.endswith('/stop') for path in posts) == (1 if final_role == 'candidate' else 2)
         finally:
             key.close()
