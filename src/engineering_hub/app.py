@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import re
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -1041,6 +1042,23 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     def image_versions(request: Request):
         actor(request)
         return image_versions_for(notes_repository)
+
+    @app.get("/api/hub/v1/projects/{project}/tracking-tasks")
+    def project_tracking_tasks(project: str, request: Request, limit: int = 50, after_task_id: str | None = None):
+        """Human-only inert tracking, scoped to an active project."""
+        human(request)
+        if not 1 <= limit <= 200:
+            raise HubError('invalid_limit', 422)
+        if after_task_id is not None:
+            try:
+                if str(uuid.UUID(after_task_id)) != after_task_id:
+                    raise ValueError()
+            except (ValueError, TypeError, AttributeError):
+                raise HubError('invalid_cursor', 422) from None
+        rows = repo.tracking_tasks(project, limit, after_task_id)
+        more = len(rows) > limit
+        return {'project': project, 'tasks': rows[:limit], 'truncated': more,
+                'next_after': rows[limit - 1]['id'] if more else None}
 
     @app.get("/api/hub/v1/agents", response_model=AgentListDTO, response_model_exclude_unset=True)
     async def list_agents(request: Request):

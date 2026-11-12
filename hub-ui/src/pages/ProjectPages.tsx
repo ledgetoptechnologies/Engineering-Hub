@@ -20,6 +20,7 @@ import type { Project } from "../types";
 import { readProject } from "../projectsApi";
 import { ComponentsPanel, GroupedProjectsPanel } from "../ComponentsPanel";
 import { ReviewsPanel } from "../ReviewsPanel";
+import { ProjectTrackingPanel } from "../ProjectTrackingPanel";
 
 const STATUSES: Task["status"][] = ["assigned", "claimed", "in_review", "verified"];
 const columnName: Record<Task["status"], string> = {
@@ -438,6 +439,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
               <TaskTable hub={projectHub} tasks={stats.tasks} empty="No tasks for this project yet." />
             </section>
           )}
+          {!project.archived && <ProjectTrackingPanel project={id} demo={hub.demo} onUnauthorized={hub.clearPrivateWorkspace} />}
           <WithdrawnList hub={hub} kind="task" project={id} />
         </>
       )}

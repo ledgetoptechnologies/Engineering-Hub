@@ -371,3 +371,25 @@ def test_integrated_mcp_and_rest_share_persisted_state_across_app_lifespans(hub)
             returned = json.loads(result["content"][0]["text"])
         assert returned["owner"] == "codex"
         assert reopened.get(BASE + "/overview", headers=agent_headers()).status_code == 200
+
+def test_human_project_tracking_is_scoped_paginated_and_non_executable(hub):
+    client, app, settings = hub
+    path = BASE + '/projects/3d-viewer/tracking-tasks'
+    assert client.get(path).status_code == 401
+    assert client.get(path, headers=agent_headers()).status_code == 403
+    human_headers(client, app, settings)
+    first = app.state.repository.propose_tracking_task('codex','3d-viewer','First','human-tracking-1')
+    second = app.state.repository.propose_tracking_task('codex','3d-viewer','Second','human-tracking-2')
+    app.state.repository.propose_tracking_task('codex','project-alpha','Private other','human-tracking-3')
+    app.state.repository.update_tracking_task('codex',first['id'],1,'human-tracking-update',
+        progress='Claimed done',evidence_links=[{'label':'Proof','url':'https://example.com/proof'}],completion_claim=True)
+    page = client.get(path,params={'limit':1}).json()
+    assert page['truncated'] is True and page['next_after'] == page['tasks'][0]['id']
+    next_page=client.get(path,params={'limit':1,'after_task_id':page['next_after']}).json()
+    assert {page['tasks'][0]['id'],next_page['tasks'][0]['id']} == {first['id'],second['id']}
+    assert all(item['project']=='3d-viewer' and item['execution_authorization'] is False for item in page['tasks']+next_page['tasks'])
+    claimed=next(item for item in page['tasks']+next_page['tasks'] if item['id']==first['id'])
+    assert claimed['status']=='completion_claimed' and claimed['updates'][0]['evidence_links'][0]['label']=='Proof'
+    assert client.get(path,params={'limit':0}).status_code == 422
+    assert client.get(path,params={'after_task_id':'bad'}).status_code == 422
+    assert client.post(path).status_code == 405

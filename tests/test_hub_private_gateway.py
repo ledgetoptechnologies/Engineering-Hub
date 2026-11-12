@@ -557,3 +557,10 @@ async def test_real_owner_human_session_tasks_decisions_and_csrf(tmp_path, monke
                     (b'cf-access-jwt-assertion', assertion.encode())])
                 assert status(duplicate) == 401
     await run()
+
+def test_project_tracking_browser_gateway_is_read_only():
+    from engineering_hub.private_gateway import browser_route_allowed
+    path = '/api/hub/v1/projects/3d-viewer/tracking-tasks'
+    assert browser_route_allowed('GET', path)
+    assert not browser_route_allowed('POST', path)
+    assert not browser_route_allowed('GET', '/api/hub/v1/projects/../tracking-tasks')
