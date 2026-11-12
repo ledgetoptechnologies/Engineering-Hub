@@ -12,7 +12,7 @@ def test_owner_cancel_is_idempotent_audited_and_unfreezes_task(setup_queue):
     queue, _, repo, _ = setup_queue
     task = reviewed_task(repo)
     job = submit(queue, target=WorkTarget(task['id'], COMMIT, 'sha256:' + 'b'*64))
-    with pytest.raises(HubError, match='task_in_progress'):
+    with pytest.raises(HubError, match='active_work_job'):
         repo.set_candidate('codex', task['id'], task['revision'], 'f'*40)
     with pytest.raises(HubError, match='forbidden'):
         queue.cancel_unclaimed(actor='claude', job_id=job['id'])
@@ -74,11 +74,22 @@ def test_historical_claim_blocks_reset_even_if_row_looks_queued(setup_queue):
         queue.cancel_unclaimed(actor='codex', job_id=job['id'])
 
 
+def test_retained_pilot_intent_blocks_cancel_even_if_job_looks_unclaimed(setup_queue):
+    queue, _, repo, _ = setup_queue
+    job = submit(queue)
+    with repo._transaction() as db:
+        db.execute('CREATE TABLE hub_queued_pilot_jobs(job_id TEXT PRIMARY KEY)')
+        db.execute('INSERT INTO hub_queued_pilot_jobs(job_id) VALUES(?)', (job['id'],))
+    with pytest.raises(HubError, match='work_not_unclaimed'):
+        queue.cancel_unclaimed(actor='codex', job_id=job['id'])
+    assert queue.get_job(job['id'])['state'] == 'queued'
+
+
 def test_queued_freezes_human_context_until_cancelled(setup_queue):
     queue, _, repo, _ = setup_queue
     task = reviewed_task(repo)
     job = submit(queue, target=WorkTarget(task['id'], COMMIT, 'sha256:' + 'b'*64))
-    with pytest.raises(HubError, match='task_in_progress'):
+    with pytest.raises(HubError, match='active_work_job'):
         repo.update_context('human:1234', 'task', task['id'], task['revision'], 'changed', [])
     queue.cancel_unclaimed(actor='codex', job_id=job['id'])
     assert repo.update_context('human:1234', 'task', task['id'], task['revision'], 'changed', [])['status'] == 'claimed'
@@ -125,6 +136,33 @@ def test_tampered_family_denied_at_transaction(setup_queue):
         db.execute('UPDATE hub_entities SET data=? WHERE id=?',(json.dumps(task),task['id']))
     with pytest.raises(HubError,match='work_review_changed'):
         submit(queue,'bad',target=WorkTarget(task['id'],COMMIT,'sha256:'+'b'*64))
+
+
+@pytest.mark.parametrize('provenance_valid', [True, False])
+def test_submission_uses_persisted_installation_reviewer_lineage(setup_queue, provenance_valid):
+    import json
+    queue, _, repo, _ = setup_queue
+    task = reviewed_task(repo)
+    installation = 'review-installation'
+    actor = 'installation:' + installation
+    task['review'].update(actor=actor, family='claude')
+    with repo._transaction() as db:
+        db.execute('CREATE TABLE hub_session_provenance '
+                   '(audit_sequence INTEGER PRIMARY KEY, installation_id TEXT, session_id TEXT, '
+                   'family TEXT, capability TEXT)')
+        db.execute('UPDATE hub_entities SET data=? WHERE id=?', (json.dumps(task), task['id']))
+        db.execute("UPDATE hub_audit SET actor=? WHERE entity_id=? AND action='task.reviewed' AND revision=?",
+                   (actor, task['id'], task['revision']))
+        sequence = db.execute("SELECT sequence FROM hub_audit WHERE entity_id=? AND action='task.reviewed' AND revision=?",
+                              (task['id'], task['revision'])).fetchone()[0]
+        db.execute('INSERT INTO hub_session_provenance VALUES(?,?,?,?,?)',
+                   (sequence, installation, 'review-session', 'claude' if provenance_valid else 'codex', 'task.review'))
+    target = WorkTarget(task['id'], COMMIT, 'sha256:'+'b'*64)
+    if provenance_valid:
+        assert submit(queue, 'session-review', target=target)['state'] == 'queued'
+    else:
+        with pytest.raises(HubError, match='work_review_changed'):
+            submit(queue, 'session-review', target=target)
 
 
 def test_concurrent_same_task_only_one_submission(setup_queue):

@@ -450,6 +450,13 @@ class WorkQueue:
                 raise HubError('work_controller_cancel_required', 409)
             if row['state'] == 'cancelled':
                 return self._public(row)
+            # A retained pilot intent is authoritative evidence that this job
+            # entered an owned lifecycle, even if another row looks unclaimed.
+            # A corrupt or partially recovered mapping must never be cancelled.
+            pilot_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_queued_pilot_jobs'").fetchone()
+            if pilot_table and db.execute('SELECT 1 FROM hub_queued_pilot_jobs WHERE job_id=? LIMIT 1',
+                                          (job_id,)).fetchone():
+                raise HubError('work_not_unclaimed', 409)
             if (row['state'] != 'queued' or row['revision'] != 1
                     or row['worker'] is not None or row['fence'] is not None
                     or row['lease_until'] is not None

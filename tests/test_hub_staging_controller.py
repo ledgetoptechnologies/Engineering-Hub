@@ -684,7 +684,7 @@ async def test_cancel_during_submit_resource_registration_never_abandons_deposit
         observed.append(job['id'])
         return job
     controller.queue.submit=interrupted
-    submitted=await controller.submit('codex',payload())
+    submitted=await controller.submit('codex',payload(repo))
     assert observed==[submitted['job']['id']]
     assert submitted['job']['state']=='queued'
     assert submitted['source_id'] and len(submitted['resource_ids'])==4
