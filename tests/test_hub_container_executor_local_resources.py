@@ -516,6 +516,65 @@ def test_single_pilot_concrete_resources_four_phases_and_ack_with_synthetic_engi
         assert sum(path.endswith('/containers/create') for path in posts)==2
 
 
+@pytest.mark.parametrize('deny_start', [False, True])
+def test_bound_single_pilot_submit_derives_start_target_from_create(rig, deny_start):
+    """Actual v2 submit, real ledgers/key/state, synthetic Engine and verifier."""
+    from uuid import UUID, uuid5
+    from hub_container_executor.adapter import TrustedEffectContextGuard
+    from hub_container_executor.effect_mac_key import create_for_new_journal, EffectMacKey
+    from hub_container_executor.enrolled_effect_provider import enrolled_effect_provider, DeferredTargetEffect
+    from tests.test_hub_container_effect_binding_canonical import fixture
+    from tests.test_hub_container_executor_adapter import command
+    class Driver:
+        def implementation_commit(self): return rig.params['manifest'].driver.implementation_commit
+    journal_path = rig.params['journal_database']
+    key_id = create_for_new_journal(journal_path.parent, journal_path.name)
+    params = dict(rig.params, single_pilot_protocol=True, driver_identity_verifier=Driver())
+    with module.local_host_adapter_resources(**params) as adapter:
+        journal = adapter.backend.operation_journal
+        journal.enable_bindings()
+        key = EffectMacKey(journal_path.parent, journal_path.name, expected_key_id=key_id)
+        try:
+            posts = _attach_synthetic_engine(adapter, params)
+            req = command(adapter.manifest, 'deploy_container')
+            op_state = str(uuid5(UUID(req.command_id), 'state_copy'))
+            op_create = str(uuid5(UUID(req.command_id), 'create_candidate'))
+            op_start = str(uuid5(UUID(req.command_id), 'start_candidate'))
+            generation = adapter.state_provisioner._generation(req.run_id, op_state, 'candidate')
+            image = adapter._verified_image('candidate')
+            profile = adapter._profile(image, adapter._defaults_from_record(image), generation,
+                                       adapter._resolve_secrets())
+            create = replace(fixture(), operation_id=op_create, run_id=req.run_id,
+                kind='create_candidate', fence=req.fencing_generation, owner_epoch=journal._owner.epoch,
+                resource_name=f'{adapter.manifest.runtime.resource_name_prefix}-{req.run_id[:12]}-candidate',
+                container_id=None, image_index_digest=image.runnable_reference,
+                platform_manifest_digest=image.platform_manifest_digest, image_config_id=image.image_config_id,
+                state_generation_id=generation, environment_names=tuple(n for n, _ in profile.environment),
+                memory_bytes=profile.memory_bytes, cpu_millicores=profile.cpu_millicores,
+                pids_limit=profile.pids_limit, tmpfs_bytes=profile.tmpfs[0][1])
+            start = replace(create, operation_id=op_start, kind='start', resource_name=None)
+            adapter.backend.effect_binding_provider = enrolled_effect_provider(journal, key,
+                (create, DeferredTargetEffect(start, req.command_id)), source_ledger=adapter.ledger,
+                verify_generation=lambda actual, _: not (deny_start and actual.context.kind == 'start_candidate'))
+            adapter.effect_context_guard = TrustedEffectContextGuard(lambda _: True, adapter.backend.effect_context_scope)
+            result = adapter.submit(req)
+            if deny_start:
+                assert result.state == 'held'
+                assert sum(path.endswith('/containers/create') for path in posts) == 1
+                assert not any('/containers/' in path and path.endswith('/start') for path in posts)
+                before = list(posts)
+                assert adapter.submit(req).state == 'held'
+                assert posts == before
+            else:
+                assert result.state == 'succeeded'
+                assert result.evidence.container_id == 'd' * 64
+                assert journal.inspect_binding(op_start).target_id == 'd' * 64
+                assert sum(path.endswith('/containers/create') for path in posts) == 1
+                assert sum('/containers/' in path and path.endswith('/start') for path in posts) == 1
+        finally:
+            key.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('lost', ['submit', 'ack'])
 async def test_concrete_controller_asgi_recovers_lost_response_without_effect_replay(rig, lost):
