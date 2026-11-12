@@ -4,7 +4,7 @@ import { TrackingItems, type TrackingTask } from "./ProjectTrackingPanel";
 
 describe("project tracking presentation", () => {
   it("shows progress, evidence and an explicitly unverified completion claim", () => {
-    const task: TrackingTask = { id: "1", project: "demo", title: "Tracked work", status: "completion_claimed",
+    const task: TrackingTask = { id: "1", revision: 2, project: "demo", title: "Tracked work", status: "completion_claimed",
       created_by: "codex", execution_authorization: false, updates: [{ actor: "codex", progress: "Tests passed",
         completion_claim: true, evidence_links: [{label: "Evidence", url: "https://example.com/report"},
           {label: "Unsafe", url: "javascript:alert(1)"}] }] };
@@ -13,5 +13,14 @@ describe("project tracking presentation", () => {
     expect(html).toContain("Tests passed");
     expect(html).toContain('href="https://example.com/report"');
     expect(html).not.toContain('href="javascript:');
+  });
+  it("shows a separately attributed verification", () => {
+    const task: TrackingTask = { id: "2", revision: 3, project: "demo", title: "Reviewed", status: "completion_verified",
+      created_by: "codex", execution_authorization: false, updates: [],
+      reviews: [{actor: "claude", verdict: "verify", note: "Checked", evidence_links: []}] };
+    const html = renderToStaticMarkup(<TrackingItems tasks={[task]} />);
+    expect(html).toContain("Completion verified by reviewer");
+    expect(html).toContain("claude");
+    expect(html).toContain("Checked");
   });
 });

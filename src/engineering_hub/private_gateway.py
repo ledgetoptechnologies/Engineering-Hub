@@ -146,6 +146,7 @@ def browser_route_allowed(method, path, *, allow_bound_oauth_callback=False):
         return (re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/components/' + _UUID, path) is not None)
     return method == 'POST' and (path in _POST
+        or re.fullmatch(r'/api/hub/v1/tracking-tasks/' + _UUID + '/review', path) is not None
         or re.fullmatch(r'/api/hub/v1/infrastructure/devices/' + _PROJECT_ID + '/maintenance', path) is not None
         or re.fullmatch(r'/api/hub/v1/infrastructure/maintenance/' + _UUID + '/resolve', path) is not None
         or re.fullmatch(

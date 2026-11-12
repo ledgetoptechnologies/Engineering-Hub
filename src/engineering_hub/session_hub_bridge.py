@@ -33,6 +33,7 @@ TOOLS = {
     'hub_component_retire': 'component.write', 'hub_task_get': 'task.read', 'hub_project_tasks': 'task.list',
     'hub_tracking_task_propose': 'tracking.propose', 'hub_tracking_task_update': 'tracking.update',
     'hub_tracking_task_list': 'tracking.read',
+    'hub_tracking_task_review': 'tracking.review',
     'hub_staging_task_propose': 'task.propose', 'hub_task_claim': 'task.claim',
     'hub_task_candidate': 'task.candidate', 'hub_task_review': 'task.review',
     'hub_planning_list': 'planning.read', 'hub_planning_get': 'planning.read',
@@ -384,7 +385,7 @@ class SessionHubBridge:
             project = arguments['project_id']
         elif tool in {'hub_task_get', 'hub_task_claim', 'hub_task_candidate', 'hub_task_review'}:
             project = self.repo.get_task(arguments['task_id'])['project']
-        elif tool == 'hub_tracking_task_update':
+        elif tool in {'hub_tracking_task_update', 'hub_tracking_task_review'}:
             project = self.repo._read(arguments['task_id'], 'tracking_task')['project']
         elif tool == 'hub_decision_get':
             try:

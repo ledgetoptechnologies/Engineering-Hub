@@ -53,7 +53,7 @@ def test_real_initialize_discovery_and_auth_on_every_request(hub):
             assert rpc(client, method, init if method == "initialize" else {}, bad).status_code == 401
     tools = rpc(client, "tools/list").json()["result"]["tools"]
     assert {tool["name"] for tool in tools} == {
-        "hub_overview", "hub_project_tasks", "hub_tracking_task_propose", "hub_tracking_task_update", "hub_tracking_task_list", "hub_task_get", "hub_task_claim", "hub_task_candidate",
+        "hub_overview", "hub_project_tasks", "hub_tracking_task_propose", "hub_tracking_task_update", "hub_tracking_task_list", "hub_tracking_task_review", "hub_task_get", "hub_task_claim", "hub_task_candidate",
         "hub_task_review", "hub_decision_request", "hub_decision_get", "hub_run_list",
         "hub_topic_peers", "hub_topic_preflight", "hub_staging_task_propose",
         "hub_planning_list", "hub_planning_get", "hub_planning_put", "hub_entity_withdraw"}
@@ -115,6 +115,17 @@ def test_tracking_task_idempotency_evidence_and_no_execution_authority(hub):
     assert call(client, 'hub_tracking_task_update', {**update, 'client_request_id': 'update-2'})['isError']
     listed = call(client, 'hub_tracking_task_list', {'project': '3d-viewer'})['structuredContent']
     assert [value['id'] for value in listed['tasks']] == [item['id']]
+    review = {'task_id': item['id'], 'expected_revision': 2, 'client_request_id': 'review-1',
+              'verdict': 'verify', 'note': 'Inspected evidence', 'evidence_links': update['evidence_links']}
+    assert call(client, 'hub_tracking_task_review', review)['isError']
+    assert call(client, 'hub_tracking_task_review', {**review, 'evidence_links': [{'label':'Other','url':'https://example.com/other'}]}, 'fixture-claude')['isError']
+    verified = call(client, 'hub_tracking_task_review', review, 'fixture-claude')['structuredContent']
+    assert verified['status'] == 'completion_verified' and verified['execution_authorization'] is False
+    assert verified['reviews'][0]['claim_revision'] == 2
+    assert call(client, 'hub_tracking_task_review', review, 'fixture-claude')['structuredContent']['revision'] == 3
+    assert call(client, 'hub_tracking_task_update', {**update, 'expected_revision': 3, 'client_request_id': 'after-review'})['isError']
+    reopen = {**review, 'expected_revision': 3, 'client_request_id': 'reopen-1', 'verdict': 'reopen', 'evidence_links': []}
+    assert call(client, 'hub_tracking_task_review', reopen, 'fixture-claude')['structuredContent']['status'] == 'open'
 
 
 def test_decisions_are_requests_not_approval_or_dispatch(hub):

@@ -303,7 +303,7 @@ def test_integrated_mcp_initialize_and_list_on_configured_https_origin(hub):
         response = mcp_rpc(client, "tools/list", name=name)
         assert response.status_code == 200, response.text
         assert {tool["name"] for tool in response.json()["result"]["tools"]} == {
-            "hub_overview", "hub_project_tasks", "hub_tracking_task_propose", "hub_tracking_task_update", "hub_tracking_task_list", "hub_task_get", "hub_task_claim", "hub_task_candidate",
+            "hub_overview", "hub_project_tasks", "hub_tracking_task_propose", "hub_tracking_task_update", "hub_tracking_task_list", "hub_tracking_task_review", "hub_task_get", "hub_task_claim", "hub_task_candidate",
             "hub_task_review", "hub_decision_request", "hub_decision_get", "hub_run_list",
             "hub_topic_peers", "hub_topic_preflight", "hub_staging_task_propose",
             "hub_planning_list", "hub_planning_get", "hub_planning_put",
@@ -393,3 +393,22 @@ def test_human_project_tracking_is_scoped_paginated_and_non_executable(hub):
     assert client.get(path,params={'limit':0}).status_code == 422
     assert client.get(path,params={'after_task_id':'bad'}).status_code == 422
     assert client.post(path).status_code == 405
+
+
+def test_human_tracking_review_requires_session_csrf_and_current_claim(hub):
+    client, app, settings = hub
+    item = app.state.repository.propose_tracking_task('codex', '3d-viewer', 'Review task', 'hr-propose')
+    links = [{'label': 'Evidence', 'url': 'https://example.com/evidence'}]
+    app.state.repository.update_tracking_task('codex', item['id'], 1, 'hr-claim', progress='Finished',
+                                              evidence_links=links, completion_claim=True)
+    path = BASE + '/tracking-tasks/' + item['id'] + '/review'
+    payload = {'expected_revision': 2, 'client_request_id': 'hr-review', 'verdict': 'verify',
+               'note': 'Evidence inspected', 'evidence_links': links}
+    assert client.post(path, json=payload).status_code == 401
+    assert client.post(path, headers=agent_headers(), json=payload).status_code == 403
+    headers = human_headers(client, app, settings)
+    assert client.post(path, json=payload).status_code == 403
+    verified = client.post(path, headers=headers, json=payload)
+    assert verified.status_code == 200 and verified.json()['status'] == 'completion_verified'
+    assert verified.json()['reviews'][0]['claim_revision'] == 2
+    assert client.post(path, headers=headers, json={**payload, 'client_request_id': 'stale'}).status_code == 409

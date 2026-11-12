@@ -1,11 +1,13 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { HubApiError } from "./api";
 import { safeHref } from "./markdown";
 
 type Evidence = { label: string; url: string };
-export type TrackingTask = { id: string; project: string; title: string; status: "open" | "completion_claimed";
+export type TrackingTask = { id: string; project: string; title: string; status: "open" | "completion_claimed" | "completion_verified";
+  revision: number;
   details?: string; links?: Evidence[]; created_by: string; execution_authorization: false;
-  updates: { actor: string; progress: string; evidence_links: Evidence[]; completion_claim: boolean }[] };
+  updates: { actor: string; progress: string; evidence_links: Evidence[]; completion_claim: boolean }[];
+  reviews?: { actor: string; verdict: "verify" | "reopen"; note: string; evidence_links: Evidence[] }[] };
 type Page = { project: string; tasks: TrackingTask[]; truncated: boolean; next_after: string | null };
 export async function readTracking(project: string, after: string | null, signal: AbortSignal): Promise<Page> {
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(project)) throw new HubApiError(422, "invalid_project");
@@ -20,7 +22,8 @@ export async function readTracking(project: string, after: string | null, signal
   if (page.project !== project || !Array.isArray(page.tasks) || page.tasks.length > 50 || typeof page.truncated !== "boolean"
       || (page.truncated ? typeof page.next_after !== "string" : page.next_after !== null)
       || page.tasks.some(task => task.project !== project || task.execution_authorization !== false
-        || !["open", "completion_claimed"].includes(task.status) || !Array.isArray(task.updates))) {
+        || !Number.isSafeInteger(task.revision) || task.revision < 1
+        || !["open", "completion_claimed", "completion_verified"].includes(task.status) || !Array.isArray(task.updates))) {
     throw new HubApiError(502, "tracking_unavailable");
   }
   return page;
@@ -31,14 +34,48 @@ function Links({ links }: { links?: Evidence[] }) {
     return <li key={index}>{href ? <a href={href} target="_blank" rel="noopener noreferrer">{link.label}</a> : link.label}</li>;
   })}</ul>;
 }
-export function TrackingItems({ tasks }: { tasks: TrackingTask[] }) {
+function ReviewForm({ task, csrf, onSaved }: { task: TrackingTask; csrf: string; onSaved: () => void }) {
+  const [note, setNote] = useState("");
+  const [checked, setChecked] = useState(false);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [key] = useState(() => crypto.randomUUID());
+  const verifying = task.status === "completion_claimed";
+  const evidence = task.updates.at(-1)?.evidence_links ?? [];
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (!note.trim() || (verifying && (!checked || !evidence.length))) return;
+    setBusy(true); setError("");
+    try {
+      const response = await fetch(`/api/hub/v1/tracking-tasks/${task.id}/review`, {
+        method: "POST", credentials: "same-origin", redirect: "error",
+        headers: {"Content-Type": "application/json", "X-Hub-CSRF": csrf},
+        body: JSON.stringify({expected_revision: task.revision, client_request_id: key,
+          verdict: verifying ? "verify" : "reopen", note: note.trim(), evidence_links: verifying ? evidence : []}),
+      });
+      if (!response.ok) throw new Error();
+      onSaved();
+    } catch { setError("Review could not be saved. Refresh to check the current task before trying again."); }
+    finally { setBusy(false); }
+  }
+  return <details><summary>{verifying ? "Review completion claim" : "Reopen task"}</summary>
+    <form onSubmit={submit}><p>{verifying ? "Review the linked evidence before verifying this exact claim." : "Reopen this task and retain the review history."}</p>
+      <label>Review note <textarea required maxLength={4096} value={note} onChange={event => setNote(event.target.value)} /></label>
+      {verifying && <label><input type="checkbox" checked={checked} onChange={event => setChecked(event.target.checked)} /> I reviewed the linked evidence</label>}
+      <button type="submit" disabled={busy || !note.trim() || (verifying && (!checked || !evidence.length))}>{verifying ? "Verify completion" : "Reopen"}</button>
+      {error && <p role="alert">{error}</p>}
+    </form></details>;
+}
+export function TrackingItems({ tasks, csrf, onSaved }: { tasks: TrackingTask[]; csrf?: string | null; onSaved?: () => void }) {
   return <>{tasks.map(task => <article key={task.id} style={{borderTop:"1px solid var(--line)", padding:"12px 0", overflowWrap:"anywhere"}}>
-        <h3>{task.title}</h3><p>{task.status === "completion_claimed" ? "Completion claimed — unverified" : "Open"} · Reported by {task.created_by}</p>
+        <h3>{task.title}</h3><p>{task.status === "completion_claimed" ? "Completion claimed — unverified" : task.status === "completion_verified" ? "Completion verified by reviewer" : "Open"} · Reported by {task.created_by}</p>
         {task.details && <p>{task.details}</p>}<Links links={task.links} />
         {task.updates.map((update, index) => <div key={index}><p><strong>{update.actor}</strong>{update.completion_claim && " · Completion claimed — unverified"}: {update.progress}</p><Links links={update.evidence_links} /></div>)}
+        {task.reviews?.map((review, index) => <div key={index}><p><strong>{review.actor}</strong> · {review.verdict === "verify" ? "Verified claim" : "Reopened"}: {review.note}</p><Links links={review.evidence_links} /></div>)}
+        {csrf && onSaved && task.status !== "open" && <ReviewForm task={task} csrf={csrf} onSaved={onSaved} />}
       </article>)}</>;
 }
-export function ProjectTrackingPanel({ project, demo, onUnauthorized }: { project: string; demo: boolean; onUnauthorized: () => void }) {
+export function ProjectTrackingPanel({ project, demo, csrf, onUnauthorized }: { project: string; demo: boolean; csrf?: string | null; onUnauthorized: () => void }) {
   const [page, setPage] = useState<Page | null>(null);
   const [state, setState] = useState<"loading" | "loaded" | "error">("loading");
   const [cursor, setCursor] = useState<string | null>(null);
@@ -54,12 +91,12 @@ export function ProjectTrackingPanel({ project, demo, onUnauthorized }: { projec
   }, [project, cursor, revision, demo, onUnauthorized]);
   return <section className="panel" aria-label="Project tracking">
     <h2>Project tracking</h2>
-    <p>Agent-reported progress and evidence. These records do not authorize execution; completion claims have not been verified.</p>
+    <p>Agent-reported progress and evidence. These records do not authorize execution; each completion claim requires a separate review.</p>
     {state === "loading" && <p role="status">Loading project tracking…</p>}
     {state === "error" && <p role="alert">Project tracking could not be loaded. <button type="button" onClick={refresh}>Retry</button></p>}
     {state === "loaded" && demo && <p>Tracking is unavailable in demo mode.</p>}
     {page && <>{page.tasks.length === 0 && <p>No tracking records on this page.</p>}
-      <TrackingItems tasks={page.tasks} />
+      <TrackingItems tasks={page.tasks} csrf={csrf} onSaved={refresh} />
       {page.truncated && <button type="button" onClick={() => setCursor(page.next_after)}>Next page</button>}
       {cursor && <button type="button" onClick={refresh}>First page</button>}
     </>}

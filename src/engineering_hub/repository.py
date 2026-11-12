@@ -358,12 +358,63 @@ class HubRepository:
                     raise HubError('idempotency_conflict', 409)
                 return self._get(db, prior['entity_id'], 'tracking_task')
             self._cas(item, expected_revision)
+            if item['status'] == 'completion_verified':
+                raise HubError('tracking_reopen_required', 409)
             if len(item['updates']) >= 50:
                 raise HubError('tracking_history_full', 409)
             item['updates'].append(dict(actor=actor, progress=progress, evidence_links=links,
-                                        completion_claim=completion_claim))
+                                        completion_claim=completion_claim, actor_family=session_context.family(actor),
+                                        revision=expected_revision + 1))
             item['status'] = 'completion_claimed' if completion_claim else 'open'
             item = self._save(db, actor, 'tracking_task.updated', 'tracking_task', item)
+            db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
+            return item
+
+    def review_tracking_task(self, actor, identity, expected_revision, client_request_id, *,
+                             verdict, note, evidence_links):
+        """Record an independent review of the exact latest claim, or reopen it."""
+        self._actor(actor)
+        key, note = self._text(client_request_id, 128), self._text(note, 4096)
+        if verdict not in ('verify', 'reopen'):
+            raise HubError('invalid_input')
+        links = self._context(None, evidence_links).get('links', [])
+        if verdict == 'verify' and not links:
+            raise HubError('evidence_required')
+        fingerprint = hashlib.sha256(_json(['tracking_review', identity, expected_revision,
+                                             verdict, note, links]).encode()).hexdigest()
+        with self._transaction() as db:
+            item = self._get(db, identity, 'tracking_task')
+            self._project(item['project'], db)
+            prior = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
+            if prior:
+                if prior['fingerprint'] != fingerprint:
+                    raise HubError('idempotency_conflict', 409)
+                return self._get(db, prior['entity_id'], 'tracking_task')
+            self._cas(item, expected_revision)
+            if item['status'] not in (('completion_claimed',) if verdict == 'verify' else ('completion_claimed', 'completion_verified')):
+                raise HubError('tracking_review_unavailable', 409)
+            claim = item['updates'][-1] if item['updates'] else None
+            if not claim or claim.get('completion_claim') is not True:
+                raise HubError('tracking_review_unavailable', 409)
+            # Old installation claims without retained family cannot be safely
+            # shown independent of another installation; a human may review.
+            if not actor.startswith('human:'):
+                family = claim.get('actor_family')
+                if family is None and claim.get('actor') in AGENTS:
+                    family = claim['actor']
+                if (not family or actor == claim.get('actor') or session_context.family(actor) == family):
+                    raise HubError('independent_review_required', 403)
+            if verdict == 'verify' and any(link not in claim.get('evidence_links', []) for link in links):
+                raise HubError('tracking_evidence_mismatch', 409)
+            reviews = item.setdefault('reviews', [])
+            if len(reviews) >= 50:
+                raise HubError('tracking_history_full', 409)
+            reviews.append(dict(actor=actor, actor_family=session_context.family(actor), verdict=verdict,
+                                note=note, evidence_links=links,
+                                claim_revision=claim.get('revision', expected_revision if item['status'] == 'completion_claimed'
+                                                         else reviews[-1]['claim_revision'])))
+            item['status'] = 'completion_verified' if verdict == 'verify' else 'open'
+            item = self._save(db, actor, 'tracking_task.reviewed', 'tracking_task', item)
             db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
             return item
 

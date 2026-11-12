@@ -439,7 +439,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
               <TaskTable hub={projectHub} tasks={stats.tasks} empty="No tasks for this project yet." />
             </section>
           )}
-          {!project.archived && <ProjectTrackingPanel key={id} project={id} demo={hub.demo} onUnauthorized={hub.clearPrivateWorkspace} />}
+          {!project.archived && <ProjectTrackingPanel key={id} project={id} demo={hub.demo} csrf={hub.writable ? hub.session?.csrf_token : null} onUnauthorized={hub.clearPrivateWorkspace} />}
           <WithdrawnList hub={hub} kind="task" project={id} />
         </>
       )}

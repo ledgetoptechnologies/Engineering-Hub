@@ -116,7 +116,7 @@ def test_explicit_grants_cas_scope_and_no_implicit_capabilities(env):
 def test_tracking_and_project_enumeration_require_distinct_grants(env):
     installation, token, _ = pair(env, caps=())
     env.bridge.grant_put(OWNER, installation, 0, [PROJECT], ['task.read'])
-    for tool in ('hub_project_tasks', 'hub_tracking_task_list', 'hub_tracking_task_propose', 'hub_tracking_task_update'):
+    for tool in ('hub_project_tasks', 'hub_tracking_task_list', 'hub_tracking_task_propose', 'hub_tracking_task_update', 'hub_tracking_task_review'):
         with pytest.raises(HubError, match='hub_capability_forbidden'):
             call(env, token, tool, lambda _: None)
     env.bridge.grant_put(OWNER, installation, 1, [PROJECT], ['tracking.propose', 'tracking.read', 'tracking.update', 'task.list'])
@@ -128,6 +128,24 @@ def test_tracking_and_project_enumeration_require_distinct_grants(env):
     env.bridge.grant_revoke(OWNER, installation, 2)
     with pytest.raises(HubError, match='hub_grant_required'):
         call(env, token, 'hub_tracking_task_list', lambda _: None)
+
+
+def test_tracking_review_requires_independent_agent_family(env):
+    _, author, _ = pair(env, 'tracking-author', family='codex')
+    _, sibling, _ = pair(env, 'tracking-sibling', family='codex')
+    _, reviewer, _ = pair(env, 'tracking-reviewer', family='claude')
+    item = call(env, author, 'hub_tracking_task_propose', lambda actor:
+        env.repo.propose_tracking_task(actor, PROJECT, 'Test claim', 'new-tracking'))
+    links = [{'label': 'Evidence', 'url': 'https://example.com/evidence'}]
+    item = call(env, author, 'hub_tracking_task_update', lambda actor:
+        env.repo.update_tracking_task(actor, item['id'], 1, 'claim-tracking', progress='Done',
+                                      evidence_links=links, completion_claim=True))
+    with pytest.raises(HubError, match='independent_review_required'):
+        call(env, sibling, 'hub_tracking_task_review', lambda actor:
+            env.repo.review_tracking_task(actor, item['id'], 2, 'same-family', verdict='verify', note='Read', evidence_links=links))
+    verified = call(env, reviewer, 'hub_tracking_task_review', lambda actor:
+        env.repo.review_tracking_task(actor, item['id'], 2, 'other-family', verdict='verify', note='Read', evidence_links=links))
+    assert verified['status'] == 'completion_verified'
 
 
 @pytest.mark.parametrize('projects,caps', [([], ['task.propose']), ([PROJECT], []), (['*'], ['task.propose']),

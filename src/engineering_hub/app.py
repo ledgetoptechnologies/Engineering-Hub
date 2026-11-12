@@ -166,6 +166,13 @@ class Revision(Input):
     expected_revision: int = Field(ge=1)
 
 
+class TrackingReview(Revision):
+    client_request_id: str = Field(min_length=1, max_length=128)
+    verdict: Literal['verify', 'reopen']
+    note: str = Field(min_length=1, max_length=4096)
+    evidence_links: list[dict[str, str]] = Field(max_length=8)
+
+
 class Candidate(Revision):
     commit: str = Field(pattern=r"^[0-9a-f]{40}$")
 
@@ -1059,6 +1066,12 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         more = len(rows) > limit
         return {'project': project, 'tasks': rows[:limit], 'truncated': more,
                 'next_after': rows[limit - 1]['id'] if more else None}
+
+    @app.post('/api/hub/v1/tracking-tasks/{task_id}/review')
+    def review_tracking_task(task_id: str, payload: TrackingReview, request: Request):
+        return repo.review_tracking_task(human(request, mutation=True), task_id, payload.expected_revision,
+                payload.client_request_id, verdict=payload.verdict, note=payload.note,
+                evidence_links=payload.evidence_links)
 
     @app.get("/api/hub/v1/agents", response_model=AgentListDTO, response_model_exclude_unset=True)
     async def list_agents(request: Request):

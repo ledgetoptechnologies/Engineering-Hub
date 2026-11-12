@@ -218,6 +218,13 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
                       completion_claim=completion_claim))
 
     @registration.tool()
+    def hub_tracking_task_review(task_id: str, expected_revision: StrictInt, client_request_id: str,
+                                 verdict: str, note: str, evidence_links: list[dict[str, str]], ctx: Context) -> dict:
+        """Independently verify a specific claim or reopen it; never grants execution authority."""
+        return invoke(lambda: repo.review_tracking_task(identity(ctx), task_id, expected_revision,
+                      client_request_id, verdict=verdict, note=note, evidence_links=evidence_links))
+
+    @registration.tool()
     def hub_tracking_task_list(project: str, ctx: Context, limit: StrictInt = 100,
                                after_task_id: str | None = None) -> dict:
         """Read inert project tracking records; a completion claim is not verified completion."""

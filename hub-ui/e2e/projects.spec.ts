@@ -249,7 +249,7 @@ test("project tracking starts at the first page after changing project", async (
     const cursor = url.searchParams.get("after_task_id");
     const next = "11111111-1111-4111-8111-111111111111";
     return route.fulfill({ contentType: "application/json", body: JSON.stringify({project,
-      tasks: [{id: cursor ?? next, project, title: cursor ? "Later page" : `${project} first record`,
+      tasks: [{id: cursor ?? next, revision: 1, project, title: cursor ? "Later page" : `${project} first record`,
         status: "open", created_by: "codex", execution_authorization: false, updates: []}],
       truncated: project === first && !cursor, next_after: project === first && !cursor ? next : null}) });
   });
