@@ -1743,11 +1743,14 @@ def test_scope_evidence_upgrades_version_atomically_and_blocks_legacy_writer(roo
     with pytest.raises(Exception):
         launch._Journal(path, create=False)  # no old or new concurrent owner
     journal.close()
-    # The previous implementation requires exactly user_version 1 before it
-    # can call state(); reject here as its actual constructor does.
+    # This is the actual, unmodified v1 _Journal class captured from the
+    # previous commit, run after releasing the current writer's owner lock.
+    from tests.legacy_launch_journal_v1 import _Journal as LegacyJournal
+    with pytest.raises(launch.LaunchSupervisorError):
+        LegacyJournal(path, create=False)
     import sqlite3
     with sqlite3.connect(path) as legacy:
-        assert legacy.execute('PRAGMA user_version').fetchone() != (1,)
+        assert legacy.execute('PRAGMA user_version').fetchone() == (2,)
         assert legacy.execute('SELECT state,data FROM launch').fetchone() == before
     reopened = launch._Journal(path, create=False)
     try:
