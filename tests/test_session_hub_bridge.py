@@ -113,6 +113,23 @@ def test_explicit_grants_cas_scope_and_no_implicit_capabilities(env):
     assert env.bridge.grant_get(OWNER, installation)['state'] == 'inactive'
 
 
+def test_tracking_and_project_enumeration_require_distinct_grants(env):
+    installation, token, _ = pair(env, caps=())
+    env.bridge.grant_put(OWNER, installation, 0, [PROJECT], ['task.read'])
+    for tool in ('hub_project_tasks', 'hub_tracking_task_list', 'hub_tracking_task_propose', 'hub_tracking_task_update'):
+        with pytest.raises(HubError, match='hub_capability_forbidden'):
+            call(env, token, tool, lambda _: None)
+    env.bridge.grant_put(OWNER, installation, 1, [PROJECT], ['tracking.propose', 'tracking.read', 'tracking.update', 'task.list'])
+    item = call(env, token, 'hub_tracking_task_propose', lambda actor:
+        env.repo.propose_tracking_task(actor, PROJECT, 'Inert test', 'tracking-key'))
+    with pytest.raises(HubError, match='hub_project_forbidden'):
+        call(env, token, 'hub_tracking_task_list', lambda _: env.repo.tracking_tasks('project-alpha', 100, None))
+    assert call(env, token, 'hub_tracking_task_list', lambda _: env.repo.tracking_tasks(PROJECT, 100, None))[0]['id'] == item['id']
+    env.bridge.grant_revoke(OWNER, installation, 2)
+    with pytest.raises(HubError, match='hub_grant_required'):
+        call(env, token, 'hub_tracking_task_list', lambda _: None)
+
+
 @pytest.mark.parametrize('projects,caps', [([], ['task.propose']), ([PROJECT], []), (['*'], ['task.propose']),
     ([PROJECT], ['*']), ([PROJECT, PROJECT], ['task.propose']), ([PROJECT], ['task.propose', 'task.propose'])])
 def test_reject_wildcard_empty_duplicate_grants(env, projects, caps):

@@ -5,7 +5,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from pydantic import ValidationError
-from pydantic import StrictInt
+from pydantic import StrictBool, StrictInt
 from agent_message_bus.knowledge import (KnowledgeConflict, KnowledgeError,
     KnowledgeIntegrityError, KnowledgeNotFound, KnowledgeRepository, KnowledgeProjectArchived)
 from .planning_api import PlanningWrite, Scope, Kind, Status
@@ -181,7 +181,7 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         This explicit read does not inject context, wake a chat, claim work,
         grant execution authority, or prove task completion. Follow next_after
         to page by task ID; concurrent changes can alter subsequent pages.
-        Pause and tasks are separate reads, not an atomic execution fence.
+        Pause and tasks share a read snapshot, not an execution fence.
         """
         identity(ctx)
         if not 1 <= limit <= 200:
@@ -194,16 +194,47 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
             except (ValueError, TypeError, AttributeError):
                 raise ToolError('invalid_cursor') from None
         def read():
-            with repo._connection() as db:
-                repo._project(project, db)
-            tasks = sorted((item for item in repo.list_task_views() if item['project'] == project
-                     and item['status'] != 'withdrawn' and (after_task_id is None or item['id'] > after_task_id)),
-                     key=lambda item: item['id'])
+            tasks, paused = repo.project_task_page(project, limit, after_task_id)
             more = len(tasks) > limit
             return {'project': project, 'tasks': tasks[:limit], 'truncated': more,
                     'next_after': tasks[limit-1]['id'] if more else None,
-                    'paused': repo.get_paused()}
+                    'paused': paused}
         return invoke(read)
+
+    @registration.tool()
+    def hub_tracking_task_propose(project: str, title: str, client_request_id: str, ctx: Context,
+                                  details: str | None = None, links: list[dict[str, str]] | None = None) -> dict:
+        """Propose an inert project tracking record; this never authorizes or dispatches work."""
+        return invoke(lambda: repo.propose_tracking_task(identity(ctx), project, title, client_request_id,
+                                                         details=details, links=links))
+
+    @registration.tool()
+    def hub_tracking_task_update(task_id: str, expected_revision: StrictInt, client_request_id: str,
+                                 progress: str, evidence_links: list[dict[str, str]], ctx: Context,
+                                 completion_claim: StrictBool = False) -> dict:
+        """Append attributed evidence; completion is an unverified claim, not approval or proof."""
+        return invoke(lambda: repo.update_tracking_task(identity(ctx), task_id, expected_revision,
+                      client_request_id, progress=progress, evidence_links=evidence_links,
+                      completion_claim=completion_claim))
+
+    @registration.tool()
+    def hub_tracking_task_list(project: str, ctx: Context, limit: StrictInt = 100,
+                               after_task_id: str | None = None) -> dict:
+        """Read inert project tracking records; a completion claim is not verified completion."""
+        identity(ctx)
+        if not 1 <= limit <= 200:
+            raise ToolError('invalid_limit')
+        if after_task_id is not None:
+            import uuid
+            try:
+                if str(uuid.UUID(after_task_id)) != after_task_id:
+                    raise ValueError()
+            except (ValueError, TypeError, AttributeError):
+                raise ToolError('invalid_cursor') from None
+        rows = invoke(repo.tracking_tasks, project, limit, after_task_id)
+        more = len(rows) > limit
+        return {'project': project, 'tasks': rows[:limit], 'truncated': more,
+                'next_after': rows[limit - 1]['id'] if more else None}
 
     @registration.tool()
     def hub_task_get(task_id: str, ctx: Context) -> dict:

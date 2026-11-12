@@ -288,6 +288,84 @@ class HubRepository:
     def list_tasks(self):
         return self._list('task')
 
+    def tracking_tasks(self, project, limit, after):
+        """Read inert agent tracking records; none is an execution task."""
+        with self._connection() as db:
+            self._project(project, db)
+            rows = db.execute("SELECT data FROM hub_entities WHERE kind='tracking_task' AND json_extract(data, '$.project')=? AND id>? ORDER BY id LIMIT ?",
+                              (project, after or '', limit + 1)).fetchall()
+            return [json.loads(row['data']) for row in rows]
+
+    def project_task_page(self, project, limit, after):
+        """Bounded project-only rows, with status audit selected by revision."""
+        with self._connection() as db:
+            self._project(project, db)
+            db.execute('BEGIN')
+            try:
+                rows = db.execute("SELECT data FROM hub_entities WHERE kind='task' AND json_extract(data, '$.project')=? AND json_extract(data, '$.status')!='withdrawn' AND id>? ORDER BY id LIMIT ?",
+                                  (project, after or '', limit + 1)).fetchall()
+                tasks = [json.loads(row['data']) for row in rows]
+                marks = ','.join('?' * len(TASK_STATUS_ACTIONS))
+                for task in tasks:
+                    audit = db.execute(f'SELECT created_at FROM hub_audit WHERE entity_id=? AND revision<=? AND action IN ({marks}) ORDER BY revision DESC LIMIT 1',
+                                       (task['id'], task['revision'], *TASK_STATUS_ACTIONS)).fetchone()
+                    task['state_since'] = audit['created_at'] if audit else None
+                paused = self._paused(db)
+                return tasks, paused
+            finally:
+                db.rollback()
+
+    def propose_tracking_task(self, actor, project, title, client_request_id, *, details=None, links=None):
+        """Idempotent agent-authored tracking only; creates no dispatch authority."""
+        self._actor(actor, agent=True)
+        title, key = self._text(title), self._text(client_request_id, 128)
+        context = self._context(details, links)
+        fingerprint = hashlib.sha256(_json(['tracking_task', project, title, context]).encode()).hexdigest()
+        with self._transaction() as db:
+            self._project(project, db)
+            prior = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
+            if prior:
+                if prior['fingerprint'] != fingerprint:
+                    raise HubError('idempotency_conflict', 409)
+                return self._get(db, prior['entity_id'], 'tracking_task')
+            item = self._save(db, actor, 'tracking_task.proposed', 'tracking_task', dict(
+                id=str(uuid.uuid4()), project=project, title=title, status='open',
+                created_by=actor, execution_authorization=False, updates=[], **context), new=True)
+            db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
+            return item
+
+    def update_tracking_task(self, actor, identity, expected_revision, client_request_id, *,
+                             progress, evidence_links, completion_claim=False):
+        """Append attributed progress or an unverified completion claim using CAS."""
+        self._actor(actor, agent=True)
+        key = self._text(client_request_id, 128)
+        progress = self._text(progress, 4096)
+        if type(completion_claim) is not bool:
+            raise HubError('invalid_input')
+        context = self._context(None, evidence_links)
+        links = context.get('links', [])
+        if completion_claim and not links:
+            raise HubError('evidence_required')
+        fingerprint = hashlib.sha256(_json(['tracking_update', identity, expected_revision,
+                                             progress, links, completion_claim]).encode()).hexdigest()
+        with self._transaction() as db:
+            item = self._get(db, identity, 'tracking_task')
+            self._project(item['project'], db)
+            prior = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
+            if prior:
+                if prior['fingerprint'] != fingerprint:
+                    raise HubError('idempotency_conflict', 409)
+                return self._get(db, prior['entity_id'], 'tracking_task')
+            self._cas(item, expected_revision)
+            if len(item['updates']) >= 50:
+                raise HubError('tracking_history_full', 409)
+            item['updates'].append(dict(actor=actor, progress=progress, evidence_links=links,
+                                        completion_claim=completion_claim))
+            item['status'] = 'completion_claimed' if completion_claim else 'open'
+            item = self._save(db, actor, 'tracking_task.updated', 'tracking_task', item)
+            db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
+            return item
+
     def list_task_views(self):
         """Response copies of tasks plus the audited time each entered its current status.
 
@@ -350,6 +428,8 @@ class HubRepository:
                 return self.task_allows_environment(task_id, environment, db=connection)
         row = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='task'", (task_id,)).fetchone()
         if row is None:
+            if db.execute("SELECT 1 FROM hub_entities WHERE id=? AND kind='tracking_task'", (task_id,)).fetchone():
+                return False
             return True
         task = json.loads(row['data'])
         if task.get('status') == 'withdrawn':

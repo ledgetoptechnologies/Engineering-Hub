@@ -53,7 +53,7 @@ def test_real_initialize_discovery_and_auth_on_every_request(hub):
             assert rpc(client, method, init if method == "initialize" else {}, bad).status_code == 401
     tools = rpc(client, "tools/list").json()["result"]["tools"]
     assert {tool["name"] for tool in tools} == {
-        "hub_overview", "hub_project_tasks", "hub_task_get", "hub_task_claim", "hub_task_candidate",
+        "hub_overview", "hub_project_tasks", "hub_tracking_task_propose", "hub_tracking_task_update", "hub_tracking_task_list", "hub_task_get", "hub_task_claim", "hub_task_candidate",
         "hub_task_review", "hub_decision_request", "hub_decision_get", "hub_run_list",
         "hub_topic_peers", "hub_topic_preflight", "hub_staging_task_propose",
         "hub_planning_list", "hub_planning_get", "hub_planning_put", "hub_entity_withdraw"}
@@ -94,6 +94,27 @@ def test_project_tasks_refresh_current_state_and_disclose_truncation(hub):
     assert {t['id']: t['status'] for t in refreshed['tasks']} == {first['id']: 'in_review', second['id']: 'assigned'}
     assert call(client, 'hub_project_tasks', {'project': '3d-viewer', 'limit': 0})['isError']
     assert call(client, 'hub_project_tasks', {'project': '3d-viewer', 'after_task_id': 'invalid'})['isError']
+
+
+def test_tracking_task_idempotency_evidence_and_no_execution_authority(hub):
+    client, repo = hub
+    args = {'project': '3d-viewer', 'title': 'Track work', 'client_request_id': 'tracking-1'}
+    item = call(client, 'hub_tracking_task_propose', args)['structuredContent']
+    assert item['status'] == 'open' and item['execution_authorization'] is False
+    assert call(client, 'hub_tracking_task_propose', args)['structuredContent']['id'] == item['id']
+    assert call(client, 'hub_tracking_task_propose', {**args, 'title': 'Different'})['isError']
+    assert repo.task_allows_environment(item['id'], 'staging') is False
+    assert call(client, 'hub_task_get', {'task_id': item['id']})['isError']
+    update = {'task_id': item['id'], 'expected_revision': 1, 'client_request_id': 'update-1',
+              'progress': 'Evidence checked', 'evidence_links': [], 'completion_claim': True}
+    assert call(client, 'hub_tracking_task_update', update)['isError']
+    update['evidence_links'] = [{'label': 'Evidence', 'url': 'https://example.com/evidence'}]
+    claimed = call(client, 'hub_tracking_task_update', update)['structuredContent']
+    assert claimed['status'] == 'completion_claimed' and claimed['updates'][0]['actor'] == 'codex'
+    assert call(client, 'hub_tracking_task_update', update)['structuredContent']['revision'] == 2
+    assert call(client, 'hub_tracking_task_update', {**update, 'client_request_id': 'update-2'})['isError']
+    listed = call(client, 'hub_tracking_task_list', {'project': '3d-viewer'})['structuredContent']
+    assert [value['id'] for value in listed['tasks']] == [item['id']]
 
 
 def test_decisions_are_requests_not_approval_or_dispatch(hub):
