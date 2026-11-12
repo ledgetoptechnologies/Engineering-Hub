@@ -433,6 +433,8 @@ def test_private_http_requires_explicit_rfc1918_ipv4_opt_in():
             validate_url(url, allow_private_http=True)
     with pytest.raises(CapabilityError):
         validate_url("http://192.168.50.80:8765/mcp")
+    with pytest.raises(CapabilityError):
+        validate_url("http://192.168.50.80:8770/mcp")
 
 
 def test_missing_native_subscription_capability_fails_before_reading():
