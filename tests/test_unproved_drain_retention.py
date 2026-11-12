@@ -69,41 +69,42 @@ asyncio.run(main())
 def test_unproved_shared_drain_retains_bus_feed_client_and_owner(tmp_path):
     run_held_child(tmp_path, r'''
 import asyncio, gc, pathlib, sys
+from contextlib import contextmanager
 from pytest import MonkeyPatch
 from tests.test_hub_unified_queued_pilot_service import rig, start
 from tests.test_shared_staging_application import shared_app
 root = pathlib.Path(sys.argv[1])
 async def main():
-    monkeypatch = MonkeyPatch()
-    state = rig.__wrapped__(root, monkeypatch)
-    state = await shared_app.__wrapped__(state, root, monkeypatch)
-    stop, serving, _ = await start(state)
-    shared = state.core.state.shared_staging
-    accepted = asyncio.create_task(asyncio.Event().wait())
-    shared._inflight.add(accepted)
-    async def unproved():
-        raise RuntimeError('synthetic drain proof failure')
-    shared._close = unproved
-    stop.set()
-    for _ in range(200):
-        from engineering_hub.unproved_drain import _held
-        if _held:
-            break
-        await asyncio.sleep(.01)
-    assert _held
-    for _ in range(3):
-        serving.cancel()
-        await asyncio.sleep(0)
-        gc.collect()
-        assert not serving.done() and not accepted.done()
-        assert not shared.policies._open
-        assert state.core.state.event_feed.available
-        assert 'bus-stop' not in state.events
-        assert state.owner.close_count == state.clients[0].close_count == 0
-        assert state.modular_clients[0].close_count == 0
-        state.owner.assert_active(state.settings.database)
-    (root / 'ready').write_text('held')
-    await serving
+    with MonkeyPatch.context() as monkeypatch:
+        with contextmanager(rig.__wrapped__)(root, monkeypatch) as state:
+            state = await shared_app.__wrapped__(state, root, monkeypatch)
+            stop, serving, _ = await start(state)
+            shared = state.core.state.shared_staging
+            accepted = asyncio.create_task(asyncio.Event().wait())
+            shared._inflight.add(accepted)
+            async def unproved():
+                raise RuntimeError('synthetic drain proof failure')
+            shared._close = unproved
+            stop.set()
+            for _ in range(200):
+                from engineering_hub.unproved_drain import _held
+                if _held:
+                    break
+                await asyncio.sleep(.01)
+            assert _held
+            for _ in range(3):
+                serving.cancel()
+                await asyncio.sleep(0)
+                gc.collect()
+                assert not serving.done() and not accepted.done()
+                assert not shared.policies._open
+                assert state.core.state.event_feed.available
+                assert 'bus-stop' not in state.events
+                assert state.owner.close_count == state.clients[0].close_count == 0
+                assert state.modular_clients[0].close_count == 0
+                state.owner.assert_active(state.settings.database)
+            (root / 'ready').write_text('held')
+            await serving
 asyncio.run(main())
 ''')
 
