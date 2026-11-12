@@ -1334,6 +1334,12 @@ class DockerEngineBackend:
         if (type(after) is not ContainerObservation or after.status != "exited"
                 or after.selected_image != before.selected_image or after.profile != before.profile):
             raise DaemonBackendError("stopped container state is not verified")
+        # The post-stop inspection is useful only while the enrolled runner is
+        # still the one being inspected. A changed runner makes the outcome
+        # uncertain even if the earlier daemon returned an exited observation.
+        # This remains a point-in-time check, not an atomic daemon fence or
+        # durable quiescence evidence suitable for releasing a reservation.
+        self._assert_runner(deadline)
         self._remaining(deadline)
 
     def _exec_frame(self, raw):

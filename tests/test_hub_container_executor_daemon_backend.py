@@ -1508,10 +1508,54 @@ def test_start_and_stop_are_fixed_lifecycle_posts_with_actual_state_checks(tmp_p
         ("POST", "/v1.56/containers/" + container_id + "/start", ""),
         ("POST", "/v1.56/containers/" + container_id + "/stop", "t=5"),
     ]
-    assert sum(path.endswith("/info") for _, path, _ in requests) == 4
+    assert sum(path.endswith("/info") for _, path, _ in requests) == 5
     assert not any("/exec" in path or "/pull" in path or "/build" in path
                    for _, path, _ in requests)
     backend.close()
+
+
+def test_stop_rejects_changed_runner_after_exited_observation_without_replay(tmp_path):
+    manifest, image, blobs = verified_image()
+    generation = safe_generation(tmp_path)
+    profile = make_profile(image)
+    container_id = "c" * 64
+    operation_id = "edfa4681-3a0a-5e5f-a670-2d2a91d7b70d"
+    state = {"status": "running", "inspected_exited": False, "posts": 0}
+    journal = FakePrivateJournal()
+    archive = oci_archive(image, blobs)
+
+    def handler(request):
+        path = request.url.path
+        if path.endswith('/info'):
+            identity = 'foreign-daemon' if state['inspected_exited'] else manifest.runner_binding.daemon_identity
+            return httpx.Response(200, json={'ID': identity, 'OSType': 'linux', 'Architecture': 'amd64'})
+        if '/images/' in path and path.endswith('/json'):
+            return httpx.Response(200, json=docker_config(image))
+        if '/images/' in path and path.endswith('/get'):
+            return httpx.Response(200, content=archive)
+        if path.endswith('/containers/' + container_id + '/json'):
+            body = container_inspect(image, profile, generation, container_id, state['status'])
+            if state['status'] == 'exited':
+                state['inspected_exited'] = True
+            return httpx.Response(200, json=body)
+        if path.endswith('/containers/' + container_id + '/stop'):
+            state['posts'] += 1
+            state['status'] = 'exited'
+            return httpx.Response(204)
+        raise AssertionError('unexpected synthetic route')
+
+    backend = DockerEngineBackend(binding(manifest, tmp_path),
+        test_transport=httpx.MockTransport(handler), operation_journal=journal)
+    try:
+        backend.inspect_image(image, 5000)
+        with pytest.raises(DaemonBackendError):
+            backend.stop_container(container_id, operation_id, 5000)
+        assert state['posts'] == 1
+        # The Engine response remains recorded; it is not evidence of exit or
+        # permission to replay or release the physical-machine reservation.
+        assert journal.inspect(operation_id) == OperationObservation(operation_id, 'completed', True, container_id)
+    finally:
+        backend.close()
 
 
 def test_start_refuses_effect_when_daemon_identity_changes_after_inspect(tmp_path):
