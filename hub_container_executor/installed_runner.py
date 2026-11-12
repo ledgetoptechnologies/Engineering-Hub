@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import partial
 import json
@@ -20,7 +20,7 @@ import re
 import signal
 import stat
 import sys
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 from engineering_hub.container_pilot_manifest import PilotManifest, Platform
 from engineering_hub.pilot_service import REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS
@@ -281,6 +281,30 @@ async def _wait_for_approval_with_startup_signals(**kwargs):
             signal.signal(number, old)
 
 
+@contextmanager
+def _continuous_bound_signals():
+    """Own termination signals continuously from approval through service drain."""
+    loop, task = asyncio.get_running_loop(), asyncio.current_task()
+    if task is None:
+        raise InstalledRunnerError()
+    state = SimpleNamespace(stop=asyncio.Event(), serving=False)
+    previous = []
+    def request_stop():
+        state.stop.set()
+        if not state.serving:
+            task.cancel()
+    try:
+        for number in (signal.SIGINT, signal.SIGTERM):
+            old = signal.getsignal(number)
+            loop.add_signal_handler(number, request_stop)
+            previous.append((number, old))
+        yield state
+    finally:
+        for number, old in reversed(previous):
+            loop.remove_signal_handler(number)
+            signal.signal(number, old)
+
+
 async def run_installed_executor(config):
     """Obtain direct identity before provider state; drain before closing identity."""
     try:
@@ -298,10 +322,13 @@ async def run_installed_executor(config):
             observations = UnixCurrentObservationTransport(**config.transport)
             owned.callback(observations.close)
             bound_options = {}
+            service_signal_options = {}
             if config.bound_profile is not None:
+                signal_state = owned.enter_context(_continuous_bound_signals())
                 pins = CurrentExecutorReleasePins(**{name: getattr(config.release, name)
                     for name in CurrentExecutorReleasePins.__dataclass_fields__})
-                lease = await _wait_for_approval_with_startup_signals(path=config.bound_profile.approval_path,
+                from .postlaunch_delivery import wait_for_postlaunch_approval
+                lease = await wait_for_postlaunch_approval(path=config.bound_profile.approval_path,
                     verifier=verifier, release=pins, approver_public_key=config.bound_profile.approver_public_key,
                     expected_engine_id=config.binding.daemon_identity, timeout_ms=config.bound_profile.approval_wait_ms)
                 observer = CurrentExecutorObserver(release=pins, launch=lease.approval.launch,
@@ -309,6 +336,10 @@ async def run_installed_executor(config):
                 owned.callback(observer.close)
                 bound_options = dict(bound_profile=config.bound_profile, bound_observer=observer,
                                      bound_release=pins, bound_approval_lease=lease)
+                # The same handlers now request a graceful service drain. No
+                # remove/reinstall window exists between these two phases.
+                signal_state.serving = True
+                service_signal_options = dict(stop_event=signal_state.stop, install_signals=False)
             with ImmutableTestSecretResolver(config.resources['secret_root'],
                     bindings=config.resources['secret_bindings']) as secrets:
                 bearer = secrets.resolve_test_secret(*config.bearer_slot)
@@ -317,7 +348,7 @@ async def run_installed_executor(config):
             await serve_owned_host_executor_unix(factory, bearer_token=bearer,
                 supervisor_stop_grace_seconds=config.stop_grace_seconds,
                 socket_path=config.socket_path, current_observation_transport=observations,
-                current_observation_timeout_ms=config.timeout_ms)
+                current_observation_timeout_ms=config.timeout_ms, **service_signal_options)
     except Exception:
         raise InstalledRunnerError() from None
 

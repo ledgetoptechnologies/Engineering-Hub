@@ -398,3 +398,56 @@ def test_bound_pilot_requires_closed_v3_profile_and_preexisting_journal():
         invalid = copy.deepcopy(source)
         transform(invalid)
         with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(invalid))
+
+
+@pytest.mark.asyncio
+async def test_bound_signal_at_approval_service_boundary_requests_drain(lifecycle, monkeypatch):
+    from hub_container_executor import postlaunch_delivery
+    config, events = lifecycle
+    config = replace(config, bound_profile=SimpleNamespace(approval_path='/test/approval',
+        approver_public_key=b'x' * 32, approval_wait_ms=1000))
+    previous = {n: signal.getsignal(n) for n in (signal.SIGINT, signal.SIGTERM)}
+    async def wait(**kwargs):
+        # Signal callback becomes runnable exactly as this coroutine returns.
+        os.kill(os.getpid(), signal.SIGTERM)
+        return SimpleNamespace(approval=SimpleNamespace(launch=None))
+    class Observer:
+        def __init__(self, **kwargs): events.append('bound-observer')
+        def close(self): events.append('bound-observer-close')
+    async def service(factory, **kwargs):
+        assert kwargs['install_signals'] is False
+        await asyncio.sleep(.05)
+        assert kwargs['stop_event'].is_set()
+        events.append('service-stopped-before-admission')
+    monkeypatch.setattr(postlaunch_delivery, 'wait_for_postlaunch_approval', wait)
+    monkeypatch.setattr(module, 'CurrentExecutorObserver', Observer)
+    monkeypatch.setattr(module, 'serve_owned_host_executor_unix', service)
+    await module.run_installed_executor(config)
+    assert 'service-stopped-before-admission' in events
+    assert events[-4:] == ['bound-observer-close', 'observation-close', 'identity-close', 'transport-close']
+    assert all(signal.getsignal(n) == previous[n] for n in previous)
+
+
+@pytest.mark.asyncio
+async def test_bound_signal_during_approval_cancels_and_closes_owned_resources(lifecycle, monkeypatch):
+    from hub_container_executor import postlaunch_delivery
+    config, events = lifecycle
+    config = replace(config, bound_profile=SimpleNamespace(approval_path='/test/approval',
+        approver_public_key=b'x' * 32, approval_wait_ms=1000))
+    started, drained = asyncio.Event(), asyncio.Event()
+    previous = {n: signal.getsignal(n) for n in (signal.SIGINT, signal.SIGTERM)}
+    async def wait(**kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            drained.set()
+    monkeypatch.setattr(postlaunch_delivery, 'wait_for_postlaunch_approval', wait)
+    task = asyncio.create_task(module.run_installed_executor(config))
+    await started.wait()
+    os.kill(os.getpid(), signal.SIGTERM)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert drained.is_set()
+    assert events[-3:] == ['observation-close', 'identity-close', 'transport-close']
+    assert all(signal.getsignal(n) == previous[n] for n in previous)
