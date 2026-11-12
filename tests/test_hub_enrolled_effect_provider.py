@@ -1,6 +1,7 @@
-"""Explicitly enrolled synthetic binding through the real backend and journal."""
+"""Opt-in composition; real local journal/key, synthetic Engine and verifier."""
 from dataclasses import replace
 from uuid import uuid4
+import time
 import pytest
 
 pytest.importorskip('fcntl', reason='Linux owner and private key required')
@@ -8,43 +9,84 @@ from hub_container_executor.enrolled_effect_provider import enrolled_effect_prov
 from hub_container_executor.effect_mac_key import EffectMacKey, create_for_new_journal
 from hub_container_executor.effect_binding_verify import verify_retained_binding
 from hub_container_executor.operation_journal import SQLiteOperationJournal
-from hub_container_executor.daemon_backend import DaemonBackendError
+from hub_container_executor.adapter import TrustedEffectContextGuard, _Held
+from hub_container_executor.runtime_profile import probe_set_digest
 from tests.test_hub_container_effect_binding_canonical import fixture
-from tests.test_hub_container_executor_daemon_backend import create_transcript
+from tests.test_hub_container_executor_daemon_backend import create_transcript, probe_fixture, run_readiness, make_profile
+from tests.test_hub_container_executor_adapter import make_fixture, command
 
 
-def test_enrolled_create_reaches_engine_only_after_authenticated_intent(tmp_path, monkeypatch):
+@pytest.mark.parametrize('kind', ['create_candidate', 'probe'])
+@pytest.mark.parametrize('failure', ['none', 'profile', 'context', 'generation', 'probe'])
+def test_adapter_through_bound_journal_to_fake_engine(tmp_path, monkeypatch, kind, failure):
     private = tmp_path / 'private'
     private.mkdir(mode=0o700)
     path = private / 'operations.sqlite'
     key_id = create_for_new_journal(private, path.name)
-    backend, _, _, plan, requests = create_transcript(tmp_path)
+    engine_root = tmp_path / 'engine'
+    engine_root.mkdir()
+    if kind == 'probe':
+        backend, manifest, image, requests = probe_fixture(engine_root)
+        profile = make_profile(image)
+        plan = None
+    else:
+        backend, manifest, image, plan, requests = create_transcript(engine_root)
+        profile = plan.profile
+    adapter_root = tmp_path / 'adapter'
+    adapter_root.mkdir()
+    adapter, _, _, _ = make_fixture(adapter_root)
+    operation = '4c96d3f7-19c5-5ff4-a29e-302f6f661009'
+    request = command(manifest, 'smoke_container' if kind == 'probe' else 'deploy_container')
+    effect = replace(fixture(), operation_id=operation, run_id=request.run_id,
+        fence=request.fencing_generation, kind=kind,
+        resource_name=plan.resource_name if plan else None,
+        container_id=None if plan else 'c' * 64,
+        image_index_digest=image.runnable_reference,
+        platform_manifest_digest=image.platform_manifest_digest, image_config_id=image.image_config_id,
+        state_generation_id=profile.state_generation_id,
+        environment_names=tuple(name for name, _ in profile.environment),
+        memory_bytes=profile.memory_bytes, cpu_millicores=profile.cpu_millicores,
+        pids_limit=profile.pids_limit, tmpfs_bytes=profile.tmpfs[0][1],
+        probe_set_digest=probe_set_digest(manifest.probes.candidate) if kind == 'probe' else None)
+    if failure == 'profile': effect = replace(effect, memory_bytes=effect.memory_bytes + 1)
+    if failure == 'context': effect = replace(effect, run_id=str(uuid4()))
+    if failure == 'probe' and kind == 'probe': effect = replace(effect, probe_set_digest='sha256:' + 'a' * 64)
+    if failure == 'probe' and kind != 'probe': effect = replace(effect, fence=effect.fence + 1)
     try:
         with SQLiteOperationJournal(path, create=True, allow_ephemeral_test_storage=True) as journal:
             journal.enable_bindings()
             key = EffectMacKey(private, path.name, expected_key_id=key_id)
             try:
-                effect = replace(fixture(), operation_id=str(uuid4()), owner_epoch=journal._owner.epoch,
-                                 resource_name=plan.resource_name)
+                effect = replace(effect, owner_epoch=journal._owner.epoch)
                 backend.operation_journal = journal
-                backend.effect_binding_provider = enrolled_effect_provider(journal, key, (effect,))
+                backend.effect_binding_provider = enrolled_effect_provider(journal, key, (effect,),
+                    verify_generation=lambda actual, expected: failure != 'generation')
+                adapter.effect_context_guard = TrustedEffectContextGuard(lambda _: True, backend.effect_context_scope)
+                monkeypatch.setattr(adapter.ledger, 'begin_operation', lambda *_: operation)
+                monkeypatch.setattr(adapter.ledger, 'complete_operation', lambda *_: None)
                 original = backend._read_response
-                def observed(method, route, *args, **kwargs):
-                    if method == 'POST' and route.endswith('/containers/create'):
-                        assert journal.inspect_record(effect.operation_id).state == 'pending'
+                def check_before_effect(method, route, *args, **kwargs):
+                    if method == 'POST':
+                        assert journal.inspect_record(operation).state == 'pending'
                         verify_retained_binding(journal, key, effect)
                     return original(method, route, *args, **kwargs)
-                monkeypatch.setattr(backend, '_read_response', observed)
-                assert backend.create_container(plan, effect.operation_id, 5000) == 'c' * 64
-                assert journal.inspect_record(effect.operation_id).state == 'completed'
-                before = list(requests)
-                with pytest.raises(DaemonBackendError):
-                    backend.create_container(plan, str(uuid4()), 5000)
-                assert sum(method == 'POST' for method, _ in requests) == sum(method == 'POST' for method, _ in before)
+                monkeypatch.setattr(backend, '_read_response', check_before_effect)
+                before = sum(item[0] == 'POST' for item in requests)
+                callback = (lambda op, timeout: run_readiness(backend, manifest.probes.candidate)) if kind == 'probe' else (lambda op, timeout: backend.create_container(plan, op, timeout))
+                if failure == 'none':
+                    adapter._effect(request, kind, callback, 30000, time.monotonic() + 30, lambda _: {})
+                    assert journal.inspect_record(operation).state == 'completed'
+                    assert sum(item[0] == 'POST' for item in requests) > before
+                else:
+                    with pytest.raises(_Held):
+                        adapter._effect(request, kind, callback, 30000, time.monotonic() + 30, lambda _: {})
+                    assert journal.inspect_record(operation) is None
+                    assert sum(item[0] == 'POST' for item in requests) == before
             finally:
                 key.close()
     finally:
         backend.close()
+        adapter.close()
 
 
 def test_enrollment_rejects_duplicate_wrong_owner_and_key_pair(tmp_path):
@@ -59,9 +101,10 @@ def test_enrollment_rejects_duplicate_wrong_owner_and_key_pair(tmp_path):
             other_key = EffectMacKey(root, other.name, expected_key_id=other_id)
             try:
                 effect = replace(fixture(), owner_epoch=journal._owner.epoch)
-                with pytest.raises(ValueError): enrolled_effect_provider(journal, key, (effect, effect))
-                with pytest.raises(ValueError): enrolled_effect_provider(journal, key, (replace(effect, owner_epoch=str(uuid4())),))
-                with pytest.raises(ValueError): enrolled_effect_provider(journal, other_key, (effect,))
+                options = {'verify_generation': lambda *_: True}
+                with pytest.raises(ValueError): enrolled_effect_provider(journal, key, (effect, effect), **options)
+                with pytest.raises(ValueError): enrolled_effect_provider(journal, key, (replace(effect, owner_epoch=str(uuid4())),), **options)
+                with pytest.raises(ValueError): enrolled_effect_provider(journal, other_key, (effect,), **options)
             finally:
                 key.close()
                 other_key.close()

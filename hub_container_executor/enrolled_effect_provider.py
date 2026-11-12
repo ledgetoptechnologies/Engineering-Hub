@@ -5,21 +5,22 @@ enrollment service, host identity attestation, fencing enforcement or proof of
 the full Engine request. Caller must establish those properties before use.
 This module never migrates a journal or clears a held operation.
 """
-from .daemon_backend import TrustedEffectBindingProvider
+from .daemon_backend import TrustedEffectBindingProvider, compare_enrolled_effect
 from .effect_binding_canonical import NonsecretEffectBinding, canonical_nonsecret_binding
 from .effect_mac_key import EffectMacKey
 from .operation_journal import OperationBinding, SQLiteOperationJournal
 
 
-def enrolled_effect_provider(journal, key, effects):
+def enrolled_effect_provider(journal, key, effects, *, verify_generation):
     """Bind an immutable finite independently enrolled set to an active owner.
 
-    This asserts exact IDs and target/name at admission. It does not establish
-    that caller-provided nonsecret profile fields match the daemon request.
+    Compares the actual daemon inputs against independently enrolled fields.
+    The required trusted verifier must independently verify current generation,
+    writer fencing and enrollment; a callback is not itself host attestation.
     No effect is issued here and no migration or credential setup is performed.
     """
     if (type(journal) is not SQLiteOperationJournal or type(key) is not EffectMacKey
-            or type(effects) is not tuple or not effects):
+            or type(effects) is not tuple or not effects or not callable(verify_generation)):
         raise TypeError('explicit journal, key and enrolled effects required')
     journal._active()
     if (key._directory / key._journal_name != journal.path
@@ -49,4 +50,8 @@ def enrolled_effect_provider(journal, key, effects):
         return OperationBinding(effect.boot_id, effect.daemon_pid, effect.daemon_start_ticks,
                                 effect.resource_name, effect.container_id, key.mac(canonical), effect.fence)
 
-    return TrustedEffectBindingProvider(create)
+    def compare(actual):
+        pair = by_id.get(actual.context.operation_id)
+        return pair is not None and compare_enrolled_effect(actual, pair[0], verify_generation)
+
+    return TrustedEffectBindingProvider(create, compare)
