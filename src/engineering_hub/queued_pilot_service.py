@@ -158,6 +158,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         return HubFrontends(core, access_verifier=access_verifier)
 
     async def cleanup():
+        from .unproved_drain import retain_unproved_drain
         failed = False
         release_owner = shared is None
         try:
@@ -166,10 +167,18 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                     await finish_owned(asyncio.gather(*rejected_reconciliation_tasks, return_exceptions=True))
                 except BaseException:
                     failed = True
-            release_owner, shared_failed = await _cleanup_shared_staging(shared, staging_draft)
+            try:
+                release_owner, shared_failed = await _cleanup_shared_staging(shared, staging_draft)
+            except BaseException:
+                if shared is not None or staging_draft is not None:
+                    release_owner = False
+                    await retain_unproved_drain(owner, shared, staging_draft, client,
+                                               reconciliation, acceptance_broker)
+                raise
             failed = shared_failed or failed
             if not release_owner:
-                raise QueuedPilotServiceError()
+                await retain_unproved_drain(owner, shared, staging_draft, client,
+                                           reconciliation, acceptance_broker)
             if acceptance_broker is not None:
                 try:
                     acceptance_broker.close()
@@ -230,7 +239,7 @@ async def _cleanup_shared_staging(shared, draft):
                 await draft.module.client.aclose()
         except BaseException:
             failed = True
-    return True, failed
+    return not failed, failed
 
 
 def _reconciliation(factory, owner, target, rejected_local_tasks, lifecycle_task):

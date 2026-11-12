@@ -578,12 +578,29 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             cleanup_started = True
             from .lifecycle import finish_owned
             async def stop_all():
-                try:
-                    if shared_staging is not None:
+                shared_error = None
+                if shared_staging is not None:
+                    drained = False
+                    try:
                         await shared_staging.close()
-                    elif staging_module.controller is not None:
+                    except BaseException as error:
+                        shared_error = error
+                    try:
+                        drained = shared_staging.is_drained is True
+                    except BaseException:
+                        pass
+                    if not drained:
+                        from .unproved_drain import retain_unproved_drain
+                        # Stay inside the bus lifespan with admission closed.
+                        # Neither a failed drain nor caller cancellation permits
+                        # the feed, transports or owner to disappear underneath it.
+                        await retain_unproved_drain(app, shared_staging, bus_app, feed,
+                            queued_pilot_runtime, staging_module, staging_observer,
+                            interactive_service, runtime, session_bridge, infrastructure)
+                try:
+                    if shared_staging is None and staging_module.controller is not None:
                         await staging_module.controller.close()
-                    elif staging_module.client is not None:
+                    elif shared_staging is None and staging_module.client is not None:
                         await staging_module.client.aclose()
                 finally:
                     try:
@@ -600,6 +617,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                                     session_bridge.close()
                                 clear_metrics_transport()
                                 infrastructure.close()
+                if shared_error is not None:
+                    raise shared_error
             await finish_owned(stop_all())
 
         async def stop_existing_components():
