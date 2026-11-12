@@ -14,7 +14,7 @@ from uuid import uuid4
 import pytest
 
 from engineering_hub.events import NativeHubEventFeed
-from engineering_hub.repository import HubRepository
+from engineering_hub.repository import HubError, HubRepository
 from engineering_hub.work_queue import SOFTWARE_VALIDATION_EXECUTOR, WorkTarget, WorkWorker
 from engineering_hub.work_queue_config import configured_work_queue
 from hub_validation_worker.core import ValidationEnrollment, ValidationError, ValidationLedger, ValidationObservation, ValidationProfile
@@ -210,8 +210,16 @@ async def test_unregistered_action_rejects_without_transferring_owner(rig):
 async def test_public_agents_cannot_claim_internal_admission_or_retarget_it(rig):
     repo, _, _, _, backend, _, admission, build, submit = rig
     public = configured_work_queue(repo)
-    wrong = replace(admission.target, artifact_digest='sha256:' + 'e' * 64)
+    # Give the retargeted work its own independently reviewed task: the
+    # queue correctly forbids two open jobs for the enrolled task itself.
+    other = repo.create_task('human:42', 'engineering-hub', 'Other reviewed task', str(uuid4()))
+    other = repo.claim_task('codex', other['id'], other['revision'])
+    other = repo.set_candidate('codex', other['id'], other['revision'], admission.target.source_commit)
+    other = repo.review_task('claude', other['id'], other['revision'], admission.target.source_commit, 'approve')
+    wrong = replace(admission.target, task_id=other['id'], artifact_digest='sha256:' + 'e' * 64)
     changed_job = submit(public, work_target=wrong)
+    with pytest.raises(HubError, match='work_task_already_queued'):
+        submit(public, work_target=wrong)
     job = submit(public)
     service = build()
     for agent in ('codex', 'hermes', 'claude'):
