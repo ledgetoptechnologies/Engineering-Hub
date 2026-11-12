@@ -2,6 +2,7 @@
 import importlib.util
 from contextlib import contextmanager
 import json
+import re
 from pathlib import Path
 import subprocess
 import itertools
@@ -210,9 +211,22 @@ def test_workflow_manual_main_read_only_package_scope_and_receipt_only():
     assert "github.event_name == 'workflow_dispatch'" in text and 'timeout-minutes: 20' in text
     assert 'packages: read' in text and 'contents: read' in text and ': write' not in text
     assert 'docker/login-action@v3' in text and '${{ secrets.GITHUB_TOKEN }}' in text
-    assert text.count('timeout 180s docker pull "'+smoke.PACKAGE+'@sha256:')==2
+    pulls = [line.strip() for line in text.splitlines() if ' docker ' in line and ' pull ' in line]
+    assert pulls == [
+        'env -u DOCKER_CONTEXT timeout 180s docker --host "$ENGINE_ENDPOINT" pull "'
+        + smoke.PACKAGE + '@sha256:$BASELINE_DIGEST"',
+        'env -u DOCKER_CONTEXT timeout 180s docker --host "$ENGINE_ENDPOINT" pull "'
+        + smoke.PACKAGE + '@sha256:$CANDIDATE_DIGEST"',
+    ]
+    assert text.count('ENGINE_ENDPOINT: ${{ steps.engine.outputs.sock }}') == 2
+    assert 'test -n "$ENGINE_ENDPOINT"' in text
+    assert '--docker-host "$ENGINE_ENDPOINT"' in text
+    assert '[[ "$BASELINE_DIGEST" =~ ^[a-f0-9]{64}$ ]]' in text
+    assert '[[ "$CANDIDATE_DIGEST" =~ ^[a-f0-9]{64}$ ]]' in text
     assert 'path: rollback-receipt.json' in text and 'docker push' not in text and 'internal-mcp' not in text
-    assert '${{ inputs.' not in text[text.index('        run: |'):text.index('      - uses: docker/login-action')].split('        run: |',1)[1]
+    run_blocks = re.findall(r'(?m)^        run: \|\n((?:^ {10}.*\n|^\n)*)', text)
+    assert len(run_blocks) == 4
+    assert all('${{ inputs.' not in block for block in run_blocks)
 
 
 @pytest.mark.parametrize('kind', ['volume','container'])
