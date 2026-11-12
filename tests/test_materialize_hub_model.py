@@ -74,8 +74,10 @@ def test_main_workflow_uses_same_pinned_context_in_both_jobs():
 
 def test_supervisor_times_out_before_slow_headers(monkeypatch, tmp_path):
     manifest, _ = _fixture(monkeypatch, tmp_path)
+    accepted = threading.Event()
     class SlowHeaders(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
+            accepted.set()
             time.sleep(1)
         def log_message(self, *args):
             pass
@@ -96,6 +98,7 @@ def test_supervisor_times_out_before_slow_headers(monkeypatch, tmp_path):
     try:
         with pytest.raises(subprocess.TimeoutExpired):
             subject.run_bounded(args, timeout=0.4)
+        assert accepted.is_set(), 'test must reach a server withholding headers'
         assert time.monotonic() - started < 2
     finally:
         server.shutdown()
