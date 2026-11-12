@@ -135,7 +135,15 @@ def test_discovery_and_every_tool_authentication(rig):
 def test_unconfigured_mcp_queue_never_claims_readiness(rig):
     with rig[3](None) as client:
         names = {tool['name'] for tool in rpc(client, 'tools/list').json()['result']['tools']}
-        assert len(names) == 20 and not TOOLS & names
+        assert names == {
+            'hub_overview', 'hub_project_tasks', 'hub_tracking_task_propose', 'hub_tracking_task_update',
+            'hub_tracking_task_list', 'hub_tracking_task_review', 'hub_tracking_task_history',
+            'hub_tracking_task_compact', 'hub_task_get', 'hub_task_claim', 'hub_task_candidate',
+            'hub_task_review', 'hub_decision_request', 'hub_decision_get', 'hub_run_list',
+            'hub_topic_peers', 'hub_topic_preflight', 'hub_staging_task_propose',
+            'hub_planning_list', 'hub_planning_get', 'hub_planning_put', 'hub_entity_withdraw',
+        }
+        assert not TOOLS & names
         assert call(client, 'hub_work_status', {}).get('isError') is True
         response = client.get('/api/hub/v1/work/status', headers={'Authorization': 'Bearer test-codex'})
         assert response.status_code == 423
