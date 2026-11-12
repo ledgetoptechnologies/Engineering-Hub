@@ -450,6 +450,62 @@ def test_tracking_mutation_does_not_disclose_cross_project_or_archived_ids(unifi
     assert repo._read(valid['id'], 'tracking_task')['revision'] == verified['revision']
 
 
+def test_session_id_tools_do_not_disclose_unavailable_entities(unified):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    _, token, _ = pair(env, projects=(PROJECT, '3d-viewer'))
+    invoke, _ = sdk(client, token)
+    repo, components = app.state.repository, env.bridge.components
+    private_task = repo.create_task(OWNER, 'project-alpha', 'Private task', 'oracle-private-task')
+    archived_task = repo.create_task(OWNER, '3d-viewer', 'Archived task', 'oracle-archived-task')
+    own_task = repo.create_task(OWNER, PROJECT, 'Own task', 'oracle-own-task')
+    private_component = components.create_component(OWNER, 'project-alpha', 'private', 'Private', 'oracle-private-comp')
+    archived_component = components.create_component(OWNER, '3d-viewer', 'archived', 'Archived', 'oracle-archived-comp')
+    own_component = components.create_component(OWNER, PROJECT, 'own', 'Own', 'oracle-own-comp')
+    private_decision = repo.create_decision(OWNER, 'project-alpha', 'Private', ['A', 'B'])
+    archived_decision = repo.create_decision(OWNER, '3d-viewer', 'Archived', ['A', 'B'])
+    own_decision = data(invoke('hub_decision_request', {'project': PROJECT, 'title': 'Own',
+        'options': ['A', 'B'], 'client_request_id': 'oracle-own-decision'}))
+    env.bridge.projects.archive_project(OWNER, '3d-viewer', 1)
+    missing = '00000000-0000-4000-8000-000000000000'
+    cases = [
+        ('hub_task_get', lambda i: {'task_id': i}, private_task['id'], archived_task['id'], 'hub_task_unavailable'),
+        ('hub_task_claim', lambda i: {'task_id': i, 'expected_revision': 1}, private_task['id'], archived_task['id'], 'hub_task_unavailable'),
+        ('hub_task_candidate', lambda i: {'task_id': i, 'expected_revision': 1, 'commit': 'a' * 40}, private_task['id'], archived_task['id'], 'hub_task_unavailable'),
+        ('hub_task_review', lambda i: {'task_id': i, 'expected_revision': 1, 'commit': 'a' * 40, 'verdict': 'approve'}, private_task['id'], archived_task['id'], 'hub_task_unavailable'),
+        ('hub_component_get', lambda i: {'component_id': i}, private_component['id'], archived_component['id'], 'hub_component_unavailable'),
+        ('hub_component_update', lambda i: {'payload': {'component_id': i, 'expected_revision': 1, 'name': 'New'}}, private_component['id'], archived_component['id'], 'hub_component_unavailable'),
+        ('hub_component_retire', lambda i: {'payload': {'component_id': i, 'expected_revision': 1}}, private_component['id'], archived_component['id'], 'hub_component_unavailable'),
+        ('hub_entity_withdraw', lambda i: {'kind': 'task', 'entity_id': i, 'expected_revision': 1, 'reason': 'Done'}, private_task['id'], archived_task['id'], 'hub_entity_unavailable'),
+        ('hub_entity_withdraw', lambda i: {'kind': 'decision', 'entity_id': i, 'expected_revision': 1, 'reason': 'Done'}, private_decision['id'], archived_decision['id'], 'hub_entity_unavailable'),
+    ]
+    for tool, args, private, archived, error in cases:
+        results = [invoke(tool, args(i)) for i in (private, archived, missing)]
+        assert all(result['isError'] for result in results), tool
+        assert len({result['content'][0]['text'] for result in results}) == 1, tool
+        assert error in results[0]['content'][0]['text']
+    assert data(invoke('hub_task_get', {'task_id': own_task['id']}))['id'] == own_task['id']
+    claimed = data(invoke('hub_task_claim', {'task_id': own_task['id'], 'expected_revision': 1}))
+    candidate = data(invoke('hub_task_candidate', {'task_id': own_task['id'], 'expected_revision': claimed['revision'], 'commit': 'a' * 40}))
+    assert candidate['candidate_commit'] == 'a' * 40
+    _, reviewer, _ = pair(env, name='task-reviewer', family='claude', caps=('task.review',))
+    review, _ = sdk(client, reviewer)
+    assert data(review('hub_task_review', {'task_id': own_task['id'], 'expected_revision': candidate['revision'],
+        'commit': 'a' * 40, 'verdict': 'approve'}))['review']['verdict'] == 'approve'
+    assert data(invoke('hub_component_get', {'component_id': own_component['id']}))['id'] == own_component['id']
+    edited = data(invoke('hub_component_update', {'payload': {'component_id': own_component['id'], 'expected_revision': 1, 'name': 'New'}}))
+    assert data(invoke('hub_component_retire', {'payload': {'component_id': own_component['id'], 'expected_revision': edited['revision']}}))['status'] == 'retired'
+    assert data(invoke('hub_entity_withdraw', {'kind': 'decision', 'entity_id': own_decision['id'], 'expected_revision': 1, 'reason': 'Done'}))['status'] == 'withdrawn'
+    own_withdraw = data(invoke('hub_staging_task_propose', {'project': PROJECT, 'title': 'Withdraw',
+        'client_request_id': 'oracle-own-withdraw'}))
+    assert data(invoke('hub_entity_withdraw', {'kind': 'task', 'entity_id': own_withdraw['id'],
+        'expected_revision': 1, 'reason': 'Done'}))['status'] == 'withdrawn'
+    bad = invoke('hub_component_get', {'component_id': 'not-a-uuid'})
+    assert bad['isError'] and 'invalid_component_id' in bad['content'][0]['text']
+    bad = invoke('hub_entity_withdraw', {'kind': 'invalid', 'entity_id': missing, 'expected_revision': 1, 'reason': 'Done'})
+    assert bad['isError'] and 'invalid_kind' in bad['content'][0]['text']
+
+
 def test_session_decision_read_cross_surface_and_project_grants(unified):
     client, app, bus, csrf = unified
     env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)

@@ -384,7 +384,14 @@ class SessionHubBridge:
         if tool == 'hub_project_get':
             project = arguments['project_id']
         elif tool in {'hub_task_get', 'hub_task_claim', 'hub_task_candidate', 'hub_task_review'}:
-            project = self.repo.get_task(arguments['task_id'])['project']
+            try:
+                project = self.repo.get_task(arguments['task_id'])['project']
+                operation.project(project)
+            except HubError as error:
+                if error.code not in {'not_found', 'hub_project_forbidden', 'project_archived'}:
+                    raise
+                raise HubError('hub_task_unavailable', 404) from None
+            return
         elif tool in {'hub_tracking_task_update', 'hub_tracking_task_review'}:
             try:
                 project = self.repo._read(arguments['task_id'], 'tracking_task')['project']
@@ -405,9 +412,25 @@ class SessionHubBridge:
             return
         elif tool in {'hub_component_get', 'hub_component_update', 'hub_component_retire'}:
             identity = arguments.get('component_id', data.get('component_id'))
-            project = self.components.get_component(identity)['project']
+            try:
+                project = self.components.get_component(identity)['project']
+                operation.project(project)
+            except HubError as error:
+                if error.code not in {'not_found', 'hub_project_forbidden', 'project_archived'}:
+                    raise
+                raise HubError('hub_component_unavailable', 404) from None
+            return
         elif tool == 'hub_entity_withdraw':
-            project = self.repo._read(arguments['entity_id'], arguments['kind'])['project']
+            if arguments['kind'] not in {'task', 'decision'}:
+                raise HubError('invalid_kind')
+            try:
+                project = self.repo._read(arguments['entity_id'], arguments['kind'])['project']
+                operation.project(project)
+            except HubError as error:
+                if error.code not in {'not_found', 'hub_project_forbidden', 'project_archived'}:
+                    raise
+                raise HubError('hub_entity_unavailable', 404) from None
+            return
         if project is not None:
             operation.project(project)
 
