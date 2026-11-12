@@ -128,3 +128,24 @@ create workers the scope cannot see. The current installed launcher CLI does
 not supply that complete enrollment, and this source API never clears a hold or
 asserts an exact operation outcome. Do not infer a full recovery barrier from a
 successful hierarchical observation alone.
+
+### Installed hierarchical scope policy
+
+For the hierarchical observation path, the root-private launcher policy uses
+schema `engineering-hub.daemon-scope-policy.v2` with all v1 fields plus a
+`members` array. Each entry has exactly `pid` and `start_ticks`; it must include
+the exact daemon and every independently inventoried initial process, with no
+duplicates. The launcher retains pidfds for the additional members, verifies
+the complete live inventory is inside the root-controlled hierarchical scope
+before launch, and rechecks it after launch. After the explicit consumer stop,
+it waits for every enrolled pidfd to exit, then performs the recursive scope
+observation. Any remaining descendant, changed policy, timeout, mismatch, or
+second stop signal fails closed and preserves the hold. Additional pidfds are
+closed before the daemon owner is released. The launcher never stops a daemon
+or worker on this path.
+
+This policy does not discover the user manager, containerd, shims or other
+workers and cannot prove that a process outside the scope cannot start work.
+The operator must independently enroll the complete worker set and establish
+the placement and non-delegable boundary. An empty observation still proves no
+individual Docker effect outcome and grants no recovery or retry authority.

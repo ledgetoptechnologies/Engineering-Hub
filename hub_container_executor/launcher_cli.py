@@ -121,17 +121,28 @@ def _load_daemon_scope_policy(path):
     return load_policy(path)
 
 
+def _open_worker_process(pid, start_ticks):
+    from .launch_supervisor import _Process
+    return _Process(pid, expected_start=start_ticks)
+
+
 def _wait_for_daemon_exit(scope, stop, seconds, initial_requests):
     """Await the retained pidfd; another stop signal cancels this wait."""
     import select
     deadline = time.monotonic() + seconds
+    fds = [process.fd for process in scope._processes]
+    if not fds or any(fd is None for fd in fds) or len(set(fds)) != len(fds):
+        raise RuntimeError('retained worker pidfd unavailable')
+    pending = set(fds)
     while True:
         if stop.requests != initial_requests:
             return False
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
-        if select.select([scope._processes[0].fd], [], [], min(.1, remaining))[0]:
+        ready = select.select(list(pending), [], [], min(.1, remaining))[0]
+        pending.difference_update(ready)
+        if not pending:
             return stop.requests == initial_requests
 
 
@@ -139,6 +150,7 @@ def _execute(options):
     stop = _Stop()
     previous = []
     supervisor = scope = None
+    worker_handles = []
     code, phase = 2, 'unavailable_preserve_evidence'
     try:
         previous = _install_handlers(stop)
@@ -153,7 +165,19 @@ def _execute(options):
                 journal_file=options.journal_file, create_journal=True)
             if policy is not None:
                 policy.check(supervisor)
-                scope = supervisor.preflight_daemon_scope(policy.scope, timeout_ms=10000)
+                if policy.members:
+                    daemon = supervisor._engine.process
+                    for pid, ticks in policy.members:
+                        if pid == daemon.pid:
+                            if ticks != daemon.start:
+                                raise RuntimeError('daemon process identity differs')
+                            continue
+                        worker_handles.append(_open_worker_process(pid, ticks))
+                    processes = (daemon, *worker_handles)
+                    policy.check(supervisor)
+                    scope = supervisor.preflight_worker_scope(policy.scope, processes=processes, timeout_ms=10000)
+                else:
+                    scope = supervisor.preflight_daemon_scope(policy.scope, timeout_ms=10000)
                 policy.check(supervisor, scope)
             if stop.requested:
                 code, phase = 130, 'interrupted_before_launch'
@@ -203,6 +227,12 @@ def _execute(options):
         if scope is not None:
             try:
                 scope.close()
+            except BaseException:
+                if code == 0:
+                    code, phase = 2, 'close_failed_preserve_evidence'
+        for process in reversed(worker_handles):
+            try:
+                process.close()
             except BaseException:
                 if code == 0:
                     code, phase = 2, 'close_failed_preserve_evidence'

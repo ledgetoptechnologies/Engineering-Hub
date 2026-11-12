@@ -26,6 +26,7 @@ class DaemonScopePolicy:
     daemon_id: str
     boot_id: str
     wait_seconds: int
+    members: tuple = ()
 
     def check(self, supervisor, scope=None):
         try:
@@ -37,7 +38,9 @@ class DaemonScopePolicy:
                     or process.start != pin.start_ticks or process.boot != self.boot_id):
                 raise ValueError()
             if scope is not None and (scope._scope != self.scope or scope._identity != (self.scope_device, self.scope_inode)
-                                      or not any(item is process for item in scope._processes)):
+                                      or not any(item is process for item in scope._processes)
+                                      or scope._allow_descendants is not bool(self.members)
+                                      or (self.members and scope._original != self.members)):
                 raise ValueError()
         except Exception:
             raise DaemonScopePolicyError('daemon scope policy unavailable') from None
@@ -52,7 +55,11 @@ def load_policy(path):
         data = _strict(raw, 16384)
         fields = {'schema', 'scope', 'scope_device', 'scope_inode', 'daemon_pid',
                   'daemon_start_ticks', 'daemon_id', 'boot_id', 'wait_seconds'}
-        if type(data) is not dict or set(data) != fields or data['schema'] != 'engineering-hub.daemon-scope-policy.v1':
+        if type(data) is not dict:
+            raise ValueError()
+        schema = data.get('schema')
+        if not ((schema == 'engineering-hub.daemon-scope-policy.v1' and set(data) == fields)
+                or (schema == 'engineering-hub.daemon-scope-policy.v2' and set(data) == fields | {'members'})):
             raise ValueError()
         scope = data['scope']
         if (type(scope) is not str or not re.fullmatch(r'[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*', scope)
@@ -66,7 +73,24 @@ def load_policy(path):
         if (type(data['daemon_id']) is not str or not re.fullmatch(r'[A-Za-z0-9:_.-]{1,128}', data['daemon_id'])
                 or type(data['boot_id']) is not str or str(UUID(data['boot_id'])) != data['boot_id']):
             raise ValueError()
+        members = ()
+        if schema == 'engineering-hub.daemon-scope-policy.v2':
+            raw_members = data['members']
+            if type(raw_members) is not list or not 1 <= len(raw_members) <= 128:
+                raise ValueError()
+            parsed = []
+            for item in raw_members:
+                if (type(item) is not dict or set(item) != {'pid', 'start_ticks'}
+                        or type(item['pid']) is not int or not 1 < item['pid'] < 2**31
+                        or type(item['start_ticks']) is not int or not 1 <= item['start_ticks'] < 2**63):
+                    raise ValueError()
+                parsed.append((item['pid'], item['start_ticks']))
+            if len({pid for pid, _ in parsed}) != len(parsed):
+                raise ValueError()
+            members = tuple(sorted(parsed))
+            if (data['daemon_pid'], data['daemon_start_ticks']) not in members:
+                raise ValueError()
         return DaemonScopePolicy(path, identity, scope, data['scope_device'], data['scope_inode'],
-            data['daemon_pid'], data['daemon_start_ticks'], data['daemon_id'], data['boot_id'], data['wait_seconds'])
+            data['daemon_pid'], data['daemon_start_ticks'], data['daemon_id'], data['boot_id'], data['wait_seconds'], members)
     except Exception:
         raise DaemonScopePolicyError('daemon scope policy unavailable') from None

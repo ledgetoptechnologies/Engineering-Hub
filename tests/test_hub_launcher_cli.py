@@ -316,6 +316,7 @@ def test_explicit_scope_policy_lifecycle_never_signals_daemon(module, monkeypatc
     class Policy:
         scope = 'dedicated/daemon'
         wait_seconds = 5
+        members = ()
         def check(self, supervisor, observed=None):
             calls.append('policy-check-scoped' if observed else 'policy-check')
             if ((outcome == 'policy_changed' and calls.count('policy-check-scoped') == 3)
@@ -373,3 +374,77 @@ def test_repeated_stop_cancels_scope_wait_without_signal(module, monkeypatch):
     stop.request(0, None)
     scope = SimpleNamespace(_processes=(SimpleNamespace(fd=0),))
     assert module._wait_for_daemon_exit(scope, stop, 5, initial) is False
+
+
+@pytest.mark.parametrize('outcome', ['complete','second_worker_fails','post_enrollment_mismatch','wait_timeout'])
+def test_hierarchical_policy_retains_and_closes_exact_workers(module, monkeypatch, outcome):
+    calls = []
+    stop_ref = SimpleNamespace(value=None)
+    daemon = SimpleNamespace(pid=10,start=11,fd=10,check=lambda: None)
+    class Worker:
+        def __init__(self,pid,start): self.pid,self.start,self.fd = pid,start,pid
+        def close(self): calls.append(('worker-close',self.pid))
+    class Scope:
+        def __init__(self,processes): self._processes = processes
+        def close(self): calls.append('scope-close')
+    class Policy:
+        scope='root/worker'
+        wait_seconds=5
+        members=((10,11),(20,21),(30,31))
+        def check(self,supervisor,scope=None):
+            calls.append('policy-scoped' if scope else 'policy')
+            if scope is not None and outcome == 'post_enrollment_mismatch': raise ValueError()
+    class Supervisor:
+        def __init__(self,**kwargs): self._engine=SimpleNamespace(process=daemon)
+        def preflight_worker_scope(self,path,*,processes,timeout_ms):
+            calls.append(('preflight',tuple(x.pid for x in processes)))
+            assert path == 'root/worker' and timeout_ms == 10000
+            return Scope(processes)
+        def launch(self): calls.append('launch')
+        def verify_preflight_daemon_scope(self,scope,*,timeout_ms): calls.append('verify-live')
+        def wait_for_receipt_request(self,**kwargs): return True
+        def serve_one_receipt(self): pass
+        def wait_for_stop_with_observations(self,**kwargs):
+            stop_ref.value.request(0,None); return True
+        def graceful_stop(self): calls.append('consumer-stop')
+        def record_daemon_scope_emptiness(self,scope): calls.append('record')
+        def close(self): calls.append('supervisor-close')
+    def install(stop): stop_ref.value=stop; return []
+    def open_worker(pid,ticks):
+        calls.append(('open',pid,ticks))
+        if outcome=='second_worker_fails' and pid==30: raise ValueError()
+        return Worker(pid,ticks)
+    monkeypatch.setattr(module,'_host_available',lambda: True)
+    monkeypatch.setattr(module,'_install_handlers',install)
+    monkeypatch.setattr(module,'_restore_handlers',lambda previous: None)
+    monkeypatch.setattr(module,'_load_supervisor',lambda: Supervisor)
+    monkeypatch.setattr(module,'_load_daemon_scope_policy',lambda path: Policy())
+    monkeypatch.setattr(module,'_open_worker_process',open_worker)
+    def wait(scope,stop,seconds,initial):
+        assert tuple(p.pid for p in scope._processes)==(10,20,30)
+        calls.append('wait-all')
+        return outcome != 'wait_timeout'
+    monkeypatch.setattr(module,'_wait_for_daemon_exit',wait)
+    code = module.main(ARGS + ['--execute','--create-journal','--daemon-scope-policy','/protected/workers.json'])
+    assert code == (0 if outcome=='complete' else 2)
+    assert ('worker-close',20) in calls
+    assert ('worker-close',30) in calls if outcome!='second_worker_fails' else ('worker-close',30) not in calls
+    if outcome in ('second_worker_fails','post_enrollment_mismatch'):
+        assert 'launch' not in calls and 'record' not in calls
+    else:
+        assert calls.index('consumer-stop') < calls.index('wait-all')
+        assert ('record' in calls) == (outcome=='complete')
+    assert calls[-1] == 'supervisor-close'
+
+
+def test_worker_wait_removes_exited_pidfd_without_busy_polling(module, monkeypatch):
+    import select
+    stop=module._Stop(); stop.request(0,None)
+    scope=SimpleNamespace(_processes=(SimpleNamespace(fd=10),SimpleNamespace(fd=20)))
+    seen=[]
+    def ready(fds, writes, errors, timeout):
+        seen.append(set(fds))
+        return ([10] if len(seen)==1 else [20]), [], []
+    monkeypatch.setattr(select,'select',ready)
+    assert module._wait_for_daemon_exit(scope,stop,5,stop.requests) is True
+    assert seen == [{10,20},{20}]
