@@ -770,8 +770,15 @@ class WorkQueue:
                     pass
             if not verified:
                 raise HubError('work_reconciliation_required', 403)
-            db.execute('UPDATE hub_work_jobs SET state=? WHERE id=?', (outcome, job_id))
-            db.execute('UPDATE hub_work_machines SET job_id=NULL WHERE machine_id=? AND job_id=?', (row['machine_id'], job_id))
+            updated = db.execute(
+                "UPDATE hub_work_jobs SET state=? WHERE id=? AND state='held' AND revision=? "
+                'AND machine_id=? AND worker IS ? AND fence IS ?',
+                (outcome, job_id, row['revision'], row['machine_id'], row['worker'], row['fence'])).rowcount
+            released = db.execute(
+                'UPDATE hub_work_machines SET job_id=NULL WHERE machine_id=? AND job_id=? AND generation=?',
+                (row['machine_id'], job_id, row['fence'])).rowcount
+            if updated != 1 or released != 1:
+                raise HubError('work_reservation_changed', 409)
             self._event(db, 'work.reconciled', job_id, 'system:work-queue')
             return self._public(db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (job_id,)).fetchone())
 

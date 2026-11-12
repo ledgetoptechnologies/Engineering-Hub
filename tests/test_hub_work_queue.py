@@ -258,6 +258,74 @@ def test_reconcile_requires_exact_authoritative_evidence(setup_queue):
     assert q.claim(worker=w('claude'))['fence'] == 2
 
 
+@pytest.mark.parametrize('drift', ['missing', 'different-holder', 'empty-holder', 'stale-generation'])
+def test_reconcile_rejects_changed_machine_reservation_atomically(setup_queue, drift):
+    q, clock, repo, actions = setup_queue
+    job = submit(q)
+    claimed = q.claim(worker=w('codex'))
+    finish(q, claimed, 'held')
+    with repo._transaction() as db:
+        if drift == 'missing':
+            db.execute('DELETE FROM hub_work_machines WHERE machine_id=?', ('machine-one',))
+        elif drift == 'different-holder':
+            db.execute('UPDATE hub_work_machines SET job_id=? WHERE machine_id=?', (str(uuid.uuid4()), 'machine-one'))
+        elif drift == 'empty-holder':
+            db.execute('UPDATE hub_work_machines SET job_id=NULL WHERE machine_id=?', ('machine-one',))
+        else:
+            db.execute('UPDATE hub_work_machines SET generation=generation+1 WHERE machine_id=?', ('machine-one',))
+
+    def snapshot():
+        with repo._connection() as db:
+            job_row = tuple(db.execute('SELECT state,revision,worker,fence FROM hub_work_jobs WHERE id=?', (job['id'],)).fetchone())
+            reservation = db.execute('SELECT generation,job_id FROM hub_work_machines WHERE machine_id=?', ('machine-one',)).fetchone()
+            audit = db.execute("SELECT COUNT(*) FROM hub_audit WHERE entity_id=? AND action='work.reconciled'", (job['id'],)).fetchone()[0]
+            return job_row, tuple(reservation) if reservation is not None else None, audit
+
+    original = snapshot()
+    q = WorkQueue(repo, actions, target_verifier=lambda *args: True, clock=lambda: clock[0],
+                  reconciliation_verifier=lambda *_args: True)
+    with pytest.raises(HubError, match='work_reservation_changed'):
+        q.reconcile(job_id=job['id'], evidence_id='synthetic-proof', outcome='failed')
+    assert snapshot() == original
+
+
+def test_reconcile_verifier_scope_ends_before_queue_commit(setup_queue, monkeypatch):
+    """A synthetic verifier-local guard is not a commit-spanning fence."""
+    from agent_message_bus import session_hub_context as session_context
+
+    q, clock, repo, actions = setup_queue
+    job = submit(q)
+    claim = q.claim(worker=w('codex'))
+    finish(q, claim, 'held')
+    state = {'guard': False, 'verified': False, 'commit_checked': False}
+
+    def verifier(row, evidence, outcome):
+        state['guard'] = True
+        try:
+            state['verified'] = True
+            return row['id'] == job['id'] and evidence == 'synthetic-proof' and outcome == 'failed'
+        finally:
+            state['guard'] = False
+
+    q = WorkQueue(repo, actions, target_verifier=lambda *args: True, clock=lambda: clock[0],
+                  reconciliation_verifier=verifier)
+    original = session_context.before_commit
+
+    def inspect_before_commit(path, db):
+        assert state['verified'] and not state['guard']
+        assert db.execute('SELECT state FROM hub_work_jobs WHERE id=?', (job['id'],)).fetchone()[0] == 'failed'
+        assert db.execute('SELECT job_id FROM hub_work_machines WHERE machine_id=?', ('machine-one',)).fetchone()[0] is None
+        with sqlite3.connect(repo.path) as reader:
+            assert reader.execute('SELECT state FROM hub_work_jobs WHERE id=?', (job['id'],)).fetchone()[0] == 'held'
+            assert reader.execute('SELECT job_id FROM hub_work_machines WHERE machine_id=?', ('machine-one',)).fetchone()[0] == job['id']
+        state['commit_checked'] = True
+        return original(path, db)
+
+    monkeypatch.setattr(session_context, 'before_commit', inspect_before_commit)
+    assert q.reconcile(job_id=job['id'], evidence_id='synthetic-proof', outcome='failed')['state'] == 'failed'
+    assert state['commit_checked'] and q.get_job(job['id'])['state'] == 'failed'
+
+
 def test_idempotence_full_target_and_capacity(setup_queue):
     q, _, repo, actions = setup_queue
     q = WorkQueue(repo, actions, target_verifier=lambda *args: True, max_jobs=1)
