@@ -174,6 +174,38 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
                                                        details=details, links=links))
 
     @registration.tool()
+    def hub_project_tasks(project: str, ctx: Context, limit: StrictInt = 100,
+                          after_task_id: str | None = None) -> dict:
+        """Read a project's current task context after a conversation change.
+
+        This explicit read does not inject context, wake a chat, claim work,
+        grant execution authority, or prove task completion. Follow next_after
+        to page by task ID; concurrent changes can alter subsequent pages.
+        Pause and tasks are separate reads, not an atomic execution fence.
+        """
+        identity(ctx)
+        if not 1 <= limit <= 200:
+            raise ToolError('invalid_limit')
+        if after_task_id is not None:
+            import uuid
+            try:
+                if str(uuid.UUID(after_task_id)) != after_task_id:
+                    raise ValueError()
+            except (ValueError, TypeError, AttributeError):
+                raise ToolError('invalid_cursor') from None
+        def read():
+            with repo._connection() as db:
+                repo._project(project, db)
+            tasks = sorted((item for item in repo.list_task_views() if item['project'] == project
+                     and item['status'] != 'withdrawn' and (after_task_id is None or item['id'] > after_task_id)),
+                     key=lambda item: item['id'])
+            more = len(tasks) > limit
+            return {'project': project, 'tasks': tasks[:limit], 'truncated': more,
+                    'next_after': tasks[limit-1]['id'] if more else None,
+                    'paused': repo.get_paused()}
+        return invoke(read)
+
+    @registration.tool()
     def hub_task_get(task_id: str, ctx: Context) -> dict:
         """Read an assigned Hub task."""
         identity(ctx)

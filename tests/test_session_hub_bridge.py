@@ -522,6 +522,8 @@ def test_real_owner_api_and_existing_mcp_tools_unified(unified):
     proposed = data(invoke('hub_staging_task_propose', {'project': PROJECT, 'title': 'Transport task', 'client_request_id': 'transport'}))
     claimed = data(invoke('hub_task_claim', {'task_id': proposed['id'], 'expected_revision': 1}))
     assert claimed['owner'].startswith('installation:') and claimed['owner_session_id']
+    assert data(invoke('hub_project_tasks', {'project': PROJECT}))['tasks'][0]['id'] == claimed['id']
+    assert invoke('hub_project_tasks', {'project': 'project-alpha'})['isError']
     created = data(invoke('hub_component_create', {'payload': {'project': PROJECT, 'slug': 'transport', 'name': 'Transport', 'client_request_id': 'component'}}))
     assert created['created_by'] == claimed['owner']
     planned = data(invoke('hub_planning_put', {'payload': {'scope': 'topic', 'project': PROJECT,

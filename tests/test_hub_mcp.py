@@ -53,7 +53,7 @@ def test_real_initialize_discovery_and_auth_on_every_request(hub):
             assert rpc(client, method, init if method == "initialize" else {}, bad).status_code == 401
     tools = rpc(client, "tools/list").json()["result"]["tools"]
     assert {tool["name"] for tool in tools} == {
-        "hub_overview", "hub_task_get", "hub_task_claim", "hub_task_candidate",
+        "hub_overview", "hub_project_tasks", "hub_task_get", "hub_task_claim", "hub_task_candidate",
         "hub_task_review", "hub_decision_request", "hub_decision_get", "hub_run_list",
         "hub_topic_peers", "hub_topic_preflight", "hub_staging_task_propose",
         "hub_planning_list", "hub_planning_get", "hub_planning_put", "hub_entity_withdraw"}
@@ -75,6 +75,25 @@ def test_real_transport_task_lifecycle_uses_token_identity(hub):
     assert accepted["structuredContent"]["review"]["actor"] == "claude"
     assert accepted["structuredContent"]["status"] == "verified"
     assert call(client, "hub_task_get", {"task_id": task["id"]})["structuredContent"]["status"] == "verified"
+
+
+def test_project_tasks_refresh_current_state_and_disclose_truncation(hub):
+    client, repo = hub
+    first = repo.create_task('human:123', '3d-viewer', 'First task', 'continuity-1')
+    second = repo.create_task('human:123', '3d-viewer', 'Second task', 'continuity-2')
+    repo.claim_task('codex', first['id'], first['revision'])
+    result = call(client, 'hub_project_tasks', {'project': '3d-viewer', 'limit': 1})['structuredContent']
+    assert result['truncated'] is True and result['next_after'] == result['tasks'][0]['id']
+    page = call(client, 'hub_project_tasks', {'project': '3d-viewer', 'limit': 1,
+        'after_task_id': result['next_after']})['structuredContent']
+    assert page['truncated'] is False and {result['tasks'][0]['id'], page['tasks'][0]['id']} == {first['id'], second['id']}
+    assert result['paused'] is False
+    repo.set_candidate('codex', first['id'], 2, 'a' * 40)
+    refreshed = call(client, 'hub_project_tasks', {'project': '3d-viewer'})['structuredContent']
+    assert refreshed['truncated'] is False
+    assert {t['id']: t['status'] for t in refreshed['tasks']} == {first['id']: 'in_review', second['id']: 'assigned'}
+    assert call(client, 'hub_project_tasks', {'project': '3d-viewer', 'limit': 0})['isError']
+    assert call(client, 'hub_project_tasks', {'project': '3d-viewer', 'after_task_id': 'invalid'})['isError']
 
 
 def test_decisions_are_requests_not_approval_or_dispatch(hub):

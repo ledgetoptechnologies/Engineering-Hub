@@ -303,7 +303,7 @@ def test_integrated_mcp_initialize_and_list_on_configured_https_origin(hub):
         response = mcp_rpc(client, "tools/list", name=name)
         assert response.status_code == 200, response.text
         assert {tool["name"] for tool in response.json()["result"]["tools"]} == {
-            "hub_overview", "hub_task_get", "hub_task_claim", "hub_task_candidate",
+            "hub_overview", "hub_project_tasks", "hub_task_get", "hub_task_claim", "hub_task_candidate",
             "hub_task_review", "hub_decision_request", "hub_decision_get", "hub_run_list",
             "hub_topic_peers", "hub_topic_preflight", "hub_staging_task_propose",
             "hub_planning_list", "hub_planning_get", "hub_planning_put",
