@@ -64,15 +64,21 @@ option proves neither all effect workers quiesced nor an operation outcome.
 
 ### Optional executor cgroup parent
 
-An independently reviewed executor launch profile may supply both
+An independently reviewed executor launch profile may supply
 `cgroup_parent` (the exact systemd slice name passed as Docker `CgroupParent`)
 and `cgroup_host_parent` (its pre-existing absolute cgroup-v2 path as seen in
-host `/proc/<pid>/cgroup`). The two must name the same slice. Both fields are
-bound into the profile digest; omitting both preserves the earlier profile
-digest and behavior. The supervisor pins the existing parent inode before the
-first Engine POST, checks Docker's returned `CgroupParent`, and then checks the
-actual executor PID's kernel cgroup membership is a descendant of that pinned
-parent. An absent, replaced, mismatched or unreadable parent fails closed.
+host `/proc/<pid>/cgroup`), plus `cgroup_host_ns_device` and
+`cgroup_host_ns_inode` identifying the independently verified host cgroup
+namespace. The parent fields must name the same slice. All four fields bind
+the profile digest; omitting all four preserves the earlier profile digest and
+behavior. The supervisor and daemon must both be in the enrolled namespace,
+and the cgroup-v2 mount must expose its hierarchy root. The supervisor holds
+the parent directory FD until close, checks the named path and retained inode,
+checks Docker's returned `CgroupParent`, and checks the executor PID's
+momentary kernel membership is below that parent. A missing, replaced or
+mismatched parent or namespace fails closed. The operator must independently
+verify that the enrolled namespace is the intended host namespace; matching
+an inode by itself does not establish this fact.
 
 This does not enroll, configure, or prove an aggregate resource limit, contain
 containerd/shims, or establish application-container membership. In particular,

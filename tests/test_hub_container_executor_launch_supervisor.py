@@ -1835,7 +1835,8 @@ def test_launcher_cgroup_parent_is_enrolled_and_bound_to_profile(root_journal):
     profile = launch.ExecutorLaunchProfile.model_validate(legacy)
     assert profile.digest() == 'sha256:' + hashlib.sha256(launch._canonical(legacy)).hexdigest()
     configured = dict(legacy, cgroup_parent='ehcontaintrial.slice',
-                      cgroup_host_parent='/user.slice/user-10001.slice/ehcontaintrial.slice')
+                      cgroup_host_parent='/user.slice/user-10001.slice/ehcontaintrial.slice',
+                      cgroup_host_ns_device=1, cgroup_host_ns_inode=2)
     pinned = launch.ExecutorLaunchProfile.model_validate(configured)
     assert pinned.digest() != profile.digest()
     assert pinned.digest() == 'sha256:' + hashlib.sha256(launch._canonical(configured)).hexdigest()
@@ -1871,17 +1872,30 @@ def test_launcher_checks_kernel_membership_against_exact_pinned_parent(root_jour
     monkeypatch.setattr(launch, '_CGROUPFS_ROOT', root)
     authority, _ = synthetic_launcher(root_journal)
     try:
+        from hub_container_executor import cgroup_scope_evidence as cgroups
+        monkeypatch.setattr(cgroups, '_mount_root', lambda: None)
+        monkeypatch.setattr(cgroups, '_filesystem', lambda fd: None)
+        namespace = launch._identity(os.stat('/proc/self/ns/cgroup'))
+        authority._daemon_pin = SimpleNamespace(pid=os.getpid())
         authority.profile = launch.ExecutorLaunchProfile.model_validate(dict(profile_data(),
-            cgroup_parent='parent.slice', cgroup_host_parent='/parent.slice'))
-        authority._cgroup_parent_identity = launch._identity(parent.stat())
+            cgroup_parent='parent.slice', cgroup_host_parent='/parent.slice',
+            cgroup_host_ns_device=namespace[0], cgroup_host_ns_inode=namespace[1]))
+        authority._pin_cgroup_parent()
+        retained_fd = authority._cgroup_parent_fd
+        assert os.fstat(retained_fd).st_ino == parent.stat().st_ino
         authority._check_cgroup_parent_membership('/parent.slice/runner.scope')
         with pytest.raises(launch.LaunchSupervisorError):
             authority._check_cgroup_parent_membership('/other.scope')
-        authority._cgroup_parent_identity = (0, 0)
+        parent.rename(root / 'moved.slice')
+        parent.mkdir()
+        (parent / 'runner.scope').mkdir()
         with pytest.raises(launch.LaunchSupervisorError):
             authority._check_cgroup_parent_membership('/parent.slice/runner.scope')
+        assert os.fstat(retained_fd).st_ino != parent.stat().st_ino
     finally:
         authority.close()
+    with pytest.raises(OSError):
+        os.fstat(retained_fd)
 
 
 
@@ -1890,7 +1904,8 @@ def test_launcher_wrong_cgroup_parent_readback_holds_before_start(root_journal):
     authority, _ = synthetic_launcher(root_journal, failure='wrong-cgroup-parent')
     try:
         authority.profile = launch.ExecutorLaunchProfile.model_validate(dict(profile_data(),
-            cgroup_parent='parent.slice', cgroup_host_parent='/user.slice/parent.slice'))
+            cgroup_parent='parent.slice', cgroup_host_parent='/user.slice/parent.slice',
+            cgroup_host_ns_device=1, cgroup_host_ns_inode=2))
         authority._pin_cgroup_parent = lambda: None  # no real cgroup in this fixture
         with pytest.raises(launch.LaunchSupervisorError):
             authority.launch()
@@ -1899,5 +1914,21 @@ def test_launcher_wrong_cgroup_parent_readback_holds_before_start(root_journal):
         assert not any(method == 'POST' and route.endswith('/start') for method, route in calls)
         with root_journal.transaction() as db:
             assert db.execute('SELECT state FROM launch').fetchone() == ('held',)
+    finally:
+        authority.close()
+
+
+def test_launcher_rejects_unenrolled_cgroup_namespace_before_engine_post(root_journal, monkeypatch):
+    from hub_container_executor import cgroup_scope_evidence as cgroups
+    authority, _ = synthetic_launcher(root_journal)
+    try:
+        namespace = launch._identity(os.stat('/proc/self/ns/cgroup'))
+        authority._daemon_pin = SimpleNamespace(pid=os.getpid())
+        authority.profile = launch.ExecutorLaunchProfile.model_validate(dict(profile_data(),
+            cgroup_parent='parent.slice', cgroup_host_parent='/user.slice/parent.slice',
+            cgroup_host_ns_device=namespace[0], cgroup_host_ns_inode=namespace[1] + 1))
+        monkeypatch.setattr(cgroups, '_mount_root', lambda: None)
+        with pytest.raises(launch.LaunchSupervisorError): authority.launch()
+        assert authority._engine.effect_calls == []
     finally:
         authority.close()

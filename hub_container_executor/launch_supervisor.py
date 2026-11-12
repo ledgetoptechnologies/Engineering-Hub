@@ -262,6 +262,8 @@ class ExecutorLaunchProfile(_Closed):
     runner_digest: str
     cgroup_parent: str | None = None
     cgroup_host_parent: str | None = None
+    cgroup_host_ns_device: int | None = None
+    cgroup_host_ns_inode: int | None = None
 
     @field_validator('supplementary_groups', 'entrypoint', 'command', 'environment', 'mounts', mode='before')
     @classmethod
@@ -292,14 +294,17 @@ class ExecutorLaunchProfile(_Closed):
         _require(all(not (left == right or left in right.parents or right in left.parents)
                      for index, left in enumerate(sources) for right in sources[index + 1:]))
         if self.cgroup_parent is None or self.cgroup_host_parent is None:
-            _require(self.cgroup_parent is None and self.cgroup_host_parent is None)
+            _require(self.cgroup_parent is None and self.cgroup_host_parent is None
+                     and self.cgroup_host_ns_device is None and self.cgroup_host_ns_inode is None)
         else:
             _require(type(self.cgroup_parent) is str
                      and re.fullmatch(r'[a-z][a-z0-9-]{0,60}\.slice', self.cgroup_parent)
                      and type(self.cgroup_host_parent) is str and self.cgroup_host_parent.startswith('/')
                      and os.path.normpath(self.cgroup_host_parent) == self.cgroup_host_parent
                      and '..' not in Path(self.cgroup_host_parent).parts
-                     and Path(self.cgroup_host_parent).name == self.cgroup_parent)
+                     and Path(self.cgroup_host_parent).name == self.cgroup_parent
+                     and type(self.cgroup_host_ns_device) is int and self.cgroup_host_ns_device > 0
+                     and type(self.cgroup_host_ns_inode) is int and self.cgroup_host_ns_inode > 0)
         _path(self.runner_file)
         _require(self.runner_file.endswith('/hub_container_executor/installed_runner.py')
                  and not any(self.runner_file == item.target or Path(item.target) in Path(self.runner_file).parents
@@ -311,6 +316,8 @@ class ExecutorLaunchProfile(_Closed):
         if self.cgroup_parent is None:
             del value['cgroup_parent']
             del value['cgroup_host_parent']
+            del value['cgroup_host_ns_device']
+            del value['cgroup_host_ns_inode']
         return 'sha256:' + hashlib.sha256(_canonical(value)).hexdigest()
 
 
@@ -691,7 +698,7 @@ class LaunchSupervisor:
         self._approval_expires_at_ms = None
         self._held = False
         self._source_pins = {}
-        self._cgroup_parent_identity = None
+        self._cgroup_parent_identity = self._cgroup_parent_fd = None
         try:
             _require(sys.platform == 'linux' and os.geteuid() == os.getuid() == 0
                      and hasattr(socket, 'SO_PEERCRED') and hasattr(os, 'pidfd_open'))
@@ -831,11 +838,20 @@ class LaunchSupervisor:
         os.chmod(pinned, 0o660, follow_symlinks=False)
         self._listener.listen(1)
 
+    def _check_cgroup_namespace(self):
+        from .cgroup_scope_evidence import _mount_root
+        _mount_root()
+        expected = (self.profile.cgroup_host_ns_device, self.profile.cgroup_host_ns_inode)
+        _require(_identity(os.stat('/proc/self/ns/cgroup')) == expected
+                 and _identity(os.stat(f'/proc/{self._daemon_pin.pid}/ns/cgroup')) == expected)
+
     def _pin_cgroup_parent(self):
-        """Pin the independently enrolled, pre-provisioned host cgroup path."""
+        """Retain the enrolled parent inode in the enrolled cgroup namespace."""
         if self.profile.cgroup_parent is None:
             return
         from .cgroup_scope_evidence import _filesystem
+        _require(getattr(self, '_cgroup_parent_fd', None) is None)
+        self._check_cgroup_namespace()
         path = _CGROUPFS_ROOT / self.profile.cgroup_host_parent.lstrip('/')
         _require(path.resolve(strict=True) == path and path != _CGROUPFS_ROOT)
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -843,20 +859,28 @@ class LaunchSupervisor:
             _filesystem(fd)
             info = os.fstat(fd)
             _require(stat.S_ISDIR(info.st_mode) and _identity(info) == _identity(os.stat(path, follow_symlinks=False)))
+            self._check_cgroup_namespace()
             self._cgroup_parent_identity = _identity(info)
+            self._cgroup_parent_fd, fd = fd, None
         finally:
-            os.close(fd)
+            if fd is not None: os.close(fd)
 
     def _check_cgroup_parent_membership(self, process_cgroup):
-        """Compare kernel-observed membership with the retained host parent."""
+        """Compare momentary kernel membership to the retained parent handle."""
         if self.profile.cgroup_parent is None:
             return
+        from .cgroup_scope_evidence import _filesystem
         parent = _CGROUPFS_ROOT / self.profile.cgroup_host_parent.lstrip('/')
         observed = _CGROUPFS_ROOT / process_cgroup.lstrip('/')
-        _require(getattr(self, '_cgroup_parent_identity', None) is not None
-                 and parent.resolve(strict=True) == parent and observed.resolve(strict=True) == observed
+        fd = getattr(self, '_cgroup_parent_fd', None)
+        _require(fd is not None and getattr(self, '_cgroup_parent_identity', None) is not None)
+        self._check_cgroup_namespace()
+        _filesystem(fd)
+        _require(parent.resolve(strict=True) == parent and observed.resolve(strict=True) == observed
                  and parent in observed.parents
+                 and _identity(os.fstat(fd)) == self._cgroup_parent_identity
                  and _identity(os.stat(parent, follow_symlinks=False)) == self._cgroup_parent_identity)
+        self._check_cgroup_namespace()
 
     def _create_body(self):
         p = self.profile
@@ -1645,11 +1669,11 @@ class LaunchSupervisor:
         self._issuance_open = False
         self._closed = True
         failed = False
-        for name in ('_listener', '_socket_parent', '_consumer', '_engine', '_journal'):
+        for name in ('_listener', '_socket_parent', '_cgroup_parent_fd', '_consumer', '_engine', '_journal'):
             value = getattr(self, name, None)
             if value is not None:
                 try:
-                    if name == '_socket_parent':
+                    if name in ('_socket_parent', '_cgroup_parent_fd'):
                         os.close(value)
                     else:
                         value.close()
