@@ -1,4 +1,4 @@
-# Opt-in candidate only: the existing main publication recipe is unchanged.
+# Main release recipe: the caller supplies the reviewed immutable inputs.
 # Caller must supply a reviewed immutable Node ref and an independently pinned
 # `hub_model` named context containing manifest.json and model/ regular files.
 ARG HUB_NODE_IMAGE

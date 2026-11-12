@@ -1,9 +1,9 @@
 # Hub build input verification candidate
 
-This is an opt-in input checker, not an image builder, provenance attestation,
-or change to the existing release workflow. It does not modify the current
-Dockerfile or enforce its use. The present control recipe still uses the mutable
-`node:24-bookworm-slim` reference and downloads a FastEmbed model while building.
+This input checker is not an image builder or provenance attestation. The main
+control-image workflow now uses the pinned recipe and materializes the fixed
+public model snapshot as described in [pinned release inputs](pinned-release-model-input.md).
+The older `Dockerfile.hub-control` remains available for non-release uses.
 
 Before building a revised recipe, an independent reviewer must supply (1) the
 full immutable Node OCI reference `docker.io/library/node@sha256:<64 hex>` and
@@ -33,7 +33,7 @@ It cannot stop a concurrent writer changing files after verification, prove OCI
 platform selection, authenticate upstream origin or prove that these files load
 correctly. Its manifest digest is meaningful only if independently obtained.
 
-`docker/Dockerfile.hub-control.pinned` is a separate opt-in candidate. It accepts
+`docker/Dockerfile.hub-control.pinned` accepts
 an explicit Node digest and a BuildKit named context `hub_model` containing
 `manifest.json` and `model/`. It verifies the copied context, copies the verified
 files to `/opt/fastembed-cache/bge-small-en-v1.5/`, verifies again, and loads
@@ -57,8 +57,7 @@ docker buildx build --file docker/Dockerfile.hub-control.pinned \
 Select a suitable local output and ensure the context contains only the reviewed
 model and manifest; do not publish or use a shared builder by accident. Record
 the builder, base platform manifest/config, wheel and model inputs, then test
-installed code and UI against the exact image digest. This opt-in file is not
-used by the current main publication workflow: the old path remains unproven.
-Any workflow cutover needs separately supplied and reviewed pins and must retain
-main-only Actions. Do not claim reproducibility or deployed acceptance until
-the actual build and offline model loading are proven.
+installed code and UI against the exact image digest. The main publication
+workflow supplies the reviewed pins and retains main-only Actions. Do not claim
+reproducibility or deployed acceptance until the actual build and offline model
+loading are proven.
