@@ -540,7 +540,18 @@ class _Journal:
                     db.execute('CREATE TABLE issuance (launch_id TEXT PRIMARY KEY, nonce TEXT UNIQUE NOT NULL, '
                                'state TEXT NOT NULL, receipt_digest TEXT)')
                     db.execute('PRAGMA user_version=1')
-                _require(db.execute('PRAGMA user_version').fetchone()[0] == 1)
+                version = db.execute('PRAGMA user_version').fetchone()[0]
+                _require(version in (1, 2))
+                rows = db.execute('SELECT data FROM launch').fetchall()
+                _require(len(rows) <= 1)
+                records = [_strict(row[0].encode('utf-8'), 65536) for row in rows]
+                _require(all(type(record) is dict for record in records))
+                if version == 1:
+                    _require(all('daemon_scope_observation' not in record for record in records))
+                else:
+                    _require(len(records) == 1 and type(records[0].get('daemon_scope_observation')) is dict
+                             and records[0]['daemon_scope_observation'].get('verification')
+                                 in ('provisional', 'postcheck_complete'))
                 _require({row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")} == {'launch', 'issuance'})
         except BaseException:
             self.close()
@@ -583,6 +594,9 @@ class _Journal:
             _require(row is not None)
             prior = _strict(row[0].encode('utf-8'), 65536)
             _require(type(prior) is dict)
+            version = db.execute('PRAGMA user_version').fetchone()[0]
+            _require((version == 1 and 'daemon_scope_observation' not in prior)
+                     or (version == 2 and type(prior.get('daemon_scope_observation')) is dict))
             retained = dict(data)
             if 'daemon_scope_observation' in prior:
                 retained['daemon_scope_observation'] = prior['daemon_scope_observation']
@@ -592,6 +606,7 @@ class _Journal:
     def record_empty_daemon_scope(self, identity, expected_record, observation):
         """Retain one post-stop scope snapshot; it grants no recovery authority."""
         with self.transaction() as db:
+            _require(db.execute('PRAGMA user_version').fetchone() == (1,))
             row = db.execute('SELECT state,data FROM launch WHERE id=?', (identity,)).fetchone()
             _require(row is not None and row[0] == 'stopped')
             data = _strict(row[1].encode('utf-8'), 65536)
@@ -599,10 +614,14 @@ class _Journal:
             data['daemon_scope_observation'] = observation
             _require(db.execute('UPDATE launch SET data=? WHERE id=? AND state=? AND data=?',
                 (_canonical(data).decode(), identity, 'stopped', row[1])).rowcount == 1)
+            # Same transaction as the first observation: legacy binaries
+            # reject v2 before they can execute their destructive state update.
+            db.execute('PRAGMA user_version=2')
 
     def confirm_empty_daemon_scope(self, identity, observation):
         """Record that a second scope check finished, never prove effect outcome."""
         with self.transaction() as db:
+            _require(db.execute('PRAGMA user_version').fetchone() == (2,))
             row = db.execute('SELECT state,data FROM launch WHERE id=?', (identity,)).fetchone()
             _require(row is not None and row[0] == 'stopped')
             data = _strict(row[1].encode('utf-8'), 65536)

@@ -1712,3 +1712,67 @@ def test_supervisor_records_empty_daemon_scope_without_claiming_effect_outcome(
                 except subprocess.TimeoutExpired:
                     child.kill()
                     child.wait(timeout=2)
+
+
+def test_scope_evidence_upgrades_version_atomically_and_blocks_legacy_writer(root_journal, monkeypatch):
+    """v1 binaries check the same user_version while holding the exclusive owner lock."""
+    from contextlib import contextmanager
+    journal = root_journal
+    identity = str(uuid4())
+    journal.reserve(identity, {'expected': 'original'})
+    journal.state(identity, 'stopped', {'expected': 'original'})
+    observation = {'verification': 'provisional', 'effect_outcome_proven': False}
+    original_transaction = journal.transaction
+    @contextmanager
+    def failing_transaction():
+        with original_transaction() as db:
+            yield db
+            raise RuntimeError('synthetic rollback before commit')
+    monkeypatch.setattr(journal, 'transaction', failing_transaction)
+    with pytest.raises(RuntimeError):
+        journal.record_empty_daemon_scope(identity, {'expected': 'original'}, observation)
+    monkeypatch.setattr(journal, 'transaction', original_transaction)
+    with journal.transaction() as db:
+        assert db.execute('PRAGMA user_version').fetchone() == (1,)
+        assert 'daemon_scope_observation' not in json.loads(db.execute('SELECT data FROM launch').fetchone()[0])
+    journal.record_empty_daemon_scope(identity, {'expected': 'original'}, observation)
+    path = str(journal.path)
+    with journal.transaction() as db:
+        assert db.execute('PRAGMA user_version').fetchone() == (2,)
+        before = db.execute('SELECT state,data FROM launch').fetchone()
+    with pytest.raises(Exception):
+        launch._Journal(path, create=False)  # no old or new concurrent owner
+    journal.close()
+    # The previous implementation requires exactly user_version 1 before it
+    # can call state(); reject here as its actual constructor does.
+    import sqlite3
+    with sqlite3.connect(path) as legacy:
+        assert legacy.execute('PRAGMA user_version').fetchone() != (1,)
+        assert legacy.execute('SELECT state,data FROM launch').fetchone() == before
+    reopened = launch._Journal(path, create=False)
+    try:
+        reopened.state(identity, 'held', {'expected': 'original'})
+        with reopened.transaction() as db:
+            state, raw = db.execute('SELECT state,data FROM launch').fetchone()
+        assert state == 'held' and json.loads(raw)['daemon_scope_observation'] == observation
+    finally:
+        reopened.close()
+
+
+def test_legacy_version_with_unprotected_scope_evidence_requires_review(root_journal):
+    journal = root_journal
+    identity = str(uuid4())
+    journal.reserve(identity, {'expected': 'original'})
+    # Reproduce the earlier candidate's v1 evidence without promoting it.
+    data = {'expected': 'original', 'daemon_scope_observation': {'verification': 'provisional'}}
+    with journal.transaction() as db:
+        db.execute('UPDATE launch SET data=? WHERE id=?', (launch._canonical(data).decode(), identity))
+        assert db.execute('PRAGMA user_version').fetchone() == (1,)
+    path = str(journal.path)
+    journal.close()
+    with pytest.raises(launch.LaunchSupervisorError):
+        launch._Journal(path, create=False)
+    import sqlite3
+    with sqlite3.connect(path) as db:
+        assert db.execute('PRAGMA user_version').fetchone() == (1,)
+        assert json.loads(db.execute('SELECT data FROM launch').fetchone()[0]) == data

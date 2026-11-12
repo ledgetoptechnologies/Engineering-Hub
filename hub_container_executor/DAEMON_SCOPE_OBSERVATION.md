@@ -26,3 +26,13 @@ not prove an interrupted Docker request completed, that all writers were fenced,
 or that any effect outcome is correct. An independently enforced closure and
 exact host outcome remain necessary for any future held-effect recovery. This
 API must not be used to clear a hold or claim staging acceptance.
+
+The first scope observation and the journal's `user_version` change from 1 to 2
+commit in the same SQLite transaction. The previous v1 supervisor rejects v2
+while acquiring the same exclusive owner lock, before it can write state. The
+new supervisor reads both versions and preserves v2 observations across later
+state changes; the table schema is unchanged. A v1 journal already containing
+an observation from an earlier candidate is ambiguous and is rejected without
+automatic migration or deletion. Preserve that journal for explicit review.
+This version check is not protection against an administrator or other code
+that bypasses the journal's ownership protocol and writes SQLite directly.
