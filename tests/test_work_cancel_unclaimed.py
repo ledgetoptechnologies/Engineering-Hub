@@ -104,6 +104,9 @@ def test_same_task_single_open_idempotent_and_cancel_allows_new(setup_queue):
     with pytest.raises(HubError,match='work_task_already_queued'):
         submit(queue,'second',target=target)
     queue.cancel_unclaimed(actor='codex',job_id=first['id'])
+    replay = submit(queue, 'same', target=target)
+    assert replay['id'] == first['id'] and replay['state'] == 'cancelled'
+    assert queue.claim(worker=w('codex')) is None
     second=submit(queue,'second',target=target)
     assert second['id']!=first['id']
     claim=queue.claim(worker=w('codex'))
