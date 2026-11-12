@@ -268,7 +268,7 @@ export function StagingPage({ hub, actions, view = "overview" }: {
                   <code>{run.artifact_digest}</code>
                   <p className="small-text">Fence {run.fencing_generation} · {run.events.length} recorded events</p>
                   {!hub.demo && hub.session?.authenticated && (
-                    <RunReleaseEvidence runId={run.id} onUnauthorized={hub.clearPrivateWorkspace} />
+                    <RunReleaseEvidence key={`${run.id}-${hub.session?.actor ?? "signed-out"}`} runId={run.id} onUnauthorized={hub.clearPrivateWorkspace} />
                   )}
                 </details>
               ))}
