@@ -1,8 +1,8 @@
 """Compare retained journal evidence against independently supplied effect data.
 
 This is an offline comparison, not host attestation, a fence, or permission to
-execute, replay, adopt, stop, or release anything. Reads are not an atomic
-snapshot across the journal and key. The caller must supply the complete binding
+execute, replay, adopt, stop, or release anything. The journal snapshot and key
+check are not atomic together. The caller must supply the complete binding
 from an independently trusted source, not reconstruct it from the stored row.
 """
 import hmac
@@ -26,10 +26,10 @@ def verify_retained_binding(journal, key, expected):
                 or key._journal_identity != journal._owner._database_identity):
             raise ValueError
         canonical = canonical_nonsecret_binding(expected)
-        record = journal.inspect_record(expected.operation_id)
-        stored = journal.inspect_binding(expected.operation_id)
-        if record is None or stored is None:
+        snapshot = journal.inspect_bound_record(expected.operation_id)
+        if snapshot is None:
             raise ValueError
+        record, stored = snapshot
         if (record.operation_id != expected.operation_id or record.kind != expected.kind
                 or stored.boot_id != expected.boot_id or stored.daemon_pid != expected.daemon_pid
                 or stored.daemon_start != expected.daemon_start_ticks

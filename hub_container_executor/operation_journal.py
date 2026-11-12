@@ -378,6 +378,27 @@ class SQLiteOperationJournal:
             _row(row)
             return None if row is None else JournalOperationRecord(*row)
 
+    def inspect_bound_record(self, operation_id: str):
+        """Read a record and its binding together under one ownership transaction.
+
+        This is evidence only; neither a completed receipt nor this snapshot
+        authenticates a host effect or grants recovery authority.
+        """
+        _operation(operation_id)
+        with self._transaction() as db:
+            if db.execute("PRAGMA user_version").fetchone() != (2,):
+                return None
+            row = db.execute("SELECT j.operation_id,j.kind,j.state,j.container_id,b.boot_id,b.daemon_pid,b.daemon_start,b.resource_name,b.target_id,b.request_mac,b.fence,b.owner_epoch FROM private_operation_journal j JOIN private_operation_binding b ON b.operation_id=j.operation_id WHERE j.operation_id=?", (operation_id,)).fetchone()
+            if row is None:
+                return None
+            _row(row[:4])
+            _validate_binding_row((row[0], row[1], *row[4:]))
+            if db.execute("SELECT 1 FROM hub_pilot_owner_epochs WHERE epoch=?", (row[-1],)).fetchone() is None:
+                raise OperationJournalError("Unknown binding owner epoch")
+            if row[2] == "completed" and row[8] is not None and row[3] != row[8]:
+                raise OperationJournalError("Operation receipt conflicts with bound target")
+            return JournalOperationRecord(*row[:4]), OperationBinding(*row[4:])
+
     def inspect(self, operation_id: str) -> OperationObservation | None:
         _operation(operation_id)
         with self._transaction() as db:

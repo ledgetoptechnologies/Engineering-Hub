@@ -56,6 +56,29 @@ def test_unbound_legacy_record_is_not_authenticated(tmp_path):
             key.close()
 
 
+def test_verifier_reads_record_and_binding_in_one_snapshot(tmp_path, monkeypatch):
+    root = tmp_path / 'private'
+    root.mkdir(mode=0o700)
+    path = root / 'journal.sqlite'
+    key_id = create_for_new_journal(root, path.name)
+    with SQLiteOperationJournal(path, create=True, allow_ephemeral_test_storage=True) as journal:
+        key = EffectMacKey(root, path.name, expected_key_id=key_id)
+        try:
+            expected = replace(fixture(), owner_epoch=journal._owner.epoch)
+            journal.enable_bindings()
+            journal.begin_bound(expected.operation_id, expected.kind, OperationBinding(
+                expected.boot_id, expected.daemon_pid, expected.daemon_start_ticks,
+                expected.resource_name, expected.container_id,
+                key.mac(canonical_nonsecret_binding(expected)), expected.fence))
+            def reject_split_read(*args):
+                raise AssertionError('split journal read')
+            monkeypatch.setattr(journal, 'inspect_record', reject_split_read)
+            monkeypatch.setattr(journal, 'inspect_binding', reject_split_read)
+            assert verify_retained_binding(journal, key, expected) is None
+        finally:
+            key.close()
+
+
 def test_replaced_key_file_and_closed_handles_fail_closed(tmp_path):
     root = tmp_path / 'private'
     root.mkdir(mode=0o700)
