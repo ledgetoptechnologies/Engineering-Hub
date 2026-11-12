@@ -6,11 +6,11 @@ self-approval occurs. A missing, malformed, changed or revoked record fails
 closed. An accepted Engine call cannot be cancelled by revoking the file.
 """
 import ctypes
+import asyncio
 from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
-import select
 import struct
 import sys
 import time
@@ -46,9 +46,11 @@ class ProtectedApprovalLease:
         return accepted
 
 
-def wait_for_postlaunch_approval(path, *, verifier, release, approver_public_key, expected_engine_id, timeout_ms):
+async def wait_for_postlaunch_approval(path, *, verifier, release, approver_public_key, expected_engine_id, timeout_ms):
     """Subscribe before checking existence; wait only for the exact leaf event."""
     fd = None
+    registered = False
+    loop = asyncio.get_running_loop()
     try:
         if (sys.platform != 'linux' or type(path) is not str or not path.startswith('/')
                 or os.path.normpath(path) != path or type(timeout_ms) is not int or not 100 <= timeout_ms <= 3600000):
@@ -64,8 +66,6 @@ def wait_for_postlaunch_approval(path, *, verifier, release, approver_public_key
         fd = init(os.O_CLOEXEC | os.O_NONBLOCK)
         if fd < 0 or add(fd, os.fsencode(target.parent), _MOVED_TO | _CREATE | _CLOSE_WRITE | _INVALID) < 0:
             raise OSError('native approval watch unavailable')
-        poller = select.poll()
-        poller.register(fd, select.POLLIN)
         deadline = time.monotonic() + timeout_ms / 1000
         # Receipt expiry is independently enforced while waiting and while read.
         verifier.accepted_launch_receipt()
@@ -85,9 +85,16 @@ def wait_for_postlaunch_approval(path, *, verifier, release, approver_public_key
             remaining = min(deadline, verifier._deadline) - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError
-            ready = poller.poll(max(1, int(remaining * 1000)))
-            if not ready:
-                raise TimeoutError
+            ready = loop.create_future()
+            def notify():
+                if not ready.done(): ready.set_result(None)
+            loop.add_reader(fd, notify)
+            registered = True
+            try:
+                await asyncio.wait_for(ready, timeout=remaining)
+            finally:
+                loop.remove_reader(fd)
+                registered = False
             data = os.read(fd, 65536)
             offset = 0
             matched = False
@@ -107,5 +114,7 @@ def wait_for_postlaunch_approval(path, *, verifier, release, approver_public_key
     except Exception:
         raise PostLaunchApprovalError('Independent launch approval unavailable') from None
     finally:
+        if registered:
+            loop.remove_reader(fd)
         if fd is not None and fd >= 0:
             os.close(fd)

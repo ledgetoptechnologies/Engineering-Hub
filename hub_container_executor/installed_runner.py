@@ -282,7 +282,7 @@ async def run_installed_executor(config):
                 from .postlaunch_delivery import wait_for_postlaunch_approval
                 pins = CurrentExecutorReleasePins(**{name: getattr(config.release, name)
                     for name in CurrentExecutorReleasePins.__dataclass_fields__})
-                lease = wait_for_postlaunch_approval(config.bound_profile.approval_path,
+                lease = await wait_for_postlaunch_approval(config.bound_profile.approval_path,
                     verifier=verifier, release=pins, approver_public_key=config.bound_profile.approver_public_key,
                     expected_engine_id=config.binding.daemon_identity, timeout_ms=config.bound_profile.approval_wait_ms)
                 observer = CurrentExecutorObserver(release=pins, launch=lease.approval.launch,

@@ -1,5 +1,6 @@
 """Synthetic signed post-launch delivery; read-only mounts are tested elsewhere."""
 import base64
+import asyncio
 from dataclasses import asdict
 import json
 import os
@@ -22,7 +23,8 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('ascii')
 
 
-def test_postlaunch_wait_receives_independent_record_then_revocation_denies(tmp_path, monkeypatch, clock, enrolled):
+@pytest.mark.asyncio
+async def test_postlaunch_wait_receives_independent_record_then_revocation_denies(tmp_path, monkeypatch, clock, enrolled):
     enrollment, issuer_key = enrolled
     verifier = LaunchReceiptIdentityVerifier(enrollment=enrollment,
         issuer_transport=Issuer(enrollment, issuer_key, clock),
@@ -49,7 +51,7 @@ def test_postlaunch_wait_receives_independent_record_then_revocation_denies(tmp_
     timer = threading.Timer(.1, publish)
     timer.start()
     try:
-        lease = delivery.wait_for_postlaunch_approval(str(target), verifier=verifier, release=release,
+        lease = await delivery.wait_for_postlaunch_approval(str(target), verifier=verifier, release=release,
             approver_public_key=public, expected_engine_id='approved-engine', timeout_ms=3000)
         assert lease.check().launch == launch
         target.unlink()
@@ -58,3 +60,30 @@ def test_postlaunch_wait_receives_independent_record_then_revocation_denies(tmp_
         timer.join(timeout=2)
         verifier.close()
     assert not timer.is_alive()
+
+
+@pytest.mark.asyncio
+async def test_pending_wait_cancels_and_closes_inotify(tmp_path, monkeypatch, clock, enrolled):
+    enrollment, issuer_key = enrolled
+    verifier = LaunchReceiptIdentityVerifier(enrollment=enrollment,
+        issuer_transport=Issuer(enrollment, issuer_key, clock),
+        max_receipt_lifetime_seconds=60, exchange_timeout_ms=2000)
+    release = CurrentExecutorReleasePins(**{name: getattr(enrollment, name)
+        for name in CurrentExecutorReleasePins.__dataclass_fields__})
+    closed = []
+    real_close = delivery.os.close
+    def close(fd):
+        closed.append(fd)
+        return real_close(fd)
+    monkeypatch.setattr(delivery.os, 'close', close)
+    task = asyncio.create_task(delivery.wait_for_postlaunch_approval(str(tmp_path / 'absent'),
+        verifier=verifier, release=release, approver_public_key=bytes(32),
+        expected_engine_id='approved-engine', timeout_ms=3000))
+    try:
+        await asyncio.sleep(0)
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError): await task
+        assert closed
+    finally:
+        verifier.close()
