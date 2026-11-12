@@ -6,7 +6,7 @@ are not one atomic snapshot and hostile same-UID writers are out of scope.
 import time
 import uuid
 from .backend import BaselineIdentity, StateGeneration
-from .daemon_backend import DockerEngineBackend
+from .daemon_backend import DockerEngineBackend, TrustedEffectBindingProvider
 from .operation_journal import SQLiteOperationJournal
 from .state_provider import FrozenSQLiteStateProvisioner
 from .runtime_profile import probe_set_digest
@@ -18,9 +18,28 @@ def require_resources(backend, state):
         raise ValueError('single pilot requires exact private providers')
 
 
+def require_journal_ready(adapter):
+    """Allow v2 only with an explicit guard, bound transport and receipt check."""
+    backend = adapter.backend
+    provider = getattr(backend, 'effect_binding_provider', None)
+    if provider is None:
+        backend.operation_journal.require_no_pending()
+        return False
+    from .adapter import TrustedEffectContextGuard
+    guard = getattr(adapter, 'effect_context_guard', None)
+    if (type(backend) is not DockerEngineBackend or type(provider) is not TrustedEffectBindingProvider
+            or type(guard) is not TrustedEffectContextGuard
+            or getattr(guard.scope, '__self__', None) is not backend
+            or getattr(guard.scope, '__func__', None) is not DockerEngineBackend.effect_context_scope
+            or not all(callable(x) for x in (provider.compare_actual, provider.recheck, provider.verify_completed))):
+        raise ValueError('bound single pilot requires explicit guarded admission')
+    backend.operation_journal.require_no_pending(allow_bound=True)
+    return True
+
+
 def verify_phase(adapter, request, response, deadline):
     journal = adapter.backend.operation_journal
-    journal.require_no_pending()
+    bound = require_journal_ready(adapter)
     adapter.state_provisioner.require_complete_reservations(deadline_monotonic=deadline)
     if response.replayed or response.model_dump(include=set(type(request).model_fields)) != request.model_dump():
         raise ValueError('phase identity mismatch')
@@ -81,5 +100,8 @@ def verify_phase(adapter, request, response, deadline):
         record = journal.inspect_record(row['operation_id'])
         if record is None or record.kind != kind or record.state != 'completed' or record.container_id != evidence.container_id:
             raise ValueError('journal receipt mismatch')
+        if bound and adapter.backend.effect_binding_provider.verify_completed(
+                row['operation_id'], kind, request, evidence.container_id) is not True:
+            raise ValueError('bound journal evidence unavailable')
     if time.monotonic() >= deadline:
         raise ValueError('phase verification timed out')

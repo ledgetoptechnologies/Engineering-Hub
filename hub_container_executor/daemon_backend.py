@@ -238,6 +238,7 @@ class TrustedEffectBindingProvider:
     create: Callable
     compare_actual: Callable | None = None
     recheck: Callable | None = None
+    verify_completed: Callable | None = None
 
     def __post_init__(self):
         if not callable(self.create):
@@ -246,6 +247,8 @@ class TrustedEffectBindingProvider:
             raise TypeError("actual effect comparator must be callable")
         if self.recheck is not None and not callable(self.recheck):
             raise TypeError("effect recheck must be callable")
+        if self.verify_completed is not None and not callable(self.verify_completed):
+            raise TypeError("completed effect verifier must be callable")
 
 
 @dataclass(frozen=True)

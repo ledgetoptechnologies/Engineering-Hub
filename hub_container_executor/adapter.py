@@ -258,7 +258,8 @@ class HostAdapter:
                         return prior.response
                     self.ledger.arm_single_pilot(request)
                     deadline = time.monotonic() + self.manifest.timeouts.total_command_ms / 1000
-                    self.backend.operation_journal.require_no_pending()
+                    from .single_pilot_evidence import require_journal_ready
+                    require_journal_ready(self)
                     self.state_provisioner.require_complete_reservations(deadline_monotonic=deadline)
                     return self._submit_active(request)
                 except Exception:

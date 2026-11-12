@@ -357,11 +357,18 @@ class SQLiteOperationJournal:
                 db.execute("UPDATE private_operation_journal SET state='completed', container_id=? WHERE operation_id=?",
                            (container_id, operation_id))
 
-    def require_no_pending(self) -> None:
-        """Hold if the v1 journal contains any unresolved private intent."""
+    def require_no_pending(self, *, allow_bound=False) -> None:
+        """Hold on unresolved intents; bound journals require explicit opt-in."""
+        if type(allow_bound) is not bool:
+            raise OperationJournalError('Explicit bound mode required')
         with self._transaction() as db:
-            if db.execute('PRAGMA user_version').fetchone() != (1,):
+            version = db.execute('PRAGMA user_version').fetchone()
+            if version != (1,) and not (allow_bound and version == (2,)):
                 raise OperationJournalError('Single pilot requires v1 journal')
+            if version == (2,):
+                _schema(db, inspect_rows=True)
+                if db.execute('SELECT 1 FROM private_operation_journal j LEFT JOIN private_operation_binding b ON b.operation_id=j.operation_id WHERE b.operation_id IS NULL LIMIT 1').fetchone():
+                    raise OperationJournalError('Unbound historical operation requires recovery')
             if db.execute("SELECT 1 FROM private_operation_journal WHERE state='pending' LIMIT 1").fetchone():
                 raise OperationJournalError('Private operation intent remains pending')
 

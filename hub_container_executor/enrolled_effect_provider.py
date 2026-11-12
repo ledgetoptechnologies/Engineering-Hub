@@ -67,4 +67,19 @@ def enrolled_effect_provider(journal, key, effects, *, verify_generation):
         # the subsequent socket request are not an atomic host fence.
         return compare_enrolled_effect(actual, pair[0], verify_generation)
 
-    return TrustedEffectBindingProvider(create, compare, recheck)
+    def verify_completed(operation_id, kind, request, container_id):
+        pair = by_id.get(operation_id)
+        if pair is None:
+            return False
+        effect, _ = pair
+        if (effect.kind != kind or effect.run_id != request.run_id
+                or effect.fence != request.fencing_generation
+                or effect.owner_epoch != epoch
+                or (effect.container_id is not None and effect.container_id != container_id)):
+            return False
+        verify_retained_binding(journal, key, effect)
+        snapshot = journal.inspect_bound_record(operation_id)
+        return (snapshot is not None and snapshot[0].state == 'completed'
+                and snapshot[0].kind == kind and snapshot[0].container_id == container_id)
+
+    return TrustedEffectBindingProvider(create, compare, recheck, verify_completed)

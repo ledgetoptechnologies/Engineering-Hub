@@ -73,6 +73,34 @@ def test_bound_target_validation_and_no_plaintext_binding(path):
 
 
 @LINUX
+def test_single_pilot_bound_journal_requires_opt_in_and_no_pending(path):
+    with journal(path) as store:
+        store.enable_bindings()
+        with pytest.raises(OperationJournalError):
+            store.require_no_pending()
+        store.require_no_pending(allow_bound=True)
+        identity = str(uuid4())
+        store.begin_bound(identity, 'stop', binding(name=None, target=CID))
+        with pytest.raises(OperationJournalError):
+            store.require_no_pending(allow_bound=True)
+        store.completed(identity, 'stop', CID)
+        store.require_no_pending(allow_bound=True)
+        with pytest.raises(OperationJournalConflict):
+            store.begin_bound(identity, 'stop', binding(name=None, target=CID))
+
+
+@LINUX
+def test_single_pilot_bound_mode_refuses_migrated_unbound_history(path):
+    with journal(path) as store:
+        identity = str(uuid4())
+        store.begin(identity, 'stop')
+        store.completed(identity, 'stop', CID)
+        store.enable_bindings()
+        with pytest.raises(OperationJournalError):
+            store.require_no_pending(allow_bound=True)
+
+
+@LINUX
 @pytest.mark.parametrize("kind", ("start", "stop", "probe"))
 def test_bound_completion_requires_original_container_and_allows_exact_retry(path, kind):
     identity = str(uuid4())

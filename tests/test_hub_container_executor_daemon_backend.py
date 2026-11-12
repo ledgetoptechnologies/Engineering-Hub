@@ -61,6 +61,30 @@ def test_opt_in_bound_journal_matches_exact_target_before_effect(tmp_path):
         backend.close()
 
 
+def test_single_pilot_bound_admission_requires_actual_backend_scope(tmp_path):
+    from types import SimpleNamespace
+    from hub_container_executor.adapter import TrustedEffectContextGuard
+    from hub_container_executor.single_pilot_evidence import require_journal_ready
+    manifest, _, _ = verified_image()
+    calls = []
+    class Journal:
+        def require_no_pending(self, **kwargs): calls.append(kwargs)
+    provider = TrustedEffectBindingProvider(lambda *_: None, lambda _: True, lambda _: True, lambda *_: True)
+    backend = DockerEngineBackend(binding(manifest, tmp_path), operation_journal=Journal(),
+                                 effect_binding_provider=provider,
+                                 test_transport=httpx.MockTransport(lambda _: pytest.fail('unexpected effect')))
+    try:
+        subject = SimpleNamespace(backend=backend, effect_context_guard=None)
+        with pytest.raises(ValueError): require_journal_ready(subject)
+        subject.effect_context_guard = TrustedEffectContextGuard(lambda _: True, lambda _: None)
+        with pytest.raises(ValueError): require_journal_ready(subject)
+        subject.effect_context_guard = TrustedEffectContextGuard(lambda _: True, backend.effect_context_scope)
+        assert require_journal_ready(subject) is True
+        assert calls == [{'allow_bound': True}]
+    finally:
+        backend.close()
+
+
 def test_enrolled_actual_projection_rejects_mismatch_and_unverified_generation(tmp_path):
     from hub_container_executor.backend import ActualImageSelection, ContainerObservation
     from hub_container_executor.runtime_profile import probe_set_digest

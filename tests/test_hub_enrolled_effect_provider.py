@@ -96,6 +96,10 @@ def test_adapter_through_bound_journal_to_fake_engine(tmp_path, monkeypatch, kin
                 if succeeds:
                     adapter._effect(request, kind, callback, 30000, time.monotonic() + 30, lambda _: {})
                     assert journal.inspect_record(operation).state == 'completed'
+                    assert backend.effect_binding_provider.verify_completed(operation, kind, request, 'c' * 64)
+                    assert not backend.effect_binding_provider.verify_completed(operation, kind,
+                        request.model_copy(update={'fencing_generation': request.fencing_generation + 1}), 'c' * 64)
+                    assert not backend.effect_binding_provider.verify_completed(operation, kind, request, 'd' * 64)
                     assert sum(item[0] == 'POST' for item in requests) > before
                 else:
                     with pytest.raises(_Held):
