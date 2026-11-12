@@ -1081,7 +1081,7 @@ def test_probe_missing_or_mismatched_verified_source_cache_denied_before_journal
         elif variant == "create-binding":
             backend._container_images["c" * 64] = replace(image, source_commit="d" * 40)
         effects = []
-        monkeypatch.setattr(backend, "_journal_begin", lambda *args: effects.append(args))
+        monkeypatch.setattr(backend, "_journal_begin", lambda *args, **kwargs: effects.append(args))
         before = len(requests)
         with pytest.raises(DaemonBackendError, match="verified source-image binding"):
             backend.run_compiled_probes("c" * 64, manifest.probes.candidate,
@@ -1327,7 +1327,7 @@ def test_invalid_bypassed_grace_is_denied_before_exec_or_journal(tmp_path, monke
     probes = list(manifest.probes.candidate)
     probes[index] = probes[index].model_copy(update={'startup_grace_ms':value})
     journal=[]
-    monkeypatch.setattr(backend,'_journal_begin',lambda *args:journal.append(args))
+    monkeypatch.setattr(backend,'_journal_begin',lambda *args, **kwargs:journal.append(args))
     try:
         before=len(requests)
         with pytest.raises(DaemonBackendError):
