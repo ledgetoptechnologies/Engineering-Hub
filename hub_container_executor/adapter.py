@@ -14,7 +14,8 @@ import re
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from typing import Callable
 
 from engineering_hub.container_pilot_client import (
     ContainerPilotEvidence,
@@ -52,6 +53,30 @@ _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _OPAQUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 
 
+@dataclass(frozen=True)
+class EffectCallContext:
+    """Original admitted request and durable operation; not host authority."""
+    request: ContainerPilotRequest
+    operation_id: str
+    kind: str
+
+
+@dataclass(frozen=True)
+class TrustedEffectContextGuard:
+    """Explicitly supplied verifier and scoped transport, never auto-enrolled.
+
+    The verifier must check independently enrolled live generation and fencing;
+    the request's asserted fence alone is not proof of either. The scope must
+    carry the exact context to the effect consumer without granting replay.
+    """
+    verify: Callable
+    scope: Callable
+
+    def __post_init__(self):
+        if not callable(self.verify) or not callable(self.scope):
+            raise TypeError('effect context verifier and scope required')
+
+
 class KnownTerminalFailure(RuntimeError):
     """Backend says this exact operation reached a terminal, non-late failure."""
 
@@ -76,11 +101,14 @@ class HostAdapter:
                  backend: PilotBackend | None = None,
                  baseline_provider=None, state_provisioner=None, secret_resolver=None,
                  driver_identity_verifier: TrustedDriverIdentityVerifier | None = None,
+                 effect_context_guard: TrustedEffectContextGuard | None = None,
                  single_pilot_protocol: bool = False):
         if type(manifest) is not PilotManifest:
             raise TypeError("shared PilotManifest required")
         if type(single_pilot_protocol) is not bool:
             raise TypeError('single pilot protocol requires explicit boolean')
+        if effect_context_guard is not None and type(effect_context_guard) is not TrustedEffectContextGuard:
+            raise TypeError('explicit trusted effect context guard required')
         if single_pilot_protocol:
             from .single_pilot_evidence import require_resources
             require_resources(backend, state_provisioner)
@@ -97,6 +125,7 @@ class HostAdapter:
         self.state_provisioner = state_provisioner
         self.secret_resolver = secret_resolver
         self.driver_identity_verifier = driver_identity_verifier
+        self.effect_context_guard = effect_context_guard
         self._owner_pid = os.getpid()
         self._lifecycle = threading.Condition()
         self._active_operations = 0
@@ -485,7 +514,14 @@ class HostAdapter:
             # Durable admission can wait on SQLite; recompute the budget only
             # after admission and never start an effect with an expired intent.
             timeout = self._timeout(deadline, phase_limit)
-            result = callback(operation_id, timeout)
+            if self.effect_context_guard is None:
+                result = callback(operation_id, timeout)
+            else:
+                context = EffectCallContext(request, operation_id, kind)
+                if self.effect_context_guard.verify(context) is not True:
+                    raise PermissionError('effect context denied')
+                with self.effect_context_guard.scope(context):
+                    result = callback(operation_id, timeout)
             # A deadline detects an overrun; it is not cancellation. Keep the
             # intent held so no later effect can run after an untrusted worker returns.
             self._timeout(deadline, phase_limit)

@@ -4,6 +4,7 @@ import json
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import replace
 
 import pytest
@@ -11,7 +12,7 @@ import pytest
 import hub_container_executor.adapter as adapter_module
 from engineering_hub.container_pilot_client import ContainerPilotRequest
 from engineering_hub.container_pilot_manifest import PilotManifest
-from hub_container_executor.adapter import HostAdapter, KnownTerminalFailure
+from hub_container_executor.adapter import HostAdapter, KnownTerminalFailure, TrustedEffectContextGuard
 from hub_container_executor.backend import (
     ActualImageSelection,
     BaselineIdentity,
@@ -258,6 +259,45 @@ def command(manifest, action, *, run_id=None, fence=1):
         candidate_commit=manifest.candidate.source_commit,
         policy_revision=manifest.policy_revision, fencing_generation=fence,
     )
+
+
+def test_explicit_effect_context_carries_original_admitted_run_and_fence(tmp_path):
+    adapter, backend, state, manifest = make_fixture(tmp_path)
+    request = command(manifest, 'deploy_container', fence=7)
+    seen, entered = [], []
+    def verify(context):
+        assert context.request is request
+        assert context.request.run_id == request.run_id and context.request.fencing_generation == 7
+        seen.append((context.operation_id, context.kind))
+        return True
+    @contextmanager
+    def scope(context):
+        entered.append(context.operation_id)
+        yield
+    adapter.effect_context_guard = TrustedEffectContextGuard(verify, scope)
+    try:
+        response = adapter.submit(request)
+        assert response.state == 'succeeded'
+        assert len(seen) >= 2 and entered == [operation for operation, _ in seen]
+        assert len({operation for operation, _ in seen}) == len(seen)
+    finally:
+        adapter.close()
+
+
+def test_explicit_effect_context_denial_holds_without_any_effect(tmp_path):
+    adapter, backend, state, manifest = make_fixture(tmp_path)
+    @contextmanager
+    def forbidden_scope(context):
+        pytest.fail('denied context reached scope')
+        yield
+    adapter.effect_context_guard = TrustedEffectContextGuard(lambda context: False, forbidden_scope)
+    try:
+        response = adapter.submit(command(manifest, 'deploy_container'))
+        assert response.state == 'held' and response.reason == 'inspect_required'
+        assert state.calls == []
+        assert not any(event in {'create', 'start', 'probe'} for event in backend.events)
+    finally:
+        adapter.close()
 
 
 def test_default_missing_trusted_verifier_fails_before_any_effect(tmp_path):
