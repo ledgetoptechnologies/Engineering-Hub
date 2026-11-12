@@ -16,11 +16,11 @@ class EffectBindingVerificationError(ValueError):
     """Sanitized rejection of unavailable or mismatched evidence."""
 
 
-def verify_retained_binding(journal, key, expected):
-    """Return no authority; raise unless stored identities and MAC match exactly."""
+def verify_retained_binding(journal, key, expected, *, require_pending=False):
+    """Compare binding; optionally require pending in the same journal snapshot."""
     try:
         if (type(journal) is not SQLiteOperationJournal or type(key) is not EffectMacKey
-                or type(expected) is not NonsecretEffectBinding):
+                or type(expected) is not NonsecretEffectBinding or type(require_pending) is not bool):
             raise ValueError
         if (key._directory / key._journal_name != journal.path
                 or key._journal_identity != journal._owner._database_identity):
@@ -30,6 +30,8 @@ def verify_retained_binding(journal, key, expected):
         if snapshot is None:
             raise ValueError
         record, stored = snapshot
+        if require_pending and record.state != 'pending':
+            raise ValueError
         if (record.operation_id != expected.operation_id or record.kind != expected.kind
                 or stored.boot_id != expected.boot_id or stored.daemon_pid != expected.daemon_pid
                 or stored.daemon_start != expected.daemon_start_ticks

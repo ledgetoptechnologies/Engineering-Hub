@@ -59,10 +59,9 @@ def enrolled_effect_provider(journal, key, effects, *, verify_generation):
         pair = by_id.get(actual.context.operation_id)
         if pair is None:
             return False
-        record = journal.inspect_record(actual.context.operation_id)
-        if record is None or record.state != 'pending':
-            return False
-        verify_retained_binding(journal, key, pair[0])
+        # Pending state and binding must come from the same owner-guarded SQLite
+        # snapshot. This does not make the later Engine request atomic with it.
+        verify_retained_binding(journal, key, pair[0], require_pending=True)
         # The independent live-generation/fence verification is deliberately
         # last, after key custody and durable intent checks. Its observation and
         # the subsequent socket request are not an atomic host fence.

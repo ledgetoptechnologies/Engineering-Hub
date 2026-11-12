@@ -79,6 +79,32 @@ def test_verifier_reads_record_and_binding_in_one_snapshot(tmp_path, monkeypatch
             key.close()
 
 
+def test_pending_required_uses_bound_snapshot_after_interleaved_completion(tmp_path, monkeypatch):
+    root = tmp_path / 'private'
+    root.mkdir(mode=0o700)
+    path = root / 'journal.sqlite'
+    key_id = create_for_new_journal(root, path.name)
+    with SQLiteOperationJournal(path, create=True, allow_ephemeral_test_storage=True) as journal:
+        key = EffectMacKey(root, path.name, expected_key_id=key_id)
+        try:
+            expected = replace(fixture(), owner_epoch=journal._owner.epoch)
+            journal.enable_bindings()
+            journal.begin_bound(expected.operation_id, expected.kind, OperationBinding(
+                expected.boot_id, expected.daemon_pid, expected.daemon_start_ticks,
+                expected.resource_name, expected.container_id,
+                key.mac(canonical_nonsecret_binding(expected)), expected.fence))
+            original = journal.inspect_bound_record
+            def complete_before_snapshot(operation_id):
+                journal.completed(operation_id, expected.kind, 'c' * 64)
+                return original(operation_id)
+            monkeypatch.setattr(journal, 'inspect_bound_record', complete_before_snapshot)
+            with pytest.raises(EffectBindingVerificationError):
+                verify_retained_binding(journal, key, expected, require_pending=True)
+            assert journal.inspect_record(expected.operation_id).state == 'completed'
+        finally:
+            key.close()
+
+
 def test_replaced_key_file_and_closed_handles_fail_closed(tmp_path):
     root = tmp_path / 'private'
     root.mkdir(mode=0o700)
