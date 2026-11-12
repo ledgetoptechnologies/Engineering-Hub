@@ -207,13 +207,19 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
             if bound_profile is not None:
                 from .effect_mac_key import EffectMacKey
                 with journal._transaction() as db:
-                    if db.execute('PRAGMA user_version').fetchone() != (2,):
-                        raise LocalResourcesError('Pre-existing bound journal required')
+                    expected_version = 3 if bound_profile.record_effect_responses else 2
+                    if db.execute('PRAGMA user_version').fetchone() != (expected_version,):
+                        raise LocalResourcesError('Pre-existing bound journal version required')
                 journal.require_no_pending(allow_bound=True)
                 key = EffectMacKey(journal_path.parent, journal_path.name, expected_key_id=bound_profile.key_id)
                 resources.callback(key.close)
             backend = DockerEngineBackend(binding, operation_journal=journal)
             resources.callback(backend.close)
+            if bound_profile is not None and bound_profile.record_effect_responses:
+                from .effect_response_recorder import DurableEffectResponseRecorder
+                recorder = DurableEffectResponseRecorder(journal, key)
+                resources.callback(recorder.close)
+                backend.effect_response_recorder = recorder
             if bound_profile is not None:
                 from .app_cgroup_observation import AppCgroupObserver
                 if bound_profile.app_cgroup is None:

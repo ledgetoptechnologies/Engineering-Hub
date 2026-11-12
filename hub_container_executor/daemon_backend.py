@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Protocol
 from urllib.parse import quote
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 
@@ -619,6 +619,7 @@ class DockerEngineBackend:
         self.operation_journal = operation_journal
         self.effect_binding_provider = effect_binding_provider
         self.app_cgroup_observer = None
+        self.effect_response_recorder = None
         self._using_test_transport = test_transport is not None
         transport = (test_transport if test_transport is not None
                      else httpx.HTTPTransport(uds=binding.unix_socket_path))
@@ -726,6 +727,36 @@ class DockerEngineBackend:
             method, route, deadline, expected_statuses={expected_status},
             json_body=json_body, params=params, body_limit=body_limit,
         )
+        return raw
+
+    def _effect_response(self, operation_id, step, route, deadline, *, expected_status,
+                         admitted, container_id=None, readiness_deadline=None,
+                         json_body=None, params=None, body_limit=_MAX_JSON):
+        """Optionally persist response intent before POST and safe reply before return."""
+        recorder = self.effect_response_recorder
+        if recorder is None:
+            return self._read_response('POST', route, deadline, expected_status=expected_status,
+                json_body=json_body, params=params, body_limit=body_limit)
+        from .effect_response_recorder import DurableEffectResponseRecorder
+        selected = _effect_context.get()
+        if (type(recorder) is not DurableEffectResponseRecorder or selected is None
+                or selected[0] is not self or selected[1].operation_id != operation_id
+                or recorder.journal is not self.operation_journal):
+            raise DaemonBackendError('durable response admission unavailable')
+        request_mac = recorder.begin(operation_id, step, route=route, params=params, body=json_body)
+        # Durable admission can block. Recheck both authority and app scope
+        # after it, immediately before the one permitted POST.
+        if container_id is None:
+            self._recheck_effect(admitted, deadline)
+        else:
+            self._recheck_contained_effect(admitted, container_id, deadline)
+        if readiness_deadline is not None and time.monotonic() >= readiness_deadline:
+            raise DaemonBackendError('health readiness admission deadline exceeded')
+        self._remaining(deadline)
+        raw = self._read_response('POST', route, deadline, expected_status=expected_status,
+            json_body=json_body, params=params, body_limit=body_limit)
+        recorder.complete(operation_id, step, request_mac, status=expected_status, raw=raw)
+        self._remaining(deadline)
         return raw
 
     def _archive_response(self, route, deadline):
@@ -906,6 +937,10 @@ class DockerEngineBackend:
         if self.operation_journal is None:
             return
         try:
+            if self.effect_response_recorder is not None:
+                rows = self.effect_response_recorder.inspect(operation_id)
+                if not rows or any(row[3] != 'received' for row in rows):
+                    raise ValueError('response evidence incomplete')
             self.operation_journal.completed(operation_id, kind, container_id)
         except Exception:
             # The engine may already have changed state; leave the intent uncertain.
@@ -1187,8 +1222,8 @@ class DockerEngineBackend:
         body = self._create_body(plan, source, environment)
         route = self._route("/containers/create")
         self._recheck_effect(admitted, deadline)
-        raw = self._read_response("POST", route, deadline, expected_status=201,
-                                  json_body=body, params={"name": plan.resource_name})
+        raw = self._effect_response(operation_id, 'create', route, deadline, expected_status=201,
+                                    admitted=admitted, json_body=body, params={"name": plan.resource_name})
         result = _strict_json(raw)
         self._remaining(deadline)
         if (not isinstance(result, dict) or type(result.get("Id")) is not str
@@ -1491,7 +1526,7 @@ class DockerEngineBackend:
         self._assert_runner(deadline)
         route = self._route("/containers/" + container_id + "/start")
         self._recheck_effect(admitted, deadline)
-        self._read_response("POST", route, deadline, expected_status=204)
+        self._effect_response(operation_id, 'start', route, deadline, expected_status=204, admitted=admitted)
         self._journal_complete(operation_id, "start", container_id)
         self._assert_runner(deadline)
         after = self.inspect_container(container_id, self._remaining_ms(deadline))
@@ -1510,8 +1545,8 @@ class DockerEngineBackend:
         self._assert_runner(deadline)
         route = self._route("/containers/" + container_id + "/stop")
         self._recheck_contained_effect(admitted, container_id, deadline)
-        self._read_response("POST", route, deadline, expected_status=204,
-                            params={"t": "5"})
+        self._effect_response(operation_id, 'stop', route, deadline, expected_status=204,
+                              admitted=admitted, container_id=container_id, params={"t": "5"})
         self._journal_complete(operation_id, "stop", container_id)
         self._assert_runner(deadline)
         after = self.inspect_container(container_id, self._remaining_ms(deadline))
@@ -1579,9 +1614,11 @@ class DockerEngineBackend:
         self._recheck_contained_effect(admitted, container_id, probe_deadline)
         if readiness_deadline is not None and time.monotonic() >= readiness_deadline:
             raise DaemonBackendError("health readiness admission deadline exceeded")
-        raw_create = self._read_response(
-            "POST", self._route("/containers/" + container_id + "/exec"),
-            probe_deadline, expected_status=201, json_body=create_body,
+        operation_id = _effect_context.get()[1].operation_id if self.effect_response_recorder is not None else None
+        raw_create = self._effect_response(
+            operation_id, 'probe-create:' + str(uuid4()), self._route("/containers/" + container_id + "/exec"),
+            probe_deadline, expected_status=201, admitted=admitted, container_id=container_id,
+            readiness_deadline=readiness_deadline, json_body=create_body,
         )
         created = _strict_json(raw_create)
         if (not isinstance(created, dict) or type(created.get("Id")) is not str
@@ -1590,9 +1627,9 @@ class DockerEngineBackend:
         exec_id = created["Id"]
         self._assert_runner(probe_deadline)
         self._recheck_contained_effect(admitted, container_id, probe_deadline)
-        raw_stream = self._read_response(
-            "POST", self._route("/exec/" + exec_id + "/start"),
-            probe_deadline, expected_status=200,
+        raw_stream = self._effect_response(
+            operation_id, 'probe-start:' + exec_id, self._route("/exec/" + exec_id + "/start"),
+            probe_deadline, expected_status=200, admitted=admitted, container_id=container_id,
             json_body={"Detach": False, "Tty": False}, body_limit=_MAX_EXEC_OUTPUT,
         )
         stdout = self._exec_frame(raw_stream)

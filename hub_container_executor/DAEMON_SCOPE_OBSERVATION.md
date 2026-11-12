@@ -150,3 +150,31 @@ workers and cannot prove that a process outside the scope cannot start work.
 The operator must independently enroll the complete worker set and establish
 the placement and non-delegable boundary. An empty observation still proves no
 individual Docker effect outcome and grants no recovery or retry authority.
+
+## Opt-in durable response projections
+
+An owner may explicitly migrate a quiescent, fully bound private operation
+journal from version 2 to version 3 using
+`SQLiteOperationJournal.enable_response_records()` before starting the bound
+runner. Migration refuses pending or unbound historical operations. Configure
+`record_effect_responses: true` in the independently approved v3 bound profile;
+the runtime requires an existing v3 journal and exact key. Legacy profiles
+continue to use v2. Older binaries reject a v3 journal; retain compatible
+readers and original evidence rather than downgrading it.
+
+For each Engine POST the backend persists a unique operation/step intent with a
+keyed fingerprint of the full request before issuing it. After receiving an
+accepted response, it persists a keyed safe projection before returning the
+response to backend logic. Only a validated container/exec ID, status, and keyed fingerprint of raw
+response bytes are retained; credentials, request bodies, daemon errors and
+probe output are not. Externally retained bytes can be compared to the keyed
+fingerprint, but are not produced or reconstructed by the recorder.
+A lost response, timeout, failed recorder, or uncertain commit remains pending
+and cannot be replayed. Response projections do not prove actual host state,
+probe success, worker quiescence or recovery permission.
+
+This is same-process recording, not an independent proxy: a runner crash after
+the daemon sends a response but before recording it still leaves an unknown
+outcome. An authenticated independent response proxy and full worker barrier
+would require separate implementation and enrollment; this option must not be
+presented as either one or used to clear a hold.

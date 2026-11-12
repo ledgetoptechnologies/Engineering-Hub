@@ -1,17 +1,13 @@
-"""Opt-in private durable operation intent/receipt journal, not an executor.
+"""Owned private durable operation intent, binding, and optional response journal.
 
-This records uncertainty, never health, recovery authority or retry permission.
-Callers must use a dedicated journal database on approved local Linux storage.
-No environment discovery, service activation, tokens or Docker labels are used.
-Bindings are explicit opt-in stored evidence only: no backend effect uses them,
-and they do not authenticate a daemon, MAC, lease, or enable reconciliation.
-No MAC key is provisioned or verified here; callers must not supply secrets or
-claim authentication. Old binaries reject a migrated v2 journal; rollback needs
-a compatible reader or an unmigrated backup. An exception during commit or fsync
-can occur after commit; reopen and inspect instead of inferring rollback.
-After migration, unbound begin is rejected: the current backend still calls it,
-so do not migrate any active deployment until separately reviewed integration.
-The stored local owner epoch is history, not a daemon or dispatch fence.
+Version 1 is the original unbound journal; v2 adds explicit effect bindings;
+v3 adds an opt-in sanitized HTTP-response subjournal. Migrations are explicit,
+transactional and never performed by a running executor. Older binaries reject
+newer versions. A pending request or missing response remains held; neither an
+HTTP response nor any stored MAC establishes a host effect outcome, writer fence,
+recovery permission or permission to replay. Credentials and raw probe output
+must never be stored. Commit or fsync failure can occur after commit: preserve
+and inspect evidence rather than inferring rollback or retry permission.
 """
 from __future__ import annotations
 
@@ -46,6 +42,9 @@ _BINDING_SCHEMA = ("CREATE TABLE private_operation_binding (operation_id TEXT PR
                    "boot_id TEXT NOT NULL, daemon_pid INTEGER NOT NULL, daemon_start INTEGER NOT NULL, "
                    "resource_name TEXT UNIQUE, target_id TEXT, request_mac TEXT NOT NULL, fence INTEGER NOT NULL, "
                    "owner_epoch TEXT NOT NULL)")
+_RESPONSE_SCHEMA = ("CREATE TABLE private_effect_response (operation_id TEXT NOT NULL, step TEXT NOT NULL, "
+                    "request_mac TEXT NOT NULL, state TEXT NOT NULL, status INTEGER, response_mac TEXT, "
+                    "safe_value TEXT, raw_mac TEXT, PRIMARY KEY(operation_id,step))")
 _TABLES = {"hub_pilot_owner", "hub_pilot_owner_epochs", "private_operation_journal"}
 _BUSY_SECONDS = .25
 
@@ -88,27 +87,69 @@ def _schema(db, *, inspect_rows=False):
     rows = db.execute("SELECT name, type, sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'").fetchall()
     tables = {name for name, kind, _ in rows if kind == "table"}
     version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (1, 2):
+    if version not in (1, 2, 3):
         raise OperationJournalError("Unsupported operation journal version")
-    expected = _TABLES | ({"private_operation_binding"} if version == 2 else set())
+    expected = (_TABLES | ({"private_operation_binding"} if version in (2, 3) else set())
+                | ({"private_effect_response"} if version == 3 else set()))
     if tables != expected or any(kind != "table" for _, kind, _ in rows):
         raise OperationJournalError("Dedicated operation journal schema required")
     if next(sql for name, _, sql in rows if name == "private_operation_journal") != _SCHEMA:
         raise OperationJournalError("Dedicated operation journal schema required")
-    if version == 2 and next(sql for name, _, sql in rows if name == "private_operation_binding") != _BINDING_SCHEMA:
+    if version in (2, 3) and next(sql for name, _, sql in rows if name == "private_operation_binding") != _BINDING_SCHEMA:
         raise OperationJournalError("Dedicated binding schema required")
+    if version == 3 and next(sql for name, _, sql in rows if name == "private_effect_response") != _RESPONSE_SCHEMA:
+        raise OperationJournalError("Dedicated response schema required")
     if db.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
         raise OperationJournalError("Operation journal integrity unavailable")
     if inspect_rows:
         for row in db.execute("SELECT operation_id,kind,state,container_id FROM private_operation_journal"):
             _row(row)
-        if version == 2:
+        if version in (2, 3):
             for row in db.execute("SELECT b.operation_id,j.kind,b.boot_id,b.daemon_pid,b.daemon_start,b.resource_name,b.target_id,b.request_mac,b.fence,b.owner_epoch,j.state,j.container_id FROM private_operation_binding b LEFT JOIN private_operation_journal j ON j.operation_id=b.operation_id"):
                 _validate_binding_row(row[:10])
                 if db.execute("SELECT 1 FROM hub_pilot_owner_epochs WHERE epoch=?", (row[9],)).fetchone() is None:
                     raise OperationJournalError("Unknown binding owner epoch")
                 if row[10] == "completed" and row[6] is not None and row[11] != row[6]:
                     raise OperationJournalError("Operation receipt conflicts with bound target")
+
+        if version == 3:
+            for row in db.execute("SELECT r.operation_id,r.step,r.request_mac,r.state,r.status,r.response_mac,r.safe_value,r.raw_mac,j.kind "
+                                  "FROM private_effect_response r LEFT JOIN private_operation_journal j ON j.operation_id=r.operation_id"):
+                _response_row(row)
+
+
+def _response_row(row):
+    operation, step, request_mac, state, status, response_mac, safe_value, raw_mac, kind = row
+    _operation(operation)
+    _kind(kind)
+    if (type(step) is not str or not re.fullmatch(r'(?:create|start|stop|probe-create:[0-9a-f-]{36}|probe-start:[0-9a-f]{64})', step)
+            or type(request_mac) is not str or not re.fullmatch(r'hmac-sha256:[0-9a-f]{64}', request_mac)):
+        raise OperationJournalError('Invalid response evidence')
+    if step == 'create':
+        valid_kind, expected_status, needs_value = kind in {'create_candidate', 'create_rollback'}, 201, True
+    elif step == 'start':
+        valid_kind, expected_status, needs_value = kind == 'start', 204, False
+    elif step == 'stop':
+        valid_kind, expected_status, needs_value = kind == 'stop', 204, False
+    elif step.startswith('probe-create:'):
+        _operation(step.removeprefix('probe-create:'))
+        valid_kind, expected_status, needs_value = kind == 'probe', 201, True
+    else:
+        valid_kind, expected_status, needs_value = kind == 'probe', 200, False
+    if not valid_kind:
+        raise OperationJournalError('Response step differs from operation')
+    if state == 'pending':
+        if status is not None or response_mac is not None or safe_value is not None or raw_mac is not None:
+            raise OperationJournalError('Invalid pending response evidence')
+    elif state == 'received':
+        if (type(status) is not int or status != expected_status
+                or type(response_mac) is not str or not re.fullmatch(r'hmac-sha256:[0-9a-f]{64}', response_mac)
+                or type(raw_mac) is not str or not re.fullmatch(r'hmac-sha256:[0-9a-f]{64}', raw_mac)
+                or (needs_value and (type(safe_value) is not str or not _CONTAINER.fullmatch(safe_value)))
+                or (not needs_value and safe_value is not None)):
+            raise OperationJournalError('Invalid received response evidence')
+    else:
+        raise OperationJournalError('Invalid response evidence state')
 
 
 @dataclass(frozen=True)
@@ -300,6 +341,65 @@ class SQLiteOperationJournal:
             db.execute("PRAGMA user_version=2")
             _schema(db, inspect_rows=True)
 
+    def enable_response_records(self) -> None:
+        """Explicit v2->v3 migration only with no unresolved or unbound operations."""
+        with self._transaction() as db:
+            if db.execute('PRAGMA user_version').fetchone() != (2,):
+                raise OperationJournalConflict('Bound journal v2 required')
+            _schema(db, inspect_rows=True)
+            if (db.execute("SELECT 1 FROM private_operation_journal WHERE state='pending' LIMIT 1").fetchone()
+                    or db.execute('SELECT 1 FROM private_operation_journal j LEFT JOIN private_operation_binding b '
+                                  'ON b.operation_id=j.operation_id WHERE b.operation_id IS NULL LIMIT 1').fetchone()):
+                raise OperationJournalConflict('Unresolved historical operation requires review')
+            db.execute(_RESPONSE_SCHEMA)
+            db.execute('PRAGMA user_version=3')
+            _schema(db, inspect_rows=True)
+
+    def begin_response(self, operation_id, step, request_mac):
+        """Persist a unique response intent before one daemon POST."""
+        _operation(operation_id)
+        with self._transaction() as db:
+            if db.execute('PRAGMA user_version').fetchone() != (3,):
+                raise OperationJournalError('Response recording not enabled')
+            row = db.execute('SELECT j.kind,j.state FROM private_operation_journal j JOIN private_operation_binding b '
+                             'ON j.operation_id=b.operation_id WHERE j.operation_id=?', (operation_id,)).fetchone()
+            if row is None or row[1] != 'pending':
+                raise OperationJournalConflict('Bound pending operation required')
+            _response_row((operation_id,step,request_mac,'pending',None,None,None,None,row[0]))
+            try:
+                db.execute("INSERT INTO private_effect_response VALUES (?,?,?,'pending',NULL,NULL,NULL,NULL)",
+                           (operation_id,step,request_mac))
+            except sqlite3.IntegrityError:
+                raise OperationJournalConflict('Response intent already exists; no replay') from None
+
+    def record_response(self, operation_id, step, request_mac, status, response_mac, safe_value, raw_mac):
+        """Persist a sanitized response before the backend consumes it."""
+        _operation(operation_id)
+        with self._transaction() as db:
+            if db.execute('PRAGMA user_version').fetchone() != (3,):
+                raise OperationJournalError('Response recording not enabled')
+            row = db.execute('SELECT j.kind,j.state FROM private_operation_journal j JOIN private_operation_binding b '
+                             'ON j.operation_id=b.operation_id WHERE j.operation_id=?', (operation_id,)).fetchone()
+            if row is None or row[1] != 'pending':
+                raise OperationJournalConflict('Bound pending operation required')
+            _response_row((operation_id,step,request_mac,'received',status,response_mac,safe_value,raw_mac,row[0]))
+            changed = db.execute("UPDATE private_effect_response SET state='received',status=?,response_mac=?,safe_value=?,raw_mac=? "
+                                 "WHERE operation_id=? AND step=? AND request_mac=? AND state='pending'",
+                                 (status,response_mac,safe_value,raw_mac,operation_id,step,request_mac))
+            if changed.rowcount != 1:
+                raise OperationJournalConflict('Response evidence differs or is already recorded')
+
+    def inspect_responses(self, operation_id):
+        _operation(operation_id)
+        with self._transaction() as db:
+            if db.execute('PRAGMA user_version').fetchone() != (3,):
+                raise OperationJournalError('Response recording not enabled')
+            rows = db.execute('SELECT r.operation_id,r.step,r.request_mac,r.state,r.status,r.response_mac,r.safe_value,r.raw_mac,j.kind '
+                              'FROM private_effect_response r LEFT JOIN private_operation_journal j ON j.operation_id=r.operation_id '
+                              'WHERE r.operation_id=? ORDER BY r.rowid', (operation_id,)).fetchall()
+            for row in rows: _response_row(row)
+            return tuple(rows)
+
     def begin_bound(self, operation_id: str, kind: str, binding: OperationBinding) -> None:
         """Atomically persist untrusted binding and intent; never replay an ID.
 
@@ -309,7 +409,7 @@ class SQLiteOperationJournal:
         if type(binding) is not OperationBinding or binding.owner_epoch is not None:
             raise OperationJournalError("Exact operation binding required")
         with self._transaction() as db:
-            if db.execute("PRAGMA user_version").fetchone() != (2,):
+            if db.execute("PRAGMA user_version").fetchone() not in ((2,), (3,)):
                 raise OperationJournalError("Explicit binding migration required")
             row = (operation_id, kind, binding.boot_id, binding.daemon_pid, binding.daemon_start,
                    binding.resource_name, binding.target_id, binding.request_mac, binding.fence, self._owner.epoch)
@@ -328,7 +428,7 @@ class SQLiteOperationJournal:
         """Read stored evidence only; never turn it into a terminal outcome."""
         _operation(operation_id)
         with self._transaction() as db:
-            if db.execute("PRAGMA user_version").fetchone() != (2,):
+            if db.execute("PRAGMA user_version").fetchone() not in ((2,), (3,)):
                 return None
             row = db.execute("SELECT b.operation_id,j.kind,b.boot_id,b.daemon_pid,b.daemon_start,b.resource_name,b.target_id,b.request_mac,b.fence,b.owner_epoch FROM private_operation_binding b LEFT JOIN private_operation_journal j ON j.operation_id=b.operation_id WHERE b.operation_id=?", (operation_id,)).fetchone()
             if row is None:
@@ -348,12 +448,32 @@ class SQLiteOperationJournal:
             _row(row)
             if row is None or row[1] != kind or (row[2] == "completed" and row[3] != container_id):
                 raise OperationJournalConflict("Operation receipt conflicts with durable intent")
-            if db.execute("PRAGMA user_version").fetchone() == (2,):
+            if db.execute("PRAGMA user_version").fetchone() in ((2,), (3,)):
                 binding = db.execute("SELECT target_id FROM private_operation_binding WHERE operation_id=?",
                                      (operation_id,)).fetchone()
                 if binding is not None and binding[0] is not None and binding[0] != container_id:
                     raise OperationJournalConflict("Operation receipt conflicts with bound target")
             if row[2] == "pending":
+                if db.execute('PRAGMA user_version').fetchone() == (3,):
+                    responses = db.execute('SELECT step,state,safe_value FROM private_effect_response WHERE operation_id=?',
+                                           (operation_id,)).fetchall()
+                    steps = {item[0] for item in responses}
+                    if (not responses or any(item[1] != 'received' for item in responses)
+                            or len(steps) != len(responses)):
+                        raise OperationJournalConflict('Complete response evidence required')
+                    if kind in {'create_candidate', 'create_rollback', 'start', 'stop'}:
+                        expected_step = 'create' if kind.startswith('create_') else kind
+                        if steps != {expected_step}:
+                            raise OperationJournalConflict('Exact response step required')
+                        if expected_step == 'create' and responses[0][2] != container_id:
+                            raise OperationJournalConflict('Create response target differs')
+                    else:
+                        created = {item[2] for item in responses if item[0].startswith('probe-create:')}
+                        started = {item[0].removeprefix('probe-start:') for item in responses
+                                   if item[0].startswith('probe-start:')}
+                        if (len(responses) != 2 * len(created) or not created or None in created
+                                or created != started):
+                            raise OperationJournalConflict('Complete probe response pairs required')
                 db.execute("UPDATE private_operation_journal SET state='completed', container_id=? WHERE operation_id=?",
                            (container_id, operation_id))
 
@@ -363,14 +483,16 @@ class SQLiteOperationJournal:
             raise OperationJournalError('Explicit bound mode required')
         with self._transaction() as db:
             version = db.execute('PRAGMA user_version').fetchone()
-            if version != (1,) and not (allow_bound and version == (2,)):
+            if version != (1,) and not (allow_bound and version in ((2,), (3,))):
                 raise OperationJournalError('Single pilot requires v1 journal')
-            if version == (2,):
+            if version in ((2,), (3,)):
                 _schema(db, inspect_rows=True)
                 if db.execute('SELECT 1 FROM private_operation_journal j LEFT JOIN private_operation_binding b ON b.operation_id=j.operation_id WHERE b.operation_id IS NULL LIMIT 1').fetchone():
                     raise OperationJournalError('Unbound historical operation requires recovery')
             if db.execute("SELECT 1 FROM private_operation_journal WHERE state='pending' LIMIT 1").fetchone():
                 raise OperationJournalError('Private operation intent remains pending')
+            if version == (3,) and db.execute("SELECT 1 FROM private_effect_response WHERE state='pending' LIMIT 1").fetchone():
+                raise OperationJournalError('Private response intent remains pending')
 
     def inspect_record(self, operation_id: str) -> JournalOperationRecord | None:
         """Read kind and receipt in one owner-guarded transaction; never re-effect.
@@ -393,7 +515,7 @@ class SQLiteOperationJournal:
         """
         _operation(operation_id)
         with self._transaction() as db:
-            if db.execute("PRAGMA user_version").fetchone() != (2,):
+            if db.execute("PRAGMA user_version").fetchone() not in ((2,), (3,)):
                 return None
             row = db.execute("SELECT j.operation_id,j.kind,j.state,j.container_id,b.boot_id,b.daemon_pid,b.daemon_start,b.resource_name,b.target_id,b.request_mac,b.fence,b.owner_epoch FROM private_operation_journal j JOIN private_operation_binding b ON b.operation_id=j.operation_id WHERE j.operation_id=?", (operation_id,)).fetchone()
             if row is None:

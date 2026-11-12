@@ -470,3 +470,19 @@ def test_bound_profile_app_cgroup_pins_are_closed_and_independent():
     assert parsed.bound_profile.app_cgroup.parent == 'parent.slice'
     source['bound_profile']['app_cgroup']['extra'] = True
     with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(source))
+
+
+def test_response_recording_requires_explicit_boolean_in_bound_profile():
+    from tests.test_hub_container_effect_binding_canonical import fixture
+    source = configuration()
+    source['schema'] = module.SCHEMA_BOUND_PILOT
+    source['resources']['single_pilot_protocol'] = True
+    source['resources']['journal_create'] = False
+    binding = asdict(fixture()); binding.pop('owner_epoch')
+    binding['environment_names'] = list(binding['environment_names'])
+    source['bound_profile'] = dict(key_id=digest('b'), approval_path='/fixture/approval.json',
+        approver_public_key_hex='e'*64, approval_wait_ms=30000,
+        effects=[dict(binding=binding, create_command_id=None)], record_effect_responses=True)
+    assert module.parse_configuration(canonical(source)).bound_profile.record_effect_responses is True
+    source['bound_profile']['record_effect_responses'] = 1
+    with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(source))

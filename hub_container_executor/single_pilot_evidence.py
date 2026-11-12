@@ -45,6 +45,16 @@ def require_journal_ready(adapter):
             raise ValueError('ledger owner identity changed')
     except OSError:
         raise ValueError('ledger owner identity unavailable') from None
+    with backend.operation_journal._transaction() as db:
+        journal_version = db.execute('PRAGMA user_version').fetchone()
+    recorder = getattr(backend, 'effect_response_recorder', None)
+    if journal_version == (3,):
+        from .effect_response_recorder import DurableEffectResponseRecorder
+        if (type(recorder) is not DurableEffectResponseRecorder
+                or recorder.journal is not backend.operation_journal):
+            raise ValueError('v3 response journal requires its exact recorder')
+    elif recorder is not None:
+        raise ValueError('response recorder requires a v3 journal')
     backend.operation_journal.require_no_pending(allow_bound=True)
     return True
 

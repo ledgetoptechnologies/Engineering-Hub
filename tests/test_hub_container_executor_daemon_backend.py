@@ -71,6 +71,12 @@ def test_single_pilot_bound_admission_requires_actual_backend_scope(tmp_path):
     calls = []
     class Journal:
         def require_no_pending(self, **kwargs): calls.append(kwargs)
+        def _transaction(self):
+            from contextlib import contextmanager
+            @contextmanager
+            def connection():
+                yield SimpleNamespace(execute=lambda query: SimpleNamespace(fetchone=lambda: (2,)))
+            return connection()
     root = tmp_path / 'ledgers'
     root.mkdir(mode=0o700)
     options = dict(manifest_digest=manifest.digest(), candidate_commit=manifest.candidate.source_commit,
