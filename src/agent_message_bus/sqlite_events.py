@@ -201,11 +201,11 @@ _FIONREAD = getattr(termios, "FIONREAD", None) if termios is not None else None
 class SQLiteEventSource:
     """Persistent native eventsource for message delivery-sequence changes.
 
-Lifecycle methods are blocking and must be called via ``asyncio.to_thread``
-from an ASGI lifespan. Startup installs every watch before taking one
-barrier-protected head snapshot. Normal operation has no timer or SQLite
-query when idle; a bounded retry timer exists only while an invalidation is
-dirty and a verified SQLite BUSY prevents reconciliation.
+    Lifecycle methods are blocking and must be called via ``asyncio.to_thread``
+    from an ASGI lifespan. Startup installs every watch before taking one
+    barrier-protected head snapshot. Normal operation has no timer or SQLite
+    query when idle; a bounded retry timer exists only while an invalidation is
+    dirty and a verified SQLite BUSY prevents reconciliation.
     """
 
     def __init__(
