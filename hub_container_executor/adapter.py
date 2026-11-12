@@ -102,17 +102,22 @@ class HostAdapter:
                  baseline_provider=None, state_provisioner=None, secret_resolver=None,
                  driver_identity_verifier: TrustedDriverIdentityVerifier | None = None,
                  effect_context_guard: TrustedEffectContextGuard | None = None,
-                 single_pilot_protocol: bool = False):
+                 single_pilot_protocol: bool = False,
+                 stop_failed_candidate_before_rollback: bool = False):
         if type(manifest) is not PilotManifest:
             raise TypeError("shared PilotManifest required")
         if type(single_pilot_protocol) is not bool:
             raise TypeError('single pilot protocol requires explicit boolean')
+        if (type(stop_failed_candidate_before_rollback) is not bool
+                or stop_failed_candidate_before_rollback and not single_pilot_protocol):
+            raise TypeError('explicit single-pilot candidate cleanup required')
         if effect_context_guard is not None and type(effect_context_guard) is not TrustedEffectContextGuard:
             raise TypeError('explicit trusted effect context guard required')
         if single_pilot_protocol:
             from .single_pilot_evidence import require_resources
             require_resources(backend, state_provisioner)
         self._single_pilot_protocol = single_pilot_protocol
+        self._stop_failed_candidate_before_rollback = stop_failed_candidate_before_rollback
         self._pilot_mutex = threading.RLock()
         self.manifest = PilotManifest.from_bytes(manifest.canonical_bytes())
         self.manifest_bytes = self.manifest.canonical_bytes()
@@ -275,7 +280,8 @@ class HostAdapter:
             if self._single_pilot_protocol:
                 from .single_pilot_evidence import verify_phase
                 verify_phase(self, request, result, deadline)
-                self.ledger.record_single_pilot_verified_outcome(request, result)
+                self.ledger.record_single_pilot_verified_outcome(request, result,
+                    candidate_stop=(self._stop_failed_candidate_before_rollback and request.action == "rollback_container"))
                 return self.ledger.get(request.command_id)
             if self.ledger.single_pilot_enabled():
                 return self.ledger.get(request.command_id)
@@ -313,6 +319,8 @@ class HostAdapter:
             rollback_image = image if role == "rollback" else self._verified_image("rollback")
             rollback_defaults = defaults if role == "rollback" else self._image_defaults(rollback_image, deadline)
             self._verify_baseline_container(baseline, rollback_image, rollback_defaults, secrets, deadline)
+            if role == 'rollback' and self._stop_failed_candidate_before_rollback:
+                self._stop_same_run_candidate(request, baseline, secrets, deadline)
             method = (self.state_provisioner.prepare_candidate if role == "candidate"
                       else self.state_provisioner.prepare_rollback)
             state = self._effect(
@@ -364,6 +372,33 @@ class HostAdapter:
         evidence = self._evidence(container_id, image.image_config_id, "healthy", True)
         self._timeout(deadline, self.manifest.timeouts.total_command_ms)
         return self.ledger.finish(request.command_id, state="succeeded", reason=None, evidence=evidence)
+
+    def _stop_same_run_candidate(self, request, baseline, secrets, deadline):
+        """One pre-enrolled stop of the exact current candidate; never the baseline."""
+        from .app_cgroup_observation import AppCgroupObserver
+        from .effect_response_recorder import DurableEffectResponseRecorder
+        if (not self._single_pilot_protocol or type(self.effect_context_guard) is not TrustedEffectContextGuard
+                or type(getattr(self.backend, 'app_cgroup_observer', None)) is not AppCgroupObserver
+                or type(getattr(self.backend, 'effect_response_recorder', None)) is not DurableEffectResponseRecorder):
+            raise _Held('recovery_required')
+        target = self.ledger.target_snapshot(request.target_id)
+        if (not target or target.get('current_run_id') != request.run_id
+                or target.get('fence') != request.fencing_generation
+                or target.get('image_config_id') != self.manifest.candidate.image_config_id
+                or not isinstance(target.get('container_id'), str)
+                or not _CONTAINER_ID.fullmatch(target['container_id'])
+                or target['container_id'] == baseline.container_id
+                or not isinstance(target.get('generation_id'), str)
+                or target['generation_id'] == baseline.state_generation_id):
+            raise _Held('recovery_required')
+        image = self._verified_image('candidate')
+        defaults = self._image_defaults(image, deadline)
+        profile = self._profile(image, defaults, target['generation_id'], secrets)
+        self._inspect_container(target['container_id'], image, profile, target['generation_id'], {'running'}, deadline)
+        self._effect(request, 'stop',
+            lambda operation_id, timeout: self.backend.stop_container(target['container_id'], operation_id, timeout),
+            self.manifest.timeouts.stop_ms, deadline,
+            lambda _value: {'container_id': target['container_id'], 'stopped': True})
 
     def _verified_image(self, role: str) -> VerifiedImage:
         return verify_image_record(self.manifest, role, self.record_store, self.metadata_store,

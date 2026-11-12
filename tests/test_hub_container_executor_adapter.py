@@ -733,3 +733,45 @@ def test_single_pilot_state_preflight_failure_reopen_concurrent_retries_stay_hel
         assert backend.events == [] and state.calls == []
     finally:
         reopened.close()
+
+@pytest.mark.parametrize('invalid', [None, 'baseline', 'run', 'fence', 'image', 'generation'])
+def test_opt_in_candidate_stop_checks_exact_target_before_effect(invalid):
+    """Synthetic boundaries: mismatch must issue no stop; baseline is never stopped."""
+    from types import SimpleNamespace
+    from hub_container_executor.app_cgroup_observation import AppCgroupObserver
+    from hub_container_executor.effect_response_recorder import DurableEffectResponseRecorder
+    adapter = object.__new__(HostAdapter)
+    adapter._single_pilot_protocol = True
+    adapter.effect_context_guard = TrustedEffectContextGuard(lambda _: True, lambda _: None)
+    calls = []
+    adapter.backend = SimpleNamespace(app_cgroup_observer=object.__new__(AppCgroupObserver),
+        effect_response_recorder=object.__new__(DurableEffectResponseRecorder),
+        stop_container=lambda cid, op, timeout: calls.append(('stop', cid)))
+    adapter.manifest = SimpleNamespace(candidate=SimpleNamespace(image_config_id='image'),
+                                       timeouts=SimpleNamespace(stop_ms=1000))
+    target = dict(current_run_id='run', fence=3, image_config_id='image',
+                  container_id='d'*64, generation_id='candidate')
+    baseline = SimpleNamespace(container_id='c'*64, state_generation_id='baseline')
+    if invalid == 'baseline': target['container_id'] = baseline.container_id
+    if invalid == 'run': target['current_run_id'] = 'wrong'
+    if invalid == 'fence': target['fence'] = 4
+    if invalid == 'image': target['image_config_id'] = 'wrong'
+    if invalid == 'generation': target['generation_id'] = 'baseline'
+    adapter.ledger = SimpleNamespace(target_snapshot=lambda _: target)
+    adapter._verified_image = lambda _: 'verified'
+    adapter._image_defaults = lambda *_: 'defaults'
+    adapter._profile = lambda *_: 'profile'
+    adapter._inspect_container = lambda *args: calls.append(('inspect', args[0]))
+    def effect(request, kind, callback, limit, deadline, receipt):
+        calls.append(('admit', kind))
+        assert receipt(None) == {'container_id':'d'*64, 'stopped':True}
+        callback('op', limit)
+    adapter._effect = effect
+    req = SimpleNamespace(target_id='target', run_id='run', fencing_generation=3)
+    if invalid is None:
+        adapter._stop_same_run_candidate(req, baseline, {}, 10)
+        assert calls == [('inspect','d'*64),('admit','stop'),('stop','d'*64)]
+    else:
+        with pytest.raises(adapter_module._Held):
+            adapter._stop_same_run_candidate(req, baseline, {}, 10)
+        assert calls == []

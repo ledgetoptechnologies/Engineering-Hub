@@ -238,6 +238,8 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
                 baseline_provider=baseline, state_provisioner=state,
                 secret_resolver=secrets, driver_identity_verifier=driver_identity_verifier,
                 single_pilot_protocol=single_pilot_protocol,
+                stop_failed_candidate_before_rollback=(bound_profile is not None
+                    and bound_profile.stop_failed_candidate_before_rollback),
             )
             resources.callback(adapter.close)
             if bound_profile is not None:

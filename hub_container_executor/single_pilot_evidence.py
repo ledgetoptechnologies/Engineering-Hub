@@ -6,6 +6,7 @@ are not one atomic snapshot and hostile same-UID writers are out of scope.
 import time
 import uuid
 import os
+import re
 from .backend import BaselineIdentity, StateGeneration
 from .daemon_backend import DockerEngineBackend, TrustedEffectBindingProvider
 from .operation_journal import SQLiteOperationJournal
@@ -69,6 +70,11 @@ def verify_phase(adapter, request, response, deadline):
     deploy = request.action in ('deploy_container', 'rollback_container')
     expected = ({'state_copy' if role == 'candidate' else 'rollback_state', 'create_'+role, 'start_'+role}
                 if deploy else {'probe'})
+    cleanup = getattr(adapter, '_stop_failed_candidate_before_rollback', False)
+    if type(cleanup) is not bool:
+        raise ValueError('invalid candidate stop policy')
+    if cleanup and request.action == 'rollback_container':
+        expected.add('stop')
     rows = adapter.ledger.operation_rows(request.command_id)
     if len(rows) != len(expected) or {row['kind'] for row in rows} != expected:
         raise ValueError('phase operation set mismatch')
@@ -106,6 +112,21 @@ def verify_phase(adapter, request, response, deadline):
         create, start = by_kind['create_'+role], by_kind['start_'+role]
         if create['receipt'] != {'container_id':evidence.container_id} or start['receipt'] != {'container_id':evidence.container_id,'started':True}:
             raise ValueError('container receipt mismatch')
+        if cleanup and request.action == 'rollback_container':
+            stop = by_kind['stop']
+            receipt = stop['receipt']
+            if (not bound or type(receipt) is not dict or set(receipt) != {'container_id','stopped'}
+                    or type(receipt['container_id']) is not str
+                    or not re.fullmatch(r'[a-f0-9]{64}', receipt['container_id'])
+                    or receipt['container_id'] in (evidence.container_id, baseline.container_id)
+                    or receipt['stopped'] is not True):
+                raise ValueError('candidate stop receipt mismatch')
+            record = journal.inspect_record(stop['operation_id'])
+            if (record is None or record.kind != 'stop' or record.state != 'completed'
+                    or record.container_id != receipt['container_id']
+                    or adapter.backend.effect_binding_provider.verify_completed(
+                        stop['operation_id'], 'stop', request, receipt['container_id']) is not True):
+                raise ValueError('bound candidate stop evidence unavailable')
         pairs = ((create,'create_'+role), (start,'start'))
     else:
         if (evidence.evidence_verified is not True or not

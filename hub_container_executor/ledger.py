@@ -785,7 +785,7 @@ class SQLiteLedger:
             db.execute("INSERT INTO control(key,value) VALUES('single_pilot_gate',?)", (gate,))
 
     def record_single_pilot_verified_outcome(self, request: ContainerPilotRequest,
-                                              outcome: ContainerPilotResponse) -> None:
+                                              outcome: ContainerPilotResponse, *, candidate_stop: bool = False) -> None:
         """Store caller-verified outcome; caller must verify all external evidence.
 
         This only binds the exact stored terminal response and authenticated
@@ -797,6 +797,8 @@ class SQLiteLedger:
             raise TypeError('exact pilot identities required')
         if outcome.model_dump(include=set(ContainerPilotRequest.model_fields)) != request.model_dump():
             raise PermissionError('pilot outcome identity mismatch')
+        if type(candidate_stop) is not bool or (candidate_stop and request.action != 'rollback_container'):
+            raise ValueError('invalid candidate stop policy')
         deploy = request.action in {'deploy_container','rollback_container'}
         eligible = ((deploy and outcome.state == 'succeeded' and outcome.reason is None
                      and outcome.evidence.health == 'unknown' and outcome.evidence.evidence_verified is True)
@@ -808,6 +810,8 @@ class SQLiteLedger:
         role = 'rollback' if request.action in {'rollback_container','smoke_container_rollback'} else 'candidate'
         expected = ({'state_copy' if role == 'candidate' else 'rollback_state', 'create_'+role, 'start_'+role}
                     if request.action in {'deploy_container','rollback_container'} else {'probe'})
+        if candidate_stop:
+            expected.add('stop')
         gate_text = _canonical({'state':'effect_held', 'request':request.model_dump(mode='json')})
         next_text = _canonical({'state':'awaiting_ack', 'request':request.model_dump(mode='json'),
                                 'outcome':outcome.model_dump(mode='json')})
@@ -824,6 +828,14 @@ class SQLiteLedger:
                     or any(item['status'] != 'completed' or item['receipt_authentic'] is not True
                            or item['operation_id'] != str(uuid.uuid5(uuid.UUID(request.command_id), item['kind'])) for item in parsed)):
                 raise PermissionError('pilot ledger evidence incomplete')
+            if candidate_stop:
+                receipt = next(item['receipt'] for item in parsed if item['kind'] == 'stop')
+                if (type(receipt) is not dict or set(receipt) != {'container_id', 'stopped'}
+                        or type(receipt['container_id']) is not str
+                        or not re.fullmatch(r'[a-f0-9]{64}', receipt['container_id'])
+                        or receipt['container_id'] == outcome.evidence.container_id
+                        or receipt['stopped'] is not True):
+                    raise PermissionError('candidate stop receipt mismatch')
             db.execute("UPDATE control SET value=? WHERE key='single_pilot_gate'", (next_text,))
 
     def acknowledge_single_pilot(self, request: ContainerPilotRequest, outcome_digest: str) -> None:

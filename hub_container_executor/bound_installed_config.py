@@ -20,14 +20,18 @@ class InstalledBoundProfile:
     effects: tuple
     app_cgroup: object = None
     record_effect_responses: bool = False
+    stop_failed_candidate_before_rollback: bool = False
 
 
 def parse_bound_profile(value):
     base = {'key_id', 'approval_path', 'approver_public_key_hex', 'approval_wait_ms', 'effects'}
     if (type(value) is not dict or not base <= set(value)
-            or set(value) - base - {'app_cgroup', 'record_effect_responses'}):
+            or set(value) - base - {'app_cgroup', 'record_effect_responses', 'stop_failed_candidate_before_rollback'}):
         raise ValueError('closed bound profile required')
     recording = value.get('record_effect_responses', False)
+    cleanup = value.get('stop_failed_candidate_before_rollback', False)
+    if type(cleanup) is not bool:
+        raise ValueError('explicit boolean candidate cleanup required')
     if type(recording) is not bool:
         raise ValueError('explicit boolean response recording required')
     if type(value['key_id']) is not str or not re.fullmatch(r'sha256:[a-f0-9]{64}', value['key_id']):
@@ -75,4 +79,6 @@ def parse_bound_profile(value):
         if type(item) is not dict or set(item) != {'parent', 'device', 'inode', 'namespace_device', 'namespace_inode'}:
             raise ValueError('closed app cgroup pins required')
         app_cgroup = AppCgroupPins(**item)
-    return InstalledBoundProfile(value['key_id'], path, bytes.fromhex(public_hex), wait_ms, tuple(result), app_cgroup, recording)
+    if cleanup and (app_cgroup is None or not recording):
+        raise ValueError('candidate cleanup requires app cgroup and response recording')
+    return InstalledBoundProfile(value['key_id'], path, bytes.fromhex(public_hex), wait_ms, tuple(result), app_cgroup, recording, cleanup)
