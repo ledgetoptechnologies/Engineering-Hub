@@ -386,7 +386,14 @@ class SessionHubBridge:
         elif tool in {'hub_task_get', 'hub_task_claim', 'hub_task_candidate', 'hub_task_review'}:
             project = self.repo.get_task(arguments['task_id'])['project']
         elif tool in {'hub_tracking_task_update', 'hub_tracking_task_review'}:
-            project = self.repo._read(arguments['task_id'], 'tracking_task')['project']
+            try:
+                project = self.repo._read(arguments['task_id'], 'tracking_task')['project']
+                operation.project(project)
+            except HubError:
+                # A tracking ID is not a capability to discover a task in an
+                # ungranted, archived, or nonexistent project.
+                raise HubError('hub_tracking_task_unavailable', 404) from None
+            return
         elif tool == 'hub_decision_get':
             try:
                 project = self.repo.get_decision(arguments['decision_id'])['project']

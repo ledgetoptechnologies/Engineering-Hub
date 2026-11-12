@@ -409,6 +409,47 @@ def data(result):
     return result.get('structuredContent') or json.loads(result['content'][0]['text'])
 
 
+def test_tracking_mutation_does_not_disclose_cross_project_or_archived_ids(unified):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, caps=('tracking.propose', 'tracking.update', 'tracking.review'),
+                                  projects=(PROJECT, '3d-viewer'))
+    invoke, _ = sdk(client, token)
+    repo = app.state.repository
+    private = repo.propose_tracking_task('codex', 'project-alpha', 'Private', 'private-tracking')
+    archived = repo.propose_tracking_task('codex', '3d-viewer', 'Archived', 'archived-tracking')
+    env.bridge.projects.archive_project(OWNER, '3d-viewer', 1)
+    valid = data(invoke('hub_tracking_task_propose', {'project': PROJECT, 'title': 'Valid',
+                                                      'client_request_id': 'valid-tracking'}))
+    missing = '00000000-0000-4000-8000-000000000000'
+    for tool, args in (
+        ('hub_tracking_task_update', {'expected_revision': 1, 'client_request_id': 'update-test',
+                                      'progress': 'Progress', 'evidence_links': [], 'completion_claim': False}),
+        ('hub_tracking_task_review', {'expected_revision': 1, 'client_request_id': 'review-test',
+                                      'verdict': 'reopen', 'note': 'Review', 'evidence_links': []}),
+    ):
+        results = [invoke(tool, {**args, 'task_id': task_id}) for task_id in
+                   (private['id'], archived['id'], missing)]
+        assert all(result['isError'] for result in results)
+        assert len({result['content'][0]['text'] for result in results}) == 1
+        assert 'hub_tracking_task_unavailable' in results[0]['content'][0]['text']
+    updated = data(invoke('hub_tracking_task_update', {'task_id': valid['id'], 'expected_revision': 1,
+        'client_request_id': 'valid-update', 'progress': 'Progress', 'evidence_links': [], 'completion_claim': False}))
+    assert updated['revision'] == 2
+    links = [{'label': 'Evidence', 'url': 'https://example.com/evidence'}]
+    claim = data(invoke('hub_tracking_task_update', {'task_id': valid['id'], 'expected_revision': 2,
+        'client_request_id': 'valid-claim', 'progress': 'Done', 'evidence_links': links, 'completion_claim': True}))
+    _, reviewer, _ = pair(env, name='reviewer', family='claude', caps=('tracking.review',))
+    review, _ = sdk(client, reviewer)
+    verified = data(review('hub_tracking_task_review', {'task_id': valid['id'], 'expected_revision': claim['revision'],
+        'client_request_id': 'valid-review', 'verdict': 'verify', 'note': 'Checked', 'evidence_links': links}))
+    assert verified['status'] == 'completion_verified'
+    env.bridge.grant_revoke(OWNER, installation, 1)
+    assert invoke('hub_tracking_task_update', {'task_id': valid['id'], 'expected_revision': verified['revision'],
+        'client_request_id': 'revoked', 'progress': 'No', 'evidence_links': [], 'completion_claim': False})['isError']
+    assert repo._read(valid['id'], 'tracking_task')['revision'] == verified['revision']
+
+
 def test_session_decision_read_cross_surface_and_project_grants(unified):
     client, app, bus, csrf = unified
     env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
