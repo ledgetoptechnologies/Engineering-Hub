@@ -16,12 +16,15 @@ import shutil
 from pathlib import Path
 
 
+_engine_pin = None
+
 def docker_command(args):
     """Bind all Docker CLI operations to the explicitly selected private socket.
 
     Preserve the existing Docker config for registry auth and Buildx; never
     inherit a Docker context or endpoint. This is not host attestation.
     """
+    global _engine_pin
     host = os.environ.get("EH_EXECUTOR_DOCKER_HOST", "")
     if (not re.fullmatch(r"unix:///run/[A-Za-z0-9_./-]+\.sock", host)
             or any(part in ("", ".", "..") for part in host[8:].split("/"))
@@ -47,7 +50,30 @@ def docker_command(args):
     executable = shutil.which("docker", path="/usr/bin:/bin")
     if executable is None or not executable.startswith("/"):
         raise ValueError("System Docker CLI required")
-    return [executable, "--host", host, *args], env
+    prefix = [executable, "--host", host]
+    try:
+        probe = subprocess.run([*prefix, "info", "--format", "{{.ID}}"],
+                               env=env, check=True, capture_output=True, text=True, timeout=15)
+        daemon_id = probe.stdout.strip()
+        after = path.stat()
+        if ((after.st_dev, after.st_ino) != (info.st_dev, info.st_ino)
+                or not re.fullmatch(r"[A-Za-z0-9:-]{1,128}", daemon_id)):
+            raise ValueError
+    except (OSError, subprocess.SubprocessError, ValueError):
+        raise ValueError("Docker engine identity unavailable") from None
+    current = (host, info.st_dev, info.st_ino, daemon_id)
+    if _engine_pin is None:
+        _engine_pin = current
+    elif current != _engine_pin:
+        raise ValueError("Docker engine changed during transaction")
+    return [*prefix, *args], env
+
+
+def engine_identity():
+    """Check and return process-pinned identity, not privileged host attestation."""
+    docker_command([])
+    return {"socket": _engine_pin[0], "device": _engine_pin[1],
+            "inode": _engine_pin[2], "daemon_id": _engine_pin[3]}
 
 
 OWNER = 'hub.executor-smoke-owner'

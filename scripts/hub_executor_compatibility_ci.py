@@ -12,7 +12,7 @@ import sys
 
 from build_hub_executor_wheel import prepare_archive
 from verify_hub_executor_wheel import verify_wheel
-from hub_executor_image_smoke import smoke, docker_command
+from hub_executor_image_smoke import smoke, docker_command, engine_identity
 
 PACKAGE = 'ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:'
 BACKEND_SHA = '51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670'
@@ -163,7 +163,8 @@ def compatibility(values, directory, evidence=None):
         '--build-arg', 'EXECUTOR_WHEEL_SHA256=' + values['WHEEL_SHA256'], str(directory / 'context'), timeout=600)
     evidence['stage'] = 'executor_import_smoke'
     return {'core_config_digest': info['Id'], 'core_commit': values['CORE_COMMIT'],
-            'installed_core_identity': 'passed', 'executor_imports': smoke(tag, values['SOURCE_COMMIT'])}
+            'installed_core_identity': 'passed', 'executor_imports': smoke(tag, values['SOURCE_COMMIT']),
+            'engine_identity': engine_identity()}
 
 
 def main():
