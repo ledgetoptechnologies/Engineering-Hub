@@ -1626,8 +1626,9 @@ def test_separate_consumer_receives_supervisor_proposal_and_operator_approval(sy
         child.stderr.close()
 
 
+@pytest.mark.parametrize('postcheck_failure', [False, True])
 def test_supervisor_records_empty_daemon_scope_without_claiming_effect_outcome(
-        synthetic_issuer, monkeypatch):
+        synthetic_issuer, monkeypatch, postcheck_failure):
     """Synthetic cgroup/Engine; real owned pidfds and real journal transaction."""
     from dataclasses import replace
     from types import SimpleNamespace
@@ -1675,15 +1676,32 @@ def test_supervisor_records_empty_daemon_scope_without_claiming_effect_outcome(
         daemon.wait(timeout=3)
         (scope_path / 'cgroup.procs').write_text('')
         (scope_path / 'cgroup.events').write_text('populated 0\nfrozen 0\n')
-        observed = authority.record_daemon_scope_emptiness(scope)
-        assert observed.effect_outcome_proven is False
+        if postcheck_failure:
+            original_observe = scope.observe_empty
+            calls = []
+            def fail_second():
+                calls.append(True)
+                if len(calls) == 2:
+                    raise cgroups.ScopeEvidenceError('synthetic postcheck failure')
+                return original_observe()
+            monkeypatch.setattr(scope, 'observe_empty', fail_second)
+            with pytest.raises(launch.LaunchSupervisorError):
+                authority.record_daemon_scope_emptiness(scope)
+        else:
+            observed = authority.record_daemon_scope_emptiness(scope)
+            assert observed.effect_outcome_proven is False
         with authority._journal.transaction() as db:
             state, raw = db.execute('SELECT state,data FROM launch').fetchone()
         record = json.loads(raw)['daemon_scope_observation']
         assert state == 'stopped' and record['effect_outcome_proven'] is False
+        assert record['verification'] == ('provisional' if postcheck_failure else 'postcheck_complete')
         assert record['original_members'] == [[daemon.pid, daemon_process.start]]
         with pytest.raises(launch.LaunchSupervisorError):
             authority.record_daemon_scope_emptiness(scope)  # no overwrite or replay
+        authority._hold()
+        with authority._journal.transaction() as db:
+            state, raw = db.execute('SELECT state,data FROM launch').fetchone()
+        assert state == 'held' and json.loads(raw)['daemon_scope_observation'] == record
     finally:
         if scope is not None: scope.close()
         daemon_process.close()

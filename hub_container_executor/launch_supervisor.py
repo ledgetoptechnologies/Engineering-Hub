@@ -578,8 +578,16 @@ class _Journal:
 
     def state(self, identity, state, data):
         with self.transaction() as db:
-            _require(db.execute('UPDATE launch SET state=?,data=? WHERE id=?',
-                (state, _canonical(data).decode(), identity)).rowcount == 1)
+            _require(type(data) is dict and 'daemon_scope_observation' not in data)
+            row = db.execute('SELECT data FROM launch WHERE id=?', (identity,)).fetchone()
+            _require(row is not None)
+            prior = _strict(row[0].encode('utf-8'), 65536)
+            _require(type(prior) is dict)
+            retained = dict(data)
+            if 'daemon_scope_observation' in prior:
+                retained['daemon_scope_observation'] = prior['daemon_scope_observation']
+            _require(db.execute('UPDATE launch SET state=?,data=? WHERE id=? AND data=?',
+                (state, _canonical(retained).decode(), identity, row[0])).rowcount == 1)
 
     def record_empty_daemon_scope(self, identity, expected_record, observation):
         """Retain one post-stop scope snapshot; it grants no recovery authority."""
@@ -589,6 +597,18 @@ class _Journal:
             data = _strict(row[1].encode('utf-8'), 65536)
             _require(type(data) is dict and data == expected_record and 'daemon_scope_observation' not in data)
             data['daemon_scope_observation'] = observation
+            _require(db.execute('UPDATE launch SET data=? WHERE id=? AND state=? AND data=?',
+                (_canonical(data).decode(), identity, 'stopped', row[1])).rowcount == 1)
+
+    def confirm_empty_daemon_scope(self, identity, observation):
+        """Record that a second scope check finished, never prove effect outcome."""
+        with self.transaction() as db:
+            row = db.execute('SELECT state,data FROM launch WHERE id=?', (identity,)).fetchone()
+            _require(row is not None and row[0] == 'stopped')
+            data = _strict(row[1].encode('utf-8'), 65536)
+            _require(type(data) is dict and data.get('daemon_scope_observation') == observation
+                     and observation.get('verification') == 'provisional')
+            data['daemon_scope_observation'] = dict(observation, verification='postcheck_complete')
             _require(db.execute('UPDATE launch SET data=? WHERE id=? AND state=? AND data=?',
                 (_canonical(data).decode(), identity, 'stopped', row[1])).rowcount == 1)
 
@@ -1473,11 +1493,17 @@ class LaunchSupervisor:
                 record = {'boot_id': evidence.boot_id, 'scope_device': evidence.scope_device,
                     'scope_inode': evidence.scope_inode, 'original_members': [list(p) for p in evidence.original_members],
                     'observed_monotonic_ns': int(evidence.observed_monotonic * 1_000_000_000),
-                    'effect_outcome_proven': False}
+                    'effect_outcome_proven': False, 'verification': 'provisional'}
                 self._journal.record_empty_daemon_scope(self._launch_id, self._record(), record)
                 # This second check detects common changes around persistence;
                 # neither check is atomic with kernel state or external effects.
-                scope.observe_empty()
+                after = scope.observe_empty()
+                _require(type(after) is EmptyScopeObservation and after.effect_outcome_proven is False
+                         and after.boot_id == evidence.boot_id and after.scope_device == evidence.scope_device
+                         and after.scope_inode == evidence.scope_inode
+                         and after.original_members == evidence.original_members
+                         and after.observed_monotonic >= evidence.observed_monotonic)
+                self._journal.confirm_empty_daemon_scope(self._launch_id, record)
                 return evidence
             except Exception:
                 raise LaunchSupervisorError() from None

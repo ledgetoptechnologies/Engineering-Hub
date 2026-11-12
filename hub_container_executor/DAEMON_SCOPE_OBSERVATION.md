@@ -11,7 +11,10 @@ After the existing `graceful_stop()` has durably recorded the supervised
 consumer's exit, an independent operator may stop the dedicated TEST daemon.
 Once the retained daemon pidfd and enrolled scope show empty, call
 `supervisor.record_daemon_scope_emptiness(scope)`. The existing root-private
-launch journal retains one observation; it does not alter a held operation or
+launch journal first retains a `provisional` observation, then marks it
+`postcheck_complete` only after a second scope check succeeds. Both states are
+preserved by later hold updates. A provisional record does not establish that
+the postcheck succeeded. Neither state alters a held operation or
 start, stop, kill, adopt, or replay a daemon effect. Failure, including an
 already recorded observation, is closed and requires evidence review. Scope
 observations are snapshots and are not an atomic barrier against a privileged
