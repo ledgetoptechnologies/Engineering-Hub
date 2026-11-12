@@ -162,7 +162,7 @@ async def test_coherent_target_rewrite_cannot_rebind_original_submission(held, f
 @pytest.mark.asyncio
 async def test_legacy_unbound_hold_is_recognized_read_only_and_tampering_denied(held):
     # Model an old three-field target and old public fingerprint, not a new
-    # reviewed hold with a random field removed. Recovery remains manual-only.
+    # reviewed hold with a random field removed. Recognition grants no recovery.
     with held.repo._transaction() as db:
         row = db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (held.job_id,)).fetchone()
         submission = db.execute('SELECT id,data FROM hub_staging_submissions WHERE json_extract(data,\'$.job_id\')=?',

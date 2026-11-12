@@ -174,7 +174,8 @@ def modular_hold_matches(db, *, repo, queue, policies, modular_controller, reser
             _uuid(item[key])
         if legacy:
             # Preserve only the exact pre-review shape. Legacy unbound holds
-            # remain manual-only in the controller; recognition grants no work.
+            # uncertain holds remain guarded by source binding; recognition
+            # itself grants no work or recovery authority.
             _require(not {'review_task_id', 'review_task_revision', 'source_binding'} & set(item))
         else:
             _uuid(item['review_task_id'])
