@@ -107,3 +107,24 @@ and fails closed on mismatch or expiry. These are point-in-time checks, not an
 atomic kernel fence. They do not prove uninterrupted containment, all worker
 closure, or recovery of a held effect. The profile is opt-in; legacy profiles
 retain their prior behavior. No installation or staging acceptance is implied.
+
+### Opt-in hierarchical worker scope
+
+`preflight_worker_scope` is a root-supervisor API for an independently
+provisioned scope that includes the daemon and every explicitly inventoried
+worker process. It accepts retained pidfds for the exact initial inventory and
+rejects a missing, extra, or outside member. The root scope and every ancestor
+remain root-controlled, while descendants may be delegated within the scope.
+Kernel descendant depth and count must be finite and bounded. The reader
+rechecks the exact initial inventory and uses the root's recursive
+`cgroup.events` plus retained pidfds when observing emptiness. The journal marks
+such an observation as `hierarchy`; it is still only a point-in-time observation.
+
+This does not discover all relevant processes. An independent operator must
+establish that user-systemd, containerd, shims, application processes and all
+other effect workers are actually inside that boundary and cannot use an
+outside delegation. A pre-existing outside user manager or privileged actor can
+create workers the scope cannot see. The current installed launcher CLI does
+not supply that complete enrollment, and this source API never clears a hold or
+asserts an exact operation outcome. Do not infer a full recovery barrier from a
+successful hierarchical observation alone.

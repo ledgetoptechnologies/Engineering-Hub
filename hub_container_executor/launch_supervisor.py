@@ -1625,6 +1625,35 @@ class LaunchSupervisor:
                 if scope is not None: scope.close()
                 raise LaunchSupervisorError() from None
 
+    def preflight_worker_scope(self, scope_path, *, processes, timeout_ms):
+        """Pin an explicitly inventoried daemon/worker tree before launch.
+
+        The caller supplies already retained live pidfds, including this exact
+        daemon handle, under independently provisioned root-controlled scope.
+        Full worker inventory and privileged process placement remain external
+        responsibilities. No effect outcome or recovery authority is inferred.
+        """
+        from .cgroup_scope_evidence import EnrolledCgroupScope
+        _require(self._pid == os.getpid() and type(timeout_ms) is int and 1 <= timeout_ms <= 10000)
+        with self._mutex:
+            scope = None
+            try:
+                self._guard()
+                _require(self._launch_id is None and self._engine is not None
+                         and type(self._engine.process) is _Process and type(processes) is tuple
+                         and any(item is self._engine.process for item in processes)
+                         and self._engine.process.pid == self._daemon_pin.pid
+                         and self._engine.process.start == self._daemon_pin.start_ticks)
+                deadline = time.monotonic() + timeout_ms / 1000
+                self._engine.process.check()
+                scope = EnrolledCgroupScope(scope_path, processes=processes, allow_descendants=True)
+                self._engine.process.check()
+                _remaining(deadline)
+                return scope
+            except BaseException:
+                if scope is not None: scope.close()
+                raise LaunchSupervisorError() from None
+
     def verify_preflight_daemon_scope(self, scope, *, timeout_ms):
         """Recheck the preflight scope against the actual running launch."""
         from .cgroup_scope_evidence import EnrolledCgroupScope
@@ -1697,7 +1726,9 @@ class LaunchSupervisor:
                 _require(type(evidence) is EmptyScopeObservation and evidence.effect_outcome_proven is False
                          and evidence.boot_id == self._engine.process.boot
                          and (self._daemon_pin.pid, self._daemon_pin.start_ticks) in evidence.original_members)
-                record = {'boot_id': evidence.boot_id, 'scope_device': evidence.scope_device,
+                record = {'boot_id': evidence.boot_id,
+                    'scope_mode': 'hierarchy' if scope._allow_descendants else 'leaf',
+                    'scope_device': evidence.scope_device,
                     'scope_inode': evidence.scope_inode, 'original_members': [list(p) for p in evidence.original_members],
                     'observed_monotonic_ns': int(evidence.observed_monotonic * 1_000_000_000),
                     'effect_outcome_proven': False, 'verification': 'provisional'}

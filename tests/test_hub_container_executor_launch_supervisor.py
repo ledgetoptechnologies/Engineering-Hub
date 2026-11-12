@@ -1971,3 +1971,53 @@ def test_authenticated_app_cgroup_observation_round_trip(synthetic_issuer):
             except subprocess.TimeoutExpired:
                 child.kill(); child.wait(timeout=2)
         worker.join(4)
+
+
+def test_supervisor_worker_scope_requires_exact_prelaunch_process_inventory(root_journal, short_root, monkeypatch):
+    """Real pidfds, synthetic cgroup files and no fake Engine POST."""
+    from hub_container_executor import cgroup_scope_evidence as cgroups
+    authority, _ = synthetic_launcher(root_journal)
+    engine = authority._engine
+    fake_root = short_root / 'worker-cgroup'
+    fake_root.mkdir(mode=0o700)
+    scope_dir = fake_root / 'worker'
+    scope_dir.mkdir(mode=0o700)
+    nested = scope_dir / 'delegated'
+    nested.mkdir(mode=0o700)
+    for base, names in ((fake_root, {'cgroup.procs':'', 'cgroup.threads':''}),
+        (scope_dir, {'cgroup.max.depth':'2\n', 'cgroup.max.descendants':'8\n',
+                     'cgroup.procs':'', 'cgroup.threads':'', 'cgroup.subtree_control':'',
+                     'cgroup.events':'populated 1\nfrozen 0\n'}),
+        (nested, {'cgroup.procs':''})):
+        for name, value in names.items():
+            (base/name).write_text(value)
+            (base/name).chmod(0o600)
+    monkeypatch.setattr(cgroups, '_CGROUP_ROOT', fake_root)
+    monkeypatch.setattr(cgroups, '_filesystem', lambda fd: None)
+    monkeypatch.setattr(cgroups, '_mount_root', lambda: None)
+    monkeypatch.setattr(cgroups, '_membership', lambda process, expected, **kwargs: None)
+    children = [subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for _ in range(2)]
+    processes = tuple(launch._Process(child.pid) for child in children)
+    scope = None
+    try:
+        authority._daemon_pin = launch._DaemonPin('/synthetic/daemon.sock', processes[0].pid,
+            processes[0].start, 10001, 10001, 'synthetic-engine', '1.45')
+        engine.process = processes[0]
+        (scope_dir/'cgroup.procs').write_text(str(children[0].pid)+'\n')
+        (nested/'cgroup.procs').write_text(str(children[1].pid)+'\n')
+        scope = authority.preflight_worker_scope('worker', processes=processes, timeout_ms=1000)
+        scope.assert_enrolled_live()
+        (nested/'cgroup.procs').write_text(str(children[1].pid)+'\n999999\n')
+        with pytest.raises(cgroups.ScopeEvidenceError): scope.assert_enrolled_live()
+        assert engine.effect_calls == []
+    finally:
+        if scope is not None: scope.close()
+        for process in processes: process.close()
+        for child in children:
+            if child.poll() is None:
+                child.terminate()
+                try: child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    child.kill(); child.wait(timeout=2)
+        authority.close()

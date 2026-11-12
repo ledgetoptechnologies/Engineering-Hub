@@ -91,10 +91,58 @@ def _events(raw):
     return values
 
 
-def _membership(process, expected):
+def _membership(process, expected, *, descendants=False):
     raw = Path(f'/proc/{process.pid}/cgroup').read_text(encoding='ascii')
     rows = raw.splitlines()
-    _require(len(rows) == 1 and rows[0] == '0::/' + expected)
+    _require(len(rows) == 1)
+    prefix = '0::/' + expected
+    _require(rows[0] == prefix or descendants and rows[0].startswith(prefix + '/'))
+
+
+def _read_kernel_members(directory):
+    """Read a kernel cgroup file in a delegated descendant, never as authority."""
+    name = 'cgroup.procs'
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=directory)
+    try:
+        _filesystem(fd)
+        before = os.fstat(fd)
+        _require(stat.S_ISREG(before.st_mode)
+                 and _identity(before) == _identity(os.stat(name, dir_fd=directory, follow_symlinks=False)))
+        raw = os.read(fd, 65537)
+        _require(len(raw) <= 65536 and _identity(before) == _identity(os.fstat(fd))
+                 and _identity(before) == _identity(os.stat(name, dir_fd=directory, follow_symlinks=False)))
+        return _members(raw.decode('ascii'))
+    finally:
+        os.close(fd)
+
+
+def _tree_members(directory):
+    """Bounded no-follow snapshot of all direct and descendant process IDs."""
+    members, visited = [], [0]
+    root_device = os.fstat(directory).st_dev
+    def walk(fd):
+        visited[0] += 1
+        _require(visited[0] <= 129)
+        _filesystem(fd)
+        _require(os.fstat(fd).st_dev == root_device)
+        members.extend(_read_kernel_members(fd))
+        _require(len(members) <= 4096)
+        entries = list(os.scandir(fd))
+        _require(len(entries) <= 1024)
+        for item in entries:
+            _require(not item.is_symlink())
+            if not item.is_dir(follow_symlinks=False):
+                continue
+            child = os.open(item.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            try:
+                _require(_identity(os.fstat(child)) == _identity(os.stat(item.name, dir_fd=fd, follow_symlinks=False)))
+                walk(child)
+                _require(_identity(os.fstat(child)) == _identity(os.stat(item.name, dir_fd=fd, follow_symlinks=False)))
+            finally:
+                os.close(child)
+    walk(directory)
+    _require(len(set(members)) == len(members))
+    return tuple(sorted(members))
 
 
 @dataclass(frozen=True)
@@ -115,17 +163,17 @@ class EnrolledCgroupScope:
     out of scope. This reader does not prove that all daemon dependencies were
     enrolled or prevent privileged changes after its final check.
     """
-    def __init__(self, scope, *, processes):
+    def __init__(self, scope, *, processes, allow_descendants=False):
         self._pid, self._fd, self._root = os.getpid(), None, None
         self._processes = ()
         try:
             _require(sys.platform == 'linux' and os.getuid() == os.geteuid() == 0
                      and type(scope) is str and re.fullmatch(r'[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*', scope)
                      and all(part not in {'.', '..'} for part in scope.split('/'))
-                     and type(processes) is tuple and processes
+                     and type(processes) is tuple and processes and type(allow_descendants) is bool
                      and all(type(item) is _Process and item.pid != os.getpid() for item in processes))
             _require(len({p.pid for p in processes}) == len(processes))
-            self._scope = scope
+            self._scope, self._allow_descendants = scope, allow_descendants
             _mount_root()
             flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
             self._root = os.open(_CGROUP_ROOT, flags)
@@ -185,14 +233,20 @@ class EnrolledCgroupScope:
             _require(_identity(os.fstat(current)) == self._identity)
         finally:
             os.close(current)
-        # Both limits must be permanently root-controlled and set to zero, so
-        # child cgroups cannot escape an otherwise empty parent observation.
-        _require(_read(self._fd, 'cgroup.max.depth').strip() == '0'
-                 and _read(self._fd, 'cgroup.max.descendants').strip() == '0')
+        # The root boundary and all ancestors are root-controlled. Descendant
+        # delegation is opt-in and bounded; kernel populated is recursive.
+        depth = _read(self._fd, 'cgroup.max.depth').strip()
+        count = _read(self._fd, 'cgroup.max.descendants').strip()
+        _require(re.fullmatch(r'[0-9]+', depth) and re.fullmatch(r'[0-9]+', count))
+        if self._allow_descendants:
+            _require(1 <= int(depth) <= 32 and 1 <= int(count) <= 128)
+        else:
+            _require(depth == '0' and count == '0')
         for name in ('cgroup.procs', 'cgroup.threads', 'cgroup.subtree_control'):
             _read(self._fd, name)
-        _require(not any(entry.is_dir(follow_symlinks=False) or entry.is_symlink()
-                         for entry in os.scandir(self._fd)))
+        if not self._allow_descendants:
+            _require(not any(entry.is_dir(follow_symlinks=False) or entry.is_symlink()
+                             for entry in os.scandir(self._fd)))
         path = _CGROUP_ROOT / self._scope
         _require(path.resolve(strict=True) == path and _identity(os.stat(path, follow_symlinks=False)) == self._identity)
 
@@ -203,12 +257,17 @@ class EnrolledCgroupScope:
             for item in self._processes:
                 item.check()
                 _require(item.boot == self._boot)
-                _membership(item, self._scope)
+                if self._allow_descendants:
+                    _membership(item, self._scope, descendants=True)
+                else:
+                    _membership(item, self._scope)
             ids = tuple(sorted(item.pid for item in self._processes))
-            _require(_members(_read(self._fd, 'cgroup.procs')) == ids)
+            read_members = (lambda: _tree_members(self._fd)) if self._allow_descendants else (
+                lambda: _members(_read(self._fd, 'cgroup.procs')))
+            _require(read_members() == ids)
             for item in self._processes: item.check()
             self._check_scope()
-            _require(_members(_read(self._fd, 'cgroup.procs')) == ids)
+            _require(read_members() == ids)
         except Exception:
             raise ScopeEvidenceError('cgroup scope evidence unavailable') from None
 
@@ -221,7 +280,8 @@ class EnrolledCgroupScope:
                      and not _members(_read(self._fd, 'cgroup.procs')))
             self._check_scope()
             _require(_events(_read(self._fd, 'cgroup.events'))['populated'] == 0
-                     and not _members(_read(self._fd, 'cgroup.procs')))
+                     and not _members(_read(self._fd, 'cgroup.procs'))
+                     and (not self._allow_descendants or not _tree_members(self._fd)))
             now = time.monotonic()
             _require(math.isfinite(now) and now >= 0)
             return EmptyScopeObservation(self._boot, *self._identity, self._original, now)

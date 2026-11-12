@@ -109,3 +109,48 @@ def test_live_scope_recheck_denies_new_member_before_use(fixture):
             enrolled.assert_enrolled_live()
     finally:
         enrolled.close()
+
+
+def test_opt_in_worker_tree_requires_all_members_and_recursive_empty(fixture, monkeypatch):
+    """Synthetic cgroup files; does not prove external worker completeness."""
+    scope, child, process = fixture
+    (scope / 'cgroup.max.depth').write_text('2\n')
+    (scope / 'cgroup.max.descendants').write_text('8\n')
+    (scope / 'cgroup.procs').write_text('')
+    nested = scope / 'delegated'
+    nested.mkdir()
+    (nested / 'cgroup.procs').write_text(str(child.pid) + '\n')
+    (nested / 'cgroup.procs').chmod(0o666)  # delegated kernel control, root boundary stays protected
+    monkeypatch.setattr(module, '_membership', lambda process, expected, **kwargs: None)
+    with pytest.raises(module.ScopeEvidenceError):
+        module.EnrolledCgroupScope('scope', processes=(process,))  # legacy leaf remains closed
+    enrolled = module.EnrolledCgroupScope('scope', processes=(process,), allow_descendants=True)
+    try:
+        child.terminate()
+        child.wait(timeout=3)
+        (scope / 'cgroup.events').write_text('populated 0\nfrozen 0\n')
+        with pytest.raises(module.ScopeEvidenceError):
+            enrolled.observe_empty()  # stale descendant member still blocks
+        (nested / 'cgroup.procs').write_text('')
+        observed = enrolled.observe_empty()
+        assert observed.original_members == ((child.pid, process.start),)
+        assert observed.effect_outcome_proven is False
+    finally:
+        enrolled.close()
+
+
+def test_worker_tree_rejects_unlisted_members_and_delegated_boundary(fixture, monkeypatch):
+    scope, child, process = fixture
+    (scope / 'cgroup.max.depth').write_text('2\n')
+    (scope / 'cgroup.max.descendants').write_text('8\n')
+    nested = scope / 'delegated'
+    nested.mkdir()
+    (nested / 'cgroup.procs').write_text('999999\n')
+    (nested / 'cgroup.procs').chmod(0o666)
+    monkeypatch.setattr(module, '_membership', lambda process, expected, **kwargs: None)
+    with pytest.raises(module.ScopeEvidenceError):
+        module.EnrolledCgroupScope('scope', processes=(process,), allow_descendants=True)
+    (nested / 'cgroup.procs').write_text('')
+    (scope / 'cgroup.procs').chmod(0o666)
+    with pytest.raises(module.ScopeEvidenceError):
+        module.EnrolledCgroupScope('scope', processes=(process,), allow_descendants=True)
