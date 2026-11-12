@@ -621,7 +621,7 @@ class LaunchSupervisor:
         self._closed = False
         self._issuance_open = False
         self._receipt_served = False
-        self._receipt_id = self._receipt_digest = None
+        self._receipt_id = self._receipt_digest = self._receipt_expires_at_ms = None
         self._approval_expires_at_ms = None
         self._held = False
         self._source_pins = {}
@@ -1054,6 +1054,7 @@ class LaunchSupervisor:
                 self._journal.issuance_state(self._launch_id, 'sent', hashlib.sha256(raw).hexdigest())
                 self._receipt_id = payload['receipt_id']
                 self._receipt_digest = hashlib.sha256(raw).hexdigest()
+                self._receipt_expires_at_ms = payload['expires_at_ms']
                 self._receipt_served = True
                 return payload['receipt_id']
             except BaseException:
@@ -1144,13 +1145,14 @@ class LaunchSupervisor:
         with self._observation_mutex(deadline):
             self._guard()
             _require(self._receipt_served and type(self._receipt_id) is str
-                     and type(self._receipt_digest) is str and _HEX.fullmatch(self._receipt_digest))
+                     and type(self._receipt_digest) is str and _HEX.fullmatch(self._receipt_digest)
+                     and type(self._receipt_expires_at_ms) is int and self._receipt_expires_at_ms > 0)
             nonce = secrets.token_hex(32)
             raw = self._observe_current_launch_locked(nonce, deadline)
             observation = _strict(raw, current_observation.MAX_OBSERVATION_BYTES)
             payload = {'schema': 'engineering-hub.launch-approval-proposal.v1',
                        'receipt_id': self._receipt_id, 'receipt_sha256': self._receipt_digest,
-                       'observation': observation}
+                       'receipt_expires_at_ms': self._receipt_expires_at_ms, 'observation': observation}
             signature = base64.urlsafe_b64encode(self._signer.sign(
                 APPROVAL_PROPOSAL_DOMAIN + _canonical(payload))).rstrip(b'=').decode()
             result = _canonical({'payload': payload, 'signature': signature})

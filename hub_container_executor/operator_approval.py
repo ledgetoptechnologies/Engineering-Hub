@@ -99,6 +99,7 @@ def publish(*, policy_file, proposal_file, signing_key_file):
                                            expected_engine_id=policy['expected_engine_id'])
         launch_hash = hashlib.sha256(_canonical(asdict(proposal.launch))).hexdigest()
         _require(proposal.receipt_id == policy['receipt_id'] and proposal.receipt_sha256 == policy['receipt_sha256']
+                 and proposal.receipt_expires_at_ms == policy['receipt_expires_at_ms']
                  and launch_hash == policy['launch_sha256'])
         now = int(time.time() * 1000)
         expires = min(policy['approval_expires_at_ms'], policy['receipt_expires_at_ms'],

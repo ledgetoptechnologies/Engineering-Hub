@@ -36,6 +36,7 @@ class AcceptedPostLaunchApproval:
 class VerifiedLaunchProposal:
     receipt_id: str
     receipt_sha256: str
+    receipt_expires_at_ms: int
     launch: CurrentLaunchPins
     observation_expires_at_ms: int
 
@@ -65,10 +66,11 @@ def verify_launch_proposal(raw, *, release, expected_engine_id):
             if len(value) != 64 or base64.urlsafe_b64encode(value).rstrip(b'=').decode() != signature: raise ValueError
             Ed25519PublicKey.from_public_bytes(release.public_key).verify(value, domain + _canonical(data))
         payload = envelope['payload']
-        if (type(payload) is not dict or set(payload) != {'schema', 'receipt_id', 'receipt_sha256', 'observation'}
+        if (type(payload) is not dict or set(payload) != {'schema', 'receipt_id', 'receipt_sha256', 'receipt_expires_at_ms', 'observation'}
                 or payload['schema'] != 'engineering-hub.launch-approval-proposal.v1'
                 or type(payload['receipt_id']) is not str or str(UUID(payload['receipt_id'])) != payload['receipt_id']
-                or type(payload['receipt_sha256']) is not str or not re.fullmatch(r'[a-f0-9]{64}', payload['receipt_sha256'])):
+                or type(payload['receipt_sha256']) is not str or not re.fullmatch(r'[a-f0-9]{64}', payload['receipt_sha256'])
+                or type(payload['receipt_expires_at_ms']) is not int or payload['receipt_expires_at_ms'] <= 0):
             raise ValueError
         verify(envelope['signature'], PROPOSAL_DOMAIN, payload)
         obs = payload['observation']
@@ -88,9 +90,11 @@ def verify_launch_proposal(raw, *, release, expected_engine_id):
         launch = CurrentLaunchPins(**{f.name: body[f.name] for f in fields(CurrentLaunchPins)})
         observed, expires, now = body['observed_at_ms'], body['expires_at_ms'], int(time.time() * 1000)
         if (launch.engine_id != expected_engine_id or type(observed) is not int or type(expires) is not int
-                or not observed <= now < expires <= launch.approval_expires_at_ms or expires - observed > 5000):
+                or not observed <= now < expires <= launch.approval_expires_at_ms or expires - observed > 5000
+                or now >= payload['receipt_expires_at_ms']):
             raise ValueError
-        return VerifiedLaunchProposal(payload['receipt_id'], payload['receipt_sha256'], launch, expires)
+        return VerifiedLaunchProposal(payload['receipt_id'], payload['receipt_sha256'],
+                                      payload['receipt_expires_at_ms'], launch, expires)
     except Exception:
         raise PostLaunchApprovalError('Signed launch proposal unavailable') from None
 

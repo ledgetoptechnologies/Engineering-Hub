@@ -19,9 +19,11 @@ A root-private JSON policy is a closed object with schema
   `receipt_id`, `receipt_sha256`, and `launch_sha256` identify the independently
   reviewed proposal. The launch hash is SHA-256 of the UTF-8 canonical JSON of
   the full verified `CurrentLaunchPins` object, with sorted keys and compact
-  separators. The receipt hash is the proposal's signed `receipt_sha256`.
-- `receipt_expires_at_ms` and `approval_expires_at_ms` are independently
-  reviewed integer ceilings, in Unix milliseconds. The signed record is clipped
+  separators. The receipt hash and original receipt expiry are the proposal's signed
+  `receipt_sha256` and `receipt_expires_at_ms`.
+- `receipt_expires_at_ms` is the exact signed proposal value and
+  `approval_expires_at_ms` is an independently reviewed integer ceiling,
+  both in Unix milliseconds. The signed record is clipped
   to both and to the original signed launch ceiling; the runner additionally
   checks the authenticated receipt's own expiration.
 - `output_path`, `output_uid`, and `output_gid` select the new approval file and
