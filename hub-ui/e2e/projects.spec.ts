@@ -261,3 +261,27 @@ test("project tracking starts at the first page after changing project", async (
   expect(requests).toContain(`${second}:first`);
   expect(requests.filter(value => value.startsWith(`${second}:`))).toEqual([`${second}:first`]);
 });
+
+test("tracking completion review requires evidence acknowledgement and sends exact revision", async ({ page }) => {
+  const { overview } = await fixture(page);
+  const project = overview.projects[0].id as string;
+  let sent: Record<string, unknown> | undefined;
+  let csrf: string | undefined;
+  const task = { id: "11111111-1111-4111-8111-111111111111", project, title: "Verify task", status: "completion_claimed", revision: 2,
+    created_by: "codex", execution_authorization: false, updates: [{actor:"codex", progress:"Done", completion_claim:true,
+      evidence_links:[{label:"Evidence",url:"https://example.com/evidence"}]}] };
+  await page.route("**/api/hub/v1/projects/*/tracking-tasks*", route => route.fulfill({contentType:"application/json", body:JSON.stringify({project,tasks:[task],truncated:false,next_after:null})}));
+  await page.route("**/api/hub/v1/tracking-tasks/*/review", route => {
+    sent = route.request().postDataJSON(); csrf = route.request().headers()["x-hub-csrf"];
+    return route.fulfill({contentType:"application/json", body:JSON.stringify({...task,status:"completion_verified",revision:3})});
+  });
+  await page.goto(`/#/projects/${project}/work`);
+  await page.getByText("Review completion claim").click();
+  const verify = page.getByRole("button", {name:"Verify completion"});
+  await page.getByLabel("Review note").fill("I checked the evidence");
+  await expect(verify).toBeDisabled();
+  await page.getByLabel("I reviewed the linked evidence").check();
+  await verify.click();
+  await expect.poll(() => sent).toMatchObject({expected_revision:2,verdict:"verify",note:"I checked the evidence",evidence_links:[{label:"Evidence",url:"https://example.com/evidence"}]});
+  expect(csrf).toBe("fixture-csrf");
+});
