@@ -206,7 +206,7 @@ def test_incorrect_runtime_image_or_swap_denies_profile(monkeypatch):
 
 
 def workflow_run_commands(text):
-    """Extract inline and block run commands without reading step env values."""
+    """Extract this workflow's block/inline run forms; this is not a YAML parser."""
     lines = text.splitlines()
     commands = []
     i = 0
@@ -233,7 +233,7 @@ def workflow_run_commands(text):
 
 
 def has_direct_input_expression(command):
-    return bool(re.search(r'\$\{\{(?:(?!\}\}).)*?\binputs\s*(?:\.|\[)',
+    return bool(re.search(r'\$\{\{(?:(?!\}\}).)*?\binputs\b',
                           command, re.IGNORECASE | re.DOTALL))
 
 
@@ -244,12 +244,18 @@ def has_direct_input_expression(command):
     'echo ${{ INPUTS . baseline_digest }}',
     "echo ${{ inputs ['baseline_digest'] }}",
     'echo ${{ format("{0}", inputs.baseline_digest) }}',
+    'echo ${{ toJSON(inputs) }}',
+    'echo ${{ inputs }}',
 ])
 @pytest.mark.parametrize('run', ['        run: |\n          {}\n', '        run: {}\n',
                                 '      - run: {}\n'])
 def test_direct_input_interpolation_is_rejected_for_block_and_inline(run, command):
     commands = workflow_run_commands(run.format(command))
     assert len(commands) == 1 and has_direct_input_expression(commands[0])
+
+
+def test_shell_environment_reference_is_not_direct_interpolation():
+    assert not has_direct_input_expression('echo "$BASELINE_DIGEST"')
 
 
 def test_workflow_manual_main_read_only_package_scope_and_receipt_only():
