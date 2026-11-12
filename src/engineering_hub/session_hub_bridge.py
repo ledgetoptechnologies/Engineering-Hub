@@ -457,8 +457,9 @@ class SessionHubBridge:
                                 if fn.__name__ == 'hub_project_list':
                                     from .projects_api import project_view
                                     items = [bridge.projects.get_project(p) for p in operation.projects]
-                                    return {'items': [project_view(p) for p in items if not p['archived']]}
-                                result = fn(*args, **kwargs)
+                                    result = {'items': [project_view(p) for p in items if not p['archived']]}
+                                else:
+                                    result = fn(*args, **kwargs)
                                 if operation.capability.endswith('.read') or operation.capability == 'task.list':
                                     operation.before_commit(bridge.repo.path, None)
                                 return result

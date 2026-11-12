@@ -567,6 +567,57 @@ def test_withdraw_retry_rechecks_replacement_grant(unified):
     assert app.state.repository._read(original['id'], 'task')['revision'] == result['revision']
 
 
+@pytest.mark.parametrize('expiry', ['grant', 'session'])
+def test_project_list_rechecks_expiry_after_enumeration(unified, monkeypatch, expiry):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, caps=('project.read',))
+    if expiry == 'grant':
+        env.bridge.grant_put(OWNER, installation, 1, [PROJECT], ['project.read'], lifetime_seconds=60)
+    invoke, _ = sdk(client, token)
+    assert [item['id'] for item in data(invoke('hub_project_list', {}))['items']] == [PROJECT]
+    original = env.bridge.projects.get_project
+    def expire_during_enumeration(project):
+        result = original(project)
+        bus.state.agent_sessions.clock.value += 61 if expiry == 'grant' else 901
+        return result
+    monkeypatch.setattr(env.bridge.projects, 'get_project', expire_during_enumeration)
+    denied = invoke('hub_project_list', {})
+    assert denied['isError']
+    assert not denied.get('structuredContent')
+
+
+def test_project_list_serializes_with_grant_revocation(unified, monkeypatch):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, caps=('project.read',))
+    invoke, _ = sdk(client, token)
+    entered, release, revoked = threading.Event(), threading.Event(), threading.Event()
+    original = env.bridge.projects.get_project
+    def block_during_enumeration(project):
+        result = original(project)
+        entered.set()
+        assert release.wait(5)
+        return result
+    monkeypatch.setattr(env.bridge.projects, 'get_project', block_during_enumeration)
+    def revoke():
+        try:
+            return env.bridge.grant_revoke(OWNER, installation, 1)
+        finally:
+            revoked.set()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        read_future = pool.submit(invoke, 'hub_project_list', {})
+        try:
+            assert entered.wait(5)
+            revoke_future = pool.submit(revoke)
+            assert not revoked.wait(.05)
+        finally:
+            release.set()
+        assert [item['id'] for item in data(read_future.result(timeout=5))['items']] == [PROJECT]
+        revoke_future.result(timeout=5)
+    assert invoke('hub_project_list', {})['isError']
+
+
 def test_session_decision_read_cross_surface_and_project_grants(unified):
     client, app, bus, csrf = unified
     env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
