@@ -140,8 +140,15 @@ export function link(path: string): string {
   return pathMode ? path + location.search : "#" + path;
 }
 
+function isRouteHash(url: { pathname: string; hash: string }): boolean {
+  // An explicit #/ route works at any path. Old single-page anchors are routes
+  // only at the app root; on a real path #name is that page's fragment.
+  return url.hash.startsWith('#/') ||
+    ((url.pathname === '/' || url.pathname === '/index.html') && Object.hasOwn(legacy, url.hash.slice(1)));
+}
+
 function routeAt(url: { pathname: string; hash: string }): Route {
-  return url.hash.length > 1 ? parseRoute(url.hash) : parseRoute(url.pathname);
+  return isRouteHash(url) ? parseRoute(url.hash) : parseRoute(url.pathname);
 }
 const current = () => routeAt(location);
 const here = () => location.pathname + location.search + location.hash;
@@ -184,9 +191,16 @@ function enablePathMode() {
   if (pathMode) return;
   pathMode = true;
   // Move an old #/ address onto the real path without adding a history entry.
-  if (location.hash.length > 1 && !restoring) {
+  if (isRouteHash(location) && !restoring) {
     const value = accepted?.position ?? position() ?? freshPosition();
-    history.replaceState(stateAt(value), "", pathOf(parseRoute(location.hash)) + location.search);
+    const inner = location.hash.startsWith('#/') ? location.hash.slice(1) : '';
+    const fragmentAt = inner.indexOf('#');
+    const beforeFragment = fragmentAt < 0 ? inner : inner.slice(0, fragmentAt);
+    const fragment = fragmentAt < 0 ? '' : inner.slice(fragmentAt);
+    const queryAt = beforeFragment.indexOf('?');
+    const innerQuery = queryAt < 0 ? '' : beforeFragment.slice(queryAt + 1);
+    const query = location.search + (innerQuery ? (location.search ? '&' : '?') + innerQuery : '');
+    history.replaceState(stateAt(value), "", pathOf(parseRoute(location.hash)) + query + fragment);
     accepted = { url: here(), position: value };
   }
   notify();
