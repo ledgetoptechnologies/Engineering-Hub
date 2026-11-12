@@ -96,6 +96,24 @@ def test_admission_cleanup_closes_directory_and_preserves_primary_error(tmp_path
     assert not (inputs / 'admit.json').exists()
 
 
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX directory synchronization semantics')
+def test_admission_directory_sync_failure_can_follow_visible_gate(tmp_path, monkeypatch):
+    inputs = tmp_path / 'input'
+    runner.prepare_input_directory(inputs)
+    original_fsync = os.fsync
+    def fail_directory_fsync(fd):
+        if os.path.samestat(os.fstat(fd), inputs.stat()):
+            raise OSError('synthetic directory sync failure')
+        return original_fsync(fd)
+    monkeypatch.setattr(runner.os, 'fsync', fail_directory_fsync)
+    with pytest.raises(OSError, match='directory sync'):
+        runner.publish_admission(inputs, 'c' * 32)
+    # Once linked, the consumer may have observed admission even though later
+    # directory durability failed. Never claim that this exception undid it.
+    assert json.loads((inputs / 'admit.json').read_text()) == {'intent': 'c' * 32}
+    assert sorted(p.name for p in inputs.iterdir()) == ['admit.json']
+
+
 @pytest.mark.parametrize('value', [1, 300, 900])
 def test_ci_wait_accepts_only_positive_bounded_seconds(value):
     assert runner.validate_timeout(value) == value
@@ -655,6 +673,26 @@ def test_private_guard_phases_and_detached_observer_precede_fd_close(hooked_cont
     assert result['kernel_limits']['path']!='mutated private observer copy'
     assert rig.state.closed and rig.state.pin.fd is None
     assert not (rig.engine/'HELD.json').exists() and not (rig.output/'HELD.json').exists()
+
+
+@pytest.mark.skipif(sys.platform!='linux',reason='Real Linux controller lock and kernel FD fixture')
+def test_visible_gate_followed_by_sync_failure_stops_and_records_failed(hooked_controller, monkeypatch):
+    rig = hooked_controller
+    observed = []
+    original = runner.publish_admission
+    def publish_then_fail(inputs, intent):
+        original(inputs, intent)
+        raise OSError('simulated failure after gate publication')
+    monkeypatch.setattr(runner, 'publish_admission', publish_then_fail)
+    with pytest.raises(runner.CIError):
+        runner.run(rig.args, expected_commit='c'*40, admission_guard=lambda: None,
+                   terminal_observer=observed.append)
+    assert rig.events == ['create', 'start', 'stop']
+    assert json.loads((rig.state.inputs/'admit.json').read_text())['intent'] == rig.state.intent
+    assert len(observed) == 1 and observed[0]['failed'] is True
+    assert observed[0]['terminal_verified'] is True
+    assert observed[0]['cgroup_terminal']['descendants_empty'] is True
+    assert rig.state.closed
 
 
 @pytest.mark.skipif(sys.platform!='linux',reason='Real Linux controller lock and kernel FD fixture')
