@@ -31,9 +31,39 @@ from tests.test_hub_container_executor_launch_supervisor import (synthetic_issue
     root_journal, serve_fixture, current_pins)
 
 
-def test_readonly_mount_separate_consumer_and_operator(synthetic_issuer):
+def test_readonly_mount_separate_consumer_and_operator(request):
     if os.environ.get('HUB_RUN_READONLY_E2E') != '1' or os.getuid() != 0:
         pytest.skip('explicit root opt-in required for isolated bind-mount fixture')
+    if os.environ.get('HUB_READONLY_E2E_CHILD') != '1':
+        # Mount namespace changes, blocking reads, test subprocesses, and all
+        # task-owned descendants belong to a bounded separate process group.
+        env = dict(os.environ, HUB_READONLY_E2E_CHILD='1')
+        command = [sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider',
+                   str(Path(__file__).resolve()), '-k', 'readonly_mount_separate_consumer_and_operator']
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, env=env, start_new_session=True)
+        output = ''
+        try:
+            try:
+                output, _ = process.communicate(timeout=35)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    output, _ = process.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    output, _ = process.communicate(timeout=3)
+                pytest.fail('bounded mount-test process timed out: ' + output[-2000:])
+            assert process.returncode == 0, output[-4000:]
+        finally:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=3)
+        return
+    synthetic_issuer = request.getfixturevalue('synthetic_issuer')
     # Unshare first: every subsequent mount/umount belongs only to this test
     # process. The subprocess consumer inherits this private mount namespace.
     libc = ctypes.CDLL(None, use_errno=True)
@@ -114,13 +144,22 @@ def test_readonly_mount_separate_consumer_and_operator(synthetic_issuer):
         assert child.stdout.readline().strip() == 'drained'
         assert child.wait(timeout=5) == 0, child.stderr.read()
     finally:
-        if child is not None:
-            if child.poll() is None:
-                child.terminate()
-                child.wait(timeout=5)
-            child.stdin.close()
-            child.stdout.close()
-            child.stderr.close()
-        if mounted:
-            subprocess.run(['umount', str(mountpoint)], check=True, timeout=5)
-        shutil.rmtree(visible)
+        try:
+            if child is not None:
+                try:
+                    if child.poll() is None:
+                        child.terminate()
+                        try:
+                            child.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            child.kill()
+                            child.wait(timeout=2)
+                finally:
+                    child.stdin.close()
+                    child.stdout.close()
+                    child.stderr.close()
+        finally:
+            if mounted:
+                # Never recursively remove through a still-mounted path.
+                subprocess.run(['umount', str(mountpoint)], check=True, timeout=5)
+            shutil.rmtree(visible)
