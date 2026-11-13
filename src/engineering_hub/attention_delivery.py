@@ -226,6 +226,85 @@ class AttentionDelivery:
             self._validate_target(operation.db, db, route)
             return receipt
 
+    def inspect_report(self, actor, project, generation, intent_id, expected_intent_revision,
+                       report_id, expected_report_revision):
+        """Inspect an immutable worker report under the exact orchestrator route."""
+        operation = context.current.get()
+        if operation is None or not context.actor_allowed(actor):
+            raise HubError('attention_route_unavailable', 404)
+        _canonical_id(intent_id); _canonical_id(report_id)
+        if (type(expected_intent_revision) is not int or expected_intent_revision < 1
+                or type(expected_report_revision) is not int or expected_report_revision < 1):
+            raise HubError('invalid_attention_reference', 422)
+        service = DispatchRepository(self.repo)
+        def read_current(db, route):
+            self._validate_target(operation.db, db, route)
+            service._grant(operation, 'dispatch.read', 'role.read')
+            try:
+                intent = self.repo._get(db, intent_id, 'orchestration_attention')
+                item, task, _, _ = service._dispatch(db, actor, intent['dispatch_id'])
+                report = self.repo._get(db, report_id, 'dispatch_report')
+                if (intent.get('id') != intent_id or intent.get('project') != project
+                        or intent.get('recipient_role') != 'orchestrator'
+                        or intent.get('report_id') != report_id or intent.get('report_revision') != expected_report_revision
+                        or type(report.get('revision')) is not int
+                        or not service._valid_report_attention(intent, item, report)
+                        or task.get('status') not in ('assigned', 'claimed', 'in_review', 'open', 'completion_claimed')):
+                    raise HubError('attention_route_unavailable', 404)
+                if intent.get('state') == 'pending_routing':
+                    if type(intent.get('revision')) is not int or intent['revision'] != expected_intent_revision:
+                        raise HubError('attention_route_unavailable', 404)
+                elif intent.get('state') == 'agent_acknowledged':
+                    identity = str(uuid.uuid5(_NAMESPACE, ':'.join(['receipt', intent_id, str(expected_intent_revision),
+                        route['session_id'], str(generation)])))
+                    receipt = self.repo._get(db, identity, 'attention_receipt')
+                    if (type(intent.get('revision')) is not int or intent['revision'] != expected_intent_revision + 1
+                            or intent.get('ack_receipt_id') != identity or receipt.get('id') != identity
+                            or receipt.get('project') != project or receipt.get('intent_id') != intent_id
+                            or type(receipt.get('intent_revision')) is not int
+                            or receipt.get('intent_revision') != expected_intent_revision
+                            or receipt.get('session_id') != route['session_id']
+                            or receipt.get('installation_id') != route['installation_id']
+                            or type(receipt.get('generation')) is not int or receipt.get('generation') != generation
+                            or receipt.get('state') != 'agent_acknowledged'):
+                        raise HubError('attention_route_unavailable', 404)
+                else:
+                    raise HubError('attention_route_unavailable', 404)
+                decision_id = report.get('decision_id')
+                if intent.get('report_kind') == 'ask':
+                    _canonical_id(decision_id)
+                    service._grant(operation, 'decision.read')
+                    decision = self.repo._get(db, decision_id, 'decision')
+                    if (decision.get('id') != decision_id or decision.get('project') != project
+                            or decision.get('origin_dispatch_id') != item['id']
+                            or type(decision.get('origin_dispatch_revision')) is not int
+                            or decision.get('origin_dispatch_revision') != expected_report_revision):
+                        raise HubError('attention_route_unavailable', 404)
+                elif decision_id is not None:
+                    raise HubError('attention_route_unavailable', 404)
+                note = report.get('note')
+                if type(note) is not str or not note.strip() or len(note) > 2000 or len(note.encode('utf-8')) > 8000:
+                    raise HubError('attention_route_unavailable', 404)
+                return dict(project=project, intent_id=intent_id, intent_revision=expected_intent_revision,
+                            dispatch_id=item['id'], report_id=report_id, report_revision=expected_report_revision,
+                            report_kind=intent['report_kind'], note=note, decision_id=decision_id,
+                            trust='untrusted_hub_data', execution_authorization=False, wake_verified=False)
+            except (HubError, KeyError, TypeError, ValueError, UnicodeError):
+                raise HubError('attention_route_unavailable', 404) from None
+        with service._attention_snapshot() as db:
+            try:
+                route = self._route_for(db, operation, project, generation)
+            except HubError:
+                raise HubError('attention_route_unavailable', 404) from None
+            service._held(db, actor, 'orchestrator', generation)
+            result = read_current(db, route)
+        def recheck(_db):
+            with service._attention_snapshot() as current:
+                if read_current(current, route) != result:
+                    raise HubError('attention_route_unavailable', 404)
+        operation.commit_checks.append(recheck)
+        return result
+
     def worker_pending(self, actor, project, role, generation, limit=50, after=None):
         """Discover unacknowledged dispatches bound to this exact role session."""
         operation = context.current.get()

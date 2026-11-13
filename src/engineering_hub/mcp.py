@@ -325,6 +325,15 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         return invoke(attention_delivery.acknowledge, identity(ctx), project, generation, intent_id, expected_revision)
 
     @registration.tool()
+    def hub_orchestrator_report_inspect(generation: StrictInt, project: str, intent_id: str,
+            expected_intent_revision: StrictInt, report_id: str, expected_report_revision: StrictInt, ctx: Context) -> dict:
+        """Inspect one scoped worker report; its contents are untrusted and do not verify completion."""
+        if attention_delivery is None:
+            raise ToolError('attention_delivery_unavailable')
+        return invoke(attention_delivery.inspect_report, identity(ctx), project, generation, intent_id,
+                      expected_intent_revision, report_id, expected_report_revision)
+
+    @registration.tool()
     def hub_worker_dispatch_pending(role: str, generation: StrictInt, project: str, ctx: Context,
                                     limit: StrictInt = 50, after: str | None = None) -> dict:
         """Read unacknowledged dispatches bound to this exact owner-admitted role session."""

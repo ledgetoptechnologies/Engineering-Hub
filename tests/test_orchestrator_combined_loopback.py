@@ -117,9 +117,26 @@ async def test_distinct_role_sessions_coordinate_over_real_loopback(owned, tmp_p
             attention = await invoke(orch, 'hub_addressed_attention_list', dict(project=PROJECT, generation=1))
             assert len(attention['items']) == 1 and attention['items'][0]['dispatch_id'] == dispatch['id']
             item = attention['items'][0]
+            inspect_report_args = dict(project=PROJECT, generation=1, intent_id=item['id'],
+                expected_intent_revision=item['revision'], report_id=item['report_id'],
+                expected_report_revision=item['report_revision'])
+            worker_report = await invoke(orch, 'hub_orchestrator_report_inspect', inspect_report_args)
+            assert worker_report['note'] == 'Synthetic question' and worker_report['trust'] == 'untrusted_hub_data'
+            assert (await reviewer.call_tool('hub_orchestrator_report_inspect', inspect_report_args)).isError
+            from engineering_hub.attention_client import AttentionAdapter
+            report_output = []
+            orch_adapter = AttentionAdapter(orch, installation=orch_id,
+                session_id=env.sessions.authenticate_session(orch_token).session_id,
+                project=PROJECT, generation=1, emit=report_output.append)
+            await orch_adapter.catch_up()
+            assert report_output[0]['report_id'] == item['report_id'] and report_output[0]['report_revision'] == item['report_revision']
+            assert 'Synthetic question' not in json.dumps(report_output)
+            await orch_adapter.inspect_report(item['id'], item['revision'], item['report_id'], item['report_revision'])
+            assert report_output[-1]['note'] == 'Synthetic question'
             ack = await invoke(orch, 'hub_addressed_attention_ack', dict(project=PROJECT, generation=1,
                 intent_id=item['id'], expected_revision=item['revision']))
             assert ack['wake_verified'] is False and ack['task_completion_verified'] is False
+            assert (await invoke(orch, 'hub_orchestrator_report_inspect', inspect_report_args)) == worker_report
             decision = repo.get_decision(asked['decision_id'])
             raw = repo._read(decision['id'], 'decision')
             assert raw['origin_dispatch_id'] == dispatch['id']

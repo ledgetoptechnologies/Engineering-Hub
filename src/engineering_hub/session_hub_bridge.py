@@ -45,6 +45,7 @@ TOOLS = {
     'hub_dispatch_checkpoint': 'dispatch.write', 'hub_dispatch_decisions': 'dispatch.read', 'hub_dispatch_reports': 'dispatch.read',
     'hub_orchestrator_attention_list': 'dispatch.read', 'hub_orchestrator_attention_reconcile_closed': 'dispatch.write',
     'hub_addressed_attention_list': 'dispatch.read', 'hub_addressed_attention_ack': 'dispatch.read',
+    'hub_orchestrator_report_inspect': 'dispatch.read',
     'hub_worker_dispatch_pending': 'dispatch.read', 'hub_worker_dispatch_ack': 'dispatch.read',
     'hub_worker_decision_inspect': 'dispatch.read',
     'hub_staging_task_propose': 'task.propose', 'hub_task_claim': 'task.claim',

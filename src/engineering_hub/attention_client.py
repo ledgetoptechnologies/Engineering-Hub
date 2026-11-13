@@ -160,9 +160,19 @@ class AttentionAdapter:
                 key = (identity, revision)
                 if key not in seen:
                     seen.add(key)
-                    self.emit(dict(type='attention_reference', trust='untrusted_hub_data', project=self.project,
+                    reference = dict(type='attention_reference', trust='untrusted_hub_data', project=self.project,
                                    intent_id=identity, intent_revision=revision, dispatch_id=dispatch,
-                                   role_generation=self.generation, execution_authorization=False, wake_verified=False))
+                                   role_generation=self.generation, execution_authorization=False, wake_verified=False)
+                    if item.get('intent_type') == 'worker_report':
+                        report_id = _uuid(item.get('report_id'))
+                        report_revision = item.get('report_revision')
+                        kind = item.get('report_kind')
+                        if (type(report_revision) is not int or report_revision < 1
+                                or item.get('dispatch_revision') != report_revision
+                                or kind not in ('blocked', 'ask', 'resume', 'done', 'failed')):
+                            raise ClientError('invalid_attention_response')
+                        reference.update(report_id=report_id, report_revision=report_revision, report_kind=kind)
+                    self.emit(reference)
             if next_cursor is None:
                 self.emit(dict(type='attention_catchup', complete=True, next_after=None))
                 return
@@ -220,6 +230,36 @@ class AttentionAdapter:
         self.emit(dict(type='attention_acknowledgment', intent_id=intent_id, intent_revision=revision,
                        receipt_id=_uuid(result.get('id')), wake_verified=False, task_completion_verified=False))
 
+
+    async def inspect_report(self, intent_id, intent_revision, report_id, report_revision):
+        if self.role != 'orchestrator':
+            raise ClientError('invalid_attention_reference')
+        _uuid(intent_id); _uuid(report_id)
+        if (type(intent_revision) is not int or intent_revision < 1
+                or type(report_revision) is not int or report_revision < 1):
+            raise ClientError('invalid_attention_reference')
+        await self.verify_identity()
+        result = await _call(self.session, 'hub_orchestrator_report_inspect', dict(
+            project=self.project, generation=self.generation, intent_id=intent_id,
+            expected_intent_revision=intent_revision, report_id=report_id, expected_report_revision=report_revision))
+        note, kind, decision = result.get('note'), result.get('report_kind'), result.get('decision_id')
+        if (result.get('project') != self.project or result.get('intent_id') != intent_id
+                or type(result.get('intent_revision')) is not int or result['intent_revision'] != intent_revision
+                or result.get('report_id') != report_id or type(result.get('report_revision')) is not int
+                or result['report_revision'] != report_revision or kind not in ('blocked', 'ask', 'resume', 'done', 'failed')
+                or result.get('trust') != 'untrusted_hub_data' or result.get('execution_authorization') is not False
+                or result.get('wake_verified') is not False or type(note) is not str or not note.strip()
+                or len(note) > 2000 or len(note.encode('utf-8')) > 8000):
+            raise ClientError('invalid_attention_response')
+        dispatch_id = _uuid(result.get('dispatch_id'))
+        if kind == 'ask':
+            _uuid(decision)
+        elif decision is not None:
+            raise ClientError('invalid_attention_response')
+        self.emit(dict(type='orchestrator_worker_report', trust='untrusted_hub_data', project=self.project,
+                       intent_id=intent_id, intent_revision=intent_revision, dispatch_id=dispatch_id,
+                       report_id=report_id, report_revision=report_revision, report_kind=kind, note=note,
+                       decision_id=decision, execution_authorization=False, wake_verified=False))
 
     async def inspect_answer(self, dispatch_id, dispatch_revision, decision_id, decision_revision):
         if self.role == 'orchestrator':
@@ -329,6 +369,9 @@ async def _run(args):
             elif args.command == 'inspect-answer':
                 await use_mcp(lambda adapter: adapter.inspect_answer(args.dispatch_id, args.revision,
                     args.decision_id, args.decision_revision))
+            elif args.command == 'inspect-report':
+                await use_mcp(lambda adapter: adapter.inspect_report(args.intent_id, args.revision,
+                    args.report_id, args.report_revision))
             else:
                 reference = getattr(args, 'intent_id', None) if role == 'orchestrator' else getattr(args, 'dispatch_id', None)
                 if (role == 'orchestrator' and getattr(args, 'dispatch_id', None) is not None
@@ -355,6 +398,11 @@ def main(argv=None):
     inspect.add_argument('--revision', type=int, required=True)
     inspect.add_argument('--decision-id', required=True)
     inspect.add_argument('--decision-revision', type=int, required=True)
+    report = commands.add_parser('inspect-report')
+    report.add_argument('--intent-id', required=True)
+    report.add_argument('--revision', type=int, required=True)
+    report.add_argument('--report-id', required=True)
+    report.add_argument('--report-revision', type=int, required=True)
     ack = commands.add_parser('ack')
     reference = ack.add_mutually_exclusive_group(required=True)
     reference.add_argument('--intent-id')
