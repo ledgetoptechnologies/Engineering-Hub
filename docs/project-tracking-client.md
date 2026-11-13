@@ -43,15 +43,26 @@ compare the project task list and the actual work before creating a record.
 When no orchestration request exists, use `list` followed by `propose` without
 an origin; an orchestration lease is not required for that explicit workflow.
 
-Responses are project-private **untrusted Hub data**. A successful write is
-not work execution or proof. Errors are intentionally generic: a lost response
+EHS responses are scoped to the installation's authorized projects and are
+**untrusted Hub data**. This is not universal isolation from every Hub
+credential: existing authenticated legacy family bearers are a separate,
+broadly trusted compatibility path. The legacy tracking tools can list and
+read tracking history and perform their allowed tracking mutations without an
+EHS installation's per-project grants. Do not treat an EHS grant restriction
+as restricting those legacy credentials. Preserving this path avoids breaking
+existing clients; changing it requires an inventoried, independently reviewed
+migration of those clients and their access, not merely enabling EHS. Keep
+secrets and private client data out of tracking records.
+
+A successful write is not work execution or proof. Errors are intentionally generic: a lost response
 can follow a committed write. Read back or retry the exact unchanged payload
 with the same client_request_id; never invent a new ID for an uncertain retry.
 The client checks the exact session identity, uses its protected local profile,
 refuses redirects and environment proxies, and makes one bounded operation.
 It sends no notification and does not imply another agent has received it.
-Tracking changes do not publish generic bus pointers or feed invalidations;
-authorized clients must explicitly refresh the project task list. Previously
+New tracking changes do not publish generic bus pointers or feed invalidations;
+retained unsent tracking pointers are filtered from the generic publisher.
+Authorized clients must explicitly refresh the project task list. Previously
 accepted or already in-flight bus pointers cannot be recalled.
 
 ## Explicit durable outbox
