@@ -126,6 +126,7 @@ def browser_route_allowed(method, path, *, allow_bound_oauth_callback=False):
                 or re.fullmatch(r'/api/hub/v1/task-progress/' + _UUID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/orchestration/requests/' + _UUID + r'(?:/dispatches)?', path) is not None
                 or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/orchestration-requests', path) is not None
+                or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/orchestration-attention', path) is not None
                 or re.fullmatch(r'/api/hub/v1/orchestration/dispatches/' + _UUID + r'/(?:reports|decisions)', path) is not None
                 or re.fullmatch(r'/api/hub/v1/roles/' + _PROJECT_ID, path) is not None
                 or path == '/api/hub/v1/infrastructure/devices'

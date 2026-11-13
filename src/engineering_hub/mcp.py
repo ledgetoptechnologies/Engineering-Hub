@@ -295,6 +295,22 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         return invoke(DispatchRepository(repo).checkpoint, identity(ctx), dispatch_id, expected_revision, generation, client_request_id)
 
     @registration.tool()
+    def hub_orchestrator_attention_list(generation: StrictInt, project: str, ctx: Context,
+                                        limit: StrictInt = 50, after: str | None = None) -> dict:
+        """Read pending role-addressed attention intents; routing and wake have not occurred."""
+        from .dispatch import DispatchRepository
+        return invoke(DispatchRepository(repo).attention, identity(ctx), generation, project, limit, after)
+
+    @registration.tool()
+    def hub_orchestrator_attention_reconcile_closed(generation: StrictInt, intent_id: str,
+            expected_revision: StrictInt, expected_dispatch_revision: StrictInt,
+            client_request_id: str, ctx: Context) -> dict:
+        """Resolve a closed-task intent without claiming delivery, wake, or execution."""
+        from .dispatch import DispatchRepository
+        return invoke(DispatchRepository(repo).reconcile_closed_attention, identity(ctx), generation, intent_id,
+                      expected_revision, expected_dispatch_revision, client_request_id)
+
+    @registration.tool()
     def hub_task_progress_get(task_id: str, ctx: Context) -> dict:
         """Read separately versioned task progress; it is not completion proof."""
         from .task_progress import TaskProgress

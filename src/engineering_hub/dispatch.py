@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import uuid
+from contextlib import contextmanager
 
 from agent_message_bus import session_hub_context as context
 from agent_message_bus.agent_sessions import AgentSessionError
@@ -25,6 +26,16 @@ def _canonical_id(value):
 class DispatchRepository:
     def __init__(self, repo):
         self.repo = repo
+
+    @contextmanager
+    def _attention_snapshot(self):
+        # One read snapshot for project, task, role, dispatch and intent.
+        with self.repo._connection() as db:
+            db.execute('BEGIN')
+            try:
+                yield db
+            finally:
+                db.rollback()
 
     def _operation(self, actor):
         operation = context.current.get()
@@ -169,6 +180,32 @@ class DispatchRepository:
                    (identity, 'dispatch_receipt', json.dumps({'entity_id': item['id'], 'revision': item['revision']}, sort_keys=True, separators=(',', ':'))))
         db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, identity))
 
+    def _resolve_attention(self, db, actor, item, state):
+        """Retain an unattempted intent when a stale condition changes."""
+        identity = item.get('attention_intent_id')
+        if identity is None:
+            return
+        try:
+            intent = self.repo._get(db, identity, 'orchestration_attention')
+            if intent.get('dispatch_id') != item['id'] or intent.get('project') != item['project']:
+                raise HubError('attention_corrupt', 409)
+        except HubError:
+            raise HubError('attention_corrupt', 409) from None
+        if intent.get('state') == 'pending_routing':
+            intent.update(state=state, delivery='not_attempted', wake_verified=False)
+            self.repo._save(db, actor, 'orchestration.attention_resolved', 'orchestration_attention', intent, publish=False)
+        item['attention_intent_id'] = None
+
+    def _stale_attention(self, db, actor, item, basis):
+        self._resolve_attention(db, actor, item, 'superseded_without_delivery')
+        stale_revision = item['revision'] + 1
+        identity = str(uuid.uuid5(_NAMESPACE, 'stale-attention:' + item['id'] + ':' + str(stale_revision)))
+        item['attention_intent_id'] = identity
+        return dict(id=identity, project=item['project'], request_id=item['request_id'], dispatch_id=item['id'],
+                    dispatch_revision=stale_revision, recipient_role='orchestrator', reason=basis,
+                    state='pending_routing', delivery='not_attempted', wake_verified=False,
+                    execution_authorization=False)
+
     @staticmethod
     def _fingerprint(parts):
         return hashlib.sha256(json.dumps(parts, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
@@ -252,6 +289,115 @@ class DispatchRepository:
     def owner_list_requests(self, actor, project, limit, after):
         self.repo._actor(actor, human=True)
         return self._list_requests(project, limit, after)
+
+    def owner_attention(self, actor, project, limit, after):
+        self.repo._actor(actor, human=True)
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise HubError('invalid_limit', 422)
+        if after is not None:
+            _canonical_id(after)
+        with self._attention_snapshot() as db:
+            self.repo._project(project, db, require_active=False)
+            projects_exist = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_projects'").fetchone()
+            project_row = db.execute('SELECT data FROM hub_projects WHERE id=?', (project,)).fetchone() if projects_exist else None
+            archived = bool(json.loads(project_row['data']).get('archived', False)) if project_row else False
+            rows = db.execute("SELECT a.data,t.data AS task_data,d.data AS dispatch_data FROM hub_entities a "
+                "JOIN hub_entities d ON d.id=json_extract(a.data,'$.dispatch_id') AND d.kind='role_dispatch' "
+                "JOIN hub_entities t ON t.id=json_extract(d.data,'$.task_id') AND t.kind IN ('task','tracking_task') "
+                "WHERE a.kind='orchestration_attention' AND json_extract(a.data,'$.project')=? "
+                "AND json_extract(d.data,'$.project')=? AND json_extract(t.data,'$.project')=? "
+                "AND json_extract(a.data,'$.state')='pending_routing' AND a.id>? ORDER BY a.id LIMIT ?",
+                (project, project, project, after or '', limit + 1)).fetchall()
+            items = [self._attention_view(row, project_archived=archived) for row in rows]
+            return dict(items=items[:limit], next_after=items[limit-1]['id'] if len(items) > limit else None,
+                        note='Pending routing only; no delivery or wake is implied. Restart UUID paging to find new items.')
+
+    def attention(self, actor, generation, project, limit, after):
+        operation = self._operation(actor)
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise HubError('invalid_limit', 422)
+        if after is not None:
+            _canonical_id(after)
+        with self._attention_snapshot() as db:
+            role, operation = self._held(db, actor, 'orchestrator', generation)
+            self._grant(operation, 'dispatch.read')
+            self._grant(operation, 'role.read')
+            self.repo._project(project, db)
+            if project not in role['projects']:
+                raise HubError('dispatch_unavailable', 404)
+            kinds = []
+            for kind, capability in (('task', 'task.read'), ('tracking_task', 'tracking.read')):
+                try:
+                    operation.bridge._live(operation.db, operation.secret, operation.principal.authorization_revision,
+                                           capability, session_id=operation.principal.session_id)
+                    kinds.append(kind)
+                except HubError:
+                    pass
+            if not kinds:
+                return dict(items=[], next_after=None, note='Pending routing only; no delivery or wake is implied.')
+            try:
+                self._grant(operation, 'decision.read')
+                decision_read = 1
+            except HubError:
+                decision_read = 0
+            project_marks = ','.join('?' for _ in operation.projects)
+            kind_marks = ','.join('?' for _ in kinds)
+            rows = db.execute("SELECT a.data,t.data AS task_data,d.data AS dispatch_data FROM hub_entities a JOIN hub_entities d ON d.id=json_extract(a.data,'$.dispatch_id') AND d.kind='role_dispatch' "
+                "JOIN hub_entities q ON q.id=json_extract(d.data,'$.request_id') AND q.kind='orchestration_request' "
+                "JOIN hub_entities t ON t.id=json_extract(d.data,'$.task_id') "
+                "JOIN hub_entities r ON r.kind='coordination_role' AND json_extract(r.data,'$.role_id')=json_extract(d.data,'$.role_id') "
+                "WHERE a.kind='orchestration_attention' AND json_extract(a.data,'$.project')=? "
+                "AND json_extract(a.data,'$.recipient_role')='orchestrator' AND json_extract(a.data,'$.state')='pending_routing' AND a.id>? "
+                "AND json_extract(d.data,'$.project')=? AND json_extract(q.data,'$.project')=? AND json_extract(t.data,'$.project')=? "
+                "AND (json_extract(d.data,'$.decision_id') IS NULL OR ?=1) "
+                "AND t.kind IN (" + kind_marks + ") AND t.kind=json_extract(d.data,'$.task_kind') "
+                "AND EXISTS (SELECT 1 FROM json_each(r.data,'$.projects') rp WHERE rp.value=?) "
+                "AND NOT EXISTS (SELECT 1 FROM json_each(r.data,'$.projects') rp LEFT JOIN hub_projects hp ON hp.id=rp.value "
+                "WHERE rp.value NOT IN (" + project_marks + ") OR hp.id IS NULL OR json_extract(hp.data,'$.archived')=1) "
+                "ORDER BY a.id LIMIT ?", (project, after or '', project, project, project, decision_read, *kinds, project, *operation.projects, limit + 1)).fetchall()
+            items = [self._attention_view(row) for row in rows]
+            for item in items:
+                self._dispatch(db, actor, item['dispatch_id'])
+            return dict(items=items[:limit], next_after=items[limit-1]['id'] if len(items) > limit else None,
+                        note='Pending routing only; no delivery or wake is implied. Restart UUID paging to find new items.')
+
+    @staticmethod
+    def _attention_view(row, *, project_archived=False):
+        intent, task, dispatch = json.loads(row['data']), json.loads(row['task_data']), json.loads(row['dispatch_data'])
+        status = task.get('status')
+        open_status = status in ('assigned', 'claimed', 'in_review', 'open', 'completion_claimed')
+        current = dispatch.get('attention_intent_id') == intent['id'] and dispatch.get('coordination_stale') is True
+        return {**intent, 'task_status': status, 'project_archived': project_archived,
+                'actionable': open_status and current and not project_archived}
+
+    def reconcile_closed_attention(self, actor, generation, intent_id, expected_revision,
+                                   expected_dispatch_revision, client_request_id):
+        key = self.repo._text(client_request_id, 128)
+        fingerprint = self._fingerprint(['attention_closed', generation, intent_id, expected_revision, expected_dispatch_revision])
+        with self.repo._transaction() as db:
+            role, operation = self._held(db, actor, 'orchestrator', generation)
+            self._grant(operation, 'dispatch.read')
+            try:
+                intent = self.repo._get(db, _canonical_id(intent_id), 'orchestration_attention')
+                item, task, _, _ = self._dispatch(db, actor, intent['dispatch_id'])
+                if intent['project'] != item['project'] or item['project'] not in role['projects']:
+                    raise HubError('dispatch_unavailable', 404)
+            except (HubError, KeyError):
+                raise HubError('dispatch_unavailable', 404) from None
+            prior = self._receipt(db, actor, key, fingerprint, 'orchestration_attention')
+            if prior:
+                return prior
+            self.repo._cas(intent, expected_revision)
+            self.repo._cas(item, expected_dispatch_revision)
+            if (intent.get('state') != 'pending_routing' or item.get('attention_intent_id') != intent['id']
+                    or task.get('status') not in ('withdrawn', 'verified', 'completion_verified')):
+                raise HubError('attention_not_closed', 409)
+            intent.update(state='resolved_task_closed_without_delivery', delivery='not_attempted', wake_verified=False)
+            intent = self.repo._save(db, actor, 'orchestration.attention_task_closed', 'orchestration_attention', intent, publish=False)
+            item['attention_intent_id'] = None
+            self.repo._save(db, actor, 'orchestration.attention_reconciled', 'role_dispatch', item, publish=False)
+            self._save_receipt(db, actor, key, fingerprint, intent)
+            return intent
 
     def _list_requests(self, project, limit, after):
         if type(limit) is not int or not 1 <= limit <= 100:
@@ -438,6 +584,7 @@ class DispatchRepository:
             now = operation.bridge.sessions._now()
             if not math.isfinite(now) or now < item['last_report_at']:
                 raise HubError('dispatch_clock_untrusted', 409)
+            self._resolve_attention(db, actor, item, 'resolved_without_delivery')
             item.update(state='asked' if state == 'ask' else 'working' if state == 'resume' else state, report=note,
                         last_report_at=now, stale_basis=None, coordination_stale=False,
                         target_binding=dict(generation=generation, session_id=operation.principal.session_id,
@@ -503,8 +650,11 @@ class DispatchRepository:
                 # expiry is an advisory stale flag, not loss of that context.
                 state = item['state'] if item['state'] in ('blocked', 'asked') else 'stale'
                 if item.get('state') != state or item.get('stale_basis') != basis or not item.get('coordination_stale'):
+                    intent = self._stale_attention(db, actor, item, basis)
                     item.update(state=state, stale_basis=basis, coordination_stale=True, wake_delivery='not_attempted')
                     item = self.repo._save(db, actor, 'orchestration.stale', 'role_dispatch', item, publish=False)
+                    self.repo._save(db, actor, 'orchestration.attention_pending', 'orchestration_attention', intent,
+                                    new=True, publish=False)
             elif bound_by_activity:
                 item = self.repo._save(db, actor, 'orchestration.activity_bound', 'role_dispatch', item, publish=False)
             self._save_receipt(db, actor, key, fingerprint, item)

@@ -48,6 +48,23 @@ Dispatch records, reports and created decisions are audited but intentionally
 do not enter the generic unscoped notification bus. No automatic wake, polling,
 or delivery guarantee is provided. Consumers must explicitly reread.
 
+An explicit checkpoint which newly marks a dispatch stale also atomically saves
+a durable attention intent addressed to the `orchestrator` role. Its state is
+`pending_routing`, delivery is `not_attempted`, and `wake_verified` is false;
+it is not a bus message, delivery receipt, or proof that a session woke. The
+currently leased orchestrator can read project-scoped pending items with
+`hub_orchestrator_attention_list`; the owner has an authenticated read-only
+project endpoint. UUID paging is not chronological, so restart to see newer
+items. A later valid report retains the old intent as resolved without delivery.
+Views derive the current task status in the same snapshot and mark closed tasks
+or archived projects non-actionable. For a closed task in an active project, the
+current orchestrator can explicitly reconcile its pending intent with exact
+intent and dispatch revisions; this records no delivery or execution and does
+not modify the task or reservation. Archived-project pending intents remain
+owner-visible but need unarchive before session-scoped reconciliation. Any
+future sender must recheck current task, recipient and grants immediately before
+delivery; the pending record itself conveys no routing authority.
+
 This is an incomplete backend foundation. Project creation, automatic
 request capture, orchestration runtime, UI wiring, automatic stale evaluation,
 addressed delivery and real staging acceptance remain separate work.

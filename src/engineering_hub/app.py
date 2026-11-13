@@ -1099,6 +1099,11 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         from .dispatch import DispatchRepository
         return DispatchRepository(repo).owner_list_requests(role_owner(request), project, limit, after)
 
+    @app.get('/api/hub/v1/projects/{project}/orchestration-attention')
+    def list_orchestration_attention(project: str, request: Request, limit: int = 50, after: str | None = None):
+        from .dispatch import DispatchRepository
+        return DispatchRepository(repo).owner_attention(role_owner(request), project, limit, after)
+
     @app.get('/api/hub/v1/orchestration/dispatches/{dispatch_id}/reports')
     def get_orchestration_reports(dispatch_id: str, request: Request, limit: int = 50, after_revision: int = 0):
         from .dispatch import DispatchRepository
