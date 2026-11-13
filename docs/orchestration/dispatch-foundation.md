@@ -68,3 +68,5 @@ delivery; the pending record itself conveys no routing authority.
 This is an incomplete backend foundation. Project creation, automatic
 request capture, orchestration runtime, UI wiring, automatic stale evaluation,
 addressed delivery and real staging acceptance remain separate work.
+
+Dispatch-origin decisions are private to scoped coordination reads. Their creation, answer, context change and withdrawal are audited without generic outbox publication. The generic publisher also holds previously queued pointers to dispatch-origin decisions, including prepared but unsent receipts; malformed or missing decision records are held as unknown. Other decision notifications continue to publish. Previously accepted or already in-flight external deliveries cannot be recalled, and old outbox and receipt rows are retained rather than deleted. The owner-only event feed exposes invalidation cursors, not decision IDs; the staging dispatcher only acts on task-review events. No worker wake or answer delivery is implied by suppressing generic publication.

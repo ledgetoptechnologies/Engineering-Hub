@@ -256,7 +256,12 @@ class HubRepository:
         db.execute('INSERT INTO hub_audit(actor,action,entity_id,revision,created_at) VALUES(?,?,?,?,?)',
                    (actor, action, item['id'], item['revision'], item['updated_at']))
         session_context.provenance(db, db.execute("SELECT last_insert_rowid()").fetchone()[0])
-        if publish:
+        # Dispatch-origin decisions are scoped coordination data. The generic
+        # outbox broadcasts IDs without project or decision-grant filtering.
+        # Treat even incomplete origin metadata as private, on every mutation.
+        private_dispatch_decision = (kind == 'decision' and
+            ('origin_dispatch_id' in item or 'origin_dispatch_revision' in item))
+        if publish and not private_dispatch_decision:
             self._emit(db, action, item)
         return item
 

@@ -17,6 +17,16 @@ def _valid_route(topic, correlation):
             and all(correlation.split('/')))
 
 
+# A dispatch-origin decision is coordination-private even if an older Hub
+# already queued a pointer or prepared a receipt. Unknown/malformed decision
+# rows are held rather than sent to unscoped recipients.
+_VISIBLE_EVENT = """CASE WHEN o.action LIKE 'decision.%' THEN
+    CASE WHEN e.kind='decision' AND json_valid(e.data) THEN
+        json_type(e.data)='object' AND json_type(e.data,'$.origin_dispatch_id') IS NULL AND
+        json_type(e.data,'$.origin_dispatch_revision') IS NULL
+    ELSE 0 END ELSE 1 END"""
+
+
 class HubOutboxPublisher:
     """One fixed authenticated bus principal per Hub database.
 
@@ -62,8 +72,9 @@ class HubOutboxPublisher:
         with self._db() as db:
             candidates = []
             for recipient in self.recipients:
-                rows = db.execute("""SELECT o.* FROM hub_outbox o LEFT JOIN hub_delivery_receipts d
-                    ON d.sequence=o.sequence AND d.recipient=? WHERE d.message_id IS NULL
+                rows = db.execute("""SELECT o.* FROM hub_outbox o LEFT JOIN hub_entities e ON e.id=o.entity_id
+                    LEFT JOIN hub_delivery_receipts d ON d.sequence=o.sequence AND d.recipient=?
+                    WHERE d.message_id IS NULL AND (""" + _VISIBLE_EVENT + """)
                     ORDER BY o.sequence LIMIT ?""", (recipient, limit)).fetchall()
                 candidates.extend((dict(row), recipient) for row in rows)
             candidates.sort(key=lambda item: (item[0]["sequence"], item[1]))
@@ -95,8 +106,9 @@ class HubOutboxPublisher:
 
     def _pending(self):
         with self.repo._connection() as db:
-            return sum(db.execute("""SELECT COUNT(*) FROM hub_outbox o LEFT JOIN hub_delivery_receipts d
-                ON d.sequence=o.sequence AND d.recipient=? WHERE d.message_id IS NULL""", (recipient,)).fetchone()[0]
+            return sum(db.execute("""SELECT COUNT(*) FROM hub_outbox o LEFT JOIN hub_entities e ON e.id=o.entity_id
+                LEFT JOIN hub_delivery_receipts d ON d.sequence=o.sequence AND d.recipient=?
+                WHERE d.message_id IS NULL AND (""" + _VISIBLE_EVENT + """)""", (recipient,)).fetchone()[0]
                        for recipient in self.recipients)
 
     async def _verify_sender(self):

@@ -145,6 +145,9 @@ async def test_distinct_role_sessions_coordinate_over_real_loopback(owned, tmp_p
             assert repo.get_decision(decision['id'])['status'] == 'answered'
             assert response.status_code == 200, response.text
             assert 'origin_dispatch_id' not in response.json() and 'origin_dispatch_revision' not in response.json()
+            with repo._connection() as db:
+                assert db.execute('SELECT count(*) FROM hub_outbox WHERE entity_id=?', (decision['id'],)).fetchone()[0] == 0
+                assert db.execute("SELECT count(*) FROM hub_audit WHERE entity_id=? AND action='decision.answered'", (decision['id'],)).fetchone()[0] == 1
             retry = await owner_http.post(base + '/api/hub/v1/decisions/' + decision['id'] + '/answer',
                 json=dict(expected_revision=decision['revision'], answer='Yes'))
             assert retry.status_code == 409
@@ -184,6 +187,10 @@ def test_owner_decision_context_and_withdraw_redact_dispatch_lineage(unified):
     withdrawn = client.post(path + '/withdraw', headers=csrf, json={'expected_revision': updated.json()['revision'], 'reason': 'Not needed'})
     assert withdrawn.status_code == 200 and 'origin_dispatch_id' not in withdrawn.json()
     assert env.repo._read(identity, 'decision')['origin_dispatch_id'] == item['id']
+    with env.repo._connection() as db:
+        assert db.execute('SELECT count(*) FROM hub_outbox WHERE entity_id=?', (identity,)).fetchone()[0] == 0
+        actions = [row[0] for row in db.execute('SELECT action FROM hub_audit WHERE entity_id=? ORDER BY sequence', (identity,))]
+        assert actions == ['decision.created', 'decision.context_updated', 'decision.withdrawn']
 
 
 def test_decision_only_session_withdraw_redacts_origin_and_cannot_read_other_project(unified):
