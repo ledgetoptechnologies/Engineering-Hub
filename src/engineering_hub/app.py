@@ -826,7 +826,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                     except RuntimeError:
                         pass
             def subscribe():
-                result = session_bridge.sessions.subscribe_session(secret, revoked)
+                result = session_bridge.sessions.subscribe_session(secret, revoked, purpose='attention')
                 acquired.append(result)
                 return result
             try:

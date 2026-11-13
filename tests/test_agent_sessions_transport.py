@@ -116,6 +116,63 @@ async def rpc(client, token, sid, method, params=None):
         json={'jsonrpc': '2.0', 'id': 2, 'method': method, 'params': params or {}})
 
 
+@pytest.mark.asyncio
+async def test_occupied_owner_pool_does_not_consume_response_guard_capacity(tmp_path, monkeypatch):
+    # Reduced limits exercise the same saturation behavior without opening
+    # thousands of sessions. The default listener pool must not supply hidden
+    # headroom to the transport or its response guards.
+    monkeypatch.setattr('agent_message_bus.agent_sessions.MAX_SUBSCRIPTIONS', 1)
+    monkeypatch.setattr('agent_message_bus.agent_sessions.MAX_OWNER_SUBSCRIPTIONS', 2)
+    monkeypatch.setattr('agent_message_bus.agent_sessions.MAX_RESPONSE_SUBSCRIPTIONS', 2)
+    app = bus(tmp_path)
+    repo = app.state.agent_sessions
+    issued = repo.exchange(credential(repo))
+    async with listening(app) as origin:
+        async with httpx.AsyncClient(base_url=origin, timeout=5) as client:
+            first = await initialize(client, issued['token'])
+            second = await initialize(client, issued['token'])
+            assert (await rpc(client, issued['token'], first, 'ping')).status_code == 200
+            assert (await rpc(client, issued['token'], second, 'ping')).status_code == 200
+            denied = await client.post('/mcp', headers=headers(issued['token']), json={
+                'jsonrpc': '2.0', 'id': 3, 'method': 'initialize', 'params': {
+                    'protocolVersion': '2025-06-18', 'capabilities': {},
+                    'clientInfo': {'name': 'over-capacity', 'version': '1'}}})
+            assert denied.status_code != 200
+            assert (await rpc(client, issued['token'], first, 'ping')).status_code == 200
+            assert (await client.delete('/mcp', headers=headers(issued['token'], second))).status_code == 200
+            replacement = await initialize(client, issued['token'])
+            assert (await rpc(client, issued['token'], replacement, 'ping')).status_code == 200
+            assert (await client.delete('/mcp', headers=headers(issued['token'], replacement))).status_code == 200
+            assert (await client.delete('/mcp', headers=headers(issued['token'], first))).status_code == 200
+    assert repo._listeners == {}
+    assert all(count == 0 for count in repo._listener_counts.values())
+
+
+@pytest.mark.asyncio
+async def test_one_session_cannot_take_another_sessions_owner_capacity(tmp_path, monkeypatch):
+    monkeypatch.setattr('agent_message_bus.agent_sessions.MAX_OWNER_SUBSCRIPTIONS', 3)
+    monkeypatch.setattr('agent_message_bus.agent_sessions.MAX_OWNER_SUBSCRIPTIONS_PER_SESSION', 2)
+    app = bus(tmp_path)
+    repo = app.state.agent_sessions
+    installation_secret = credential(repo)
+    first, second = repo.exchange(installation_secret), repo.exchange(installation_secret)
+    async with listening(app) as origin:
+        async with httpx.AsyncClient(base_url=origin, timeout=5) as client:
+            first_sid = await initialize(client, first['token'])
+            second_sid = await initialize(client, first['token'])
+            refused = await client.post('/mcp', headers=headers(first['token']), json={
+                'jsonrpc': '2.0', 'id': 3, 'method': 'initialize', 'params': {
+                    'protocolVersion': '2025-06-18', 'capabilities': {},
+                    'clientInfo': {'name': 'over-per-session', 'version': '1'}}})
+            assert refused.status_code == 429
+            other_sid = await initialize(client, second['token'])
+            assert (await rpc(client, second['token'], other_sid, 'ping')).status_code == 200
+            for token, sid in ((first['token'], first_sid), (first['token'], second_sid), (second['token'], other_sid)):
+                assert (await client.delete('/mcp', headers=headers(token, sid))).status_code == 200
+    assert repo._listeners == {}
+    assert all(count == 0 for count in repo._listener_counts.values())
+
+
 def test_default_off_and_separate_database_configuration(tmp_path, monkeypatch):
     monkeypatch.setenv('HUB_AGENT_SESSIONS_MODE', 'disabled')
     app = bus(tmp_path, enabled=False)

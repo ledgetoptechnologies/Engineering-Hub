@@ -598,6 +598,32 @@ def test_subscribe_racing_revoke_cannot_leave_a_live_unauthorized_registration(e
             unsubscribe()
 
 
+def test_subscription_pools_are_bounded_fair_and_reclaimed_on_installation_revoke(env, monkeypatch):
+    import agent_message_bus.agent_sessions as sessions_module
+    monkeypatch.setattr(sessions_module, 'MAX_OWNER_SUBSCRIPTIONS', 3)
+    monkeypatch.setattr(sessions_module, 'MAX_OWNER_SUBSCRIPTIONS_PER_SESSION', 2)
+    monkeypatch.setattr(sessions_module, 'MAX_RESPONSE_SUBSCRIPTIONS', 1)
+    repo, _ = env
+    installation_row, secret, _ = installation(repo, 'reserved-pools')
+    first, second = repo.exchange(secret), repo.exchange(secret)
+    seen = []
+    owner_a = repo.subscribe_session(first['token'], lambda: seen.append('a'), purpose='owner')[1]
+    owner_b = repo.subscribe_session(first['token'], lambda: seen.append('b'), purpose='owner')[1]
+    denied('subscription_limit', lambda: repo.subscribe_session(first['token'], lambda: None, purpose='owner'))
+    owner_c = repo.subscribe_session(second['token'], lambda: seen.append('c'), purpose='owner')[1]
+    def failing():
+        seen.append('failed')
+        raise RuntimeError('synthetic')
+    response = repo.subscribe_session(first['token'], failing, purpose='response')[1]
+    denied('subscription_limit', lambda: repo.subscribe_session(second['token'], lambda: None, purpose='response'))
+    repo.revoke_installation(OWNER, installation_row['id'], installation_row['revision'])
+    check(sorted(seen) == ['a', 'b', 'c', 'failed'], 'revocation did not notify every pool')
+    for unsubscribe in (owner_a, owner_b, owner_c, response):
+        unsubscribe(); unsubscribe()
+    check(repo._listeners == {} and all(count == 0 for count in repo._listener_counts.values()),
+          'revocation or repeated unsubscribe leaked pool capacity')
+
+
 def test_metadata_audit_and_sqlite_store_have_no_raw_credentials_or_claim_handles(env):
     repo, _, a, b, asecret, bsecret, sa, sb = pair(env)
     message = repo.send(sa['token'], b['id'], 'body deliberately absent from audit', 'redaction')
