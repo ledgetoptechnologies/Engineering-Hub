@@ -186,6 +186,12 @@ class RoleRecovery(Revision):
     reason: str = Field(min_length=1, max_length=1000)
 
 
+class StaleServiceWrite(Input):
+    expected_revision: int = Field(ge=0)
+    projects: list[str] = Field(min_length=1, max_length=32)
+    lifetime_seconds: int = Field(ge=60, le=86400)
+
+
 class Candidate(Revision):
     commit: str = Field(pattern=r"^[0-9a-f]{40}$")
 
@@ -1073,6 +1079,21 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         if actor_id != session_bridge.sessions.owner:
             raise HubError('role_owner_required', 403)
         return actor_id
+
+    @app.get('/api/hub/v1/orchestration/stale-service-grant')
+    def get_stale_service_grant(request: Request):
+        from .stale_service_authority import StaleServiceGrant
+        return StaleServiceGrant(repo).owner_get(role_owner(request))
+
+    @app.put('/api/hub/v1/orchestration/stale-service-grant')
+    def configure_stale_service_grant(payload: StaleServiceWrite, request: Request):
+        from .stale_service_authority import StaleServiceGrant
+        return StaleServiceGrant(repo).owner_configure(role_owner(request, mutation=True), **payload.model_dump())
+
+    @app.post('/api/hub/v1/orchestration/stale-service-grant/revoke')
+    def revoke_stale_service_grant(payload: Revision, request: Request):
+        from .stale_service_authority import StaleServiceGrant
+        return StaleServiceGrant(repo).owner_revoke(role_owner(request, mutation=True), payload.expected_revision)
 
     @app.get('/api/hub/v1/roles')
     def list_roles(request: Request, limit: int = 50, after: str | None = None):

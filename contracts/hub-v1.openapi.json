@@ -2821,6 +2821,92 @@
         }
       }
     },
+    "/api/hub/v1/orchestration/stale-service-grant": {
+      "get": {
+        "summary": "Get Stale Service Grant",
+        "operationId": "get_stale_service_grant_api_hub_v1_orchestration_stale_service_grant_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Configure Stale Service Grant",
+        "operationId": "configure_stale_service_grant_api_hub_v1_orchestration_stale_service_grant_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StaleServiceWrite"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/orchestration/stale-service-grant/revoke": {
+      "post": {
+        "summary": "Revoke Stale Service Grant",
+        "operationId": "revoke_stale_service_grant_api_hub_v1_orchestration_stale_service_grant_revoke_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Revision"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/roles": {
       "get": {
         "summary": "List Roles",
@@ -8266,6 +8352,38 @@
           "client_request_id"
         ],
         "title": "StagingTaskProposal"
+      },
+      "StaleServiceWrite": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Expected Revision"
+          },
+          "projects": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 32,
+            "minItems": 1,
+            "title": "Projects"
+          },
+          "lifetime_seconds": {
+            "type": "integer",
+            "maximum": 86400.0,
+            "minimum": 60.0,
+            "title": "Lifetime Seconds"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "projects",
+          "lifetime_seconds"
+        ],
+        "title": "StaleServiceWrite"
       },
       "TaskDTO": {
         "properties": {
