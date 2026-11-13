@@ -99,7 +99,7 @@ def main(argv=None):
                     raise ClientError('invalid_tracking_request')
                 result = {'type': 'tracking_outbox_references', 'record_ids': tracking_outbox.references(args.outbox_dir)}
             elif args.action == 'stage':
-                if set(arguments) != {'action', 'arguments'} or arguments['action'] not in ('propose', 'update'):
+                if set(arguments) != {'action', 'arguments'} or arguments['action'] not in ('propose', 'update', 'review'):
                     raise ClientError('invalid_tracking_request')
                 _arguments(arguments['action'], arguments['arguments'])
                 origin, installation = _installation_profile(
@@ -112,7 +112,7 @@ def main(argv=None):
                 if set(arguments) != {'record_id'}:
                     raise ClientError('invalid_tracking_request')
                 record = tracking_outbox.read(args.outbox_dir, arguments['record_id'])
-                if record['action'] not in ('propose', 'update'):
+                if record['action'] not in ('propose', 'update', 'review'):
                     raise ClientError('invalid_tracking_request')
                 _arguments(record['action'], record['arguments'])
                 if args.action == 'inspect-staged':

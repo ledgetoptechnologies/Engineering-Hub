@@ -56,7 +56,7 @@ It sends no notification and does not imply another agent has received it.
 For a write that must survive a lost response, first create an existing private,
 exclusively user-controlled outbox directory (0700 on POSIX; private user ACL
 on Windows). Use `--outbox-dir` with `stage` and stdin
-`{"action":"propose","arguments":{...}}` or `update` with the exact ordinary
+`{"action":"propose","arguments":{...}}`, `update`, or `review` with the exact ordinary
 write arguments and a stable `client_request_id`. Stage requires the protected
 installation profile but no session or network; it returns a record ID only
 after file flush and atomic publication (and directory flush on POSIX). Windows
@@ -70,6 +70,10 @@ On a later turn, `list-staged` with `{}` lists opaque IDs. `inspect-staged`
 with `{"record_id":"..."}` explicitly prints the private local payload so it
 can be checked in a protected channel; `send-staged` with the same input sends
 the saved unchanged payload.
+A staged review remains subject to the server's independent-review and evidence rules;
+staging or sending it does not itself prove work was completed. A successful
+idempotent retry returns the current task, which may include later changes; it
+is not an immutable receipt of the original review.
 Send requires a currently valid session and verifies its identity; the current
 profile must be the same Hub origin and installation that staged the record.
 An explicitly renewed session on that installation may be used because server

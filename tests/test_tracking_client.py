@@ -137,8 +137,20 @@ async def test_loopback_session_tracking_scope_retry_and_independent_review(owne
                           verdict='verify', note='Reviewed synthetic evidence', evidence_links=links)
             with pytest.raises(ClientError):
                 await action(w, wp, 'review', review)
-            done = await action(r, rp, 'review', review)
+            # Preserve the exact review/key before network I/O. Only the reviewer
+            # installation can send or retry this record after a lost response.
+            _write(profile / 'installation.private', dict(origin=url.removesuffix('/mcp'), installation_id=reviewer_id))
+            _write(profile / 'first.session.private', dict(token=reviewer, installation_id=reviewer_id,
+                session_id=rp.session_id, expires_at=rp.expires_at))
+            review_id = tracking_outbox.stage(outbox, url.removesuffix('/mcp'), reviewer_id, None, 'review', review)
+            saved_review = tracking_outbox.read(outbox, review_id)
+            with monkeypatch.context() as patch:
+                patch.setattr(tracking_client.httpx, 'AsyncClient', TestClient)
+                done = (await _run(args, saved_review['arguments'], binding=saved_review, action=saved_review['action']))['result']
+                retry_review = (await _run(args, saved_review['arguments'], binding=saved_review, action=saved_review['action']))['result']
             assert done['status'] == 'completion_verified'
+            assert retry_review == done
+            assert len(done['reviews']) == 1
             with pytest.raises(ClientError):
                 await action(w, wp, 'update', dict(task_id=task['id'], expected_revision=task['revision'],
                     client_request_id='old', progress='stale', evidence_links=[]))

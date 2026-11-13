@@ -92,3 +92,30 @@ def test_staging_without_session_and_send_binding(tmp_path, monkeypatch, capsys)
     params = SimpleNamespace(profile_dir=profile, session='new', private_vpn=False, action='send-staged')
     with pytest.raises(ClientError, match='binding_mismatch'):
         asyncio.run(tracking_client._run(params, arguments, binding=record, action='propose'))
+
+
+def test_cli_stages_and_explicitly_sends_review(tmp_path, monkeypatch, capsys):
+    import io
+    profile = tmp_path / 'profile'; profile.mkdir(mode=0o700)
+    outbox = tmp_path / 'outbox'; outbox.mkdir(mode=0o700)
+    installation = 'b39e3ea5-567c-45cb-a184-01dd1c6352bb'
+    _write(profile / 'installation.private', {'origin': 'https://hub.example', 'installation_id': installation})
+    payload = {'task_id': 'task', 'expected_revision': 2, 'client_request_id': 'review-stable',
+               'verdict': 'verify', 'note': 'reviewed', 'evidence_links': [{'label': 'e', 'url': 'https://example.com'}]}
+    class Input:
+        def __init__(self, value): self.buffer = io.BytesIO(json.dumps(value).encode())
+    argv = ['--profile-dir', str(profile), '--session', 'first', '--outbox-dir', str(outbox)]
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'action': 'review', 'arguments': payload}))
+    assert tracking_client.main(argv + ['stage']) == 0
+    record_id = json.loads(capsys.readouterr().out)['record_id']
+    record = tracking_outbox.read(outbox, record_id)
+    assert record['action'] == 'review' and record['arguments'] == payload
+    calls = []
+    async def send(args, arguments, *, binding, action):
+        calls.append((arguments, binding, action))
+        return {'type': 'tracking_result', 'execution_authorization': False, 'result': {'status': 'completion_verified'}}
+    monkeypatch.setattr(tracking_client, '_run', send)
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': record_id}))
+    assert tracking_client.main(argv + ['send-staged']) == 0
+    assert calls == [(payload, record, 'review')]
+    assert json.loads(capsys.readouterr().out)['result']['status'] == 'completion_verified'
