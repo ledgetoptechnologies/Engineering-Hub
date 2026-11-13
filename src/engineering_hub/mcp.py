@@ -279,6 +279,13 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         return invoke(DispatchRepository(repo).reports, identity(ctx), dispatch_id, limit, after_revision)
 
     @registration.tool()
+    def hub_role_dispatch_inbox(role: str, generation: StrictInt, project: str, ctx: Context,
+                                limit: StrictInt = 50, after: str | None = None) -> dict:
+        """Discover open dispatches for this exact leased role session; no execution or wake is implied."""
+        from .dispatch import DispatchRepository
+        return invoke(DispatchRepository(repo).role_inbox, identity(ctx), role, generation, project, limit, after)
+
+    @registration.tool()
     def hub_dispatch_report(dispatch_id: str, expected_revision: StrictInt, generation: StrictInt,
                             state: str, note: str, client_request_id: str, ctx: Context,
                             ask_title: str | None = None, ask_options: list[str] | None = None) -> dict:

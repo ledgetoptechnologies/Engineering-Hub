@@ -540,6 +540,92 @@ class DispatchRepository:
             return dict(items=visible[:limit], next_after=visible[limit-1]['id'] if len(visible) > limit else None,
                         wake_delivery='not_attempted')
 
+    def role_inbox(self, actor, role, generation, project, limit, after):
+        """Discover a held role's open dispatches; this never assigns execution."""
+        operation = self._operation(actor)
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise HubError('invalid_limit', 422)
+        if after is not None:
+            _canonical_id(after)
+        with self._attention_snapshot() as db:
+            held, operation = self._held(db, actor, role, generation)
+            self._grant(operation, 'dispatch.read', 'role.read')
+            self.repo._project(project, db)
+            if project not in held['projects']:
+                raise HubError('dispatch_unavailable', 404)
+            # Ensure even an empty response rechecks the exact lease.
+            def recheck(_db):
+                with self.repo._connection() as current_db:
+                    self._held(current_db, actor, role, generation)
+                    self.repo._project(project, current_db)
+            operation.commit_checks.append(recheck)
+            kinds = []
+            for kind, capability in (('task', 'task.read'), ('tracking_task', 'tracking.read')):
+                try:
+                    self._grant(operation, capability)
+                    kinds.append(kind)
+                except HubError:
+                    pass
+            if not kinds:
+                return dict(items=[], next_after=None, wake_delivery='not_attempted', execution_authorization=False)
+            try:
+                self._grant(operation, 'decision.read')
+                decision_read = 1
+            except HubError:
+                decision_read = 0
+            marks = ','.join('?' for _ in kinds)
+            rows = db.execute("SELECT d.id FROM hub_entities d "
+                "JOIN hub_entities t ON t.id=json_extract(d.data,'$.task_id') "
+                "JOIN hub_entities q ON q.id=json_extract(d.data,'$.request_id') AND q.kind='orchestration_request' "
+                "WHERE d.kind='role_dispatch' AND json_extract(d.data,'$.role_id')=? "
+                "AND json_extract(d.data,'$.project')=? AND json_extract(q.data,'$.project')=? "
+                "AND json_extract(t.data,'$.project')=? AND d.id>? "
+                "AND json_extract(d.data,'$.state') IN ('dispatched','working','blocked','asked','stale') "
+                "AND json_extract(t.data,'$.status') IN ('assigned','claimed','in_review','open','completion_claimed') "
+                "AND (json_extract(d.data,'$.decision_id') IS NULL OR ?=1) "
+                "AND t.kind IN (" + marks + ") AND t.kind=json_extract(d.data,'$.task_kind') "
+                "ORDER BY d.id LIMIT ?", (role, project, project, project, after or '', decision_read, *kinds, limit + 1)).fetchall()
+            values = []
+            for row in rows:
+                item, task, target, _ = self._dispatch(db, actor, row['id'])
+                if target.get('role_id') != role or item.get('project') != project:
+                    raise HubError('dispatch_unavailable', 404)
+                binding = item.get('target_binding')
+                current = self._binding(held.get('lease'))
+                if binding is None:
+                    binding_state = 'unbound'
+                elif self._binding(binding) is None:
+                    binding_state = 'unknown'
+                elif self._binding(binding) == current:
+                    binding_state = 'current_session'
+                else:
+                    binding_state = 'prior_or_other_session'
+                from .roles import _NAMESPACE as role_namespace
+                claim_id = str(uuid.uuid5(role_namespace, 'claim:' + item['task_id']))
+                claim_row = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='role_claim'", (claim_id,)).fetchone()
+                claim_state = 'unavailable'
+                if claim_row is not None:
+                    try:
+                        claim = json.loads(claim_row['data'])
+                        if (type(claim) is dict and claim.get('task_id') == item['task_id']
+                                and claim.get('project') == project and claim.get('role_id') == role):
+                            if claim.get('status') == 'released':
+                                claim_state = 'released'
+                            elif claim.get('status') == 'claimed':
+                                if (claim.get('created_session_id') == operation.principal.session_id
+                                        and claim.get('created_installation_id') == operation.principal.installation_id):
+                                    claim_state = 'current_session'
+                                else:
+                                    claim_state = 'prior_or_other_session'
+                    except (ValueError, TypeError):
+                        pass  # Missing, foreign and malformed claims are indistinguishable.
+                values.append(dict(dispatch=item, task_status=task['status'], target_binding_state=binding_state,
+                                   coordination_claim_state=claim_state, report_text_untrusted=True, execution_authorization=False))
+            return dict(items=values[:limit],
+                        next_after=values[limit-1]['dispatch']['id'] if len(values) > limit else None,
+                        wake_delivery='not_attempted', execution_authorization=False,
+                        note='UUID order; refresh from the beginning for new dispatches. Prior bindings do not imply takeover.')
+
     def report(self, actor, dispatch_id, expected_revision, generation, state, note, client_request_id,
                ask_title=None, ask_options=None):
         if state not in ('working', 'blocked', 'ask', 'resume', 'done', 'failed'):
