@@ -129,13 +129,28 @@ class AttentionAdapter:
                             or item.get('execution_authorization') is not False or item.get('wake_verified') is not False):
                         raise ClientError('invalid_attention_response')
                     task_id = _uuid(item.get('task_id'))
+                    event_type = item.get('event_type', 'dispatch')
+                    if event_type not in ('dispatch', 'decision_answered'):
+                        raise ClientError('invalid_attention_response')
+                    decision = None
+                    if event_type == 'decision_answered':
+                        decision = _uuid(item.get('decision_id'))
+                        decision_revision = item.get('decision_revision')
+                        if type(decision_revision) is not int or decision_revision < 1:
+                            raise ClientError('invalid_attention_response')
+                    elif 'decision_id' in item or 'decision_revision' in item:
+                        raise ClientError('invalid_attention_response')
                     key = (identity, revision)
                     if key not in seen:
                         seen.add(key)
-                        self.emit(dict(type='worker_dispatch_reference', trust='untrusted_hub_data',
+                        reference = dict(type='worker_dispatch_reference', trust='untrusted_hub_data',
                                        project=self.project, role=self.role, dispatch_id=identity,
                                        dispatch_revision=revision, task_id=task_id, role_generation=self.generation,
-                                       execution_authorization=False, wake_verified=False))
+                                       execution_authorization=False, wake_verified=False)
+                        if decision is not None:
+                            reference.update(event_type='decision_answered', decision_id=decision,
+                                             decision_revision=decision_revision)
+                        self.emit(reference)
                     continue
                 if (item.get('project') != self.project or item.get('recipient_role') != 'orchestrator'
                         or item.get('state') != 'pending_routing' or item.get('actionable') is not True
@@ -157,24 +172,42 @@ class AttentionAdapter:
             cursor = next_cursor
         self.emit(dict(type='attention_catchup', complete=False, next_after=cursor))
 
-    async def acknowledge(self, intent_id, revision):
+    async def acknowledge(self, intent_id, revision, decision_id=None, decision_revision=None):
         await self.verify_identity()
         _uuid(intent_id)
         if type(revision) is not int or revision < 1:
             raise ClientError('invalid_attention_reference')
+        if decision_id is not None:
+            _uuid(decision_id)
+            if type(decision_revision) is not int or decision_revision < 1 or self.role == 'orchestrator':
+                raise ClientError('invalid_attention_reference')
+        elif decision_revision is not None:
+            raise ClientError('invalid_attention_reference')
         if self.role != 'orchestrator':
-            result = await _call(self.session, 'hub_worker_dispatch_ack', dict(
+            arguments = dict(
                 project=self.project, role=self.role, generation=self.generation,
-                dispatch_id=intent_id, expected_revision=revision))
+                dispatch_id=intent_id, expected_revision=revision)
+            if decision_id is not None:
+                arguments.update(decision_id=decision_id, decision_revision=decision_revision)
+            result = await _call(self.session, 'hub_worker_dispatch_ack', arguments)
             if (result.get('project') != self.project or result.get('role') != self.role
                     or result.get('dispatch_id') != intent_id or result.get('dispatch_revision') != revision
                     or result.get('session_id') != self.session_id or result.get('installation_id') != self.installation
                     or result.get('generation') != self.generation or result.get('state') != 'agent_acknowledged'
                     or result.get('wake_verified') is not False or result.get('execution_authorization') is not False):
                 raise ClientError('invalid_attention_response')
-            self.emit(dict(type='worker_dispatch_acknowledgment', project=self.project, role=self.role,
+            if decision_id is not None and (result.get('event_type') != 'decision_answered'
+                    or result.get('decision_id') != decision_id or result.get('decision_revision') != decision_revision):
+                raise ClientError('invalid_attention_response')
+            if decision_id is None and any(key in result for key in ('event_type', 'decision_id', 'decision_revision')):
+                raise ClientError('invalid_attention_response')
+            acknowledgment = dict(type='worker_dispatch_acknowledgment', project=self.project, role=self.role,
                            dispatch_id=intent_id, dispatch_revision=revision, receipt_id=_uuid(result.get('id')),
-                           wake_verified=False, execution_authorization=False))
+                           wake_verified=False, execution_authorization=False)
+            if decision_id is not None:
+                acknowledgment.update(event_type='decision_answered', decision_id=decision_id,
+                                      decision_revision=decision_revision)
+            self.emit(acknowledgment)
             return
         result = await _call(self.session, 'hub_addressed_attention_ack', dict(
             project=self.project, generation=self.generation, intent_id=intent_id, expected_revision=revision))
@@ -268,7 +301,8 @@ async def _run(args):
                 if (role == 'orchestrator' and getattr(args, 'dispatch_id', None) is not None
                         or role != 'orchestrator' and getattr(args, 'intent_id', None) is not None):
                     raise ClientError('invalid_attention_reference')
-                await use_mcp(lambda adapter: adapter.acknowledge(reference, args.revision))
+                await use_mcp(lambda adapter: adapter.acknowledge(reference, args.revision,
+                    getattr(args, 'decision_id', None), getattr(args, 'decision_revision', None)))
 
 
 def main(argv=None):
@@ -288,6 +322,8 @@ def main(argv=None):
     reference.add_argument('--intent-id')
     reference.add_argument('--dispatch-id')
     ack.add_argument('--revision', type=int, required=True)
+    ack.add_argument('--decision-id')
+    ack.add_argument('--decision-revision', type=int)
     args = parser.parse_args(argv)
     try:
         asyncio.run(_run(args))

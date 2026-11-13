@@ -334,12 +334,13 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
 
     @registration.tool()
     def hub_worker_dispatch_ack(role: str, generation: StrictInt, project: str, dispatch_id: str,
-                                expected_revision: StrictInt, ctx: Context) -> dict:
+                                expected_revision: StrictInt, ctx: Context, decision_id: str | None = None,
+                                decision_revision: StrictInt | None = None) -> dict:
         """Record a scoped receipt; it does not authorize or prove execution or wake."""
         if attention_delivery is None:
             raise ToolError('attention_delivery_unavailable')
         return invoke(attention_delivery.worker_acknowledge, identity(ctx), project, role, generation,
-                      dispatch_id, expected_revision)
+                      dispatch_id, expected_revision, decision_id, decision_revision)
 
     @registration.tool()
     def hub_orchestrator_attention_reconcile_closed(generation: StrictInt, intent_id: str,

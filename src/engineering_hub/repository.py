@@ -973,7 +973,23 @@ class HubRepository:
             if item['status'] != 'open' or (not free_text and answer not in item['options']):
                 raise HubError('invalid_answer', 409)
             item.update(answer=answer, answered_by=actor, status='answered')
-            return self._save(db, actor, 'decision.answered', 'decision', item)
+            item = self._save(db, actor, 'decision.answered', 'decision', item)
+            audience = None
+            origin = item.get('origin_dispatch_id')
+            if type(origin) is str:
+                row = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='role_dispatch'", (origin,)).fetchone()
+                try:
+                    dispatch = json.loads(row['data']) if row else None
+                    if (type(dispatch) is dict and dispatch.get('id') == origin
+                            and dispatch.get('project') == item['project'] and dispatch.get('state') == 'asked'
+                            and dispatch.get('decision_id') == item['id'] and type(dispatch.get('role_id')) is str):
+                        audience = ('worker', item['project'], dispatch['role_id'])
+                except (ValueError, TypeError):
+                    pass  # Corrupt historical data never prevents the answer or sends an unscoped pointer.
+        broker = getattr(self, '_attention_hint_broker', None)
+        if audience is not None and broker is not None:
+            broker.signal(audience)
+        return item
 
     def create_run(self, actor, task_id, expected_revision, artifact_digest, target, *, execution_manifest_digest=None, client_request_id=None):
         if actor not in AGENTS:

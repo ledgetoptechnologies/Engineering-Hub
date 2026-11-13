@@ -145,6 +145,17 @@ async def test_distinct_role_sessions_coordinate_over_real_loopback(owned, tmp_p
             assert repo.get_decision(decision['id'])['status'] == 'answered'
             assert response.status_code == 200, response.text
             assert 'origin_dispatch_id' not in response.json() and 'origin_dispatch_revision' not in response.json()
+            for expected in ('event: attention-check', 'data: {}', ''):
+                assert await asyncio.wait_for(anext(lines), 3) == expected
+            answered_page = await invoke(worker, 'hub_worker_dispatch_pending', dict(role='backend', generation=1, project=PROJECT))
+            answered_ref = answered_page['items'][0]
+            assert answered_ref['event_type'] == 'decision_answered' and answered_ref['decision_id'] == decision['id']
+            assert answered_ref['decision_revision'] == response.json()['revision']
+            received = await invoke(worker, 'hub_worker_dispatch_ack', dict(role='backend', generation=1, project=PROJECT,
+                dispatch_id=dispatch['id'], expected_revision=asked['revision'], decision_id=decision['id'],
+                decision_revision=answered_ref['decision_revision']))
+            assert received['wake_verified'] is False and received['event_type'] == 'decision_answered'
+            assert (await invoke(worker, 'hub_worker_dispatch_pending', dict(role='backend', generation=1, project=PROJECT)))['items'] == []
             with repo._connection() as db:
                 assert db.execute('SELECT count(*) FROM hub_outbox WHERE entity_id=?', (decision['id'],)).fetchone()[0] == 0
                 assert db.execute("SELECT count(*) FROM hub_audit WHERE entity_id=? AND action='decision.answered'", (decision['id'],)).fetchone()[0] == 1

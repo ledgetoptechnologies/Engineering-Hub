@@ -203,3 +203,27 @@ async def test_worker_rejects_orchestrator_ack_reference_before_mcp(monkeypatch,
         generation=1, role='backend', command='ack', intent_id=DISPATCH, dispatch_id=None, revision=1)
     with pytest.raises(ClientError, match='invalid_attention_reference'):
         await attention_client._run(args)
+
+
+@pytest.mark.asyncio
+async def test_worker_answer_reference_and_explicit_ack_are_session_scoped():
+    session, output = WorkerSession(), []
+    decision = '77777777-7777-4777-8777-777777777777'
+    session.page['items'][0].update(event_type='decision_answered', decision_id=decision, decision_revision=2)
+    original = session.call_tool
+    async def answer_call(name, args):
+        result = await original(name, args)
+        if name == 'hub_worker_dispatch_ack':
+            result.structuredContent.update(event_type='decision_answered', decision_id=args['decision_id'],
+                                            decision_revision=args['decision_revision'])
+        return result
+    session.call_tool = answer_call
+    client = adapter(session, output)
+    await client.catch_up()
+    assert output[0]['decision_id'] == decision and output[0]['decision_revision'] == 2
+    assert output[0]['event_type'] == 'decision_answered'
+    assert not any(name == 'hub_worker_dispatch_ack' for name, _ in session.calls)
+    await client.acknowledge(DISPATCH, 1, decision, 2)
+    assert output[-1]['decision_id'] == decision and output[-1]['wake_verified'] is False
+    with pytest.raises(ClientError, match='invalid_attention_reference'):
+        await client.acknowledge(DISPATCH, 1, decision, None)

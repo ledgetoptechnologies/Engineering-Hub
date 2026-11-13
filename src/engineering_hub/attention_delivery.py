@@ -250,14 +250,29 @@ class AttentionDelivery:
             if not kinds:
                 self._validate_target(operation.db, db, route)
                 return dict(items=[], next_after=None, wake_verified=False, execution_authorization=False)
+            try:
+                service._grant(operation, 'decision.read')
+                decision_read = 1
+            except HubError:
+                decision_read = 0
             marks = ','.join('?' for _ in kinds)
             rows = db.execute("SELECT d.id FROM hub_entities d "
                 "JOIN hub_entities t ON t.id=json_extract(d.data,'$.task_id') "
                 "JOIN hub_entities q ON q.id=json_extract(d.data,'$.request_id') AND q.kind='orchestration_request' "
+                "LEFT JOIN hub_entities a ON a.id=json_extract(d.data,'$.decision_id') AND a.kind='decision' "
                 "WHERE d.kind='role_dispatch' AND json_extract(d.data,'$.role_id')=? "
                 "AND json_extract(d.data,'$.project')=? AND json_extract(t.data,'$.project')=? "
-                "AND json_extract(q.data,'$.project')=? AND d.id>? AND json_extract(d.data,'$.state')='dispatched' "
-                "AND json_extract(d.data,'$.decision_id') IS NULL "
+                "AND json_extract(q.data,'$.project')=? AND d.id>? "
+                "AND ((json_extract(d.data,'$.state')='dispatched' AND json_extract(d.data,'$.decision_id') IS NULL) "
+                "OR (?=1 AND json_extract(d.data,'$.state')='asked' AND a.id IS NOT NULL "
+                "AND CASE WHEN json_valid(a.data) THEN json_type(a.data)='object' "
+                "AND json_extract(a.data,'$.id')=a.id AND json_type(a.data,'$.revision')='integer' "
+                "AND json_extract(a.data,'$.revision')>0 AND json_extract(a.data,'$.status')='answered' "
+                "AND json_type(a.data,'$.origin_dispatch_revision')='integer' "
+                "AND json_extract(a.data,'$.origin_dispatch_revision')>0 "
+                "AND json_extract(a.data,'$.origin_dispatch_revision')<=json_extract(d.data,'$.revision') "
+                "AND json_extract(a.data,'$.project')=? "
+                "AND json_extract(a.data,'$.origin_dispatch_id')=d.id ELSE 0 END)) "
                 "AND json_extract(t.data,'$.status') IN ('assigned','claimed','in_review','open','completion_claimed') "
                 "AND t.kind IN (" + marks + ") AND t.kind=json_extract(d.data,'$.task_kind') "
                 "AND json_extract(d.data,'$.target_binding.session_id')=? "
@@ -265,8 +280,12 @@ class AttentionDelivery:
                 "AND json_extract(d.data,'$.target_binding.generation')=? "
                 "AND NOT EXISTS (SELECT 1 FROM hub_entities r WHERE r.kind='worker_dispatch_receipt' "
                 "AND json_extract(r.data,'$.dispatch_id')=d.id AND json_extract(r.data,'$.session_id')=? "
-                "AND json_extract(r.data,'$.generation')=?) ORDER BY d.id LIMIT ?",
-                (role, project, project, project, after or '', *kinds, route['session_id'],
+                "AND json_extract(r.data,'$.generation')=? AND ((json_extract(d.data,'$.state')='dispatched' "
+                "AND json_extract(r.data,'$.decision_id') IS NULL) OR (json_extract(d.data,'$.state')='asked' "
+                "AND json_extract(r.data,'$.decision_id')=a.id AND json_extract(r.data,'$.decision_revision')="
+                "CASE WHEN json_valid(a.data) THEN json_extract(a.data,'$.revision') ELSE NULL END))) "
+                "ORDER BY d.id LIMIT ?",
+                (role, project, project, project, after or '', decision_read, project, *kinds, route['session_id'],
                  route['installation_id'], generation, route['session_id'], generation, limit + 1)).fetchall()
             items = []
             for row in rows:
@@ -274,20 +293,35 @@ class AttentionDelivery:
                 if (target.get('role_id') != role or item.get('project') != project
                         or service._binding(item.get('target_binding')) != service._binding(held.get('lease'))):
                     raise HubError('attention_route_unavailable', 404)
-                items.append(dict(dispatch_id=item['id'], dispatch_revision=item['revision'],
-                                  task_id=task['id'], project=project, role=role,
-                                  execution_authorization=False, wake_verified=False))
+                view = dict(dispatch_id=item['id'], dispatch_revision=item['revision'],
+                            task_id=task['id'], project=project, role=role,
+                            execution_authorization=False, wake_verified=False)
+                if item['state'] == 'asked':
+                    decision = self.repo._get(db, item['decision_id'], 'decision')
+                    if (decision.get('project') != project or decision.get('origin_dispatch_id') != item['id']
+                            or decision.get('status') != 'answered' or type(decision.get('revision')) is not int):
+                        raise HubError('attention_route_unavailable', 404)
+                    view.update(event_type='decision_answered', decision_id=decision['id'],
+                                decision_revision=decision['revision'])
+                items.append(view)
             self._validate_target(operation.db, db, route)
             return dict(items=items[:limit], next_after=items[limit-1]['dispatch_id'] if len(items) > limit else None,
                         wake_verified=False, execution_authorization=False,
                         note='Refresh UUID paging from the beginning for new dispatches; no execution or wake is implied.')
 
-    def worker_acknowledge(self, actor, project, role, generation, dispatch_id, expected_revision):
+    def worker_acknowledge(self, actor, project, role, generation, dispatch_id, expected_revision,
+                           decision_id=None, decision_revision=None):
         operation = context.current.get()
         if operation is None or not context.actor_allowed(actor) or role == 'orchestrator':
             raise HubError('attention_route_unavailable', 404)
         _canonical_id(dispatch_id)
         if type(expected_revision) is not int or expected_revision < 1:
+            raise HubError('invalid_attention_receipt', 422)
+        if decision_id is not None:
+            _canonical_id(decision_id)
+            if type(decision_revision) is not int or decision_revision < 1:
+                raise HubError('invalid_attention_receipt', 422)
+        elif decision_revision is not None:
             raise HubError('invalid_attention_receipt', 422)
         service = DispatchRepository(self.repo)
         with self.repo._transaction() as db:
@@ -296,13 +330,27 @@ class AttentionDelivery:
             service._grant(operation, 'dispatch.read', 'role.read')
             item, task, target, _ = service._dispatch(db, actor, dispatch_id)
             if (item.get('project') != project or target.get('role_id') != role
-                    or item.get('state') != 'dispatched' or item.get('decision_id') is not None
                     or task.get('status') not in ('assigned', 'claimed', 'in_review', 'open', 'completion_claimed')
                     or service._binding(item.get('target_binding')) != service._binding(held.get('lease'))):
                 raise HubError('attention_route_unavailable', 404)
             self.repo._cas(item, expected_revision)
-            identity = str(uuid.uuid5(_NAMESPACE, ':'.join(['worker-receipt', dispatch_id,
-                str(expected_revision), route['session_id'], str(generation)])))
+            if decision_id is None:
+                if item.get('state') != 'dispatched' or item.get('decision_id') is not None:
+                    raise HubError('attention_route_unavailable', 404)
+            else:
+                service._grant(operation, 'decision.read')
+                decision = self.repo._get(db, decision_id, 'decision')
+                if (item.get('state') != 'asked' or item.get('decision_id') != decision_id
+                        or decision.get('project') != project or decision.get('origin_dispatch_id') != dispatch_id
+                        or decision.get('id') != decision_id
+                        or type(decision.get('origin_dispatch_revision')) is not int
+                        or not 1 <= decision['origin_dispatch_revision'] <= item['revision']
+                        or decision.get('status') != 'answered' or decision.get('revision') != decision_revision):
+                    raise HubError('attention_route_unavailable', 404)
+            parts = ['worker-receipt', dispatch_id, str(expected_revision), route['session_id'], str(generation)]
+            if decision_id is not None:
+                parts += [decision_id, str(decision_revision)]
+            identity = str(uuid.uuid5(_NAMESPACE, ':'.join(parts)))
             row = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='worker_dispatch_receipt'", (identity,)).fetchone()
             if row:
                 return json.loads(row['data'])
@@ -310,6 +358,8 @@ class AttentionDelivery:
                            dispatch_revision=expected_revision, installation_id=route['installation_id'],
                            session_id=route['session_id'], generation=generation, state='agent_acknowledged',
                            wake_verified=False, execution_authorization=False)
+            if decision_id is not None:
+                receipt.update(event_type='decision_answered', decision_id=decision_id, decision_revision=decision_revision)
             receipt = self.repo._save(db, actor, 'worker_dispatch.acknowledged', 'worker_dispatch_receipt', receipt,
                                       new=True, publish=False)
             self._validate_target(operation.db, db, route)
