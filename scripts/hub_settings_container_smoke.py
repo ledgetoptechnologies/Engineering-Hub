@@ -133,7 +133,7 @@ asyncio.run(asyncio.wait_for(main(),50))
 
 def smoke(image, commit):
     if not isinstance(image, str) or not re.fullmatch(
-            r'ghcr\.io/ledgetoptechnologies/engineering-hub-control:(?:build-)[a-z0-9-]+|'
+            r'sha256:[a-f0-9]{64}|ghcr\.io/ledgetoptechnologies/engineering-hub-control:(?:build-)[a-z0-9-]+|'
             r'ghcr\.io/ledgetoptechnologies/engineering-hub-control@sha256:[a-f0-9]{64}', image):
         raise ValueError('Expected the explicit Hub release artifact')
     if not isinstance(commit, str) or not re.fullmatch(r'[a-f0-9]{40}', commit):

@@ -116,20 +116,26 @@ jobs:
       - name: Test the exact publication candidate before upload
         run: |
           set -eu
-          python scripts/hub_release_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-startup.json
-          python scripts/hub_split_container_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-split-startup.json
-          python scripts/hub_unified_container_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-unified-startup.json
-          python scripts/hub_settings_container_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-settings-startup.json
-          python scripts/hub_protected_container_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-protected-startup.json
+          TESTED_CONFIG="$(docker image inspect "$BUILD_IMAGE" --format '{{.Id}}')"
+          [[ "$TESTED_CONFIG" =~ ^sha256:[a-f0-9]{64}$ ]]
+          python scripts/hub_release_smoke.py --image "$TESTED_CONFIG" --commit "$GITHUB_SHA" > hub-local-startup.json
+          python scripts/hub_split_container_smoke.py --image "$TESTED_CONFIG" --commit "$GITHUB_SHA" > hub-local-split-startup.json
+          python scripts/hub_unified_container_smoke.py --image "$TESTED_CONFIG" --commit "$GITHUB_SHA" > hub-local-unified-startup.json
+          python scripts/hub_settings_container_smoke.py --image "$TESTED_CONFIG" --commit "$GITHUB_SHA" > hub-local-settings-startup.json
+          python scripts/hub_protected_container_smoke.py --image "$TESTED_CONFIG" --commit "$GITHUB_SHA" > hub-local-protected-startup.json
+          echo "TESTED_CONFIG=$TESTED_CONFIG" >> "$GITHUB_ENV"
       - name: Publish unique build tag and verify authenticated registry read
         run: |
           set -eu
+          test "$(docker image inspect "$BUILD_IMAGE" --format '{{.Id}}')" = "$TESTED_CONFIG"
           docker push "$BUILD_IMAGE"
           docker buildx imagetools inspect "$BUILD_IMAGE" --raw > hub-registry-manifest.json
           docker buildx imagetools inspect "$BUILD_IMAGE" --format '{{json .Manifest}}' > hub-registry-descriptor.json
-          DIGEST="$(python -c 'import json,re; d=json.load(open("hub-registry-descriptor.json"))["digest"]; assert re.fullmatch("sha256:[a-f0-9]{64}",d); print(d)')"
+          DIGEST="$(python scripts/verify_hub_publication_manifest.py --manifest hub-registry-manifest.json --descriptor hub-registry-descriptor.json --expected-config "$TESTED_CONFIG")"
           echo "IMAGE_DIGEST=$DIGEST" >> "$GITHUB_ENV"
           docker pull "$PACKAGE@$DIGEST"
+          PULLED_CONFIG="$(docker image inspect "$PACKAGE@$DIGEST" --format '{{.Id}}')"
+          python scripts/verify_hub_publication_manifest.py --manifest hub-registry-manifest.json --descriptor hub-registry-descriptor.json --expected-config "$TESTED_CONFIG" --pulled-config "$PULLED_CONFIG" > /dev/null
           python scripts/hub_release_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-startup.json
           python scripts/hub_split_container_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-split-startup.json
           python scripts/hub_unified_container_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-unified-startup.json
