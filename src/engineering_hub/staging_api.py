@@ -115,6 +115,10 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         HubRepository._actor(principal, human=human_only)
         return principal
 
+    def revalidate(request, principal, *, human_only=False):
+        if authenticated(request, mutation=True, human_only=human_only) != principal:
+            raise HubError('staging_identity_changed', 403)
+
     @app.get('/api/hub/v1/staging/status')
     async def status(request: Request):
         principal = authenticated(request)
@@ -200,6 +204,7 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         principal = authenticated(request, mutation=True)
         service = configured()
         payload = await _payload(request, StagingKeep)
+        revalidate(request, principal)
         return service.resources.set_keep(principal, resource_id, **payload.model_dump())
 
     @app.post('/api/hub/v1/staging/cleanup/plan')
@@ -207,6 +212,7 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         principal = authenticated(request, mutation=True)
         service = configured()
         payload = await _payload(request, StagingCleanupPlan)
+        revalidate(request, principal)
         return service.resources.cleanup_plan(principal, **payload.model_dump())
 
     @app.post('/api/hub/v1/staging/cleanup/apply')
@@ -214,6 +220,7 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         principal = authenticated(request, mutation=True)
         service = configured()
         payload = await _payload(request, StagingCleanupApply)
+        revalidate(request, principal)
         return await service.cleanup_apply(principal, payload.plan_id, payload.digest)
 
     @app.post('/api/hub/v1/staging/jobs', status_code=202)
@@ -223,6 +230,7 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
             raise HubError('staging_agent_required', 403)
         service = configured()
         payload = await _payload(request, StagingSubmission, maximum=12 * 1024 * 1024)
+        revalidate(request, principal)
         return await service.submit(principal, payload.model_dump())
 
     @app.get('/api/hub/v1/staging/jobs/{job_id}')
@@ -235,6 +243,7 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         principal = authenticated(request, mutation=True, human_only=True)
         service = configured()
         await _payload(request, ClosedInput)
+        revalidate(request, principal, human_only=True)
         return await service.reconcile_for(principal, job_id)
 
     @app.get('/api/hub/v1/staging/projects/{project}/policy')
@@ -247,6 +256,7 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         principal = authenticated(request, mutation=True, human_only=True)
         service = configured()
         payload = await _payload(request, StagingPolicy)
+        revalidate(request, principal, human_only=True)
         return service.resources.set_policy(principal, project, **payload.model_dump())
 
     @app.post('/api/hub/v1/staging/resources/{resource_id}/preview-session')
@@ -259,5 +269,6 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         session = preview_session(request)
         if inspect.isawaitable(session):
             session = await session
+        revalidate(request, principal, human_only=True)
         result = preview_broker.issue(principal, resource_id, *session)
         return {'url': result['preview_url'], 'expires_at': result['expires_at']}

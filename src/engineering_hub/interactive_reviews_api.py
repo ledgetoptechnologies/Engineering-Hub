@@ -109,12 +109,16 @@ def attach_interactive_review_routes(app, repository, actor, human):
         _authorization(request)
         principal = actor(request, mutation=True)
         payload = await _payload(request, ReviewCreate, 1024 * 1024 + 16384)
+        if actor(request, mutation=True) != principal:
+            raise HubError('review_identity_changed', 403)
         return repository.create_review(principal, **payload.model_dump(by_alias=True, exclude_none=True))
 
     @app.post('/api/hub/v1/interactive-reviews/{review_id}/answers')
     async def answer(review_id: Identity, request: Request):
         principal = identity(request, mutation=True)
         payload = await _payload(request, ReviewAnswers, 256 * 1024)
+        if identity(request, mutation=True) != principal:
+            raise HubError('review_identity_changed', 403)
         return repository.answer_review(principal, review_id, **payload.model_dump())
 
 
