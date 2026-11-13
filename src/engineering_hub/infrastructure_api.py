@@ -125,6 +125,8 @@ def attach_infrastructure_routes(app,service,actor,*,metrics=None,metrics_identi
     async def save(device_id:str,request:Request):
         identity=authorized(request,'device_write')
         payload=(await _payload(request,DeviceInput)).model_dump()
+        if authorized(request,'device_write') != identity:
+            raise HubError('forbidden',403)
         revision=payload.pop('expected_revision')
         return service.upsert_device(identity,{'id':device_id,**payload},expected_revision=revision)
 
@@ -132,10 +134,14 @@ def attach_infrastructure_routes(app,service,actor,*,metrics=None,metrics_identi
     async def open_maintenance(device_id:str,request:Request):
         identity=authorized(request,'maintenance_write')
         payload=await _payload(request,MaintenanceInput)
+        if authorized(request,'maintenance_write') != identity:
+            raise HubError('forbidden',403)
         return service.append_maintenance(identity,device_id,**payload.model_dump())
 
     @app.post('/api/hub/v1/infrastructure/maintenance/{maintenance_id}/resolve')
     async def resolve(maintenance_id:str,request:Request):
         identity=authorized(request,'maintenance_write')
         payload=await _payload(request,ResolutionInput)
+        if authorized(request,'maintenance_write') != identity:
+            raise HubError('forbidden',403)
         return service.resolve_maintenance(identity,maintenance_id,**payload.model_dump())
