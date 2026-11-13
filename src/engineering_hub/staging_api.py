@@ -120,6 +120,13 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         if authenticated(request, mutation=True, human_only=human_only) != principal:
             raise HubError('staging_identity_changed', 403)
 
+    def admission(request, principal):
+        if not principal.startswith('human:'):
+            return None
+        if not callable(human_admission):
+            raise HubError('staging_human_admission_unavailable', 503)
+        return human_admission(request, principal)
+
     @app.get('/api/hub/v1/staging/status')
     async def status(request: Request):
         principal = authenticated(request)
@@ -206,7 +213,8 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         service = configured()
         payload = await _payload(request, StagingKeep)
         revalidate(request, principal)
-        return service.resources.set_keep(principal, resource_id, **payload.model_dump())
+        return service.resources.set_keep(principal, resource_id, **payload.model_dump(),
+                                          admission_guard=admission(request, principal))
 
     @app.post('/api/hub/v1/staging/cleanup/plan')
     async def cleanup_plan(request: Request):
@@ -214,7 +222,8 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         service = configured()
         payload = await _payload(request, StagingCleanupPlan)
         revalidate(request, principal)
-        return service.resources.cleanup_plan(principal, **payload.model_dump())
+        return service.resources.cleanup_plan(principal, **payload.model_dump(),
+                                              admission_guard=admission(request, principal))
 
     @app.post('/api/hub/v1/staging/cleanup/apply')
     async def cleanup_apply(request: Request):
@@ -264,7 +273,8 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         service = configured()
         payload = await _payload(request, StagingPolicy)
         revalidate(request, principal, human_only=True)
-        return service.resources.set_policy(principal, project, **payload.model_dump())
+        return service.resources.set_policy(principal, project, **payload.model_dump(),
+                                            admission_guard=admission(request, principal))
 
     @app.post('/api/hub/v1/staging/resources/{resource_id}/preview-session')
     async def preview(resource_id: Identity, request: Request):

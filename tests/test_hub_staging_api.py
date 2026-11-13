@@ -115,7 +115,8 @@ def application(controller, *, broker=None, session=None, observer=None):
         HubRepository._actor(principal, human=True)
         return principal
 
-    attach_staging_routes(app, controller, actor, human, broker, session, observer=observer)
+    attach_staging_routes(app, controller, actor, human, broker, session, observer=observer,
+                          human_admission=lambda request, principal: lambda db: None)
     return TestClient(app), calls
 
 

@@ -129,3 +129,90 @@ def test_preview_rechecks_after_awaited_session_binding(tmp_path):
         '/api/hub/v1/staging/resources/33762456-e740-4f80-bda9-776f8dbcf753/preview-session',
         {}, on_body=lambda session: None))
     assert response.status_code == 401
+
+@pytest.mark.parametrize('operation', ['keep', 'plan', 'policy'])
+@pytest.mark.parametrize('expiry', [False, True])
+def test_staging_sync_writes_recheck_session_in_commit_transaction(tmp_path, operation, expiry, monkeypatch):
+    """A session lost after HTTP recheck must roll back the same-ledger write."""
+    import uuid
+    from engineering_hub.auth import human_transaction_guard
+
+    core, config = setup(tmp_path)
+    repo = core.state.repository
+    control = object()
+    resources = StagingResourceStore(repo, admin_actors=frozenset({'human:42'}),
+                                     control_principal=control)
+    resources.set_policy('human:42', 'engineering-hub', 0,
+                         {'human:42': ['read', 'retain', 'cleanup']})
+    job = resources.bind_job(control, str(uuid.uuid4()), project='engineering-hub',
+                             created_by='codex', source_commit='a' * 40)
+    item = resources.register_resource(control, job['id'], 'build')
+    item = resources.mark_resource_ready(control, item['id'], item['revision'],
+                                         artifact_digest='sha256:' + 'b' * 64, size_bytes=1)
+    resources.update_job(control, job['id'], job['revision'], terminal=True)
+    item = resources.inspect_resource(control, item['id'])
+    app = FastAPI()
+    app.state.sessions = core.state.sessions
+    class Controller:
+        pass
+    controller = Controller()
+    controller.resources = resources
+
+    @app.exception_handler(HubError)
+    async def error(request, exc):
+        return JSONResponse({'code': exc.code}, status_code=exc.status)
+
+    def human(request, mutation=False):
+        return require_human(request, config, app.state.sessions, mutation=mutation)
+
+    attach_staging_routes(app, controller, human, human,
+        human_admission=lambda request, principal: human_transaction_guard(request, config, app.state.sessions, principal))
+    name = {'keep': 'set_keep', 'plan': 'cleanup_plan', 'policy': 'set_policy'}[operation]
+    original = getattr(resources, name)
+    def revoked_before_transaction(*args, **kwargs):
+        if expiry:
+            with app.state.sessions._db() as db:
+                db.execute('UPDATE auth_sessions SET expires=0')
+        else:
+            app.state.sessions.delete_session(session['cookie_token'])
+        return original(*args, **kwargs)
+    monkeypatch.setattr(resources, name, revoked_before_transaction)
+    session = app.state.sessions.create_session(42)
+    headers = {'origin': config.origin, 'x-hub-csrf': session['csrf_token'],
+               'cookie': f"{config.cookie_name}={session['cookie_token']}"}
+    target, payload, method = {
+        'keep': (f"/api/hub/v1/staging/resources/{item['id']}/keep",
+                 {'mode': 'pinned', 'reason': 'synthetic', 'expected_revision': item['revision']}, 'POST'),
+        'plan': ('/api/hub/v1/staging/cleanup/plan', {'project': 'engineering-hub'}, 'POST'),
+        'policy': ('/api/hub/v1/staging/projects/engineering-hub/policy',
+                   {'expected_revision': 1, 'grants': {'human:42': ['read']}}, 'PUT'),
+    }[operation]
+    async def request():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=config.origin) as client:
+            return await client.request(method, target, headers=headers, json=payload)
+    response = run(request())
+    assert response.status_code == 401, response.text
+    assert resources.inspect_resource(control, item['id'])['keep'] is None
+    assert resources.get_policy('human:42', 'engineering-hub')['revision'] == 1
+    with repo._connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM hub_staging_cleanup_plans').fetchone()[0] == 0
+
+def test_human_sync_staging_write_fails_closed_without_admission_guard(tmp_path):
+    core, config = setup(tmp_path)
+    resources = StagingResourceStore(core.state.repository, admin_actors=frozenset({'human:42'}))
+    class Controller:
+        pass
+    controller = Controller()
+    controller.resources = resources
+    app = FastAPI()
+    app.state.sessions = core.state.sessions
+    @app.exception_handler(HubError)
+    async def error(request, exc):
+        return JSONResponse({'code': exc.code}, status_code=exc.status)
+    def human(request, mutation=False):
+        return require_human(request, config, app.state.sessions, mutation=mutation)
+    attach_staging_routes(app, controller, human, human)
+    response = run(delayed_post(app, config, '/api/hub/v1/staging/projects/engineering-hub/policy',
+        {'expected_revision': 0, 'grants': {'codex': ['read']}}, on_body=lambda session: None, method='PUT'))
+    assert response.status_code == 503
+    assert resources.get_policy('human:42', 'engineering-hub')['revision'] == 0

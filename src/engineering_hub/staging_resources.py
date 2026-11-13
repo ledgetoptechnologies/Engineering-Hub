@@ -143,7 +143,7 @@ class StagingResourceStore:
             self._authorize(db, actor, project, action)
         return True
 
-    def set_policy(self, actor, project, expected_revision, grants):
+    def set_policy(self, actor, project, expected_revision, grants, *, admission_guard=None):
         _actor(actor)
         if actor not in self.admin_actors:
             raise HubError('staging_admin_required', 403)
@@ -155,7 +155,7 @@ class StagingResourceStore:
             if type(actions) not in (list, tuple, frozenset, set) or any(type(a) is not str or a not in ACTIONS for a in actions):
                 raise HubError('invalid_staging_grants')
             normalized[grantee] = sorted(set(actions))
-        with self.repo._transaction() as db:
+        with self.repo._transaction(before_commit=admission_guard) as db:
             self.repo._project(project, db)
             prior = self._policy(db, project)
             self.repo._cas(prior, expected_revision)
@@ -479,7 +479,7 @@ class StagingResourceStore:
                 item['protected'] = [protection for protection in item['protected'] if protection != reference]
                 self._save(db, item['created_by'], 'staging.resource_protection', item)
 
-    def set_keep(self, actor, identity, mode, *, until=None, reason='', expected_revision):
+    def set_keep(self, actor, identity, mode, *, until=None, reason='', expected_revision, admission_guard=None):
         _actor(actor)
         if mode not in ('until', 'pinned', 'none'):
             raise HubError('invalid_staging_keep')
@@ -489,7 +489,7 @@ class StagingResourceStore:
             until = _iso(_seconds(until))
         elif until is not None:
             raise HubError('invalid_staging_keep')
-        with self.repo._transaction() as db:
+        with self.repo._transaction(before_commit=admission_guard) as db:
             item = self._resource(db, identity)
             self._authorize(db, actor, item['project'], 'retain')
             self._owned(actor, item)
@@ -537,11 +537,11 @@ class StagingResourceStore:
             return 'not_expired'
         return None
 
-    def cleanup_plan(self, actor, project=None, *, kinds=None):
+    def cleanup_plan(self, actor, project=None, *, kinds=None, admission_guard=None):
         _actor(actor)
         if kinds is not None and (type(kinds) not in (list, tuple, set, frozenset) or not kinds or any(type(k) is not str or k not in KINDS for k in kinds)):
             raise HubError('invalid_staging_kinds')
-        with self.repo._transaction() as db:
+        with self.repo._transaction(before_commit=admission_guard) as db:
             if project is not None:
                 self._authorize(db, actor, project, 'cleanup')
             now = self._now()
