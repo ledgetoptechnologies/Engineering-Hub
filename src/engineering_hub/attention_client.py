@@ -82,12 +82,13 @@ async def _call(session, name, arguments):
 
 class AttentionAdapter:
     """Convert authorized hint-triggered reads into non-instructional references."""
-    def __init__(self, session, *, installation, session_id, project, generation, emit):
+    def __init__(self, session, *, installation, session_id, project, generation, emit, role='orchestrator'):
         self.session, self.installation, self.session_id = session, _uuid(installation), _uuid(session_id)
         if (type(project) is not str or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', project)
-                or type(generation) is not int or not 1 <= generation < (1 << 63) or not callable(emit)):
+                or type(generation) is not int or not 1 <= generation < (1 << 63) or not callable(emit)
+                or type(role) is not str or not re.fullmatch(r'[a-z][a-z0-9-]{0,63}', role)):
             raise ClientError('invalid_attention_subscription')
-        self.project, self.generation, self.emit = project, generation, emit
+        self.project, self.generation, self.emit, self.role = project, generation, emit, role
 
     async def verify_identity(self):
         result = await _call(self.session, 'session_identity', {})
@@ -104,7 +105,11 @@ class AttentionAdapter:
             arguments = dict(project=self.project, generation=self.generation, limit=_MAX_PAGE)
             if cursor is not None:
                 arguments['after'] = cursor
-            result = await _call(self.session, 'hub_addressed_attention_list', arguments)
+            if self.role == 'orchestrator':
+                result = await _call(self.session, 'hub_addressed_attention_list', arguments)
+            else:
+                arguments['role'] = self.role
+                result = await _call(self.session, 'hub_worker_dispatch_pending', arguments)
             items, next_cursor = result.get('items'), result.get('next_after')
             if type(items) is not list or len(items) > _MAX_PAGE:
                 raise ClientError('invalid_attention_response')
@@ -112,13 +117,26 @@ class AttentionAdapter:
             for item in items:
                 if type(item) is not dict:
                     raise ClientError('invalid_attention_response')
-                identity = _uuid(item.get('id'))
+                identity = _uuid(item.get('id') if self.role == 'orchestrator' else item.get('dispatch_id'))
                 if last is not None and identity <= last:
                     raise ClientError('invalid_attention_cursor')
                 last = identity
-                revision = item.get('revision')
+                revision = item.get('revision') if self.role == 'orchestrator' else item.get('dispatch_revision')
                 if type(revision) is not int or revision < 1:
                     raise ClientError('invalid_attention_response')
+                if self.role != 'orchestrator':
+                    if (item.get('project') != self.project or item.get('role') != self.role
+                            or item.get('execution_authorization') is not False or item.get('wake_verified') is not False):
+                        raise ClientError('invalid_attention_response')
+                    task_id = _uuid(item.get('task_id'))
+                    key = (identity, revision)
+                    if key not in seen:
+                        seen.add(key)
+                        self.emit(dict(type='worker_dispatch_reference', trust='untrusted_hub_data',
+                                       project=self.project, role=self.role, dispatch_id=identity,
+                                       dispatch_revision=revision, task_id=task_id, role_generation=self.generation,
+                                       execution_authorization=False, wake_verified=False))
+                    continue
                 if (item.get('project') != self.project or item.get('recipient_role') != 'orchestrator'
                         or item.get('state') != 'pending_routing' or item.get('actionable') is not True
                         or item.get('execution_authorization') is not False or item.get('wake_verified') is not False):
@@ -144,6 +162,20 @@ class AttentionAdapter:
         _uuid(intent_id)
         if type(revision) is not int or revision < 1:
             raise ClientError('invalid_attention_reference')
+        if self.role != 'orchestrator':
+            result = await _call(self.session, 'hub_worker_dispatch_ack', dict(
+                project=self.project, role=self.role, generation=self.generation,
+                dispatch_id=intent_id, expected_revision=revision))
+            if (result.get('project') != self.project or result.get('role') != self.role
+                    or result.get('dispatch_id') != intent_id or result.get('dispatch_revision') != revision
+                    or result.get('session_id') != self.session_id or result.get('installation_id') != self.installation
+                    or result.get('generation') != self.generation or result.get('state') != 'agent_acknowledged'
+                    or result.get('wake_verified') is not False or result.get('execution_authorization') is not False):
+                raise ClientError('invalid_attention_response')
+            self.emit(dict(type='worker_dispatch_acknowledgment', project=self.project, role=self.role,
+                           dispatch_id=intent_id, dispatch_revision=revision, receipt_id=_uuid(result.get('id')),
+                           wake_verified=False, execution_authorization=False))
+            return
         result = await _call(self.session, 'hub_addressed_attention_ack', dict(
             project=self.project, generation=self.generation, intent_id=intent_id, expected_revision=revision))
         if (result.get('project') != self.project or result.get('intent_id') != intent_id
@@ -200,6 +232,9 @@ def _emit(value):
 
 
 async def _run(args):
+    role = getattr(args, 'role', 'orchestrator')
+    if type(role) is not str or not re.fullmatch(r'[a-z][a-z0-9-]{0,63}', role):
+        raise ClientError('invalid_attention_subscription')
     origin, token, installation, session_id, expires = _profile(args.profile_dir.expanduser().absolute(), args.session, args.private_vpn)
     if type(args.project) is not str or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', args.project) or not 1 <= args.generation < (1 << 63):
         raise ClientError('invalid_attention_subscription')
@@ -212,12 +247,15 @@ async def _run(args):
                     async with ClientSession(read, write) as session:
                         await asyncio.wait_for(session.initialize(), timeout=15)
                         adapter = AttentionAdapter(session, installation=installation, session_id=session_id,
-                                                   project=args.project, generation=args.generation, emit=_emit)
+                                                   project=args.project, generation=args.generation, emit=_emit, role=role)
                         await adapter.verify_identity()
                         await action(adapter)
             if args.command == 'listen':
+                params = {'project': args.project, 'generation': args.generation}
+                if role != 'orchestrator':
+                    params['role'] = role
                 async with http.stream('GET', origin + '/api/agent-sessions/v1/hub-attention-stream',
-                                       params={'project': args.project, 'generation': args.generation}) as response:
+                                       params=params) as response:
                     _validate_stream_response(response)
                     async def consume(adapter):
                         async for _event in _events(response):
@@ -226,7 +264,11 @@ async def _run(args):
             elif args.command == 'read':
                 await use_mcp(lambda adapter: adapter.catch_up(args.after))
             else:
-                await use_mcp(lambda adapter: adapter.acknowledge(args.intent_id, args.revision))
+                reference = getattr(args, 'intent_id', None) if role == 'orchestrator' else getattr(args, 'dispatch_id', None)
+                if (role == 'orchestrator' and getattr(args, 'dispatch_id', None) is not None
+                        or role != 'orchestrator' and getattr(args, 'intent_id', None) is not None):
+                    raise ClientError('invalid_attention_reference')
+                await use_mcp(lambda adapter: adapter.acknowledge(reference, args.revision))
 
 
 def main(argv=None):
@@ -236,12 +278,15 @@ def main(argv=None):
     parser.add_argument('--project', required=True)
     parser.add_argument('--generation', type=int, required=True)
     parser.add_argument('--private-vpn', action='store_true')
+    parser.add_argument('--role', default='orchestrator', help='Exact owner-admitted role; defaults to orchestrator')
     commands = parser.add_subparsers(dest='command', required=True)
     commands.add_parser('listen')
     read = commands.add_parser('read')
     read.add_argument('--after')
     ack = commands.add_parser('ack')
-    ack.add_argument('--intent-id', required=True)
+    reference = ack.add_mutually_exclusive_group(required=True)
+    reference.add_argument('--intent-id')
+    reference.add_argument('--dispatch-id')
     ack.add_argument('--revision', type=int, required=True)
     args = parser.parse_args(argv)
     try:
