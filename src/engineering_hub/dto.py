@@ -9,6 +9,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from .image_version_reports import ImageVersionsSummary
+from .decision_projection import public_decision
 
 
 AgentId = Literal['hermes', 'codex', 'claude']
@@ -114,6 +115,13 @@ class DecisionDTO(EntityDTO):
     withdrawn_at: str | None = None
     withdrawn_family: AgentId | None = None
     withdrawn_session_id: SessionId | None = None
+
+    @model_validator(mode='before')
+    @classmethod
+    def redact_dispatch_origin(cls, value):
+        # Dispatch lineage is private coordination metadata. Keep the strict
+        # response contract for every other unexpected field.
+        return public_decision(value)
 
     @model_validator(mode='after')
     def installation_withdrawal_required(self):

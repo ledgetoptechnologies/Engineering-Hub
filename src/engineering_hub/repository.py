@@ -12,6 +12,7 @@ from agent_message_bus import session_hub_context as session_context
 from .pilot_ownership import PilotOwner
 from .image_state_boundary import ImageStateBoundaryError, require_image_state_mount
 from .entity_context import bounded_text, validated_context
+from .decision_projection import public_decision
 
 
 PROJECTS = frozenset({'engineering-hub', '3d-viewer', 'project-alpha', 'ledge-top-ops', 'treedar'})
@@ -849,10 +850,10 @@ class HubRepository:
             return self._save(db, actor, action, kind, item)
 
     def list_decisions(self):
-        return self._list('decision')
+        return [public_decision(item) for item in self._list('decision')]
 
     def get_decision(self, identity):
-        return self._read(identity, 'decision')
+        return public_decision(self._read(identity, 'decision'))
 
     @staticmethod
     def _open_work_job(db, task_id, *, excluding_job_id=None):

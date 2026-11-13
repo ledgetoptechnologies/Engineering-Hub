@@ -544,7 +544,11 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         unanswered, unprotected decisions qualify. Give a short reason and, if it was
         replaced, the full id of the replacement. This never answers, approves or reviews.
         """
-        return invoke(repo.withdraw, identity(ctx), kind, entity_id, expected_revision, reason, superseded_by)
+        result = invoke(repo.withdraw, identity(ctx), kind, entity_id, expected_revision, reason, superseded_by)
+        if kind == 'decision':
+            from .decision_projection import public_decision
+            return public_decision(result)
+        return result
 
     @registration.tool()
     def hub_run_list(ctx: Context) -> dict:
