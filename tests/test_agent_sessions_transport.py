@@ -790,6 +790,23 @@ async def _response_guard_harness(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('failure', [RuntimeError, asyncio.CancelledError])
+async def test_response_guard_timer_failure_releases_subscription(tmp_path, monkeypatch, failure):
+    async with _response_guard_harness(tmp_path) as (guard, repo, issued, entered, start, denial, cancellation_seen):
+        loop = asyncio.get_running_loop()
+        def fail_timer(*args, **kwargs):
+            raise failure('timer unavailable')
+        with monkeypatch.context() as patch:
+            patch.setattr(loop, 'call_later', fail_timer)
+            task = start('POST')
+            with pytest.raises(failure, match='timer unavailable'):
+                await task
+        assert repo._listeners == {}
+        assert repo._listener_counts.get('response', 0) == 0
+        assert guard._total == 0 and not guard._active
+
+
+@pytest.mark.asyncio
 async def test_response_guard_completed_post_allowance_is_bounded(tmp_path):
     async with _response_guard_harness(tmp_path) as (guard, repo, issued, entered, start, denial, cancellation_seen):
         first = start('GET')

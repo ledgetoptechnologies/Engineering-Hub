@@ -394,7 +394,11 @@ class AgentSessionResponseGuardMiddleware:
         if self._total >= MAX_NEW_STREAMS or self._active.get(key, 0) >= MAX_STREAMS_PER_TRANSPORT:
             unsubscribe()
             return await denied(scope, receive, send, 'session_transport_limit', 429)
-        timer = loop.call_later(max(0, principal.expires_at - self.repository.clock()), stop)
+        try:
+            timer = loop.call_later(max(0, principal.expires_at - self.repository.clock()), stop)
+        except BaseException:
+            unsubscribe()
+            raise
         self._total += 1
         self._active[key] = self._active.get(key, 0) + 1
         state['_agent_session_response_guard'] = self.repository
