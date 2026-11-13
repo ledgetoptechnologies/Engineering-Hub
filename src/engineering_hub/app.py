@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import asyncio
 import json
 import re
 import uuid
@@ -190,6 +191,12 @@ class StaleServiceWrite(Input):
     expected_revision: int = Field(ge=0)
     projects: list[str] = Field(min_length=1, max_length=32)
     lifetime_seconds: int = Field(ge=60, le=86400)
+
+
+class StaleEvaluatorWrite(Input):
+    expected_revision: int = Field(ge=0)
+    grant_revision: int = Field(ge=1)
+    enabled: bool
 
 
 class Candidate(Revision):
@@ -551,6 +558,13 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     if connection_config is not None and connection_config.hub_bridge:
         from .session_hub_bridge import SessionHubBridge
         session_bridge = SessionHubBridge(connection_service, repo, project_registry, component_registry, notes_repository)
+    stale_evaluator = None
+    if session_bridge is not None:
+        from .pilot_ownership import PilotOwner
+        if type(repo.pilot_owner) is PilotOwner:
+            from .stale_service_authority import StaleServiceGrant
+            from .stale_evaluator import StaleEvaluator
+            stale_evaluator = StaleEvaluator(StaleServiceGrant(repo), session_bridge)
     try:
         hub_mcp = build_hub_mcp(repo, settings.agent_auth, topic_peers=peers_for,
                           topic_preflight=preflight_for, autonomy_status=autonomy_for,
@@ -605,6 +619,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             cleanup_started = True
             from .lifecycle import finish_owned
             async def stop_all():
+                if stale_evaluator is not None:
+                    await asyncio.to_thread(stale_evaluator.stop)
                 shared_error = None
                 if shared_staging is not None:
                     drained = False
@@ -667,6 +683,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                     await drain()
 
         try:
+            if stale_evaluator is not None:
+                stale_evaluator.start()
             await feed.start()
             if owned_pilot_service is not None:
                 await owned_pilot_service.start(feed)
@@ -706,6 +724,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     app.state.repository, app.state.sessions, app.state.settings = repo, sessions, settings
     app.state.mcp = hub_mcp
     app.state.session_hub_bridge = session_bridge
+    app.state.stale_evaluator = stale_evaluator
     app.state.modular_staging = staging_module
     app.state.interactive_service = interactive_service
     app.state.interactive_reviews = interactive_reviews
@@ -1094,6 +1113,24 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     def revoke_stale_service_grant(payload: Revision, request: Request):
         from .stale_service_authority import StaleServiceGrant
         return StaleServiceGrant(repo).owner_revoke(role_owner(request, mutation=True), payload.expected_revision)
+
+    @app.get('/api/hub/v1/orchestration/stale-evaluator')
+    def get_stale_evaluator(request: Request):
+        actor_id = role_owner(request)
+        if stale_evaluator is None:
+            raise HubError('stale_evaluator_unavailable', 503)
+        return stale_evaluator.status(actor_id)
+
+    @app.put('/api/hub/v1/orchestration/stale-evaluator')
+    def configure_stale_evaluator(payload: StaleEvaluatorWrite, request: Request):
+        actor_id = role_owner(request, mutation=True)
+        if stale_evaluator is None:
+            raise HubError('stale_evaluator_unavailable', 503)
+        result = stale_evaluator.configure(actor_id, **payload.model_dump())
+        stale_evaluator.stop()
+        if payload.enabled:
+            stale_evaluator.start()
+        return result
 
     @app.get('/api/hub/v1/roles')
     def list_roles(request: Request, limit: int = 50, after: str | None = None):

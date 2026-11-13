@@ -91,8 +91,10 @@ class DispatchRepository:
             # Fail the transaction and let a fresh checkpoint mark it stale.
             RoleRepository._guard(operation, min(lease['expires_at'], principal.expires_at, grant['expires_at']))
             return True
-        except AgentSessionError:
-            return False
+        except AgentSessionError as error:
+            if error.code in ('invalid_session', 'installation_inactive', 'installation_not_found'):
+                return False
+            raise
         except HubError as error:
             if error.code in ('hub_grant_required', 'hub_capability_forbidden'):
                 return False
@@ -601,6 +603,57 @@ class DispatchRepository:
             self._save_receipt(db, actor, key, fingerprint, item)
             return item
 
+    def _evaluate_checkpoint(self, db, actor, item, target, operation, *, timeout_grace=0, allow_timeout=True, allow_target_loss=True, loss_observed=None):
+        """Apply the shared advisory liveness transition within a held writer."""
+        now = operation.bridge.sessions._now()
+        if (not math.isfinite(now) or type(item.get('last_report_at')) not in (int, float)
+                or not math.isfinite(item['last_report_at']) or now < item['last_report_at']):
+            raise HubError('dispatch_clock_untrusted', 409)
+        created = item.get('created_at_epoch')
+        if created is not None and (type(created) not in (int, float) or not math.isfinite(created) or now < created):
+            raise HubError('dispatch_clock_untrusted', 409)
+        binding = item.get('target_binding')
+        basis = None
+        activity_at = item['last_report_at']
+        bound_by_activity = False
+        if item['state'] in ('dispatched', 'working', 'blocked', 'asked'):
+            if binding is None:
+                # A dispatch may predate its first role lease. A committed,
+                # attributable progress update can bind the current lease;
+                # merely observing a lease cannot imply delivery or work.
+                candidate = self._binding(target.get('lease'))
+                if candidate is not None and self._activity_at(db, item, candidate, now) is not None:
+                    if self._target_live(operation, item, target, candidate, now):
+                        binding = candidate
+                        item['target_binding'] = candidate
+                        bound_by_activity = True
+            if binding is not None and (type(binding) is not dict or not self._target_live(operation, item, target, binding, now)):
+                basis = 'target_lease_or_authorization_lost'
+            elif binding is not None:
+                observed = self._activity_at(db, item, binding, now)
+                if observed is not None:
+                    activity_at = max(activity_at, observed)
+            if basis == 'target_lease_or_authorization_lost':
+                if loss_observed is not None:
+                    loss_observed.append(True)
+                if not allow_target_loss:
+                    return item
+            if basis is None and allow_timeout and item['state'] in ('dispatched', 'working') and now >= activity_at + item['window_seconds'] + timeout_grace:
+                basis = 'report_and_attributed_progress_timeout'
+        if basis is not None:
+            # Preserve blocked/asked state and its outstanding decision;
+            # expiry is an advisory stale flag, not loss of that context.
+            state = item['state'] if item['state'] in ('blocked', 'asked') else 'stale'
+            if item.get('state') != state or item.get('stale_basis') != basis or not item.get('coordination_stale'):
+                intent = self._stale_attention(db, actor, item, basis)
+                item.update(state=state, stale_basis=basis, coordination_stale=True, wake_delivery='not_attempted')
+                item = self.repo._save(db, actor, 'orchestration.stale', 'role_dispatch', item, publish=False)
+                self.repo._save(db, actor, 'orchestration.attention_pending', 'orchestration_attention', intent,
+                                new=True, publish=False)
+        elif bound_by_activity:
+            item = self.repo._save(db, actor, 'orchestration.activity_bound', 'role_dispatch', item, publish=False)
+        return item
+
     def checkpoint(self, actor, dispatch_id, expected_revision, generation, client_request_id):
         key = self.repo._text(client_request_id, 128)
         fingerprint = self._fingerprint(['dispatch_checkpoint', dispatch_id, expected_revision, generation])
@@ -615,47 +668,6 @@ class DispatchRepository:
             if prior:
                 return prior
             self.repo._cas(item, expected_revision)
-            now = operation.bridge.sessions._now()
-            if (not math.isfinite(now) or type(item.get('last_report_at')) not in (int, float)
-                    or not math.isfinite(item['last_report_at']) or now < item['last_report_at']):
-                raise HubError('dispatch_clock_untrusted', 409)
-            created = item.get('created_at_epoch')
-            if created is not None and (type(created) not in (int, float) or not math.isfinite(created) or now < created):
-                raise HubError('dispatch_clock_untrusted', 409)
-            binding = item.get('target_binding')
-            basis = None
-            activity_at = item['last_report_at']
-            bound_by_activity = False
-            if item['state'] in ('dispatched', 'working', 'blocked', 'asked'):
-                if binding is None:
-                    # A dispatch may predate its first role lease. A committed,
-                    # attributable progress update can bind the current lease;
-                    # merely observing a lease cannot imply delivery or work.
-                    candidate = self._binding(target.get('lease'))
-                    if candidate is not None and self._activity_at(db, item, candidate, now) is not None:
-                        if self._target_live(operation, item, target, candidate, now):
-                            binding = candidate
-                            item['target_binding'] = candidate
-                            bound_by_activity = True
-                if binding is not None and (type(binding) is not dict or not self._target_live(operation, item, target, binding, now)):
-                    basis = 'target_lease_or_authorization_lost'
-                elif binding is not None:
-                    observed = self._activity_at(db, item, binding, now)
-                    if observed is not None:
-                        activity_at = max(activity_at, observed)
-                if basis is None and item['state'] in ('dispatched', 'working') and now >= activity_at + item['window_seconds']:
-                    basis = 'report_and_attributed_progress_timeout'
-            if basis is not None:
-                # Preserve blocked/asked state and its outstanding decision;
-                # expiry is an advisory stale flag, not loss of that context.
-                state = item['state'] if item['state'] in ('blocked', 'asked') else 'stale'
-                if item.get('state') != state or item.get('stale_basis') != basis or not item.get('coordination_stale'):
-                    intent = self._stale_attention(db, actor, item, basis)
-                    item.update(state=state, stale_basis=basis, coordination_stale=True, wake_delivery='not_attempted')
-                    item = self.repo._save(db, actor, 'orchestration.stale', 'role_dispatch', item, publish=False)
-                    self.repo._save(db, actor, 'orchestration.attention_pending', 'orchestration_attention', intent,
-                                    new=True, publish=False)
-            elif bound_by_activity:
-                item = self.repo._save(db, actor, 'orchestration.activity_bound', 'role_dispatch', item, publish=False)
+            item = self._evaluate_checkpoint(db, actor, item, target, operation)
             self._save_receipt(db, actor, key, fingerprint, item)
             return item

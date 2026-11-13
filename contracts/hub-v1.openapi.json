@@ -2907,6 +2907,56 @@
         }
       }
     },
+    "/api/hub/v1/orchestration/stale-evaluator": {
+      "get": {
+        "summary": "Get Stale Evaluator",
+        "operationId": "get_stale_evaluator_api_hub_v1_orchestration_stale_evaluator_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Configure Stale Evaluator",
+        "operationId": "configure_stale_evaluator_api_hub_v1_orchestration_stale_evaluator_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StaleEvaluatorWrite"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/roles": {
       "get": {
         "summary": "List Roles",
@@ -8352,6 +8402,32 @@
           "client_request_id"
         ],
         "title": "StagingTaskProposal"
+      },
+      "StaleEvaluatorWrite": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Expected Revision"
+          },
+          "grant_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Grant Revision"
+          },
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "grant_revision",
+          "enabled"
+        ],
+        "title": "StaleEvaluatorWrite"
       },
       "StaleServiceWrite": {
         "properties": {
