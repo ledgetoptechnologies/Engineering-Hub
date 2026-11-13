@@ -156,6 +156,26 @@ async def test_terminal_deploy_failure_holds_without_assuming_no_prior_effects(r
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('action', ACTIONS)
+@pytest.mark.parametrize('reason', ['paused', 'evidence_mismatch', 'effect_failed'])
+async def test_success_with_failure_reason_holds_before_next_effect(repo, target, action, reason):
+    class ContradictoryClient(FakeClient):
+        def response(self, command):
+            response = super().response(command)
+            if command.action == action:
+                return response.model_copy(update={'reason': reason})
+            return response
+
+    client = ContradictoryClient({'smoke_container': 'failed'} if action in ACTIONS[2:] else None)
+    workflow, run = ready_run(repo, target, client)
+    result = await workflow.advance(run['id'])
+    assert result['status'] == 'held'
+    assert [c.action for c in client.submissions] == ACTIONS[:ACTIONS.index(action) + 1]
+    assert (await workflow.advance(run['id']))['status'] == 'held'
+    assert len(client.submissions) == ACTIONS.index(action) + 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('damage', [
     {'reason': None}, {'reason': 'paused'}, {'reason': 'target_busy'},
     {'reason': 'stale_fence'}, {'reason': 'evidence_mismatch'},

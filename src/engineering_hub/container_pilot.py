@@ -344,6 +344,11 @@ class ContainerPilotWorkflow:
                     or not response.evidence.container_id):
                 return 'held'
             return 'failed'
+        # A successful phase cannot simultaneously report a veto or failure.
+        # The executor's successful outcomes carry no reason; treating a
+        # contradictory response as success could authorize the next effect.
+        if response.reason is not None:
+            return 'held'
         evidence = response.evidence
         rollback = command.action in {'rollback_container', 'smoke_container_rollback', 'cleanup_rollback'}
         expected = target.rollback_image_config_id if rollback else target.artifact_digest
