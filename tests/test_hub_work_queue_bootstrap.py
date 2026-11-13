@@ -93,7 +93,7 @@ def test_real_app_passes_configured_queue_to_authenticated_mcp(tmp_path):
         # This fixture has no configured infrastructure module, so its six
         # conditional tools are intentionally absent.
         expected = HUB_TOOLS | queue_tools
-        assert len(expected) == len(listed) == 77 and tools == expected
+        assert len(expected) == len(listed) == 78 and tools == expected
         response = client.post('/mcp/', headers=headers, json={
             'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
             'params': {'name': 'hub_work_status', 'arguments': {'payload': {}}}})

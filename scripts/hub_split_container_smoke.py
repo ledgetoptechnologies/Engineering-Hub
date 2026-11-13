@@ -264,7 +264,7 @@ def smoke(image, commit):
             _verify_profile(name, volume)
             report = json.loads(run("docker", "exec", name, "python", "-c", PROBE, commit, timeout=110))
             assert report["split_image_smoke"] == "passed" and report["build_commit"] == commit
-            assert report["authenticated_agents"] == 3 and report["mcp_tools"] == 69
+            assert report["authenticated_agents"] == 3 and report["mcp_tools"] == 70
             assert report["agent_bind"] == "0.0.0.0:8770" and report["browser_bind"] == "127.0.0.1:8771"
             if iteration == 0:
                 run("docker", "exec", name, "python", "-c", SEED_RECORDS)
