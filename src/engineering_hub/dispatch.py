@@ -208,6 +208,31 @@ class DispatchRepository:
                     state='pending_routing', delivery='not_attempted', wake_verified=False,
                     execution_authorization=False)
 
+    def _report_attention(self, db, item, report_id, report_revision, report_kind):
+        """A distinct durable attention for each committed meaningful report."""
+        identity = str(uuid.uuid5(_NAMESPACE, 'report-attention:' + item['id'] + ':' + str(report_revision)))
+        return dict(id=identity, project=item['project'], request_id=item['request_id'], dispatch_id=item['id'],
+                    dispatch_revision=report_revision, report_id=report_id, report_revision=report_revision,
+                    report_kind=report_kind, intent_type='worker_report', recipient_role='orchestrator',
+                    reason='worker_report', state='pending_routing', delivery='not_attempted', wake_verified=False,
+                    execution_authorization=False)
+
+    @staticmethod
+    def _valid_report_attention(intent, dispatch, report):
+        if type(intent) is not dict or type(dispatch) is not dict or type(report) is not dict:
+            return False
+        kind = intent.get('report_kind')
+        expected_state = {'ask': 'asked', 'resume': 'working', 'blocked': 'blocked',
+                          'done': 'done', 'failed': 'failed'}.get(kind)
+        return bool(expected_state and intent.get('intent_type') == 'worker_report'
+            and intent.get('project') == dispatch.get('project') == report.get('project')
+            and intent.get('request_id') == dispatch.get('request_id')
+            and intent.get('dispatch_id') == dispatch.get('id') == report.get('dispatch_id')
+            and intent.get('report_id') == report.get('id')
+            and type(intent.get('report_revision')) is int and intent['report_revision'] > 0
+            and intent.get('dispatch_revision') == intent['report_revision'] == report.get('revision')
+            and report.get('state') == expected_state)
+
     @staticmethod
     def _fingerprint(parts):
         return hashlib.sha256(json.dumps(parts, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
@@ -303,7 +328,8 @@ class DispatchRepository:
             projects_exist = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_projects'").fetchone()
             project_row = db.execute('SELECT data FROM hub_projects WHERE id=?', (project,)).fetchone() if projects_exist else None
             archived = bool(json.loads(project_row['data']).get('archived', False)) if project_row else False
-            rows = db.execute("SELECT a.data,t.data AS task_data,d.data AS dispatch_data FROM hub_entities a "
+            rows = db.execute("SELECT a.data,t.data AS task_data,d.data AS dispatch_data,p.data AS report_data FROM hub_entities a "
+                "LEFT JOIN hub_entities p ON p.id=json_extract(a.data,'$.report_id') AND p.kind='dispatch_report' "
                 "JOIN hub_entities d ON d.id=json_extract(a.data,'$.dispatch_id') AND d.kind='role_dispatch' "
                 "JOIN hub_entities t ON t.id=json_extract(d.data,'$.task_id') AND t.kind IN ('task','tracking_task') "
                 "WHERE a.kind='orchestration_attention' AND json_extract(a.data,'$.project')=? "
@@ -348,9 +374,19 @@ class DispatchRepository:
         project_marks = ','.join('?' for _ in operation.projects)
         kind_marks = ','.join('?' for _ in kinds)
         active_filter = ("AND json_extract(t.data,'$.status') IN ('assigned','claimed','in_review','open','completion_claimed') "
-                         "AND json_extract(d.data,'$.attention_intent_id')=a.id "
-                         "AND json_extract(d.data,'$.coordination_stale')=1 " if actionable_only else '')
-        rows = db.execute("SELECT a.data,t.data AS task_data,d.data AS dispatch_data FROM hub_entities a JOIN hub_entities d ON d.id=json_extract(a.data,'$.dispatch_id') AND d.kind='role_dispatch' "
+                         "AND ((COALESCE(json_extract(a.data,'$.intent_type'),'stale')='stale' "
+                         "AND json_extract(d.data,'$.attention_intent_id')=a.id AND json_extract(d.data,'$.coordination_stale')=1) "
+                         "OR (json_extract(a.data,'$.intent_type')='worker_report' AND p.id IS NOT NULL "
+                         "AND json_extract(p.data,'$.id')=p.id AND json_extract(p.data,'$.project')=? "
+                         "AND json_extract(p.data,'$.dispatch_id')=d.id AND json_extract(a.data,'$.request_id')=q.id "
+                         "AND json_type(a.data,'$.report_revision')='integer' AND json_extract(a.data,'$.report_revision')>0 "
+                         "AND json_extract(p.data,'$.revision')=json_extract(a.data,'$.report_revision') "
+                         "AND json_extract(a.data,'$.dispatch_revision')=json_extract(a.data,'$.report_revision') "
+                         "AND ((json_extract(a.data,'$.report_kind')='ask' AND json_extract(p.data,'$.state')='asked') "
+                         "OR (json_extract(a.data,'$.report_kind')='resume' AND json_extract(p.data,'$.state')='working') "
+                         "OR (json_extract(a.data,'$.report_kind') IN ('blocked','done','failed') "
+                         "AND json_extract(p.data,'$.state')=json_extract(a.data,'$.report_kind'))))) " if actionable_only else '')
+        rows = db.execute("SELECT a.data,t.data AS task_data,d.data AS dispatch_data,p.data AS report_data FROM hub_entities a LEFT JOIN hub_entities p ON p.id=json_extract(a.data,'$.report_id') AND p.kind='dispatch_report' JOIN hub_entities d ON d.id=json_extract(a.data,'$.dispatch_id') AND d.kind='role_dispatch' "
             "JOIN hub_entities q ON q.id=json_extract(d.data,'$.request_id') AND q.kind='orchestration_request' "
             "JOIN hub_entities t ON t.id=json_extract(d.data,'$.task_id') "
             "JOIN hub_entities r ON r.kind='coordination_role' AND json_extract(r.data,'$.role_id')=json_extract(d.data,'$.role_id') "
@@ -362,7 +398,7 @@ class DispatchRepository:
             "AND EXISTS (SELECT 1 FROM json_each(r.data,'$.projects') rp WHERE rp.value=?) "
             "AND NOT EXISTS (SELECT 1 FROM json_each(r.data,'$.projects') rp LEFT JOIN hub_projects hp ON hp.id=rp.value "
             "WHERE rp.value NOT IN (" + project_marks + ") OR hp.id IS NULL OR json_extract(hp.data,'$.archived')=1) "
-            + active_filter + "ORDER BY a.id LIMIT ?", (project, after or '', project, project, project, decision_read, *kinds, project, *operation.projects, limit + 1)).fetchall()
+            + active_filter + "ORDER BY a.id LIMIT ?", (project, after or '', project, project, project, decision_read, *kinds, project, *operation.projects, *((project,) if actionable_only else ()), limit + 1)).fetchall()
         items = [self._attention_view(row) for row in rows]
         for item in items:
             self._dispatch(db, actor, item['dispatch_id'])
@@ -375,7 +411,16 @@ class DispatchRepository:
         intent, task, dispatch = json.loads(row['data']), json.loads(row['task_data']), json.loads(row['dispatch_data'])
         status = task.get('status')
         open_status = status in ('assigned', 'claimed', 'in_review', 'open', 'completion_claimed')
-        current = dispatch.get('attention_intent_id') == intent['id'] and dispatch.get('coordination_stale') is True
+        if intent.get('intent_type') == 'worker_report':
+            try:
+                report = json.loads(row['report_data']) if row['report_data'] else None
+            except (ValueError, TypeError):
+                report = None
+            current = DispatchRepository._valid_report_attention(intent, dispatch, report)
+        elif intent.get('intent_type') in (None, 'stale'):
+            current = dispatch.get('attention_intent_id') == intent['id'] and dispatch.get('coordination_stale') is True
+        else:
+            current = False
         return {**intent, 'task_status': status, 'project_archived': project_archived,
                 'actionable': open_status and current and not project_archived}
 
@@ -398,13 +443,23 @@ class DispatchRepository:
                 return prior
             self.repo._cas(intent, expected_revision)
             self.repo._cas(item, expected_dispatch_revision)
-            if (intent.get('state') != 'pending_routing' or item.get('attention_intent_id') != intent['id']
+            report_intent = intent.get('intent_type') == 'worker_report'
+            if report_intent:
+                try:
+                    report = self.repo._get(db, intent['report_id'], 'dispatch_report')
+                    valid = self._valid_report_attention(intent, item, report)
+                except (KeyError, HubError, TypeError, ValueError):
+                    valid = False
+            else:
+                valid = intent.get('intent_type') in (None, 'stale') and item.get('attention_intent_id') == intent['id']
+            if (intent.get('state') != 'pending_routing' or not valid
                     or task.get('status') not in ('withdrawn', 'verified', 'completion_verified')):
                 raise HubError('attention_not_closed', 409)
             intent.update(state='resolved_task_closed_without_delivery', delivery='not_attempted', wake_verified=False)
             intent = self.repo._save(db, actor, 'orchestration.attention_task_closed', 'orchestration_attention', intent, publish=False)
-            item['attention_intent_id'] = None
-            self.repo._save(db, actor, 'orchestration.attention_reconciled', 'role_dispatch', item, publish=False)
+            if not report_intent:
+                item['attention_intent_id'] = None
+                self.repo._save(db, actor, 'orchestration.attention_reconciled', 'role_dispatch', item, publish=False)
             self._save_receipt(db, actor, key, fingerprint, intent)
             return intent
 
@@ -690,11 +745,21 @@ class DispatchRepository:
                           installation_id=operation.principal.installation_id, session_id=operation.principal.session_id,
                           decision_id=item['decision_id'] if state == 'ask' else None)
             report_id = str(uuid.uuid5(_NAMESPACE, 'report:' + item['id'] + ':' + str(report_revision)))
+            report['id'] = report_id
             db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
                        (report_id, 'dispatch_report', json.dumps(report, sort_keys=True, separators=(',', ':'))))
             item = self.repo._save(db, actor, 'orchestration.reported', 'role_dispatch', item, publish=False)
+            notify = state in ('blocked', 'ask', 'resume', 'done', 'failed')
+            if notify:
+                intent = self._report_attention(db, item, report_id, report_revision, state)
+                self.repo._save(db, actor, 'orchestration.report_attention_pending', 'orchestration_attention',
+                                intent, new=True, publish=False)
             self._save_receipt(db, actor, key, fingerprint, item)
-            return item
+        if notify:
+            broker = getattr(self.repo, '_attention_hint_broker', None)
+            if broker is not None:
+                broker.signal(item['project'])
+        return item
 
     def _evaluate_checkpoint(self, db, actor, item, target, operation, *, timeout_grace=0, allow_timeout=True, allow_target_loss=True, loss_observed=None):
         """Apply the shared advisory liveness transition within a held writer."""

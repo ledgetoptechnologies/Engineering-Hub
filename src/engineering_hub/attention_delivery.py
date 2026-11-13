@@ -185,14 +185,28 @@ class AttentionDelivery:
             item, task, _, _ = service._dispatch(db, actor, intent['dispatch_id'])
             if (intent.get('project') != project or item.get('project') != project
                     or intent.get('recipient_role') != 'orchestrator'
-                    or intent.get('state') != 'pending_routing' or item.get('attention_intent_id') != intent_id
-                    or not item.get('coordination_stale')
                     or task.get('status') not in ('assigned', 'claimed', 'in_review', 'open', 'completion_claimed')):
                 raise HubError('attention_route_unavailable', 404)
-            self.repo._cas(intent, expected_revision)
             identity = str(uuid.uuid5(_NAMESPACE, ':'.join(['receipt', intent_id, str(expected_revision),
                 route['session_id'], str(generation)])))
             row = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='attention_receipt'", (identity,)).fetchone()
+            report_intent = intent.get('intent_type') == 'worker_report'
+            if report_intent:
+                try:
+                    report = self.repo._get(db, intent['report_id'], 'dispatch_report')
+                    valid = service._valid_report_attention(intent, item, report)
+                except (KeyError, HubError, TypeError, ValueError):
+                    valid = False
+                if not valid:
+                    raise HubError('attention_route_unavailable', 404)
+                if row and intent.get('state') == 'agent_acknowledged' and intent.get('ack_receipt_id') == identity:
+                    return json.loads(row['data'])
+            elif not (intent.get('intent_type') in (None, 'stale')
+                      and item.get('attention_intent_id') == intent_id and item.get('coordination_stale')):
+                raise HubError('attention_route_unavailable', 404)
+            if intent.get('state') != 'pending_routing':
+                raise HubError('attention_route_unavailable', 404)
+            self.repo._cas(intent, expected_revision)
             if row:
                 return json.loads(row['data'])
             receipt = dict(id=identity, project=project, intent_id=intent_id, intent_revision=expected_revision,
@@ -201,6 +215,11 @@ class AttentionDelivery:
                            task_completion_verified=False, wake_verified=False)
             receipt = self.repo._save(db, actor, 'attention.acknowledged', 'attention_receipt', receipt,
                                       new=True, publish=False)
+            if report_intent:
+                intent.update(state='agent_acknowledged', ack_receipt_id=identity,
+                              delivery='agent_acknowledged', wake_verified=False)
+                self.repo._save(db, actor, 'orchestration.report_attention_acknowledged',
+                                'orchestration_attention', intent, publish=False)
             self._validate_target(operation.db, db, route)
             return receipt
 
