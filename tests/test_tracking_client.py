@@ -130,6 +130,9 @@ def test_cli_suppresses_raw_errors_and_limits_stdin(monkeypatch, capsys, tmp_pat
     monkeypatch.setattr('sys.stdin', Input(b' ' * 65537))
     assert tracking_client.main(argv) == 1
     assert capsys.readouterr().out == ''
+    assert tracking_client.main(argv + ['secret-token-and-private-content']) == 1
+    out = capsys.readouterr()
+    assert out.out == '' and 'secret-token' not in out.err
 
 
 def test_cli_success_displays_only_explicit_result(monkeypatch, capsys, tmp_path):

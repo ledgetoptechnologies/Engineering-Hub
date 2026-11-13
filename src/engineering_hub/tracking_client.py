@@ -32,6 +32,13 @@ _TOOLS = {
 }
 
 
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):
+        # argparse normally echoes unknown arguments, which could accidentally
+        # contain private task content or a credential.
+        raise ClientError('invalid_tracking_request')
+
+
 def _arguments(action, value):
     if action not in _TOOLS or type(value) is not dict:
         raise ClientError('invalid_tracking_request')
@@ -66,13 +73,13 @@ async def _run(args, arguments):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Explicit project tracking; JSON operation arguments on stdin.')
+    parser = _Parser(description='Explicit project tracking; JSON operation arguments on stdin.')
     parser.add_argument('--profile-dir', type=Path, required=True)
     parser.add_argument('--session', required=True)
     parser.add_argument('--private-vpn', action='store_true')
     parser.add_argument('action', choices=sorted(_TOOLS))
-    args = parser.parse_args(argv)
     try:
+        args = parser.parse_args(argv)
         raw = sys.stdin.buffer.read(_MAX_INPUT + 1)
         if len(raw) > _MAX_INPUT:
             raise ClientError('invalid_tracking_request')
