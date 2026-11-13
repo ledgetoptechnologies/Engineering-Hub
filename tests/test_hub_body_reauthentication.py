@@ -216,3 +216,49 @@ def test_human_sync_staging_write_fails_closed_without_admission_guard(tmp_path)
         {'expected_revision': 0, 'grants': {'codex': ['read']}}, on_body=lambda session: None, method='PUT'))
     assert response.status_code == 503
     assert resources.get_policy('human:42', 'engineering-hub')['revision'] == 0
+
+@pytest.mark.parametrize('expiry', [False, True])
+@pytest.mark.parametrize('complete', [False, True])
+def test_review_answer_rechecks_session_in_commit_transaction(tmp_path, expiry, complete, monkeypatch):
+    """A logout after the HTTP check rolls back answer, history and receipt."""
+    app, config = setup(tmp_path)
+    repo = app.state.repository
+    components = ProjectComponentRepository(repo)
+    component = components.create_component('human:42', 'ledge-top-ops', 'viewer', 'Viewer', 'viewer', status='active')
+    store = app.state.interactive_reviews
+    store.authorize = lambda *args: True
+    review = store.create_review('codex', project='ledge-top-ops', component_id=component['id'],
+        component_revision=1, topic='synthetic', dataset_digest='sha256:' + 'a' * 64,
+        title='Review', schema='choice-text.v1', client_request_id='create',
+        items=[{'id': 'x', 'title': 'X', 'prompt': 'Answer'}])
+    original = store.answer_review
+    with repo._connection() as db:
+        baseline_audit = db.execute('SELECT count(*) FROM hub_audit').fetchone()[0]
+        baseline_outbox = db.execute('SELECT count(*) FROM hub_outbox').fetchone()[0]
+
+    def revoke_then_answer(*args, **kwargs):
+        with app.state.sessions._db() as db:
+            if expiry:
+                db.execute('UPDATE auth_sessions SET expires=0')
+            else:
+                db.execute('DELETE FROM auth_sessions')
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, 'answer_review', revoke_then_answer)
+    response = run(delayed_post(app, config, f"/api/hub/v1/interactive-reviews/{review['id']}/answers",
+        {'expected_revision': 1, 'client_request_id': 'answer',
+         'answers': [{'item_id': 'x', 'value': 'yes'}], 'complete': complete}, on_body=lambda session: None))
+    assert response.status_code == 401
+    assert store.get_review('human:42', review['id'])['revision'] == 1
+    with repo._connection() as db:
+        assert db.execute("SELECT count(*) FROM hub_interactive_review_answer_events WHERE review_id=?", (review['id'],)).fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM hub_interactive_review_requests WHERE key=?", ('answer',)).fetchone()[0] == 0
+        assert db.execute('SELECT count(*) FROM hub_audit').fetchone()[0] == baseline_audit
+        assert db.execute('SELECT count(*) FROM hub_outbox').fetchone()[0] == baseline_outbox
+    monkeypatch.setattr(store, 'answer_review', original)
+    retry = run(delayed_post(app, config, f"/api/hub/v1/interactive-reviews/{review['id']}/answers",
+        {'expected_revision': 1, 'client_request_id': 'answer',
+         'answers': [{'item_id': 'x', 'value': 'yes'}], 'complete': complete}, on_body=lambda session: None))
+    assert retry.status_code == 200
+    assert retry.json()['revision'] == 2
+    assert retry.json()['state'] == ('completed' if complete else 'open')

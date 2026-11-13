@@ -980,7 +980,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     attach_component_routes(app, repository=component_registry, actor=actor, human=human)
     from .interactive_reviews_api import attach_interactive_review_routes
     from .interactive_service import attach_interactive_assets
-    attach_interactive_review_routes(app, interactive_reviews, actor, human)
+    attach_interactive_review_routes(app, interactive_reviews, actor, human,
+        human_admission=lambda request, principal: human_transaction_guard(
+            request, settings.auth_config, sessions, principal))
     attach_interactive_assets(app, interactive_service, interactive_reviews, human)
     app.state.project_registry = project_registry
     from .topic_catalog_api import attach_topic_catalog_route

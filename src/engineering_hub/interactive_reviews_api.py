@@ -84,7 +84,7 @@ async def _payload(request, model, maximum):
         raise HubError('invalid_review_json') from None
 
 
-def attach_interactive_review_routes(app, repository, actor, human):
+def attach_interactive_review_routes(app, repository, actor, human, *, human_admission=None):
     def identity(request, *, mutation=False):
         _authorization(request)
         return human(request, mutation=True) if mutation else actor(request)
@@ -119,7 +119,12 @@ def attach_interactive_review_routes(app, repository, actor, human):
         payload = await _payload(request, ReviewAnswers, 256 * 1024)
         if identity(request, mutation=True) != principal:
             raise HubError('review_identity_changed', 403)
-        return repository.answer_review(principal, review_id, **payload.model_dump())
+        if human_admission is None:
+            raise HubError('interactive_review_admission_unavailable', 503)
+        guard = human_admission(request, principal)
+        if not callable(guard):
+            raise HubError('interactive_review_admission_unavailable', 503)
+        return repository.answer_review(principal, review_id, admission_guard=guard, **payload.model_dump())
 
 
 def register_interactive_review_tools(mcp, *, repository, identity, invoke):
