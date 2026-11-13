@@ -269,7 +269,7 @@ def test_mcp_discovery_and_topic_tools_preserve_original_identity(make_hub):
         "hub_infrastructure_maintenance_open", "hub_infrastructure_maintenance_resolve",
         "hub_infrastructure_probe_record", "hub_infrastructure_metrics",
     }
-    assert len(tools) == len(HUB_TOOLS | infrastructure_tools) == 66
+    assert len(tools) == len(HUB_TOOLS | infrastructure_tools) == 68
     assert {tool["name"] for tool in tools} == HUB_TOOLS | infrastructure_tools
     assert {"hub_component_create", "hub_component_update", "hub_component_retire"} <= {
         tool["name"] for tool in tools
