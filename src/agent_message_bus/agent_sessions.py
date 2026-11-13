@@ -122,6 +122,9 @@ class AgentSessionRepository:
                     installation_id TEXT NOT NULL, request_key TEXT NOT NULL,
                     fingerprint TEXT NOT NULL, message_id TEXT NOT NULL REFERENCES session_messages(id),
                     PRIMARY KEY(installation_id,request_key))''',
+                '''CREATE TABLE IF NOT EXISTS session_ack_receipts (
+                    message_id TEXT PRIMARY KEY REFERENCES session_messages(id),
+                    session_id TEXT NOT NULL, generation INTEGER NOT NULL, claim_hash TEXT NOT NULL)''',
                 '''CREATE TABLE IF NOT EXISTS agent_session_audit (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, actor TEXT NOT NULL,
                     installation_id TEXT, session_id TEXT, message_id TEXT, created_at REAL NOT NULL)''',
@@ -508,7 +511,22 @@ class AgentSessionRepository:
     def acknowledge(self, session_secret, id, claim_handle, generation):
         with self._transaction() as db:
             now = self._now(); p = self._principal(db, session_secret, now)
+            _number(generation, 1, (1 << 63) - 1)
+            try:
+                digest = _secret(claim_handle, 'ehc_')
+            except AgentSessionError:
+                raise AgentSessionError('claim_not_owned', 409) from None
+            row = self._received(db, p, id)
+            if row['status'] == 'acknowledged':
+                receipt = db.execute('SELECT session_id,generation,claim_hash FROM session_ack_receipts WHERE message_id=?', (id,)).fetchone()
+                if (receipt is not None and receipt['session_id'] == p.session_id
+                        and receipt['generation'] == generation
+                        and secrets.compare_digest(receipt['claim_hash'], digest)):
+                    return self._public_message(row)
+                raise AgentSessionError('claim_not_owned', 409)
             self._claimed(db, p, id, claim_handle, generation, now)
+            db.execute('INSERT INTO session_ack_receipts(message_id,session_id,generation,claim_hash) VALUES(?,?,?,?)',
+                       (id, p.session_id, generation, digest))
             db.execute("UPDATE session_messages SET status='acknowledged',acknowledged_at=?,claim_hash=NULL,claim_expires_at=NULL WHERE id=?", (now, id))
             self._audit(db, 'message.acknowledged', p.installation_id, now, p.installation_id, p.session_id, id)
             return self._public_message(self._received(db, p, id))

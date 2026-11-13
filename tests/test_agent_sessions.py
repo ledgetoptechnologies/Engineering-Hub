@@ -288,6 +288,74 @@ def test_renew_extends_only_current_owned_claim(env):
     check(repo.acknowledge(sb['token'], message['id'], renewed['claim_handle'], renewed['generation'])['status'] == 'acknowledged', 'renewal did not extend lease')
 
 
+def test_ack_retry_requires_original_live_session_handle_and_generation(env):
+    repo, clock, _, b, _, bsecret, sa, sb = pair(env)
+    sibling = repo.exchange(bsecret)
+    message = repo.send(sa['token'], b['id'], 'ack retry', 'ack-retry')
+    claim = repo.claim(sb['token'], message['id'], lease_seconds=2)
+    accepted = repo.acknowledge(sb['token'], message['id'], claim['claim_handle'], claim['generation'])
+    clock.advance(3)  # A committed acknowledgement remains retryable after claim expiry.
+    reopened = AgentSessionRepository(repo.path, OWNER, repo.clock)
+    replay = reopened.acknowledge(sb['token'], message['id'], claim['claim_handle'], claim['generation'])
+    check(replay == accepted, 'ack retry did not return original message state')
+    denied('claim_not_owned', lambda: reopened.acknowledge(sibling['token'], message['id'], claim['claim_handle'], claim['generation']))
+    denied('claim_not_owned', lambda: reopened.acknowledge(sb['token'], message['id'], 'ehc_' + 'A' * 43, claim['generation']))
+    denied('claim_not_owned', lambda: reopened.acknowledge(sb['token'], message['id'], claim['claim_handle'], claim['generation'] + 1))
+    with sqlite3.connect(repo.path) as db:
+        receipt = db.execute('SELECT session_id,generation,claim_hash FROM session_ack_receipts WHERE message_id=?', (message['id'],)).fetchone()
+        count = db.execute("SELECT count(*) FROM agent_session_audit WHERE action='message.acknowledged' AND message_id=?", (message['id'],)).fetchone()[0]
+    check(receipt[0] == sb['session']['id'] and receipt[1] == claim['generation'], 'receipt lost claim identity')
+    check(receipt[2] == hashlib.sha256(claim['claim_handle'].encode()).hexdigest(), 'receipt did not store claim digest')
+    check(count == 1, 'ack replay duplicated audit')
+    reopened.revoke_session(OWNER, sb['session']['id'], 1)
+    denied('invalid_session', lambda: reopened.acknowledge(sb['token'], message['id'], claim['claim_handle'], claim['generation']))
+
+
+def test_legacy_ack_without_receipt_cannot_be_replayed(env):
+    repo, _, _, b, _, _, sa, sb = pair(env)
+    message = repo.send(sa['token'], b['id'], 'old ack', 'old-ack')
+    claim = repo.claim(sb['token'], message['id'])
+    repo.acknowledge(sb['token'], message['id'], claim['claim_handle'], claim['generation'])
+    with sqlite3.connect(repo.path) as db:
+        db.execute('DELETE FROM session_ack_receipts WHERE message_id=?', (message['id'],))
+    denied('claim_not_owned', lambda: repo.acknowledge(sb['token'], message['id'], claim['claim_handle'], claim['generation']))
+
+
+def test_concurrent_ack_retry_commits_one_receipt_and_audit(env):
+    repo, _, _, b, _, _, sa, sb = pair(env)
+    message = repo.send(sa['token'], b['id'], 'concurrent ack', 'concurrent-ack')
+    claim = repo.claim(sb['token'], message['id'])
+    barrier = threading.Barrier(2)
+    second = AgentSessionRepository(repo.path, OWNER, repo.clock)
+
+    def acknowledge(repository):
+        barrier.wait()
+        return repository.acknowledge(sb['token'], message['id'], claim['claim_handle'], claim['generation'])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(acknowledge, (repo, second)))
+    check(results[0] == results[1] and results[0]['status'] == 'acknowledged', 'concurrent ACK changed result')
+    with sqlite3.connect(repo.path) as db:
+        count = db.execute("SELECT count(*) FROM agent_session_audit WHERE action='message.acknowledged' AND message_id=?", (message['id'],)).fetchone()[0]
+        receipts = db.execute('SELECT count(*) FROM session_ack_receipts WHERE message_id=?', (message['id'],)).fetchone()[0]
+    check(count == 1 and receipts == 1, 'concurrent ACK duplicated receipt or audit')
+
+
+def test_ack_receipt_rolls_back_with_failed_message_update(env):
+    repo, _, _, b, _, _, sa, sb = pair(env)
+    message = repo.send(sa['token'], b['id'], 'rollback ack', 'rollback-ack')
+    claim = repo.claim(sb['token'], message['id'])
+    with sqlite3.connect(repo.path) as db:
+        db.execute("CREATE TRIGGER reject_ack BEFORE UPDATE OF status ON session_messages WHEN NEW.status='acknowledged' BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END")
+    with pytest.raises(sqlite3.IntegrityError):
+        repo.acknowledge(sb['token'], message['id'], claim['claim_handle'], claim['generation'])
+    with sqlite3.connect(repo.path) as db:
+        count = db.execute('SELECT count(*) FROM session_ack_receipts WHERE message_id=?', (message['id'],)).fetchone()[0]
+        db.execute('DROP TRIGGER reject_ack')
+    check(count == 0 and repo.get(sb['token'], message['id'])['status'] == 'claimed', 'failed ACK committed partial receipt')
+    check(repo.acknowledge(sb['token'], message['id'], claim['claim_handle'], claim['generation'])['status'] == 'acknowledged', 'claim could not be acknowledged after rollback')
+
+
 def test_session_revoke_keeps_sibling_installation_and_other_pc_alive(env):
     repo, _, _, b, _, bsecret, sa, sb = pair(env)
     sibling = repo.exchange(bsecret)
