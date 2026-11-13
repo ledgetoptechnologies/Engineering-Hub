@@ -290,7 +290,7 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
     @registration.tool()
     def hub_dispatch_checkpoint(dispatch_id: str, expected_revision: StrictInt, generation: StrictInt,
                                 client_request_id: str, ctx: Context) -> dict:
-        """Manually checkpoint report timeout; stale is advisory and no wake is sent."""
+        """Manually check target lease and attributed progress/report timeout; stale is advisory, no wake is sent."""
         from .dispatch import DispatchRepository
         return invoke(DispatchRepository(repo).checkpoint, identity(ctx), dispatch_id, expected_revision, generation, client_request_id)
 

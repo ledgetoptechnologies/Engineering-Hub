@@ -1,12 +1,14 @@
 """Durable, inert role dispatch records. No execution or wake authority."""
 import hashlib
 import json
+import math
 import uuid
 
 from agent_message_bus import session_hub_context as context
+from agent_message_bus.agent_sessions import AgentSessionError
 from .repository import HubError
 from .roles import RoleRepository
-from .task_progress import TaskProgress
+from .task_progress import TaskProgress, role_activity_id, _key as progress_key
 
 _NAMESPACE = uuid.UUID('4ebbc0ea-4407-4779-a6a5-bd505d8dffad')
 
@@ -45,6 +47,85 @@ class DispatchRepository:
             return RoleRepository(self.repo)._held(db, actor, role, generation)[0], operation
         except (HubError, ValueError, TypeError):
             raise HubError('dispatch_unavailable', 404) from None
+
+    @staticmethod
+    def _binding(lease):
+        if (type(lease) is not dict or type(lease.get('generation')) is not int
+                or type(lease.get('session_id')) is not str or type(lease.get('installation_id')) is not str):
+            return None
+        return dict(generation=lease['generation'], session_id=lease['session_id'], installation_id=lease['installation_id'])
+
+    def _target_live(self, operation, item, target, binding, now):
+        """Check recorded target binding; this never proves a worker stopped."""
+        lease = target.get('lease')
+        if (self._binding(lease) != binding or target.get('generation') != binding['generation']
+                or type(lease.get('expires_at')) not in (int, float) or not math.isfinite(lease['expires_at'])
+                or lease['expires_at'] <= now):
+            return False
+        if binding['installation_id'] not in target['installations']:
+            return False
+        try:
+            capabilities = ['role.read', 'role.lease', 'role.claim', 'dispatch.report',
+                            'tracking.read' if item['task_kind'] == 'tracking_task' else 'task.read']
+            if item.get('decision_id') is not None:
+                capabilities.append('decision.read')
+            for capability in capabilities:
+                principal, grant = operation.bridge._live(operation.db, None, capability=capability,
+                                                          session_id=binding['session_id'])
+                if principal.installation_id != binding['installation_id']:
+                    return False
+                if not set(target['projects']).issubset(set(json.loads(grant['projects']))):
+                    return False
+            # A session or lease can expire while the Hub transaction is open.
+            # Fail the transaction and let a fresh checkpoint mark it stale.
+            RoleRepository._guard(operation, min(lease['expires_at'], principal.expires_at, grant['expires_at']))
+            return True
+        except AgentSessionError:
+            return False
+        except HubError as error:
+            if error.code in ('hub_grant_required', 'hub_capability_forbidden'):
+                return False
+            raise
+
+    def _activity_at(self, db, item, binding, now):
+        """Use only the current role claim's own committed progress event."""
+        if type(item.get('created_at_epoch')) not in (int, float):
+            return None  # Legacy dispatch: no trustworthy start time.
+        baseline_id = str(uuid.uuid5(_NAMESPACE, 'progress-baseline:' + item['id']))
+        try:
+            baseline = self.repo._get(db, baseline_id, 'dispatch_progress_baseline')
+        except HubError:
+            return None  # Legacy dispatch: no trustworthy pre-dispatch revision.
+        if (baseline.get('dispatch_id') != item['id'] or baseline.get('task_id') != item['task_id']
+                or type(baseline.get('progress_revision')) is not int or baseline['progress_revision'] < 0):
+            return None
+        from .roles import _NAMESPACE as role_namespace
+        try:
+            claim = self.repo._get(db, str(uuid.uuid5(role_namespace, 'claim:' + item['task_id'])), 'role_claim')
+        except HubError:
+            return None
+        if claim.get('status') != 'claimed' or claim.get('role_id') != item['role_id']:
+            return None
+        row = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='role_progress_activity'",
+                         (role_activity_id(item['task_id'], item['role_id']),)).fetchone()
+        if not row:
+            return None
+        activity = json.loads(row['data'])
+        if (activity.get('task_id') != item['task_id'] or activity.get('task_kind') != item['task_kind']
+                or activity.get('project') != item['project'] or activity.get('role_id') != item['role_id']
+                or activity.get('claim_id') != claim['id'] or activity.get('claim_revision') != claim['revision']
+                or activity.get('generation') != binding['generation']
+                or activity.get('session_id') != binding['session_id']
+                or activity.get('installation_id') != binding['installation_id']
+                or type(activity.get('progress_revision')) is not int
+                or activity['progress_revision'] <= baseline['progress_revision']
+                or type(activity.get('observed_at')) not in (int, float)
+                or not math.isfinite(activity['observed_at'])
+                or activity['observed_at'] < item['created_at_epoch']):
+            return None
+        if activity['observed_at'] > now:
+            raise HubError('dispatch_clock_untrusted', 409)
+        return activity['observed_at']
 
     def _request(self, db, request_id):
         try:
@@ -137,10 +218,24 @@ class DispatchRepository:
             if existing:
                 raise HubError('dispatch_already_open', 409)
             now = operation.bridge.sessions._now()
+            if not math.isfinite(now):
+                raise HubError('dispatch_clock_untrusted', 409)
             item = dict(id=str(uuid.uuid4()), request_id=request['id'], project=task['project'], task_id=task_id,
                         task_kind=kind, role_id=role, state='dispatched', report='', window_seconds=window_seconds,
-                        last_report_at=now, stale_basis=None, decision_id=None, ask_count=0, coordination_only=True,
+                        created_at_epoch=now, last_report_at=now, target_binding=self._binding(target.get('lease')),
+                        stale_basis=None, coordination_stale=False, decision_id=None, ask_count=0, coordination_only=True,
                         execution_authorization=False, completion_verified=False, wake_delivery='not_attempted')
+            existing_progress = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='task_progress'", (progress_key(task_id),)).fetchone()
+            try:
+                progress_revision = json.loads(existing_progress['data'])['revision'] if existing_progress else 0
+            except (ValueError, KeyError, TypeError):
+                raise HubError('dispatch_unavailable', 404) from None
+            if type(progress_revision) is not int or progress_revision < 0:
+                raise HubError('dispatch_unavailable', 404)
+            baseline_id = str(uuid.uuid5(_NAMESPACE, 'progress-baseline:' + item['id']))
+            db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
+                       (baseline_id, 'dispatch_progress_baseline', json.dumps(dict(dispatch_id=item['id'], task_id=task_id,
+                        progress_revision=progress_revision), sort_keys=True, separators=(',', ':'))))
             item = self.repo._save(db, actor, 'orchestration.dispatched', 'role_dispatch', item, new=True, publish=False)
             self._save_receipt(db, actor, key, fingerprint, item)
             return item
@@ -340,8 +435,13 @@ class DispatchRepository:
                         raise HubError('dispatch_decision_pending', 409)
                 except (KeyError, TypeError):
                     raise HubError('dispatch_decision_pending', 409) from None
+            now = operation.bridge.sessions._now()
+            if not math.isfinite(now) or now < item['last_report_at']:
+                raise HubError('dispatch_clock_untrusted', 409)
             item.update(state='asked' if state == 'ask' else 'working' if state == 'resume' else state, report=note,
-                        last_report_at=operation.bridge.sessions._now(), stale_basis=None)
+                        last_report_at=now, stale_basis=None, coordination_stale=False,
+                        target_binding=dict(generation=generation, session_id=operation.principal.session_id,
+                                            installation_id=operation.principal.installation_id))
             report_revision = item['revision'] + 1
             report = dict(dispatch_id=item['id'], project=item['project'], revision=report_revision,
                           state=item['state'], note=note, reported_at=item['last_report_at'],
@@ -359,7 +459,7 @@ class DispatchRepository:
         fingerprint = self._fingerprint(['dispatch_checkpoint', dispatch_id, expected_revision, generation])
         with self.repo._transaction() as db:
             role, operation = self._held(db, actor, 'orchestrator', generation)
-            item, task, _, _ = self._dispatch(db, actor, dispatch_id)
+            item, task, target, _ = self._dispatch(db, actor, dispatch_id)
             if task.get('status') in ('withdrawn', 'verified', 'completion_verified'):
                 raise HubError('dispatch_task_closed', 409)
             if item['project'] not in role['projects']:
@@ -369,8 +469,43 @@ class DispatchRepository:
                 return prior
             self.repo._cas(item, expected_revision)
             now = operation.bridge.sessions._now()
-            if item['state'] in ('dispatched', 'working') and now >= item['last_report_at'] + item['window_seconds']:
-                item.update(state='stale', stale_basis='report_timeout_only', wake_delivery='not_attempted')
-                item = self.repo._save(db, actor, 'orchestration.stale', 'role_dispatch', item, publish=False)
+            if (not math.isfinite(now) or type(item.get('last_report_at')) not in (int, float)
+                    or not math.isfinite(item['last_report_at']) or now < item['last_report_at']):
+                raise HubError('dispatch_clock_untrusted', 409)
+            created = item.get('created_at_epoch')
+            if created is not None and (type(created) not in (int, float) or not math.isfinite(created) or now < created):
+                raise HubError('dispatch_clock_untrusted', 409)
+            binding = item.get('target_binding')
+            basis = None
+            activity_at = item['last_report_at']
+            bound_by_activity = False
+            if item['state'] in ('dispatched', 'working', 'blocked', 'asked'):
+                if binding is None:
+                    # A dispatch may predate its first role lease. A committed,
+                    # attributable progress update can bind the current lease;
+                    # merely observing a lease cannot imply delivery or work.
+                    candidate = self._binding(target.get('lease'))
+                    if candidate is not None and self._activity_at(db, item, candidate, now) is not None:
+                        if self._target_live(operation, item, target, candidate, now):
+                            binding = candidate
+                            item['target_binding'] = candidate
+                            bound_by_activity = True
+                if binding is not None and (type(binding) is not dict or not self._target_live(operation, item, target, binding, now)):
+                    basis = 'target_lease_or_authorization_lost'
+                elif binding is not None:
+                    observed = self._activity_at(db, item, binding, now)
+                    if observed is not None:
+                        activity_at = max(activity_at, observed)
+                if basis is None and item['state'] in ('dispatched', 'working') and now >= activity_at + item['window_seconds']:
+                    basis = 'report_and_attributed_progress_timeout'
+            if basis is not None:
+                # Preserve blocked/asked state and its outstanding decision;
+                # expiry is an advisory stale flag, not loss of that context.
+                state = item['state'] if item['state'] in ('blocked', 'asked') else 'stale'
+                if item.get('state') != state or item.get('stale_basis') != basis or not item.get('coordination_stale'):
+                    item.update(state=state, stale_basis=basis, coordination_stale=True, wake_delivery='not_attempted')
+                    item = self.repo._save(db, actor, 'orchestration.stale', 'role_dispatch', item, publish=False)
+            elif bound_by_activity:
+                item = self.repo._save(db, actor, 'orchestration.activity_bound', 'role_dispatch', item, publish=False)
             self._save_receipt(db, actor, key, fingerprint, item)
             return item

@@ -78,7 +78,7 @@ def test_checkpoint_is_advisory_no_execution_or_wake(env):
     orch, worker, task, _, _, service, _, item = setup_dispatch(env)
     env.clock.value += 11
     stale = call(env, orch, 'hub_dispatch_checkpoint', lambda actor: service.checkpoint(actor, item['id'], 1, 1, 'checkpoint'))
-    assert stale['state'] == 'stale' and stale['stale_basis'] == 'report_timeout_only'
+    assert stale['state'] == 'stale' and stale['stale_basis'] == 'report_and_attributed_progress_timeout'
     assert stale['wake_delivery'] == 'not_attempted' and not stale['execution_authorization']
     resumed = call(env, worker, 'hub_dispatch_report', lambda actor: service.report(actor, item['id'], stale['revision'], 1, 'working', 'Still working', 'report'))
     assert resumed['state'] == 'working' and env.repo._read(task['id'], 'tracking_task') == task

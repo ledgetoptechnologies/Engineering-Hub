@@ -26,3 +26,8 @@ also change before a retry, in which case authority is rechecked first.
 Progress changes are audited but not broadcast to the unscoped generic event
 bus. Consumers must explicitly reread; no automatic wake is promised. No
 installation, runtime activation, or staging access follows from this feature.
+When a live role holder updates progress under an unchanged coordination claim,
+the same transaction records a bounded, server-attributed liveness observation.
+An explicit dispatch checkpoint may use it only for the matching role, task,
+session, lease generation and claim revision after the dispatch was created.
+It does not prove that a worker or an external effect has stopped.

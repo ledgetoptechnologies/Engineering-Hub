@@ -33,14 +33,21 @@ Individual records and responses are bounded, not total retention. Existing
 database, storage and enrollment limits still apply; operators must manage
 capacity without silently discarding reports or decisions.
 
-`hub_dispatch_checkpoint` is an explicit, manual advisory report-timeout check.
-It does not yet consider attributable progress or target lease expiry and is
-not an automatic stale detector. Stale does not mean failed, stopped, safe to
-reassign, or complete. Nothing releases a reservation or replays a command.
+`hub_dispatch_checkpoint` is an explicit, manual advisory liveness check. It
+considers the latest report and post-dispatch progress attributed to the exact
+current role lease, session and unchanged coordination claim. It marks an
+observed target lease or required authorization loss as stale. When a dispatch
+has never observed a lease, it uses the report window until attributable work
+is observed. A blocked or asked state keeps its reason and outstanding decision
+when lease loss sets its `coordination_stale` flag. Legacy dispatches without a
+trustworthy progress baseline do not credit old progress. Clock anomalies and
+lease expiry during a transaction fail closed and require a fresh checkpoint.
+It is not an automatic stale detector. Stale does not mean failed, stopped,
+safe to reassign, or complete. Nothing releases a reservation or replays a command.
 Dispatch records, reports and created decisions are audited but intentionally
 do not enter the generic unscoped notification bus. No automatic wake, polling,
 or delivery guarantee is provided. Consumers must explicitly reread.
 
 This is an incomplete backend foundation. Project creation, automatic
-request capture, orchestration runtime, UI wiring, attributable progress-aware
-staleness, addressed delivery and real staging acceptance remain separate work.
+request capture, orchestration runtime, UI wiring, automatic stale evaluation,
+addressed delivery and real staging acceptance remain separate work.

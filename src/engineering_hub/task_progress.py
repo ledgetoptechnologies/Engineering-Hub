@@ -11,6 +11,14 @@ from .roles import RoleRepository, _NAMESPACE
 _PROGRESS_NS = uuid.UUID('97181b1c-a3ca-4615-9b34-ef9cba79e6c4')
 
 
+def role_activity_id(task_id, role):
+    """One bounded last-activity record per task and coordination role."""
+    _key(task_id)
+    if type(role) is not str:
+        raise HubError('progress_unavailable', 404)
+    return str(uuid.uuid5(_PROGRESS_NS, 'role-activity:' + task_id + ':' + role))
+
+
 def _key(task_id):
     try:
         if type(task_id) is not str or str(uuid.UUID(task_id)) != task_id:
@@ -147,6 +155,17 @@ class TaskProgress:
                 item['revision'] = previous['revision']
             result = self.repo._save(db, actor, 'task.progress_updated', 'task_progress', item,
                                      new=previous is None, publish=False)
+            if role is not None:
+                activity = dict(task_id=task_id, task_kind=kind, project=task['project'], role_id=role,
+                    generation=generation, session_id=operation.principal.session_id,
+                    installation_id=operation.principal.installation_id, observed_at=now,
+                    claim_id=claim['id'], claim_revision=claim['revision'], progress_revision=result['revision'])
+                saved = db.execute("INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?) "
+                    "ON CONFLICT(id) DO UPDATE SET data=excluded.data WHERE kind='role_progress_activity'",
+                    (role_activity_id(task_id, role), 'role_progress_activity',
+                     json.dumps(activity, sort_keys=True, separators=(',', ':'))))
+                if saved.rowcount != 1:
+                    raise HubError('progress_activity_conflict', 409)
             receipt_id = str(uuid.uuid5(_PROGRESS_NS, 'receipt:' + actor + ':' + request_id))
             db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
                        (receipt_id, 'task_progress_receipt', json.dumps({'progress_id': key, 'revision': result['revision']}, sort_keys=True, separators=(',', ':'))))
