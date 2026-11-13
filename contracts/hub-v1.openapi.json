@@ -677,6 +677,106 @@
               }
             }
           }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "maxLength": 100,
+                    "minLength": 1,
+                    "title": "Name",
+                    "type": "string"
+                  },
+                  "hostname": {
+                    "anyOf": [
+                      {
+                        "maxLength": 253,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Hostname"
+                  },
+                  "metrics_host": {
+                    "anyOf": [
+                      {
+                        "maxLength": 64,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Metrics Host"
+                  },
+                  "addresses": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "maxItems": 16,
+                    "title": "Addresses",
+                    "type": "array"
+                  },
+                  "network": {
+                    "anyOf": [
+                      {
+                        "maxLength": 64,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Network"
+                  },
+                  "vlan": {
+                    "anyOf": [
+                      {
+                        "maximum": 4094,
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Vlan"
+                  },
+                  "role": {
+                    "maxLength": 100,
+                    "minLength": 1,
+                    "title": "Role",
+                    "type": "string"
+                  },
+                  "retired": {
+                    "default": false,
+                    "title": "Retired",
+                    "type": "boolean"
+                  },
+                  "expected_revision": {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "title": "Expected Revision",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "name",
+                  "addresses",
+                  "role",
+                  "expected_revision"
+                ],
+                "title": "DeviceInput",
+                "type": "object"
+              }
+            }
+          }
         }
       }
     },
@@ -714,6 +814,48 @@
               }
             }
           }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "reason": {
+                    "maxLength": 1000,
+                    "minLength": 1,
+                    "title": "Reason",
+                    "type": "string"
+                  },
+                  "expected_end": {
+                    "anyOf": [
+                      {
+                        "maxLength": 40,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Expected End"
+                  },
+                  "client_request_id": {
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "title": "Client Request Id",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "reason",
+                  "client_request_id"
+                ],
+                "title": "MaintenanceInput",
+                "type": "object"
+              }
+            }
+          }
         }
       }
     },
@@ -748,6 +890,36 @@
                 "schema": {
                   "$ref": "#/components/schemas/HTTPValidationError"
                 }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "expected_revision": {
+                    "maximum": 9007199254740991,
+                    "minimum": 1,
+                    "title": "Expected Revision",
+                    "type": "integer"
+                  },
+                  "resolution": {
+                    "maxLength": 1000,
+                    "minLength": 1,
+                    "title": "Resolution",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "expected_revision",
+                  "resolution"
+                ],
+                "title": "ResolutionInput",
+                "type": "object"
               }
             }
           }
@@ -1743,6 +1915,156 @@
               }
             }
           }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "project": {
+                    "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+                    "title": "Project",
+                    "type": "string"
+                  },
+                  "component_id": {
+                    "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",
+                    "title": "Component Id",
+                    "type": "string"
+                  },
+                  "component_revision": {
+                    "minimum": 1,
+                    "title": "Component Revision",
+                    "type": "integer"
+                  },
+                  "topic": {
+                    "maxLength": 200,
+                    "minLength": 1,
+                    "title": "Topic",
+                    "type": "string"
+                  },
+                  "dataset_digest": {
+                    "pattern": "^sha256:[a-f0-9]{64}$",
+                    "title": "Dataset Digest",
+                    "type": "string"
+                  },
+                  "schema": {
+                    "const": "choice-text.v1",
+                    "default": "choice-text.v1",
+                    "title": "Schema",
+                    "type": "string"
+                  },
+                  "title": {
+                    "maxLength": 100,
+                    "minLength": 1,
+                    "title": "Title",
+                    "type": "string"
+                  },
+                  "items": {
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "id": {
+                          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$",
+                          "title": "Id",
+                          "type": "string"
+                        },
+                        "title": {
+                          "maxLength": 100,
+                          "minLength": 1,
+                          "title": "Title",
+                          "type": "string"
+                        },
+                        "prompt": {
+                          "maxLength": 4096,
+                          "minLength": 1,
+                          "title": "Prompt",
+                          "type": "string"
+                        },
+                        "choices": {
+                          "anyOf": [
+                            {
+                              "items": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "id": {
+                                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$",
+                                    "title": "Id",
+                                    "type": "string"
+                                  },
+                                  "label": {
+                                    "maxLength": 100,
+                                    "minLength": 1,
+                                    "title": "Label",
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "id",
+                                  "label"
+                                ],
+                                "title": "ReviewChoice",
+                                "type": "object"
+                              },
+                              "maxItems": 20,
+                              "minItems": 2,
+                              "type": "array"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "title": "Choices"
+                        },
+                        "asset_id": {
+                          "anyOf": [
+                            {
+                              "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "title": "Asset Id"
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "title",
+                        "prompt"
+                      ],
+                      "title": "ReviewItem",
+                      "type": "object"
+                    },
+                    "maxItems": 1000,
+                    "minItems": 1,
+                    "title": "Items",
+                    "type": "array"
+                  },
+                  "client_request_id": {
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "title": "Client Request Id",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "project",
+                  "component_id",
+                  "component_revision",
+                  "topic",
+                  "dataset_digest",
+                  "title",
+                  "items",
+                  "client_request_id"
+                ],
+                "title": "ReviewCreate",
+                "type": "object"
+              }
+            }
+          }
         }
       }
     },
@@ -1854,6 +2176,68 @@
                 "schema": {
                   "$ref": "#/components/schemas/HTTPValidationError"
                 }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "expected_revision": {
+                    "minimum": 1,
+                    "title": "Expected Revision",
+                    "type": "integer"
+                  },
+                  "client_request_id": {
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "title": "Client Request Id",
+                    "type": "string"
+                  },
+                  "answers": {
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "item_id": {
+                          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$",
+                          "title": "Item Id",
+                          "type": "string"
+                        },
+                        "value": {
+                          "maxLength": 2000,
+                          "minLength": 1,
+                          "title": "Value",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "item_id",
+                        "value"
+                      ],
+                      "title": "ReviewAnswer",
+                      "type": "object"
+                    },
+                    "maxItems": 100,
+                    "title": "Answers",
+                    "type": "array"
+                  },
+                  "complete": {
+                    "default": false,
+                    "title": "Complete",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "expected_revision",
+                  "client_request_id",
+                  "answers"
+                ],
+                "title": "ReviewAnswers",
+                "type": "object"
               }
             }
           }
@@ -2266,6 +2650,56 @@
               }
             }
           }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "mode": {
+                    "enum": [
+                      "until",
+                      "pinned",
+                      "none"
+                    ],
+                    "title": "Mode",
+                    "type": "string"
+                  },
+                  "until": {
+                    "anyOf": [
+                      {
+                        "maxLength": 64,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Until"
+                  },
+                  "reason": {
+                    "default": "",
+                    "maxLength": 1000,
+                    "title": "Reason",
+                    "type": "string"
+                  },
+                  "expected_revision": {
+                    "minimum": 1,
+                    "title": "Expected Revision",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "mode",
+                  "expected_revision"
+                ],
+                "title": "StagingKeep",
+                "type": "object"
+              }
+            }
+          }
         }
       }
     },
@@ -2273,6 +2707,54 @@
       "post": {
         "summary": "Cleanup Plan",
         "operationId": "cleanup_plan_api_hub_v1_staging_cleanup_plan_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "project": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Project"
+                  },
+                  "kinds": {
+                    "anyOf": [
+                      {
+                        "items": {
+                          "type": "string",
+                          "enum": [
+                            "workspace",
+                            "build",
+                            "test_run",
+                            "preview"
+                          ]
+                        },
+                        "type": "array",
+                        "maxItems": 4,
+                        "minItems": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Kinds"
+                  }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "title": "StagingCleanupPlan"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -2289,6 +2771,34 @@
       "post": {
         "summary": "Cleanup Apply",
         "operationId": "cleanup_apply_api_hub_v1_staging_cleanup_apply_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "plan_id": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",
+                    "title": "Plan Id"
+                  },
+                  "digest": {
+                    "type": "string",
+                    "pattern": "^sha256:[a-f0-9]{64}$",
+                    "title": "Digest"
+                  }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "plan_id",
+                  "digest"
+                ],
+                "title": "StagingCleanupApply"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -2305,6 +2815,90 @@
       "post": {
         "summary": "Submit",
         "operationId": "submit_api_hub_v1_staging_jobs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "request_id": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",
+                    "title": "Request Id"
+                  },
+                  "review_task_id": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",
+                    "title": "Review Task Id"
+                  },
+                  "review_task_revision": {
+                    "type": "integer",
+                    "minimum": 1.0,
+                    "title": "Review Task Revision"
+                  },
+                  "project": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+                    "title": "Project"
+                  },
+                  "recipe": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+                    "title": "Recipe"
+                  },
+                  "source_commit": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{40}$",
+                    "title": "Source Commit"
+                  },
+                  "source_digest": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$",
+                    "title": "Source Digest"
+                  },
+                  "source_zip_base64": {
+                    "type": "string",
+                    "maxLength": 11184812,
+                    "minLength": 1,
+                    "title": "Source Zip Base64"
+                  },
+                  "source_commit_object_base64": {
+                    "type": "string",
+                    "maxLength": 87384,
+                    "minLength": 1,
+                    "title": "Source Commit Object Base64"
+                  },
+                  "topic": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Topic"
+                  }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "request_id",
+                  "review_task_id",
+                  "review_task_revision",
+                  "project",
+                  "recipe",
+                  "source_commit",
+                  "source_digest",
+                  "source_zip_base64",
+                  "source_commit_object_base64"
+                ],
+                "title": "StagingSubmission"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "202": {
             "description": "Successful Response",
@@ -2394,6 +2988,19 @@
               }
             }
           }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {},
+                "title": "ClosedInput",
+                "type": "object"
+              }
+            }
+          }
         }
       }
     },
@@ -2468,6 +3075,49 @@
               }
             }
           }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "expected_revision": {
+                    "minimum": 0,
+                    "title": "Expected Revision",
+                    "type": "integer"
+                  },
+                  "grants": {
+                    "additionalProperties": {
+                      "items": {
+                        "enum": [
+                          "read",
+                          "retain",
+                          "cleanup",
+                          "build",
+                          "test",
+                          "preview"
+                        ],
+                        "type": "string"
+                      },
+                      "maxItems": 6,
+                      "type": "array"
+                    },
+                    "maxProperties": 1000,
+                    "title": "Grants",
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "expected_revision",
+                  "grants"
+                ],
+                "title": "StagingPolicy",
+                "type": "object"
+              }
+            }
+          }
         }
       }
     },
@@ -2508,6 +3158,19 @@
               }
             }
           }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {},
+                "title": "ClosedInput",
+                "type": "object"
+              }
+            }
+          }
         }
       }
     },
@@ -2533,6 +3196,19 @@
       "post": {
         "summary": "Recover",
         "operationId": "recover_api_hub_v1_staging_shared_recover_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {},
+                "additionalProperties": false,
+                "type": "object",
+                "title": "_Recover"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "description": "Successful Response",

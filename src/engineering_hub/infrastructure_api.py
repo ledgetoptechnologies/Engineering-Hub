@@ -4,6 +4,7 @@ import json
 from fastapi import Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .openapi_body import request_body
 from .infrastructure_service import InfrastructureService
 from .repository import HubError
 from .work_queue_api import _authorization
@@ -132,7 +133,7 @@ def attach_infrastructure_routes(app,service,actor,*,metrics=None,metrics_identi
         identity=authorized(request)
         return service.get_device(identity,device_id)
 
-    @app.put('/api/hub/v1/infrastructure/devices/{device_id}')
+    @app.put('/api/hub/v1/infrastructure/devices/{device_id}', openapi_extra=request_body(DeviceInput))
     async def save(device_id:str,request:Request):
         identity=authorized(request,'device_write')
         payload=(await _payload(request,DeviceInput)).model_dump()
@@ -141,7 +142,7 @@ def attach_infrastructure_routes(app,service,actor,*,metrics=None,metrics_identi
         revision=payload.pop('expected_revision')
         return service.upsert_device(identity,{'id':device_id,**payload},expected_revision=revision)
 
-    @app.post('/api/hub/v1/infrastructure/devices/{device_id}/maintenance')
+    @app.post('/api/hub/v1/infrastructure/devices/{device_id}/maintenance', openapi_extra=request_body(MaintenanceInput))
     async def open_maintenance(device_id:str,request:Request):
         identity=authorized(request,'maintenance_write')
         payload=await _payload(request,MaintenanceInput)
@@ -149,7 +150,7 @@ def attach_infrastructure_routes(app,service,actor,*,metrics=None,metrics_identi
             raise HubError('forbidden',403)
         return service.append_maintenance(identity,device_id,**payload.model_dump())
 
-    @app.post('/api/hub/v1/infrastructure/maintenance/{maintenance_id}/resolve')
+    @app.post('/api/hub/v1/infrastructure/maintenance/{maintenance_id}/resolve', openapi_extra=request_body(ResolutionInput))
     async def resolve(maintenance_id:str,request:Request):
         identity=authorized(request,'maintenance_write')
         payload=await _payload(request,ResolutionInput)

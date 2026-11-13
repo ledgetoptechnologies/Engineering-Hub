@@ -13,6 +13,7 @@ from starlette.responses import Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .openapi_body import request_body
 from .repository import AGENTS, HubError, HubRepository
 
 
@@ -207,7 +208,7 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         return await diagnostic_download(service.resources, service.client, principal, resource_id,
                                          relative_path, session_alive=alive)
 
-    @app.post('/api/hub/v1/staging/resources/{resource_id}/keep')
+    @app.post('/api/hub/v1/staging/resources/{resource_id}/keep', openapi_extra=request_body(StagingKeep))
     async def keep(resource_id: Identity, request: Request):
         principal = authenticated(request, mutation=True)
         service = configured()
@@ -216,7 +217,7 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         return service.resources.set_keep(principal, resource_id, **payload.model_dump(),
                                           admission_guard=admission(request, principal))
 
-    @app.post('/api/hub/v1/staging/cleanup/plan')
+    @app.post('/api/hub/v1/staging/cleanup/plan', openapi_extra=request_body(StagingCleanupPlan))
     async def cleanup_plan(request: Request):
         principal = authenticated(request, mutation=True)
         service = configured()
@@ -225,7 +226,7 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         return service.resources.cleanup_plan(principal, **payload.model_dump(),
                                               admission_guard=admission(request, principal))
 
-    @app.post('/api/hub/v1/staging/cleanup/apply')
+    @app.post('/api/hub/v1/staging/cleanup/apply', openapi_extra=request_body(StagingCleanupApply))
     async def cleanup_apply(request: Request):
         principal = authenticated(request, mutation=True)
         service = configured()
@@ -239,7 +240,7 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
                                                admission_guard=guard)
         return await service.cleanup_apply(principal, payload.plan_id, payload.digest)
 
-    @app.post('/api/hub/v1/staging/jobs', status_code=202)
+    @app.post('/api/hub/v1/staging/jobs', status_code=202, openapi_extra=request_body(StagingSubmission))
     async def submit(request: Request):
         principal = authenticated(request, mutation=True)
         if principal not in AGENTS:
@@ -254,7 +255,7 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         principal = authenticated(request)
         return configured().get_job(principal, job_id)
 
-    @app.post('/api/hub/v1/staging/jobs/{job_id}/reconcile')
+    @app.post('/api/hub/v1/staging/jobs/{job_id}/reconcile', openapi_extra=request_body(ClosedInput))
     async def reconcile(job_id: Identity, request: Request):
         principal = authenticated(request, mutation=True, human_only=True)
         service = configured()
@@ -267,7 +268,7 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         principal = authenticated(request, human_only=True)
         return configured().resources.get_policy(principal, project)
 
-    @app.put('/api/hub/v1/staging/projects/{project}/policy')
+    @app.put('/api/hub/v1/staging/projects/{project}/policy', openapi_extra=request_body(StagingPolicy))
     async def set_policy(project: Project, request: Request):
         principal = authenticated(request, mutation=True, human_only=True)
         service = configured()
@@ -276,7 +277,7 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         return service.resources.set_policy(principal, project, **payload.model_dump(),
                                             admission_guard=admission(request, principal))
 
-    @app.post('/api/hub/v1/staging/resources/{resource_id}/preview-session')
+    @app.post('/api/hub/v1/staging/resources/{resource_id}/preview-session', openapi_extra=request_body(ClosedInput))
     async def preview(resource_id: Identity, request: Request):
         principal = authenticated(request, mutation=True, human_only=True)
         configured()

@@ -6,6 +6,7 @@ from fastapi import Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .openapi_body import request_body
 from .repository import HubError
 from .work_queue_api import _authorization
 
@@ -104,7 +105,7 @@ def attach_interactive_review_routes(app, repository, actor, human, *, human_adm
     def get_state(review_id: Identity, request: Request):
         return repository.get_state(identity(request), review_id)
 
-    @app.post('/api/hub/v1/interactive-reviews', status_code=201)
+    @app.post('/api/hub/v1/interactive-reviews', status_code=201, openapi_extra=request_body(ReviewCreate))
     async def create(request: Request):
         _authorization(request)
         principal = actor(request, mutation=True)
@@ -113,7 +114,7 @@ def attach_interactive_review_routes(app, repository, actor, human, *, human_adm
             raise HubError('review_identity_changed', 403)
         return repository.create_review(principal, **payload.model_dump(by_alias=True, exclude_none=True))
 
-    @app.post('/api/hub/v1/interactive-reviews/{review_id}/answers')
+    @app.post('/api/hub/v1/interactive-reviews/{review_id}/answers', openapi_extra=request_body(ReviewAnswers))
     async def answer(review_id: Identity, request: Request):
         principal = identity(request, mutation=True)
         payload = await _payload(request, ReviewAnswers, 256 * 1024)

@@ -21,6 +21,7 @@ from typing import Literal
 from fastapi import HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from .openapi_body import request_body
 from .auth import AuthConfig, SessionStore, require_human
 from .pilot_ownership import PilotOwner
 from .startup_reconciliation import (ExecutorSessionIdentity, OperatorReconciliation,
@@ -388,7 +389,7 @@ def attach_session_acceptance_routes(app, *, broker, config, sessions):
         except SessionAcceptanceError as error:
             unavailable(error)
 
-    @app.post(path)
+    @app.post(path, openapi_extra=request_body(_Answer))
     async def answer(request: Request):
         identity = actor(request, mutation=True)
         try:
