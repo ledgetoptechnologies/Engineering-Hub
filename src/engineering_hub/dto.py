@@ -31,6 +31,61 @@ class ResponseDTO(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
 
 
+class OrchestrationChecklistItem(ResponseDTO):
+    id: str
+    text: str
+    done: bool
+
+
+class OrchestrationProgress(ResponseDTO):
+    checklist: list[OrchestrationChecklistItem]
+    percent: float | None
+    eta_seconds: int | None
+    agent_eta_guess: int | None
+    status_line: str
+    blocked_on: str
+    updated_at: str
+
+
+class OrchestrationPendingDecision(ResponseDTO):
+    id: str
+    title: str
+    options: list[str]
+    updated_at: str
+
+
+class OrchestrationDispatchView(ResponseDTO):
+    id: str
+    task_id: str
+    task_title: str
+    task_status: str
+    task_completion_verified: bool
+    role: str
+    state: str
+    updated_at: str
+    stale_checkpoint: bool
+    report: str
+    dispatch_completion_verified: bool
+    pending_decision: OrchestrationPendingDecision | None
+    progress: OrchestrationProgress | None
+
+
+class OrchestrationRequestViewHeader(ResponseDTO):
+    id: str
+    title: str
+    updated_at: str
+
+
+class OrchestrationRequestView(ResponseDTO):
+    project: ProjectId
+    request: OrchestrationRequestViewHeader
+    dispatches: list[OrchestrationDispatchView]
+    next_after: str | None
+    snapshot: Literal['single_read_transaction']
+    freshness: Literal['checkpoint_only']
+    execution_authorization: Literal[False]
+
+
 class EntityDTO(ResponseDTO):
     id: str
     revision: int = Field(ge=1)

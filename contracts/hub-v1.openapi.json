@@ -3631,6 +3631,81 @@
         }
       }
     },
+    "/api/hub/v1/projects/{project}/orchestration-requests/{request_id}/view": {
+      "get": {
+        "summary": "Orchestration Request View",
+        "description": "Read one bounded snapshot; stale is the last checkpoint, not live liveness.",
+        "operationId": "orchestration_request_view_api_hub_v1_projects__project__orchestration_requests__request_id__view_get",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project"
+            }
+          },
+          {
+            "name": "request_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Request Id"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 25,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationRequestView"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/projects/{project}/orchestration-attention": {
       "get": {
         "summary": "List Orchestration Attention",
@@ -7155,6 +7230,297 @@
           "created_at"
         ],
         "title": "OpenMessageItem"
+      },
+      "OrchestrationChecklistItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "done": {
+            "type": "boolean",
+            "title": "Done"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "text",
+          "done"
+        ],
+        "title": "OrchestrationChecklistItem"
+      },
+      "OrchestrationDispatchView": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "task_id": {
+            "type": "string",
+            "title": "Task Id"
+          },
+          "task_title": {
+            "type": "string",
+            "title": "Task Title"
+          },
+          "task_status": {
+            "type": "string",
+            "title": "Task Status"
+          },
+          "task_completion_verified": {
+            "type": "boolean",
+            "title": "Task Completion Verified"
+          },
+          "role": {
+            "type": "string",
+            "title": "Role"
+          },
+          "state": {
+            "type": "string",
+            "title": "State"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "stale_checkpoint": {
+            "type": "boolean",
+            "title": "Stale Checkpoint"
+          },
+          "report": {
+            "type": "string",
+            "title": "Report"
+          },
+          "dispatch_completion_verified": {
+            "type": "boolean",
+            "title": "Dispatch Completion Verified"
+          },
+          "pending_decision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OrchestrationPendingDecision"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OrchestrationProgress"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "task_id",
+          "task_title",
+          "task_status",
+          "task_completion_verified",
+          "role",
+          "state",
+          "updated_at",
+          "stale_checkpoint",
+          "report",
+          "dispatch_completion_verified",
+          "pending_decision",
+          "progress"
+        ],
+        "title": "OrchestrationDispatchView"
+      },
+      "OrchestrationPendingDecision": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "options": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Options"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "options",
+          "updated_at"
+        ],
+        "title": "OrchestrationPendingDecision"
+      },
+      "OrchestrationProgress": {
+        "properties": {
+          "checklist": {
+            "items": {
+              "$ref": "#/components/schemas/OrchestrationChecklistItem"
+            },
+            "type": "array",
+            "title": "Checklist"
+          },
+          "percent": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Percent"
+          },
+          "eta_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eta Seconds"
+          },
+          "agent_eta_guess": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Eta Guess"
+          },
+          "status_line": {
+            "type": "string",
+            "title": "Status Line"
+          },
+          "blocked_on": {
+            "type": "string",
+            "title": "Blocked On"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "checklist",
+          "percent",
+          "eta_seconds",
+          "agent_eta_guess",
+          "status_line",
+          "blocked_on",
+          "updated_at"
+        ],
+        "title": "OrchestrationProgress"
+      },
+      "OrchestrationRequestView": {
+        "properties": {
+          "project": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+            "title": "Project"
+          },
+          "request": {
+            "$ref": "#/components/schemas/OrchestrationRequestViewHeader"
+          },
+          "dispatches": {
+            "items": {
+              "$ref": "#/components/schemas/OrchestrationDispatchView"
+            },
+            "type": "array",
+            "title": "Dispatches"
+          },
+          "next_after": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next After"
+          },
+          "snapshot": {
+            "type": "string",
+            "const": "single_read_transaction",
+            "title": "Snapshot"
+          },
+          "freshness": {
+            "type": "string",
+            "const": "checkpoint_only",
+            "title": "Freshness"
+          },
+          "execution_authorization": {
+            "type": "boolean",
+            "const": false,
+            "title": "Execution Authorization"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "project",
+          "request",
+          "dispatches",
+          "next_after",
+          "snapshot",
+          "freshness",
+          "execution_authorization"
+        ],
+        "title": "OrchestrationRequestView"
+      },
+      "OrchestrationRequestViewHeader": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "updated_at"
+        ],
+        "title": "OrchestrationRequestViewHeader"
       },
       "OverviewDTO": {
         "properties": {

@@ -43,7 +43,7 @@ from .registry_client import (
 from .dto import (
     AgentListDTO, AutonomyDTO, DecisionDTO, DecisionListDTO, EventStatusDTO,
     HealthDTO, OverviewDTO, PauseDTO, ProjectListDTO, RunDTO, RunListDTO, RecoveryDTO,
-    PilotReleaseEvidenceDTO, TaskDTO, TaskListDTO,
+    PilotReleaseEvidenceDTO, TaskDTO, TaskListDTO, OrchestrationRequestView,
 )
 
 @dataclass(frozen=True)
@@ -1336,6 +1336,12 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     def list_orchestration_requests(project: str, request: Request, limit: int = 50, after: str | None = None):
         from .dispatch import DispatchRepository
         return DispatchRepository(repo).owner_list_requests(role_owner(request), project, limit, after)
+
+    @app.get('/api/hub/v1/projects/{project}/orchestration-requests/{request_id}/view', response_model=OrchestrationRequestView)
+    def orchestration_request_view(project: str, request_id: str, request: Request, limit: int = 25, after: str | None = None):
+        """Read one bounded snapshot; stale is the last checkpoint, not live liveness."""
+        from .orchestration_view import request_view
+        return request_view(repo, role_owner(request), project, request_id, limit, after)
 
     @app.get('/api/hub/v1/projects/{project}/orchestration-attention')
     def list_orchestration_attention(project: str, request: Request, limit: int = 50, after: str | None = None):

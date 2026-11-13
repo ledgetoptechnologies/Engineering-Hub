@@ -185,6 +185,71 @@ def test_real_mcp_and_owner_http_recover_request_and_reports(unified):
     assert client.get(base + '/requests/' + request['id']).status_code == 401
 
 
+def test_owner_project_request_view_http_snapshot_and_privacy(unified):
+    from types import SimpleNamespace
+    client, app, bus, _ = unified
+    session_env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    caps = ('dispatch.read', 'dispatch.write', 'dispatch.report', 'role.read', 'role.lease', 'role.claim',
+            'tracking.read', 'decision.request', 'decision.read', 'progress.read', 'progress.write')
+    installation, token, _ = pair(session_env, caps=caps)
+    roles = RoleRepository(app.state.repository)
+    roles.configure(OWNER, 'orchestrator', 0, [PROJECT], [installation], ['src'], 'Coordinate', [])
+    roles.configure(OWNER, 'backend', 0, [PROJECT], [installation], ['src'], 'Work', [])
+    invoke, _ = sdk(client, token)
+    for role in ('orchestrator', 'backend'):
+        data(invoke('hub_role_acquire', {'role': role, 'expected_revision': 1, 'lease_seconds': 60}))
+    request = data(invoke('hub_orchestration_request_create', {'generation': 1, 'project': PROJECT, 'title': 'Request', 'client_request_id': 'req'}))
+    tasks = [app.state.repository.propose_tracking_task('codex', PROJECT, 'Task ' + str(n), 'task-' + str(n)) for n in range(2)]
+    dispatches = []
+    for n, task in enumerate(tasks):
+        data(invoke('hub_role_claim', {'role': 'backend', 'generation': 1, 'task_id': task['id'], 'client_request_id': 'claim-' + str(n)}))
+        dispatches.append(data(invoke('hub_dispatch_create', {'generation': 1, 'request_id': request['id'], 'task_id': task['id'], 'role': 'backend', 'window_seconds': 10, 'client_request_id': 'dispatch-' + str(n)})))
+    data(invoke('hub_task_progress_update', {'task_id': tasks[0]['id'], 'expected_revision': 0, 'client_request_id': 'progress',
+        'checklist': [{'id': 'one', 'text': 'One', 'done': True}, {'id': 'two', 'text': 'Two', 'done': False}],
+        'status_line': 'Working', 'blocked_on': '', 'agent_eta_guess': 50, 'role': 'backend', 'generation': 1}))
+    data(invoke('hub_dispatch_report', {'dispatch_id': dispatches[0]['id'], 'expected_revision': 1, 'generation': 1,
+        'state': 'ask', 'note': 'Need a choice', 'client_request_id': 'ask', 'ask_title': 'Choose', 'ask_options': ['Yes', 'No']}))
+    path = f"/api/hub/v1/projects/{PROJECT}/orchestration-requests/{request['id']}/view"
+    first = client.get(path, params={'limit': 1})
+    assert first.status_code == 200, first.text
+    page = first.json()
+    assert page['snapshot'] == 'single_read_transaction' and page['freshness'] == 'checkpoint_only'
+    assert page['execution_authorization'] is False and page['next_after']
+    second = client.get(path, params={'limit': 1, 'after': page['next_after']}).json()
+    assert second['next_after'] is None
+    by_id = {item['id']: item for item in page['dispatches'] + second['dispatches']}
+    assert set(by_id) == {item['id'] for item in dispatches}
+    asked = by_id[dispatches[0]['id']]
+    assert asked['pending_decision']['title'] == 'Choose'
+    assert asked['progress']['percent'] == 50 and asked['progress']['eta_seconds'] is None
+    assert asked['progress']['agent_eta_guess'] == 50 and asked['dispatch_completion_verified'] is False
+    assert asked['task_status'] == tasks[0]['status'] and asked['task_completion_verified'] is False
+    assert by_id[dispatches[1]['id']]['progress'] is None
+    data(invoke('hub_dispatch_report', {'dispatch_id': dispatches[1]['id'], 'expected_revision': 1, 'generation': 1,
+        'state': 'done', 'note': 'Done', 'client_request_id': 'done'}))
+    evidence = [{'label': 'Evidence', 'url': 'https://example.com/evidence'}]
+    claimed = app.state.repository.update_tracking_task('codex', tasks[1]['id'], 1, 'claim-finish',
+        progress='Completed', evidence_links=evidence, completion_claim=True)
+    claimed_view = client.get(path, params={'limit': 50}).json()
+    claimed_item = next(item for item in claimed_view['dispatches'] if item['id'] == dispatches[1]['id'])
+    assert claimed_item['state'] == 'done' and claimed_item['task_status'] == 'completion_claimed'
+    assert claimed_item['task_completion_verified'] is False
+    app.state.repository.review_tracking_task(OWNER, tasks[1]['id'], claimed['revision'], 'owner-review',
+        verdict='verify', note='Inspected evidence', evidence_links=evidence)
+    verified_view = client.get(path, params={'limit': 50}).json()
+    verified_item = next(item for item in verified_view['dispatches'] if item['id'] == dispatches[1]['id'])
+    assert verified_item['task_status'] == 'completion_verified' and verified_item['task_completion_verified'] is True
+    assert 'session_id' not in first.text + json.dumps(second)
+    assert 'target_binding' not in first.text + json.dumps(second)
+    assert client.get(path, params={'limit': 51}).status_code == 422
+    assert client.get(path.replace(PROJECT, 'project-alpha')).status_code == 404
+    assert client.get(path, headers={'Authorization': 'Bearer synthetic-codex'}).status_code == 403
+    schema = client.get('/openapi.json').json()
+    assert 'OrchestrationRequestView' in schema['components']['schemas']
+    client.cookies.clear()
+    assert client.get(path).status_code == 401
+
+
 def test_project_scope_hides_request_and_list(env):
     caps = ('dispatch.write', 'role.lease')
     installation, creator, _ = pair(env, name='creator', caps=caps, projects=('project-alpha',))

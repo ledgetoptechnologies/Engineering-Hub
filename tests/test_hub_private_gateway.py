@@ -564,3 +564,14 @@ def test_project_tracking_browser_gateway_is_read_only():
     assert browser_route_allowed('GET', path)
     assert not browser_route_allowed('POST', path)
     assert not browser_route_allowed('GET', '/api/hub/v1/projects/../tracking-tasks')
+
+
+async def test_orchestration_request_view_gateway_is_read_only_and_exact():
+    from engineering_hub.private_gateway import browser_route_allowed
+    path = '/api/hub/v1/projects/project-alpha/orchestration-requests/12345678-1234-1234-1234-123456789abc/view'
+    assert browser_route_allowed('GET', path)
+    assert browser_route_allowed('HEAD', path)
+    for method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+        assert not browser_route_allowed(method, path)
+    for near in (path + '/extra', path.replace('project-alpha', '..'), path.replace('12345678-1234-1234-1234-123456789abc', 'invalid')):
+        assert not browser_route_allowed('GET', near)
