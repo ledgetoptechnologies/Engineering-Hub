@@ -150,6 +150,7 @@ async def test_occupied_owner_pool_does_not_consume_response_guard_capacity(tmp_
 
 @pytest.mark.asyncio
 async def test_one_session_cannot_take_another_sessions_owner_capacity(tmp_path, monkeypatch):
+    monkeypatch.setattr('agent_message_bus.agent_sessions_transport.MAX_NEW_TRANSPORTS', 3)
     monkeypatch.setattr('agent_message_bus.agent_sessions.MAX_OWNER_SUBSCRIPTIONS', 3)
     monkeypatch.setattr('agent_message_bus.agent_sessions.MAX_OWNER_SUBSCRIPTIONS_PER_SESSION', 2)
     app = bus(tmp_path)
@@ -172,6 +173,51 @@ async def test_one_session_cannot_take_another_sessions_owner_capacity(tmp_path,
     assert repo._listeners == {}
     assert all(count == 0 for count in repo._listener_counts.values())
 
+
+
+@pytest.mark.asyncio
+async def test_owner_timer_failure_releases_subscription(tmp_path, monkeypatch):
+    from agent_message_bus.agent_sessions_transport import MCPAuthMiddleware
+
+    app = bus(tmp_path)
+    repo = app.state.agent_sessions
+    issued = repo.exchange(credential(repo))
+    middleware = MCPAuthMiddleware(None, AUTH, None, repo)
+    loop = asyncio.get_running_loop()
+    def fail_timer(*args, **kwargs):
+        raise RuntimeError('timer unavailable')
+    with monkeypatch.context() as patch:
+        patch.setattr(loop, 'call_later', fail_timer)
+        with pytest.raises(RuntimeError, match='timer unavailable'):
+            middleware._reserve_owner(('owner',), issued['token'])
+    assert repo._listeners == {}
+    assert all(count == 0 for count in repo._listener_counts.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', [RuntimeError, asyncio.CancelledError])
+async def test_owner_reservation_exception_rolls_back_pending(tmp_path, monkeypatch, failure):
+    from agent_message_bus.agent_sessions_transport import MCPAuthMiddleware
+
+    app = bus(tmp_path)
+    repo = app.state.agent_sessions
+    issued = repo.exchange(credential(repo))
+    middleware = MCPAuthMiddleware(None, AUTH, None, repo)
+    def fail_reservation(*args):
+        raise failure('reservation failed')
+    monkeypatch.setattr(middleware, '_reserve_owner', fail_reservation)
+    body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {}}).encode()
+    scope = {'type': 'http', 'method': 'POST', 'path': '/mcp', 'query_string': b'',
+             'headers': [(b'authorization', ('Bearer ' + issued['token']).encode())],
+             'client': ('127.0.0.1', 1234), 'server': ('127.0.0.1', 80), 'scheme': 'http'}
+    async def receive():
+        return {'type': 'http.request', 'body': body, 'more_body': False}
+    async def send(message):
+        raise AssertionError('unexpected response')
+    with pytest.raises(failure, match='reservation failed'):
+        await middleware(scope, receive, send)
+    assert middleware._new_pending == 0
+    assert repo._listeners == {}
 
 def test_default_off_and_separate_database_configuration(tmp_path, monkeypatch):
     monkeypatch.setenv('HUB_AGENT_SESSIONS_MODE', 'disabled')
