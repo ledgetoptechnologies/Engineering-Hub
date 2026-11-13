@@ -330,6 +330,13 @@ class ContainerPilotWorkflow:
         if state not in {'succeeded', 'failed'}:
             return 'held'
         if state == 'failed':
+            # Even a terminal failure of the current operation does not prove
+            # that earlier deploy operations had no effects. In particular,
+            # create may have succeeded before start failed, and the legacy
+            # failure response carries no candidate identity or quiescence.
+            # Hold for inspection instead of using it to authorize rollback.
+            if command.action == 'deploy_container':
+                return 'held'
             if command.action == 'smoke_container' and (
                     response.reason != 'health_failed' or response.evidence.health != 'unhealthy'
                     or response.evidence.evidence_verified is not True

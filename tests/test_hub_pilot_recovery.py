@@ -56,6 +56,8 @@ async def test_correctable_local_validation_error_does_not_strand_current_claim(
 class RecoveryClient(FakeClient):
     def response(self, command):
         response = super().response(command)
+        if command.action == 'deploy_container' and response.state == 'failed':
+            return response
         container = ('d' if command.action in ACTIONS[2:] else 'e') * 64
         return response.model_copy(update={'evidence': response.evidence.model_copy(update={'container_id': container})})
 
@@ -276,15 +278,30 @@ async def test_multiple_idle_restarts_preserve_original_epoch_recoverability(rig
 
 
 @pytest.mark.asyncio
-async def test_candidate_failure_recovery_counts_once_then_rollback(rig):
+async def test_deploy_failure_recovery_does_not_assume_prior_effects_absent(rig):
     _, run, _ = await rig.crash()
     current = rig.restart(RecoveryClient({'deploy_container': 'failed'}))
     result = await current.recovery.recover(run['id'])
-    assert result['run']['status'] == 'failed'
-    assert current.repo.get_task(run['task_id'])['repair_count'] == 1
-    assert (await current.workflow.advance(run['id']))['status'] == 'rolled_back'
-    assert current.repo.get_task(run['task_id'])['repair_count'] == 1
-    assert [item.action for item in current.client.submissions] == list(ACTIONS[2:])
+    assert result['recovery'] == 'held'
+    assert result['run']['status'] == 'held'
+    assert current.client.submissions == []
+    assert len(reservations(current.repo, run['id'])[0]) == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_holds_contradictory_deploy_failure_without_rollback(rig):
+    _, run, _ = await rig.crash()
+    class Contradictory(RecoveryClient):
+        def response(self, command):
+            result = super().response(command)
+            return result.model_copy(update={'reason': 'paused'})
+
+    current = rig.restart(Contradictory({'deploy_container': 'failed'}))
+    result = await current.recovery.recover(run['id'])
+    assert result['recovery'] == 'held'
+    assert result['run']['status'] == 'held'
+    assert current.client.submissions == []
+    assert len(reservations(current.repo, run['id'])[0]) == 1
 
 
 @pytest.mark.asyncio

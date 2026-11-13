@@ -58,6 +58,12 @@ class FakeClient:
         outcome = self.outcomes.get(command.action, 'succeeded')
         if isinstance(outcome, BaseException):
             raise outcome
+        if command.action == 'deploy_container' and outcome == 'failed':
+            # Match the executor's explicit KnownTerminalFailure response.
+            return ContainerPilotResponse(**command.model_dump(), state='failed',
+                reason='effect_failed', replayed=False,
+                evidence=ContainerPilotEvidence(container_id=None, image_config_id=None,
+                    health='unknown', evidence_verified=False))
         rollback = command.action in ACTIONS[2:]
         response = ContainerPilotResponse(
             **command.model_dump(), state=outcome,
@@ -138,6 +144,44 @@ async def test_smoke_failure_requires_four_distinct_commands_and_rollback_health
     assert repo.get_task(run['task_id'])['repair_count'] == 1
     assert (await workflow.advance(run['id']))['status'] == 'rolled_back'
     assert len(client.submissions) == 4
+
+
+@pytest.mark.asyncio
+async def test_terminal_deploy_failure_holds_without_assuming_no_prior_effects(repo, target):
+    client = FakeClient({'deploy_container': 'failed'})
+    workflow, run = ready_run(repo, target, client)
+    result = await workflow.advance(run['id'])
+    assert result['status'] == 'held'
+    assert [c.action for c in client.submissions] == ['deploy_container']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('damage', [
+    {'reason': None}, {'reason': 'paused'}, {'reason': 'target_busy'},
+    {'reason': 'stale_fence'}, {'reason': 'evidence_mismatch'},
+    {'evidence': {'container_id': 'e' * 64}},
+    {'evidence': {'image_config_id': IMAGE}},
+    {'evidence': {'health': 'healthy'}},
+    {'evidence': {'evidence_verified': True}},
+])
+async def test_invalid_deploy_failure_never_starts_rollback(repo, target, damage):
+    class Client(FakeClient):
+        def response(self, command):
+            response = super().response(command)
+            if command.action == 'deploy_container':
+                changes = dict(damage)
+                if 'evidence' in changes:
+                    changes['evidence'] = response.evidence.model_copy(update=changes['evidence'])
+                return response.model_copy(update=changes)
+            return response
+
+    client = Client({'deploy_container': 'failed'})
+    workflow, run = ready_run(repo, target, client)
+    result = await workflow.advance(run['id'])
+    assert result['status'] == 'held'
+    assert [c.action for c in client.submissions] == ['deploy_container']
+    assert (await workflow.advance(run['id']))['status'] == 'held'
+    assert len(client.submissions) == 1
 
 
 @pytest.mark.asyncio
