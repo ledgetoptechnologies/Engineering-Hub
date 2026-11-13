@@ -229,6 +229,72 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         return invoke(read)
 
     @registration.tool()
+    def hub_orchestration_request_create(generation: StrictInt, project: str, title: str,
+                                         client_request_id: str, ctx: Context) -> dict:
+        """Record an inert request under the currently held orchestrator role; never starts work."""
+        from .dispatch import DispatchRepository
+        return invoke(DispatchRepository(repo).create_request, identity(ctx), generation, project, title, client_request_id)
+
+    @registration.tool()
+    def hub_orchestration_request_get(request_id: str, ctx: Context) -> dict:
+        """Read a project-scoped orchestration request; no execution or wake authority."""
+        from .dispatch import DispatchRepository
+        return invoke(DispatchRepository(repo).get_request, identity(ctx), request_id)
+
+    @registration.tool()
+    def hub_orchestration_request_list(project: str, ctx: Context, limit: StrictInt = 50, after: str | None = None) -> dict:
+        """Find project requests. UUID order is not chronological; restart to find new requests."""
+        from .dispatch import DispatchRepository
+        return invoke(DispatchRepository(repo).list_requests, identity(ctx), project, limit, after)
+
+    @registration.tool()
+    def hub_dispatch_create(generation: StrictInt, request_id: str, task_id: str, role: str,
+                            window_seconds: StrictInt, client_request_id: str, ctx: Context) -> dict:
+        """Record a role dispatch; it does not execute, notify, or wake the role."""
+        from .dispatch import DispatchRepository
+        return invoke(DispatchRepository(repo).create_dispatch, identity(ctx), generation, request_id, task_id, role, window_seconds, client_request_id)
+
+    @registration.tool()
+    def hub_dispatch_get(dispatch_id: str, ctx: Context) -> dict:
+        """Read an authorized coordination dispatch; done is a report, not verified completion."""
+        from .dispatch import DispatchRepository
+        return invoke(DispatchRepository(repo).get_dispatch, identity(ctx), dispatch_id)
+
+    @registration.tool()
+    def hub_dispatch_list(request_id: str, ctx: Context, limit: StrictInt = 50, after: str | None = None) -> dict:
+        """List visible dispatches; no wake or execution state is inferred."""
+        from .dispatch import DispatchRepository
+        return invoke(DispatchRepository(repo).list_dispatches, identity(ctx), request_id, limit, after)
+
+    @registration.tool()
+    def hub_dispatch_decisions(dispatch_id: str, ctx: Context, limit: StrictInt = 50, after_revision: StrictInt = 0) -> dict:
+        """Read prior ask decisions with current dispatch and decision-read grants."""
+        from .dispatch import DispatchRepository
+        return invoke(DispatchRepository(repo).decisions, identity(ctx), dispatch_id, limit, after_revision)
+
+    @registration.tool()
+    def hub_dispatch_reports(dispatch_id: str, ctx: Context, limit: StrictInt = 50, after_revision: StrictInt = 0) -> dict:
+        """Read bounded immutable reports in ascending dispatch revision order."""
+        from .dispatch import DispatchRepository
+        return invoke(DispatchRepository(repo).reports, identity(ctx), dispatch_id, limit, after_revision)
+
+    @registration.tool()
+    def hub_dispatch_report(dispatch_id: str, expected_revision: StrictInt, generation: StrictInt,
+                            state: str, note: str, client_request_id: str, ctx: Context,
+                            ask_title: str | None = None, ask_options: list[str] | None = None) -> dict:
+        """Report under the exact current role lease. Ask records a decision, not approval or execution."""
+        from .dispatch import DispatchRepository
+        return invoke(DispatchRepository(repo).report, identity(ctx), dispatch_id, expected_revision, generation,
+                      state, note, client_request_id, ask_title, ask_options)
+
+    @registration.tool()
+    def hub_dispatch_checkpoint(dispatch_id: str, expected_revision: StrictInt, generation: StrictInt,
+                                client_request_id: str, ctx: Context) -> dict:
+        """Manually checkpoint report timeout; stale is advisory and no wake is sent."""
+        from .dispatch import DispatchRepository
+        return invoke(DispatchRepository(repo).checkpoint, identity(ctx), dispatch_id, expected_revision, generation, client_request_id)
+
+    @registration.tool()
     def hub_task_progress_get(task_id: str, ctx: Context) -> dict:
         """Read separately versioned task progress; it is not completion proof."""
         from .task_progress import TaskProgress

@@ -1084,6 +1084,31 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         from .task_progress import TaskProgress
         return TaskProgress(repo).owner_get(role_owner(request), task_id)
 
+    @app.get('/api/hub/v1/orchestration/requests/{request_id}')
+    def get_orchestration_request(request_id: str, request: Request):
+        from .dispatch import DispatchRepository
+        return DispatchRepository(repo).owner_get_request(role_owner(request), request_id)
+
+    @app.get('/api/hub/v1/orchestration/requests/{request_id}/dispatches')
+    def get_orchestration_dispatches(request_id: str, request: Request, limit: int = 50, after: str | None = None):
+        from .dispatch import DispatchRepository
+        return DispatchRepository(repo).owner_list_dispatches(role_owner(request), request_id, limit, after)
+
+    @app.get('/api/hub/v1/projects/{project}/orchestration-requests')
+    def list_orchestration_requests(project: str, request: Request, limit: int = 50, after: str | None = None):
+        from .dispatch import DispatchRepository
+        return DispatchRepository(repo).owner_list_requests(role_owner(request), project, limit, after)
+
+    @app.get('/api/hub/v1/orchestration/dispatches/{dispatch_id}/reports')
+    def get_orchestration_reports(dispatch_id: str, request: Request, limit: int = 50, after_revision: int = 0):
+        from .dispatch import DispatchRepository
+        return DispatchRepository(repo).owner_records(role_owner(request), dispatch_id, 'dispatch_report', limit, after_revision)
+
+    @app.get('/api/hub/v1/orchestration/dispatches/{dispatch_id}/decisions')
+    def get_orchestration_decisions(dispatch_id: str, request: Request, limit: int = 50, after_revision: int = 0):
+        from .dispatch import DispatchRepository
+        return DispatchRepository(repo).owner_records(role_owner(request), dispatch_id, 'decision', limit, after_revision)
+
     @app.get('/api/hub/v1/roles/{role}')
     def get_role(role: str, request: Request):
         from .roles import RoleRepository
