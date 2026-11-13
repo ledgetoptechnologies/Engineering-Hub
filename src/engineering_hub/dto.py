@@ -86,6 +86,12 @@ class OrchestrationRequestView(ResponseDTO):
     execution_authorization: Literal[False]
 
 
+class OrchestrationTrackingTaskIds(ResponseDTO):
+    request_id: str
+    task_ids: list[str]
+    next_after: str | None
+
+
 class EntityDTO(ResponseDTO):
     id: str
     revision: int = Field(ge=1)

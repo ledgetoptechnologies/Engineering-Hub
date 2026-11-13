@@ -575,3 +575,6 @@ async def test_orchestration_request_view_gateway_is_read_only_and_exact():
         assert not browser_route_allowed(method, path)
     for near in (path + '/extra', path.replace('project-alpha', '..'), path.replace('12345678-1234-1234-1234-123456789abc', 'invalid')):
         assert not browser_route_allowed('GET', near)
+    linked = path.removesuffix('/view') + '/tracking-tasks'
+    assert browser_route_allowed('GET', linked) and browser_route_allowed('HEAD', linked)
+    assert not browser_route_allowed('POST', linked) and not browser_route_allowed('GET', linked + '/extra')

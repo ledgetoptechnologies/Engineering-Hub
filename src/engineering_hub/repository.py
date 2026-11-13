@@ -448,14 +448,26 @@ class HubRepository:
             finally:
                 db.rollback()
 
-    def propose_tracking_task(self, actor, project, title, client_request_id, *, details=None, links=None):
+    def propose_tracking_task(self, actor, project, title, client_request_id, *, details=None, links=None, origin_request_id=None):
         """Idempotent agent-authored tracking only; creates no dispatch authority."""
         self._actor(actor, agent=True)
         title, key = self._text(title), self._text(client_request_id, 128)
         context = self._context(details, links)
-        fingerprint = hashlib.sha256(_json(['tracking_task', project, title, context]).encode()).hexdigest()
+        parts = ['tracking_task', project, title, context]
+        if origin_request_id is not None:
+            from .dispatch import DispatchRepository, _canonical_id
+            dispatch = DispatchRepository(self)
+            operation = dispatch._operation(actor)
+            dispatch._grant(operation, 'tracking.propose', 'dispatch.read')
+            _canonical_id(origin_request_id)
+            parts.append(origin_request_id)
+        fingerprint = hashlib.sha256(_json(parts).encode()).hexdigest()
         with self._transaction() as db:
             self._project(project, db)
+            if origin_request_id is not None:
+                request = dispatch._request(db, origin_request_id)
+                if request['project'] != project:
+                    raise HubError('dispatch_unavailable', 404)
             prior = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
             if prior:
                 if prior['fingerprint'] != fingerprint:
@@ -464,8 +476,70 @@ class HubRepository:
             item = self._save(db, actor, 'tracking_task.proposed', 'tracking_task', dict(
                 id=str(uuid.uuid4()), project=project, title=title, status='open',
                 created_by=actor, execution_authorization=False, updates=[], **context), new=True)
+            if origin_request_id is not None:
+                identity = str(uuid.uuid5(uuid.UUID('61a577b0-3296-4b36-9303-83c24ec3ab37'), item['id']))
+                db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
+                           (identity, 'tracking_origin', _json(dict(task_id=item['id'], project=project,
+                                                                   request_id=origin_request_id))))
             db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
             return item
+
+    def tracking_task_origin(self, actor, task_id):
+        """Reveal provenance only to a project-scoped EHS reader with both grants."""
+        from .dispatch import DispatchRepository, _canonical_id
+        dispatch = DispatchRepository(self)
+        operation = dispatch._operation(actor)
+        dispatch._grant(operation, 'tracking.read', 'dispatch.read')
+        try:
+            _canonical_id(task_id)
+            with self._connection() as db:
+                db.execute('BEGIN')
+                task = self._get(db, task_id, 'tracking_task')
+                self._project(task['project'], db)
+                identity = str(uuid.uuid5(uuid.UUID('61a577b0-3296-4b36-9303-83c24ec3ab37'), task_id))
+                row = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='tracking_origin'", (identity,)).fetchone()
+                if row is None:
+                    return dict(task_id=task_id, origin_request_id=None)
+                origin = json.loads(row['data'])
+                request = dispatch._request(db, origin['request_id'])
+                if origin['task_id'] != task_id or origin['project'] != task['project'] or request['project'] != task['project']:
+                    raise ValueError()
+                return dict(task_id=task_id, origin_request_id=request['id'])
+        except (HubError, ValueError, TypeError, KeyError):
+            raise HubError('hub_tracking_task_unavailable', 404) from None
+
+    def tracking_request_tasks(self, actor, project, request_id, limit, after):
+        """Bounded private reverse lookup, scoped before pagination."""
+        from .dispatch import DispatchRepository, _canonical_id
+        dispatch = DispatchRepository(self)
+        operation = dispatch._operation(actor)
+        dispatch._grant(operation, 'tracking.read', 'dispatch.read')
+        return self._tracking_request_tasks(project, request_id, limit, after)
+
+    def owner_tracking_request_tasks(self, actor, project, request_id, limit, after):
+        self._actor(actor, human=True)
+        return self._tracking_request_tasks(project, request_id, limit, after)
+
+    def _tracking_request_tasks(self, project, request_id, limit, after):
+        from .dispatch import DispatchRepository, _canonical_id
+        dispatch = DispatchRepository(self)
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise HubError('invalid_limit', 422)
+        if after is not None:
+            _canonical_id(after)
+        with self._connection() as db:
+            db.execute('BEGIN')
+            self._project(project, db)
+            request = dispatch._request(db, request_id)
+            if request['project'] != project:
+                raise HubError('dispatch_unavailable', 404)
+            rows = db.execute("SELECT t.id FROM hub_entities o JOIN hub_entities t "
+                              "ON t.id=json_extract(o.data,'$.task_id') AND t.kind='tracking_task' "
+                              "WHERE o.kind='tracking_origin' AND json_extract(o.data,'$.project')=? "
+                              "AND json_extract(o.data,'$.request_id')=? AND json_extract(t.data,'$.project')=? "
+                              "AND t.id>? ORDER BY t.id LIMIT ?", (project, request['id'], project, after or '', limit + 1)).fetchall()
+            ids = [row['id'] for row in rows[:limit]]
+            return dict(request_id=request['id'], task_ids=ids, next_after=ids[-1] if len(rows) > limit else None)
 
     def update_tracking_task(self, actor, identity, expected_revision, client_request_id, *,
                              progress, evidence_links, completion_claim=False):

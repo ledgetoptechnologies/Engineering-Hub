@@ -139,6 +139,7 @@ def browser_route_allowed(method, path, *, allow_bound_oauth_callback=False):
                 or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/worker-attention-(?:routes|receipts)/' + _PROJECT_ID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/orchestration-requests', path) is not None
                 or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/orchestration-requests/' + _UUID + r'/view', path) is not None
+                or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/orchestration-requests/' + _UUID + r'/tracking-tasks', path) is not None
                 or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/orchestration-attention', path) is not None
                 or re.fullmatch(r'/api/hub/v1/orchestration/dispatches/' + _UUID + r'/(?:reports|decisions)', path) is not None
                 or re.fullmatch(r'/api/hub/v1/roles/' + _PROJECT_ID, path) is not None

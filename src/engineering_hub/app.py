@@ -43,7 +43,7 @@ from .registry_client import (
 from .dto import (
     AgentListDTO, AutonomyDTO, DecisionDTO, DecisionListDTO, EventStatusDTO,
     HealthDTO, OverviewDTO, PauseDTO, ProjectListDTO, RunDTO, RunListDTO, RecoveryDTO,
-    PilotReleaseEvidenceDTO, TaskDTO, TaskListDTO, OrchestrationRequestView,
+    PilotReleaseEvidenceDTO, TaskDTO, TaskListDTO, OrchestrationRequestView, OrchestrationTrackingTaskIds,
 )
 
 @dataclass(frozen=True)
@@ -1342,6 +1342,11 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         """Read one bounded snapshot; stale is the last checkpoint, not live liveness."""
         from .orchestration_view import request_view
         return request_view(repo, role_owner(request), project, request_id, limit, after)
+
+    @app.get('/api/hub/v1/projects/{project}/orchestration-requests/{request_id}/tracking-tasks', response_model=OrchestrationTrackingTaskIds)
+    def orchestration_request_tracking_tasks(project: str, request_id: str, request: Request, limit: int = 50, after: str | None = None):
+        """Owner-only linked task IDs, including tasks not yet dispatched."""
+        return repo.owner_tracking_request_tasks(role_owner(request), project, request_id, limit, after)
 
     @app.get('/api/hub/v1/projects/{project}/orchestration-attention')
     def list_orchestration_attention(project: str, request: Request, limit: int = 50, after: str | None = None):

@@ -33,6 +33,8 @@ TOOLS = {
     'hub_component_retire': 'component.write', 'hub_task_get': 'task.read', 'hub_project_tasks': 'task.list',
     'hub_tracking_task_propose': 'tracking.propose', 'hub_tracking_task_update': 'tracking.update',
     'hub_tracking_task_list': 'tracking.read', 'hub_tracking_task_history': 'tracking.read',
+    'hub_tracking_task_origin': 'tracking.read',
+    'hub_orchestration_request_tasks': 'tracking.read',
     'hub_tracking_task_compact': 'tracking.update',
     'hub_tracking_task_review': 'tracking.review',
     'hub_role_list': 'role.read', 'hub_role_get': 'role.read', 'hub_role_acquire': 'role.lease', 'hub_role_renew': 'role.lease',
@@ -416,7 +418,7 @@ class SessionHubBridge:
             except HubError:
                 raise HubError('role_unavailable', 404) from None
             return
-        elif tool in {'hub_tracking_task_update', 'hub_tracking_task_review', 'hub_tracking_task_history', 'hub_tracking_task_compact'}:
+        elif tool in {'hub_tracking_task_update', 'hub_tracking_task_review', 'hub_tracking_task_history', 'hub_tracking_task_compact', 'hub_tracking_task_origin'}:
             try:
                 project = self.repo._read(arguments['task_id'], 'tracking_task')['project']
                 operation.project(project)
