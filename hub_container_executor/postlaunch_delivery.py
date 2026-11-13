@@ -47,7 +47,11 @@ class ProtectedApprovalLease:
 
 
 async def wait_for_postlaunch_approval(path, *, verifier, release, approver_public_key, expected_engine_id, timeout_ms):
-    """Subscribe before checking existence; wait only for the exact leaf event."""
+    """Subscribe before checking existence; wait only for the exact leaf event.
+
+    The deadline begins after watch setup. Synchronous filesystem or signature
+    work cannot be interrupted here; an overrun is rejected after it returns.
+    """
     fd = None
     registered = False
     loop = asyncio.get_running_loop()
@@ -70,17 +74,23 @@ async def wait_for_postlaunch_approval(path, *, verifier, release, approver_publ
         # Receipt expiry is independently enforced while waiting and while read.
         verifier.accepted_launch_receipt()
         while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError
             try:
                 os.lstat(target)
             except FileNotFoundError:
                 pass
             else:
                 raw = read_protected_file(path, maximum_bytes=MAX_BYTES, private=True, require_readonly=True)
+                if time.monotonic() >= deadline:
+                    raise TimeoutError
                 approval = verify_postlaunch_approval(raw, verifier=verifier, release=release,
                     approver_public_key=approver_public_key, expected_engine_id=expected_engine_id)
                 lease = ProtectedApprovalLease(path, hashlib.sha256(raw).digest(), approval,
                     verifier, release, approver_public_key, expected_engine_id)
                 lease.check()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError
                 return lease
             remaining = min(deadline, verifier._deadline) - time.monotonic()
             if remaining <= 0:
