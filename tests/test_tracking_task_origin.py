@@ -88,6 +88,9 @@ def test_real_mcp_origin_capability_and_legacy_privacy(unified):
     assert request['id'] not in json.dumps(item)
     assert data(invoke('hub_tracking_task_origin', {'task_id': item['id']}))['origin_request_id'] == request['id']
     assert data(invoke('hub_orchestration_request_tasks', {'project': PROJECT, 'request_id': request['id']}))['task_ids'] == [item['id']]
+    summary = data(invoke('hub_orchestration_request_origin_task_summary', {'project': PROJECT, 'request_id': request['id']}))
+    assert summary['scope'] == 'origin_linked_tracking_tasks_only' and summary['tasks'][0]['id'] == item['id']
+    assert not summary['tasks'][0]['completion_verified'] and not summary['dispatch_only_tasks_included']
     path = f"/api/hub/v1/projects/{PROJECT}/orchestration-requests/{request['id']}/tracking-tasks"
     owner_response = client.get(path)
     assert owner_response.status_code == 200 and owner_response.json()['task_ids'] == [item['id']]
@@ -98,6 +101,7 @@ def test_real_mcp_origin_capability_and_legacy_privacy(unified):
     app.state.session_hub_bridge.grant_put(OWNER, installation, 1, [PROJECT], ['tracking.read'])
     assert invoke('hub_tracking_task_origin', {'task_id': item['id']})['isError']
     assert invoke('hub_orchestration_request_tasks', {'project': PROJECT, 'request_id': request['id']})['isError']
+    assert invoke('hub_orchestration_request_origin_task_summary', {'project': PROJECT, 'request_id': request['id']})['isError']
     assert request['id'] not in json.dumps(data(invoke('hub_tracking_task_list', {'project': PROJECT})))
     client.cookies.clear()
     assert client.get(path).status_code == 401
@@ -148,3 +152,58 @@ def test_origin_write_serializes_with_grant_revoke(env):
     with pytest.raises(HubError):
         call(env, writer, 'hub_tracking_task_propose', lambda actor: env.repo.propose_tracking_task(
             actor, PROJECT, 'Race', 'race', origin_request_id=request['id']))
+
+
+def test_origin_task_summary_scope_review_and_pagination(env):
+    orch, _, _, _, _, service, request, _ = setup_dispatch(env)
+    installation, writer, _ = pair(env, name='summary-writer', caps=(
+        'tracking.propose', 'tracking.read', 'dispatch.read'))
+    second_request = call(env, orch, 'hub_orchestration_request_create', lambda actor: service.create_request(
+        actor, 1, PROJECT, 'Second', 'second-request'))
+    tasks = [call(env, writer, 'hub_tracking_task_propose', lambda actor, n=n: env.repo.propose_tracking_task(
+        actor, PROJECT, f'Origin {n}', f'origin-{n}', origin_request_id=request['id'])) for n in range(2)]
+    # The origin is A even if dispatch associates the same task with B.
+    call(env, orch, 'hub_dispatch_create', lambda actor: service.create_dispatch(
+        actor, 1, second_request['id'], tasks[0]['id'], 'backend', 10, 'other-request-dispatch'))
+    proof = [{'label': 'proof', 'url': 'https://example.test/proof'}]
+    claimed = env.repo.update_tracking_task('codex', tasks[0]['id'], tasks[0]['revision'], 'summary-claim',
+        progress='Done', evidence_links=proof, completion_claim=True)
+    def page(req, after=None):
+        return call(env, writer, 'hub_orchestration_request_origin_task_summary', lambda actor:
+            env.repo.tracking_request_summary(actor, PROJECT, req, 1, after))
+    first = page(request['id'])
+    second = page(request['id'], first['next_after'])
+    items = first['tasks'] + second['tasks']
+    assert {v['id'] for v in items} == {t['id'] for t in tasks}
+    assert first['scope'] == 'origin_linked_tracking_tasks_only'
+    assert not first['dispatch_only_tasks_included'] and not first['execution_authorization']
+    assert next(v for v in items if v['id'] == claimed['id'])['status'] == 'completion_claimed'
+    assert all(not v['completion_verified'] for v in items)
+    assert page(second_request['id'])['tasks'] == []
+    env.repo.review_tracking_task(OWNER, claimed['id'], claimed['revision'], 'summary-review',
+        verdict='verify', note='Checked', evidence_links=proof)
+    items = page(request['id'])['tasks']
+    if items[0]['id'] != claimed['id']:
+        items = page(request['id'], items[0]['id'])['tasks']
+    assert items[0]['status'] == 'completion_verified' and items[0]['completion_verified']
+    env.bridge.grant_put(OWNER, installation, 1, [PROJECT], ['tracking.read'])
+    with pytest.raises(HubError):
+        page(request['id'])
+    _, dispatch_only, _ = pair(env, name='summary-no-tracking', caps=('dispatch.read',))
+    with pytest.raises(HubError):
+        call(env, dispatch_only, 'hub_orchestration_request_origin_task_summary', lambda actor:
+             env.repo.tracking_request_summary(actor, PROJECT, request['id'], 1, None))
+    _, reader, _ = pair(env, name='summary-reader', caps=('tracking.read', 'dispatch.read'))
+    with pytest.raises(HubError, match='invalid_limit'):
+        call(env, reader, 'hub_orchestration_request_origin_task_summary', lambda actor:
+             env.repo.tracking_request_summary(actor, PROJECT, request['id'], 51, None))
+    with pytest.raises(HubError):
+        call(env, reader, 'hub_orchestration_request_origin_task_summary', lambda actor:
+             env.repo.tracking_request_summary(actor, PROJECT, request['id'], 1, 'bad-cursor'))
+    with pytest.raises(HubError, match='dispatch_unavailable'):
+        call(env, reader, 'hub_orchestration_request_origin_task_summary', lambda actor:
+             env.repo.tracking_request_summary(actor, PROJECT, '00000000-0000-0000-0000-000000000001', 1, None))
+    _, foreign, _ = pair(env, name='summary-foreign', caps=('tracking.read', 'dispatch.read'), projects=('project-alpha',))
+    with pytest.raises(HubError):
+        call(env, foreign, 'hub_orchestration_request_origin_task_summary', lambda actor:
+             env.repo.tracking_request_summary(actor, PROJECT, request['id'], 1, None))

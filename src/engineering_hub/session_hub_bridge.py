@@ -35,6 +35,7 @@ TOOLS = {
     'hub_tracking_task_list': 'tracking.read', 'hub_tracking_task_history': 'tracking.read',
     'hub_tracking_task_origin': 'tracking.read',
     'hub_orchestration_request_tasks': 'tracking.read',
+    'hub_orchestration_request_origin_task_summary': 'tracking.read',
     'hub_tracking_task_compact': 'tracking.update',
     'hub_tracking_task_review': 'tracking.review',
     'hub_role_list': 'role.read', 'hub_role_get': 'role.read', 'hub_role_acquire': 'role.lease', 'hub_role_renew': 'role.lease',

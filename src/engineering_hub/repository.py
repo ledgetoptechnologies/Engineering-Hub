@@ -516,6 +516,41 @@ class HubRepository:
         dispatch._grant(operation, 'tracking.read', 'dispatch.read')
         return self._tracking_request_tasks(project, request_id, limit, after)
 
+    def tracking_request_summary(self, actor, project, request_id, limit, after):
+        """Read origin-linked tracking tasks; dispatch-only work is excluded."""
+        from .dispatch import DispatchRepository, _canonical_id
+        dispatch = DispatchRepository(self)
+        operation = dispatch._operation(actor)
+        dispatch._grant(operation, 'tracking.read', 'dispatch.read')
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise HubError('invalid_limit', 422)
+        if after is not None:
+            _canonical_id(after)
+        with self._connection() as db:
+            db.execute('BEGIN')
+            self._project(project, db)
+            request = dispatch._request(db, request_id)
+            if request['project'] != project:
+                raise HubError('dispatch_unavailable', 404)
+            rows = db.execute("SELECT t.id,t.data FROM hub_entities o JOIN hub_entities t "
+                              "ON t.id=json_extract(o.data,'$.task_id') AND t.kind='tracking_task' "
+                              "WHERE o.kind='tracking_origin' AND json_extract(o.data,'$.project')=? "
+                              "AND json_extract(o.data,'$.request_id')=? AND json_extract(t.data,'$.project')=? "
+                              "AND t.id>? ORDER BY t.id LIMIT ?", (project, request['id'], project, after or '', limit + 1)).fetchall()
+            items = []
+            for row in rows[:limit]:
+                task = json.loads(row['data'])
+                if task.get('id') != row['id'] or task.get('project') != project:
+                    raise HubError('dispatch_unavailable', 404)
+                items.append(dict(id=row['id'], title=task['title'], status=task['status'],
+                                  revision=task['revision'], updated_at=task['updated_at'],
+                                  completion_verified=task['status'] == 'completion_verified'))
+            return dict(request_id=request['id'], tasks=items,
+                        next_after=items[-1]['id'] if len(rows) > limit else None,
+                        snapshot='single_read_transaction_page', scope='origin_linked_tracking_tasks_only',
+                        pagination_note='Pages are separate snapshots; refresh from the beginning for newly linked tasks.',
+                        dispatch_only_tasks_included=False, execution_authorization=False)
+
     def owner_tracking_request_tasks(self, actor, project, request_id, limit, after):
         self._actor(actor, human=True)
         return self._tracking_request_tasks(project, request_id, limit, after)
