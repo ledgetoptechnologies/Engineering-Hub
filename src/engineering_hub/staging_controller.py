@@ -624,6 +624,11 @@ class StagingController:
                 item['phase'] = 'accepted'; self._save(item)
                 return await self._follow(item, receipt, claim)
             except Exception as error:
+                # A terminal result may have committed before rendering its
+                # response failed. Do not rewrite durable verified facts as a
+                # hold after the queue has already finalized or been released.
+                if item.get('phase') == 'verified':
+                    raise
                 if item['phase'] in ('queued', 'deposited'):
                     return self._finish_no_effect(item, claim, 'never_sent', 'admission_changed')
                 if isinstance(error, StagingNotAccepted) and error.reason not in ('worker_busy', 'worker_busy_or_held'):
@@ -780,6 +785,14 @@ class StagingController:
             except reconciliation_context.Changed:
                 raise
             except Exception:
+                # Finalization may already have committed a verified submission
+                # or released the queue reservation before a later read fails.
+                # Preserve those facts and surface the error; the next explicit
+                # reconciliation can finish an incomplete verified transition.
+                # A save error can have an uncertain commit outcome, so do not
+                # overwrite either possible durable state here.
+                if item.get('phase') == 'verified':
+                    raise
                 self._hold(item, item.get('claim'))
                 return {'job': self.queue.get_job(identity), 'resource_ids': item['resource_ids'], 'phase': 'held'}
 

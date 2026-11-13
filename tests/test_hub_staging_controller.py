@@ -633,6 +633,111 @@ async def test_owner_rechecks_original_receipt_without_rerun(env):
 
 
 @pytest.mark.asyncio
+async def test_reconcile_terminal_view_failure_does_not_rewrite_verified_submission(env, monkeypatch):
+    controller, client, _, _, _ = env
+    client.lost_ack = True
+    submitted = await controller.submit('codex', payload(env[4]))
+    identity = submitted['job']['id']
+    assert (await controller.run_once())['phase'] == 'held'
+    original = controller.queue.get_job
+    injected = False
+
+    def fail_once_after_terminal(job_id):
+        nonlocal injected
+        result = original(job_id)
+        if not injected and result['state'] == 'succeeded':
+            injected = True
+            raise OSError('synthetic terminal view read failure')
+        return result
+
+    monkeypatch.setattr(controller.queue, 'get_job', fail_once_after_terminal)
+    with pytest.raises(OSError, match='synthetic terminal view read failure'):
+        await controller.reconcile_for('human:1', identity, admission_guard=lambda db: None)
+    assert injected
+    assert original(identity)['state'] == 'succeeded'
+    assert controller._read(job_id=identity)['phase'] == 'verified'
+    assert client.posts == 1
+
+
+@pytest.mark.asyncio
+async def test_run_terminal_view_failure_does_not_rewrite_verified_submission(env, monkeypatch):
+    controller, client, _, _, repo = env
+    submitted = await controller.submit('codex', payload(repo))
+    identity = submitted['job']['id']
+    original = controller.queue.get_job
+    injected = False
+
+    def fail_once_after_terminal(job_id):
+        nonlocal injected
+        result = original(job_id)
+        if not injected and result['state'] == 'succeeded':
+            injected = True
+            raise OSError('synthetic terminal view read failure')
+        return result
+
+    monkeypatch.setattr(controller.queue, 'get_job', fail_once_after_terminal)
+    with pytest.raises(OSError, match='synthetic terminal view read failure'):
+        await controller.run_once()
+    assert injected
+    assert original(identity)['state'] == 'succeeded'
+    assert controller._read(job_id=identity)['phase'] == 'verified'
+    assert client.posts == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure_point', ['verified_save', 'verified_save_committed', 'queue_reconcile'])
+async def test_reconcile_finalization_error_preserves_retryable_state(env, monkeypatch, failure_point):
+    controller, client, _, _, repo = env
+    client.lost_ack = True
+    submitted = await controller.submit('codex', payload(repo))
+    identity = submitted['job']['id']
+    assert (await controller.run_once())['phase'] == 'held'
+    original_save = controller._save
+    original_reconcile = controller.queue.reconcile
+
+    def fail_save(item):
+        if item.get('phase') == 'verified':
+            if failure_point == 'verified_save_committed':
+                original_save(item)
+            raise OSError('synthetic verified save failure')
+        return original_save(item)
+
+    def fail_reconcile(**kwargs):
+        raise OSError('synthetic queue reconciliation failure')
+
+    with monkeypatch.context() as patch:
+        if failure_point in ('verified_save', 'verified_save_committed'):
+            patch.setattr(controller, '_save', fail_save)
+        else:
+            patch.setattr(controller.queue, 'reconcile', fail_reconcile)
+        with pytest.raises(OSError, match='synthetic'):
+            await controller.reconcile_for('human:1', identity, admission_guard=lambda db: None)
+    assert controller.queue.get_job(identity)['state'] == 'held'
+    assert controller._read(job_id=identity)['phase'] == ('held' if failure_point == 'verified_save' else 'verified')
+    assert (await controller.reconcile_for('human:1', identity, admission_guard=lambda db: None))['job']['state'] == 'succeeded'
+    assert client.posts == 1
+
+
+@pytest.mark.asyncio
+async def test_run_queue_completion_error_preserves_verified_for_reconciliation(env, monkeypatch):
+    controller, client, _, _, repo = env
+    submitted = await controller.submit('codex', payload(repo))
+    identity = submitted['job']['id']
+
+    def fail_complete(**kwargs):
+        raise OSError('synthetic queue completion failure')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(controller.queue, 'complete', fail_complete)
+        with pytest.raises(OSError, match='synthetic queue completion failure'):
+            await controller.run_once()
+    assert controller.queue.get_job(identity)['state'] == 'claimed'
+    assert controller._read(job_id=identity)['phase'] == 'verified'
+    assert (await controller.reconcile_for('human:1', identity, admission_guard=lambda db: None))['job']['state'] == 'succeeded'
+    assert client.posts == 1
+
+
+@pytest.mark.asyncio
 async def test_reconcile_competing_pause_during_worker_read_fails_without_rewriting(env):
     controller, client, _, _, repo = env
     client.lost_ack = True
