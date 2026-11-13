@@ -3,6 +3,9 @@ import asyncio
 import hashlib
 import io
 import json
+import os
+import signal
+import sys
 import uuid
 import zipfile
 
@@ -1064,6 +1067,114 @@ async def test_reconcile_interrupted_after_each_local_commit_recovers_without_re
         if state['state'] not in ('succeeded', 'failed'):
             assert machine['job_id'] == identity
     fresh = HubRepository(repo.path)
+    principal = object()
+    reopened_resources = StagingResourceStore(fresh, admin_actors=frozenset({'human:1'}),
+        control_principal=principal, clock=resources.clock)
+    reopened_queue, actions = compose_queue(fresh, None, {'engineering-hub': ['static'], 'landscripting': ['static']}, 'staging-pc')
+    restarted = StagingController(fresh, reopened_queue, client, resources=reopened_resources,
+        control_principal=principal, actions=actions, poll_interval=0.001)
+    result = await restarted.reconcile_for('human:1', identity, admission_guard=lambda db: None)
+    assert result['job']['state'] == 'succeeded'
+    assert client.posts == 1
+
+
+@pytest.mark.skipif(sys.platform != 'linux', reason='requires POSIX SIGKILL')
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stop_after', (1, 4, 8))
+async def test_reconcile_process_killed_after_commit_recovers_without_repost(env, tmp_path, stop_after):
+    """Kill only a disposable child after a committed local transaction.
+
+    The remote worker is an in-memory synthetic receipt copied to the child;
+    this exercises SQLite process recovery, not a real worker or power loss.
+    """
+    controller, client, resources, _, repo = env
+    client.lost_ack = True
+    submitted = await controller.submit('codex', payload(repo))
+    await controller.run_once()
+    identity = submitted['job']['id']
+    state_file = tmp_path / 'worker.json'
+    state_file.write_text(json.dumps({'jobs': client.jobs, 'facts': client.facts,
+                                      'bindings': client.bindings}), encoding='utf-8')
+    child = r'''
+import asyncio, importlib.util, json, os, signal, sys
+from contextlib import contextmanager
+spec = importlib.util.spec_from_file_location('staging_fixture', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+state = json.load(open(sys.argv[3], encoding='utf-8'))
+repo = module.HubRepository(sys.argv[2])
+principal = object()
+resources = module.StagingResourceStore(repo, admin_actors=frozenset({'human:1'}),
+    control_principal=principal, clock=lambda: 1800000000)
+queue, actions = module.compose_queue(repo, None, {'engineering-hub': ['static'],
+    'landscripting': ['static']}, 'staging-pc')
+client = module.Client()
+client.jobs, client.facts, client.bindings = state['jobs'], state['facts'], state['bindings']
+async def forbidden_submit(payload):
+    with open(sys.argv[6], 'w', encoding='utf-8') as marker:
+        marker.write('unexpected submit')
+        marker.flush()
+        os.fsync(marker.fileno())
+    raise AssertionError('reconciliation must not submit')
+client.submit = forbidden_submit
+client.cleanup = forbidden_submit
+client.put_source = forbidden_submit
+controller = module.StagingController(repo, queue, client, resources=resources,
+    control_principal=principal, actions=actions, poll_interval=0.001)
+original = repo._transaction
+commits = 0
+@contextmanager
+def kill_after_commit(*args, **kwargs):
+    global commits
+    with original(*args, **kwargs) as db:
+        yield db
+    commits += 1
+    if commits == int(sys.argv[5]):
+        with repo._connection() as check:
+            job = check.execute('SELECT state, revision FROM hub_work_jobs WHERE id=?', (sys.argv[4],)).fetchone()
+            submission = json.loads(check.execute('SELECT data FROM hub_staging_submissions').fetchone()[0])
+            states = [json.loads(row[0]).get('state') for row in check.execute(
+                "SELECT data FROM hub_entities WHERE kind='staging_resource'")]
+            snapshot = {'commit': commits, 'job_state': job['state'], 'job_revision': job['revision'],
+                        'submission_phase': submission['phase'], 'resource_states': sorted(states),
+                        'admissions': check.execute('SELECT count(*) FROM hub_staging_reconcile_admissions').fetchone()[0]}
+        with open(sys.argv[7], 'w', encoding='utf-8') as marker:
+            json.dump(snapshot, marker)
+            marker.flush()
+            os.fsync(marker.fileno())
+        os.kill(os.getpid(), signal.SIGKILL)
+repo._transaction = kill_after_commit
+asyncio.run(controller.reconcile_for('human:1', sys.argv[4], admission_guard=lambda db: None))
+'''
+    post_marker = tmp_path / 'unexpected-post'
+    checkpoint = tmp_path / 'checkpoint.json'
+    process = await asyncio.create_subprocess_exec(sys.executable, '-c', child, __file__, str(repo.path),
+                                                   str(state_file), identity, str(stop_after), str(post_marker), str(checkpoint),
+                                                   stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+    assert process.returncode == -signal.SIGKILL, (process.returncode, stdout, stderr)
+    assert not post_marker.exists()
+    observed = json.loads(checkpoint.read_text(encoding='utf-8'))
+    expected = {
+        1: ('held', 'held', ['provisioning'] * 4),
+        4: ('held', 'held', ['provisioning', 'ready', 'ready', 'ready']),
+        8: ('succeeded', 'verified', ['ready'] * 4),
+    }
+    job_state, phase, resource_states = expected[stop_after]
+    assert observed['commit'] == stop_after and observed['admissions'] == 1
+    assert (observed['job_state'], observed['submission_phase'], observed['resource_states']) == (
+        job_state, phase, resource_states)
+    fresh = HubRepository(repo.path)
+    with fresh._connection() as db:
+        state = db.execute('SELECT state,machine_id FROM hub_work_jobs WHERE id=?', (identity,)).fetchone()
+        machine = db.execute('SELECT job_id FROM hub_work_machines WHERE machine_id=?', (state['machine_id'],)).fetchone()
+        if state['state'] not in ('succeeded', 'failed'):
+            assert machine['job_id'] == identity
     principal = object()
     reopened_resources = StagingResourceStore(fresh, admin_actors=frozenset({'human:1'}),
         control_principal=principal, clock=resources.clock)
