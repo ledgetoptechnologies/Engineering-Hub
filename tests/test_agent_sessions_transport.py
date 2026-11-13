@@ -315,14 +315,53 @@ async def test_source_ip_and_transport_caps_fail_closed(tmp_path, monkeypatch):
     a, b = repo.exchange(credential(repo, 'A')), repo.exchange(credential(repo, 'B'))
     async with listening(app) as origin:
         async with httpx.AsyncClient(base_url=origin, timeout=3) as client:
+            slash = await client.post('/mcp/', headers=headers(a['token']), json={
+                'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {}})
+            assert slash.status_code == 404
             sid = await initialize(client, a['token'])
             attempted = await rpc(client, b['token'], None, 'initialize', {
                 'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 'bounded', 'version': '1'}})
             assert attempted.status_code == 429
             assert (await rpc(client, a['token'], sid, 'ping')).status_code == 200
+            legacy = await initialize(client, AUTH.codex_token)
+            assert (await rpc(client, AUTH.codex_token, legacy, 'ping')).status_code == 200
+            assert (await rpc(client, b['token'], legacy, 'ping')).status_code == 404
+            assert (await rpc(client, AUTH.codex_token, sid, 'ping')).status_code == 404
             assert (await client.delete('/mcp', headers=headers(a['token'], sid))).status_code == 200
-            # Removing an owner must not permit unbounded SDK transport churn.
-            assert (await rpc(client, b['token'], None, 'initialize', {})).status_code == 429
+            # The SDK has actually ended the old transport. Its isolated slot
+            # is reusable, even after more creations than the capacity.
+            for _ in range(4):
+                current = await initialize(client, b['token'])
+                assert (await client.delete('/mcp', headers=headers(b['token'], current))).status_code == 200
+            assert (await rpc(client, AUTH.codex_token, legacy, 'ping')).status_code == 200
+            assert (await client.delete('/mcp', headers=headers(AUTH.codex_token, legacy))).status_code == 200
+    assert repo._listeners == {}
+
+
+@pytest.mark.asyncio
+async def test_failed_openings_and_revoke_reap_only_isolated_sessions(tmp_path, monkeypatch):
+    monkeypatch.setattr('agent_message_bus.agent_sessions_transport.MAX_NEW_TRANSPORTS', 1)
+    app = bus(tmp_path)
+    # Bound the real SDK idle cleanup for the test; no SDK private lifecycle
+    # hooks are used by the application or needed by this test.
+    app.state.agent_session_mcp_manager.session_idle_timeout = 0.2
+    repo = app.state.agent_sessions
+    a, b = repo.exchange(credential(repo, 'A')), repo.exchange(credential(repo, 'B'))
+    async with listening(app) as origin:
+        async with httpx.AsyncClient(base_url=origin, timeout=3) as client:
+            legacy = await initialize(client, AUTH.codex_token)
+            for _ in range(4):
+                response = await rpc(client, a['token'], None, 'ping')
+                assert response.status_code == 400
+            old = await initialize(client, a['token'])
+            repo.revoke_session(OWNER, a['session']['id'], 1)
+            await asyncio.sleep(0.6)
+            assert (await rpc(client, a['token'], old, 'ping')).status_code == 401
+            assert (await rpc(client, AUTH.codex_token, legacy, 'ping')).status_code == 200
+            current = await initialize(client, b['token'])
+            assert (await rpc(client, b['token'], current, 'ping')).status_code == 200
+            assert (await client.delete('/mcp', headers=headers(b['token'], current))).status_code == 200
+            assert (await client.delete('/mcp', headers=headers(AUTH.codex_token, legacy))).status_code == 200
     assert repo._listeners == {}
 
 
@@ -500,7 +539,8 @@ async def test_real_mcp_post_sse_ends_on_revocation_or_expiry(tmp_path, monkeypa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('composition', ['bus', 'combined', 'direct'])
-async def test_revocation_during_initialize_never_publishes_owned_sdk_session(tmp_path, composition):
+async def test_revocation_during_initialize_never_publishes_owned_sdk_session(tmp_path, composition, monkeypatch):
+    monkeypatch.setattr('agent_message_bus.agent_sessions_transport.MAX_NEW_TRANSPORTS', 1)
     embedded = bus(tmp_path)
     repo = embedded.state.agent_sessions
     app = embedded if composition == 'bus' else create_hub(Settings(
@@ -529,11 +569,18 @@ async def test_revocation_during_initialize_never_publishes_owned_sdk_session(tm
                     'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 'initialize-race', 'version': '1'}}}))
             try:
                 await asyncio.wait_for(started.wait(), 3)
+                # The in-flight open owns the sole EHS slot, but cannot block
+                # creation or use of a legacy transport in its own manager.
+                assert (await rpc(client, b['token'], None, 'initialize', {})).status_code == 429
+                legacy_sid = await initialize(client, AUTH.codex_token)
+                assert (await rpc(client, AUTH.codex_token, legacy_sid, 'ping')).status_code == 200
                 repo.revoke_session(OWNER, a['session']['id'], 1)
                 response = await asyncio.wait_for(pending, 2)
                 assert response.status_code == 401 and 'Mcp-Session-Id' not in response.headers
                 other_sid = await initialize(client, b['token'])
                 assert (await rpc(client, b['token'], other_sid, 'ping')).status_code == 200
+                assert (await rpc(client, AUTH.codex_token, legacy_sid, 'ping')).status_code == 200
+                assert (await client.delete('/mcp', headers=headers(AUTH.codex_token, legacy_sid))).status_code == 200
             finally:
                 release.set()
                 if not pending.done():
