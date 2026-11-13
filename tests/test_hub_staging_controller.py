@@ -216,6 +216,131 @@ async def test_cleanup_exact_receipt_tombstone_and_uncertainty_never_replayed(en
     assert client.cleanup_posts == posts
 
 
+def human_cleanup_guard(repo, sessions):
+    from starlette.requests import Request
+    from engineering_hub.auth import AuthConfig, human_transaction_guard
+    config = AuthConfig('https://hub.test', beau_github_id=1)
+    session = sessions.create_session(1)
+    scope = {'type': 'http', 'method': 'POST', 'path': '/', 'headers': [
+        (b'origin', config.origin.encode()),
+        (b'x-hub-csrf', session['csrf_token'].encode()),
+        (b'cookie', f"{config.cookie_name}={session['cookie_token']}".encode()),
+    ]}
+    request = Request(scope)
+    return session, human_transaction_guard(request, config, sessions, 'human:1')
+
+
+@pytest.mark.asyncio
+async def test_human_cleanup_logout_while_waiting_for_lock_rolls_back_admission(env):
+    from fastapi import HTTPException
+    from engineering_hub.auth import SessionStore
+    controller, client, resources, now, repo = env
+    submitted = await controller.submit('codex', payload(repo))
+    await controller.run_once()
+    now[0] += 32 * 86400
+    identity = submitted['resource_ids']['preview']
+    plan = resources.cleanup_plan('human:1', 'engineering-hub', kinds=['preview'])
+    sessions = SessionStore(repo.path, repository=repo)
+    session, guard = human_cleanup_guard(repo, sessions)
+    await controller.lock.acquire()
+    task = asyncio.create_task(controller.cleanup_apply('human:1', plan['plan_id'], plan['digest'], admission_guard=guard))
+    await asyncio.sleep(0)
+    sessions.delete_session(session['cookie_token'])
+    controller.lock.release()
+    with pytest.raises(HTTPException) as error:
+        await task
+    assert error.value.status_code == 401
+    assert client.cleanup_posts == 0
+    assert resources.get_resource('human:1', identity)['state'] == 'ready'
+
+
+@pytest.mark.parametrize('expire', [False, True])
+@pytest.mark.asyncio
+async def test_human_cleanup_revoked_during_preflight_never_dispatches(env, expire):
+    from engineering_hub.auth import SessionStore
+    controller, client, resources, now, repo = env
+    submitted = await controller.submit('codex', payload(repo))
+    await controller.run_once()
+    now[0] += 32 * 86400
+    identity = submitted['resource_ids']['preview']
+    plan = resources.cleanup_plan('human:1', 'engineering-hub', kinds=['preview'])
+    sessions = SessionStore(repo.path, repository=repo)
+    session, guard = human_cleanup_guard(repo, sessions)
+    original = client.resource
+    async def revoked_before_dispatch(resource_id):
+        fact = await original(resource_id)
+        if expire:
+            with sessions._db() as db:
+                db.execute('UPDATE auth_sessions SET expires=0')
+        else:
+            sessions.delete_session(session['cookie_token'])
+        return fact
+    client.resource = revoked_before_dispatch
+    result = await controller.cleanup_apply('human:1', plan['plan_id'], plan['digest'], admission_guard=guard)
+    assert result['failed'] == [{'id': identity, 'code': 'not_dispatched'}]
+    assert client.cleanup_posts == 0
+    assert resources.get_resource('human:1', identity)['state'] == 'ready'
+
+
+@pytest.mark.asyncio
+async def test_human_cleanup_admitted_before_logout_may_finish_without_repost(env):
+    from engineering_hub.auth import SessionStore
+    controller, client, resources, now, repo = env
+    submitted = await controller.submit('codex', payload(repo))
+    await controller.run_once()
+    now[0] += 32 * 86400
+    identity = submitted['resource_ids']['preview']
+    plan = resources.cleanup_plan('human:1', 'engineering-hub', kinds=['preview'])
+    sessions = SessionStore(repo.path, repository=repo)
+    session, guard = human_cleanup_guard(repo, sessions)
+    original = client.cleanup
+    async def logout_after_dispatch_intent(data):
+        sessions.delete_session(session['cookie_token'])
+        return await original(data)
+    client.cleanup = logout_after_dispatch_intent
+    result = await controller.cleanup_apply('human:1', plan['plan_id'], plan['digest'], admission_guard=guard)
+    assert result['removed'] == [identity] and client.cleanup_posts == 1
+    _, fresh_guard = human_cleanup_guard(repo, sessions)
+    replay = await controller.cleanup_apply('human:1', plan['plan_id'], plan['digest'], admission_guard=fresh_guard)
+    assert replay['removed'] == [identity] and client.cleanup_posts == 1
+
+
+@pytest.mark.asyncio
+async def test_human_cleanup_http_wires_guard_through_preflight(env):
+    import httpx
+    from fastapi import FastAPI
+    from engineering_hub.auth import AuthConfig, SessionStore, human_transaction_guard, require_human
+    from engineering_hub.staging_api import attach_staging_routes
+    controller, client, resources, now, repo = env
+    submitted = await controller.submit('codex', payload(repo))
+    await controller.run_once()
+    now[0] += 32 * 86400
+    identity = submitted['resource_ids']['preview']
+    plan = resources.cleanup_plan('human:1', 'engineering-hub', kinds=['preview'])
+    sessions = SessionStore(repo.path, repository=repo)
+    session = sessions.create_session(1)
+    config = AuthConfig('https://hub.test', beau_github_id=1)
+    app = FastAPI()
+    def human(request, mutation=False):
+        return require_human(request, config, sessions, mutation=mutation)
+    attach_staging_routes(app, controller, human, human,
+        human_admission=lambda request, principal: human_transaction_guard(request, config, sessions, principal))
+    original = client.resource
+    async def logout_during_preflight(resource_id):
+        fact = await original(resource_id)
+        sessions.delete_session(session['cookie_token'])
+        return fact
+    client.resource = logout_during_preflight
+    headers = {'origin': config.origin, 'x-hub-csrf': session['csrf_token'],
+               'cookie': f"{config.cookie_name}={session['cookie_token']}"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=config.origin) as http:
+        response = await http.post('/api/hub/v1/staging/cleanup/apply', headers=headers,
+            json={'plan_id': plan['plan_id'], 'digest': plan['digest']})
+    assert response.status_code == 200
+    assert response.json()['failed'] == [{'id': identity, 'code': 'not_dispatched'}]
+    assert client.cleanup_posts == 0
+
+
 @pytest.mark.parametrize('failure', ['timeout', 'referenced', 'wrong-job'])
 @pytest.mark.asyncio
 async def test_cleanup_preflight_failure_restores_with_receipt_and_requires_new_plan(env, failure):
@@ -600,7 +725,8 @@ async def test_public_operations_report_busy_without_waiting_for_long_job(env):
     try:
         async with asyncio.timeout(2):
             for operation in (controller.submit('codex', payload(repo)),
-                              controller.cleanup_apply('human:1', str(uuid.uuid4()), 'sha256:' + 'a' * 64),
+                              controller.cleanup_apply('human:1', str(uuid.uuid4()), 'sha256:' + 'a' * 64,
+                                                       admission_guard=lambda db: None),
                               controller.reconcile_for('human:1', submitted['job']['id'])):
                 with pytest.raises(HubError, match='staging_busy'):
                     await operation

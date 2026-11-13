@@ -149,6 +149,12 @@ Cleanup plans expire after10 minutes and bind actor, IDs, revisions and digest.
 Apply rechecks permission, expiry, job state, protection and revision in a
 transaction before marking items deleting. Worker deletion is confined to
 registered owned resource paths/containers and rechecks ownership and liveness.
+For a human cleanup apply, the exact browser session is checked in the same
+ledger writer immediately before both the initial cleanup commit and the
+dispatching journal commit. Logout is serialized with those commits; expiry is
+checked just before commit, not continuously through commit. Once the exact
+dispatch intent is committed, a later logout does not cancel that already
+admitted operation. Its original outcome is reconciled without another POST.
 EH records confirmed deletion only after a matching worker receipt; timeouts
 stay uncertain for inspection. No Docker prune, global directory sweep or
 automatic history deletion. Compact tombstones and job summaries remain.

@@ -636,10 +636,12 @@ class StagingController:
                 self._hold(item, item.get('claim'))
                 return {'job': self.queue.get_job(identity), 'resource_ids': item['resource_ids'], 'phase': 'held'}
 
-    async def cleanup_apply(self, actor, plan_id, digest):
+    async def cleanup_apply(self, actor, plan_id, digest, *, admission_guard=None):
+        if actor.startswith('human:') and admission_guard is None:
+            raise HubError('staging_human_admission_required', 403)
         async with self._short_lock():
             self._shared_guard()
-            begun = self.resources.cleanup_begin(actor, plan_id, digest)
+            begun = self.resources.cleanup_begin(actor, plan_id, digest, admission_guard=admission_guard)
             result = {'removed': [], 'failed': [], 'skipped_changed': [entry['id'] for entry in begun['skipped']]}
             for operation in begun['operations']:
                 identity, command = operation['id'], operation['operation_id']
@@ -687,7 +689,7 @@ class StagingController:
                     payload = {'command_id': command, 'idempotency_key': command,
                                'resources': [{'resource_id': identity, 'expected_revision': fact['revision']}]}
                     self._shared_guard(admission=True)
-                    with self.repo._transaction() as db:
+                    with self.repo._transaction(before_commit=admission_guard) as db:
                         local = self.resources._resource(db, identity)
                         self.repo._cas(local, operation['expected_revision'])
                         self.resources._authorize(db, actor, local['project'], 'cleanup')

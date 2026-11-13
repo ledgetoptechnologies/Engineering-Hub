@@ -22,7 +22,7 @@ from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
 
 from agent_message_bus.auth import AuthSettings
-from .auth import AuthConfig, SessionStore, build_auth_router, require_human
+from .auth import AuthConfig, SessionStore, build_auth_router, human_transaction_guard, require_human
 from .build_info import read_build_commit
 from .image_version_reports import image_versions_for
 from .image_version_reports import ImageVersionsSummary
@@ -1022,7 +1022,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     from .staging_api import attach_staging_routes
     attach_staging_routes(app, staging_module.controller, actor, human,
         preview_broker=staging_module.preview_broker, preview_session=preview_session,
-        module_status=staging_module.status, diagnostic_session=diagnostic_session, observer=staging_observer)
+        module_status=staging_module.status, diagnostic_session=diagnostic_session, observer=staging_observer,
+        human_admission=lambda request, principal: human_transaction_guard(
+            request, settings.auth_config, sessions, principal))
     from .shared_staging_api import attach_shared_staging_routes
     attach_shared_staging_routes(app, shared_staging, human)
 

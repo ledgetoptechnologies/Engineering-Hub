@@ -154,7 +154,7 @@ class HubRepository:
             db.close()
 
     @contextmanager
-    def _transaction(self):
+    def _transaction(self, *, before_commit=None):
         self._assert_pilot_owner(None)
         with self._write_connection() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -163,6 +163,8 @@ class HubRepository:
                 yield db
                 self._assert_pilot_owner(db)
                 session_context.before_commit(self.path, db)
+                if before_commit is not None:
+                    before_commit(db)
                 db.commit()
             except Exception:
                 db.rollback()

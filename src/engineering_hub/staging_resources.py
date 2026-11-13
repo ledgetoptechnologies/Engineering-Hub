@@ -574,9 +574,9 @@ class StagingResourceStore:
                        (plan['plan_id'], actor, _json(stored)))
             return plan
 
-    def cleanup_begin(self, actor, plan_id, digest):
+    def cleanup_begin(self, actor, plan_id, digest, *, admission_guard=None):
         _actor(actor)
-        with self.repo._transaction() as db:
+        with self.repo._transaction(before_commit=admission_guard) as db:
             row = db.execute('SELECT * FROM hub_staging_cleanup_plans WHERE id=?', (_uuid(plan_id),)).fetchone()
             if row is None:
                 raise HubError('not_found', 404)

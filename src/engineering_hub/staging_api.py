@@ -100,7 +100,8 @@ async def _payload(request, model, *, maximum=65536):
 
 
 def attach_staging_routes(app, controller, actor, human, preview_broker=None, preview_session=None,
-                          module_status=None, diagnostic_session=None, observer=None):
+                          module_status=None, diagnostic_session=None, observer=None,
+                          human_admission=None):
     """Compose existing authenticated callbacks; attaching starts no work."""
     def configured():
         if controller is None:
@@ -221,6 +222,12 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         service = configured()
         payload = await _payload(request, StagingCleanupApply)
         revalidate(request, principal)
+        if principal.startswith('human:'):
+            if not callable(human_admission):
+                raise HubError('staging_human_admission_unavailable', 503)
+            guard = human_admission(request, principal)
+            return await service.cleanup_apply(principal, payload.plan_id, payload.digest,
+                                               admission_guard=guard)
         return await service.cleanup_apply(principal, payload.plan_id, payload.digest)
 
     @app.post('/api/hub/v1/staging/jobs', status_code=202)

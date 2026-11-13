@@ -342,6 +342,70 @@ def require_human(request: Request, config: AuthConfig, store: SessionStore, mut
     return session["actor"]
 
 
+def human_transaction_guard(request: Request, config: AuthConfig, store: SessionStore, actor: str):
+    """Revalidate the exact browser session using the caller's ledger writer.
+
+    The caller supplies the same Hub SQLite transaction used for admission.
+    Logout shares that writer, so it is serialized with the last pre-commit
+    check. Time-based expiry is checked at that point, not during SQLite commit
+    or an already-admitted remote operation.
+    """
+    if require_human(request, config, store, mutation=True) != actor:
+        raise HTTPException(403, "Human identity changed")
+    token = request.cookies.get(config.cookie_name)
+    if type(token) is not str or not token or store.repository is None:
+        raise HTTPException(401, "Human sign-in required")
+    token_hash = _hash(token)
+    csrf = request.headers.get('x-hub-csrf', '')
+
+    def guard(db):
+        if (request.headers.get('authorization') or request.headers.get('origin') != config.origin
+                or request.cookies.get(config.cookie_name) != token
+                or not secrets.compare_digest(request.headers.get('x-hub-csrf', ''), csrf)):
+            raise HTTPException(403, "Request verification failed")
+        now = store.clock()
+        if config.human_auth_mode == 'github':
+            row = db.execute('SELECT github_id,csrf_token,expires FROM auth_sessions WHERE token_hash=?',
+                             (token_hash,)).fetchone()
+            valid = (row is not None and row[0] == config.beau_github_id
+                     and actor == f'human:{row[0]}' and row[2] > now
+                     and secrets.compare_digest(row[1], csrf))
+        elif config.human_auth_mode == 'cloudflare_access':
+            identity = getattr(request.state, 'cloudflare_identity', None)
+            valid = False
+            if type(identity) is CloudflareIdentity and identity.expires_at > now:
+                enrolled = db.execute('SELECT binding,actor FROM auth_access_identities WHERE identity_key=?',
+                    (store._cloudflare_identity_key(config, identity),)).fetchone()
+                row = db.execute('SELECT binding,actor,csrf_token,expires FROM auth_access_sessions WHERE token_hash=?',
+                                 (token_hash,)).fetchone()
+                binding = store._cloudflare_binding(config, identity)
+                valid = (enrolled is not None and row is not None and row[3] > now
+                         and actor == row[1] == enrolled[1] == identity.actor
+                         and secrets.compare_digest(enrolled[0], binding)
+                         and secrets.compare_digest(row[0], binding)
+                         and secrets.compare_digest(row[2], csrf))
+        elif config.human_auth_mode == 'github_cloudflare':
+            from .bound_oauth_draft import _binding, _check_schema
+            try:
+                identity = _bound_access(request, config)
+                _check_schema(db)
+                binding = _binding(config.cloudflare_issuer, config.cloudflare_audience,
+                                   identity.subject, config.beau_github_id)
+                row = db.execute('SELECT binding,github_id,csrf_token,expires FROM auth_bound_oauth_sessions WHERE token_hash=?',
+                                 (token_hash,)).fetchone()
+                valid = (row is not None and row[3] > now and row[1] == config.beau_github_id
+                         and actor == identity.actor and secrets.compare_digest(row[0], binding)
+                         and secrets.compare_digest(row[2], csrf))
+            except (ValueError, PermissionError):
+                valid = False
+        else:
+            valid = False
+        if not valid:
+            raise HTTPException(401, "Human sign-in required")
+
+    return guard
+
+
 class GitHubIdentityProvider:
     def __init__(self, config: AuthConfig):
         self.config = config
