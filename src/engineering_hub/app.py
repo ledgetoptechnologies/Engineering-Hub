@@ -778,7 +778,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         install_cloudflare_access(app, settings.auth_config.cloudflare_config, verifier=access_verifier)
     app.include_router(build_auth_router(settings.auth_config, sessions, github_client))
     @app.get('/api/agent-sessions/v1/hub-attention-stream', include_in_schema=False)
-    async def addressed_attention_stream(request: Request, project: str, generation: int):
+    async def addressed_attention_stream(request: Request, project: str, generation: int, role: str = 'orchestrator'):
         if attention_delivery is None or attention_broker is None or connection_config is None:
             raise HubError('attention_delivery_unavailable', 503)
         from agent_message_bus.agent_sessions_transport import bearer, session_origin_allowed, source_allowed
@@ -789,20 +789,23 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             raise HTTPException(401)
         from .lifecycle import finish_owned
 
+        audience = project if role == 'orchestrator' else ('worker', project, role)
         def validate(expected_session=None):
-            with session_bridge.admit(secret, 'hub_addressed_attention_list') as operation:
+            tool = 'hub_addressed_attention_list' if role == 'orchestrator' else 'hub_worker_dispatch_pending'
+            with session_bridge.admit(secret, tool) as operation:
                 if expected_session is not None and operation.principal.session_id != expected_session:
                     raise HubError('attention_route_unavailable', 404)
                 service = attention_delivery
-                visible = service.pending(operation.principal.actor, project, generation, limit=1, actionable_only=True)
+                visible = (service.pending(operation.principal.actor, project, generation, limit=1, actionable_only=True)
+                           if role == 'orchestrator' else service.worker_pending(operation.principal.actor, project, role, generation, limit=1))
                 from .dispatch import DispatchRepository
                 with DispatchRepository(repo)._attention_snapshot() as db:
-                    route = service._route_for(db, operation, project, generation)
+                    route = service._route_for(db, operation, project, generation, role)
                     service._validate_target(operation.db, db, route)
                     return (operation.principal.session_id, route['expires_at'], route['expires_boottime'],
                             route['revision'], bool(visible['items']))
 
-        admission_key, _ = attention_broker.register(project, 'admission:' + uuid.uuid4().hex)
+        admission_key, _ = attention_broker.register(audience, 'admission:' + uuid.uuid4().hex)
         try:
             session_id, deadline, boot_deadline, route_revision, _ = await finish_owned(asyncio.to_thread(validate))
         finally:
@@ -827,7 +830,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 acquired.append(result)
                 return result
             try:
-                key, queue = attention_broker.register(project, session_id)
+                key, queue = attention_broker.register(audience, session_id)
                 queue_ref.append(queue)
                 principal, unsubscribe = await finish_owned(asyncio.to_thread(subscribe))
                 if principal.session_id != session_id:
@@ -1275,6 +1278,38 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             raise HubError('attention_delivery_unavailable', 503)
         result = attention_delivery.owner_revoke(owner, project, payload.expected_revision)
         attention_broker.signal(project)
+        return result
+
+    @app.get('/api/hub/v1/projects/{project}/worker-attention-routes/{role}')
+    def get_worker_attention_route(project: str, role: str, request: Request):
+        owner = role_owner(request)
+        if attention_delivery is None or role == 'orchestrator':
+            raise HubError('attention_delivery_unavailable', 503)
+        return attention_delivery.owner_get(owner, project, role)
+
+    @app.get('/api/hub/v1/projects/{project}/worker-attention-receipts/{role}')
+    def get_worker_attention_receipts(project: str, role: str, request: Request, limit: int = 50, after: str | None = None):
+        owner = role_owner(request)
+        if attention_delivery is None:
+            raise HubError('attention_delivery_unavailable', 503)
+        return attention_delivery.owner_worker_receipts(owner, project, role, limit, after)
+
+    @app.put('/api/hub/v1/projects/{project}/worker-attention-routes/{role}')
+    def configure_worker_attention_route(project: str, role: str, payload: AttentionRouteWrite, request: Request):
+        owner = role_owner(request, mutation=True)
+        if attention_delivery is None or role == 'orchestrator':
+            raise HubError('attention_delivery_unavailable', 503)
+        result = attention_delivery.owner_configure(owner, project, role=role, **payload.model_dump())
+        attention_broker.signal(('worker', project, role))
+        return result
+
+    @app.post('/api/hub/v1/projects/{project}/worker-attention-routes/{role}/revoke')
+    def revoke_worker_attention_route(project: str, role: str, payload: Revision, request: Request):
+        owner = role_owner(request, mutation=True)
+        if attention_delivery is None or role == 'orchestrator':
+            raise HubError('attention_delivery_unavailable', 503)
+        result = attention_delivery.owner_revoke(owner, project, payload.expected_revision, role)
+        attention_broker.signal(('worker', project, role))
         return result
 
     @app.get('/api/hub/v1/roles')

@@ -302,7 +302,10 @@ class DispatchRepository:
                         progress_revision=progress_revision), sort_keys=True, separators=(',', ':'))))
             item = self.repo._save(db, actor, 'orchestration.dispatched', 'role_dispatch', item, new=True, publish=False)
             self._save_receipt(db, actor, key, fingerprint, item)
-            return item
+        broker = getattr(self.repo, '_attention_hint_broker', None)
+        if broker is not None and item['target_binding'] is not None:
+            broker.signal(('worker', item['project'], item['role_id']))
+        return item
 
     def get_request(self, actor, request_id):
         self._operation(actor)

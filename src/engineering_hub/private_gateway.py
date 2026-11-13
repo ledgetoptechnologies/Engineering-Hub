@@ -113,6 +113,8 @@ def browser_route_allowed(method, path, *, allow_bound_oauth_callback=False):
         return True
     if method in {'PUT', 'POST'} and re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/attention-route' + (r'/revoke' if method == 'POST' else ''), path) is not None:
         return True
+    if method in {'PUT', 'POST'} and re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/worker-attention-routes/' + _PROJECT_ID + (r'/revoke' if method == 'POST' else ''), path) is not None:
+        return True
     if method == 'PUT' and re.fullmatch(r'/api/hub/v1/roles/' + _PROJECT_ID, path) is not None:
         return True
     if method == 'PUT' and path in {'/api/hub/v1/orchestration/stale-service-grant', '/api/hub/v1/orchestration/stale-evaluator'}:
@@ -134,6 +136,7 @@ def browser_route_allowed(method, path, *, allow_bound_oauth_callback=False):
                 or re.fullmatch(r'/api/hub/v1/task-progress/' + _UUID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/orchestration/requests/' + _UUID + r'(?:/dispatches)?', path) is not None
                 or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/(?:attention-route|attention-receipts)', path) is not None
+                or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/worker-attention-(?:routes|receipts)/' + _PROJECT_ID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/orchestration-requests', path) is not None
                 or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/orchestration-attention', path) is not None
                 or re.fullmatch(r'/api/hub/v1/orchestration/dispatches/' + _UUID + r'/(?:reports|decisions)', path) is not None

@@ -15,8 +15,11 @@ from .stale_service_authority import _boot_clock, _boot_id
 _NAMESPACE = uuid.UUID('ffb754ac-2c19-4e0c-a178-a90a4b89d06e')
 
 
-def _route_id(project):
-    return str(uuid.uuid5(_NAMESPACE, 'route:' + project))
+def _route_id(project, role='orchestrator'):
+    if role == 'orchestrator':
+        return str(uuid.uuid5(_NAMESPACE, 'route:' + project))
+    _identity(role)
+    return str(uuid.uuid5(_NAMESPACE, 'worker-route:' + project + ':' + role))
 
 
 class AttentionDelivery:
@@ -49,15 +52,15 @@ class AttentionDelivery:
             raise HubError('attention_delivery_clock_untrusted', 409)
         return now, boot
 
-    def owner_get(self, actor, project):
+    def owner_get(self, actor, project, role='orchestrator'):
         self.repo._actor(actor, human=True)
         self._owner()
         with self.repo._connection() as db:
             self.repo._project(project, db, require_active=False)
-            row = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='attention_route'", (_route_id(project),)).fetchone()
+            row = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='attention_route'", (_route_id(project, role),)).fetchone()
             return json.loads(row['data']) if row else dict(project=project, revision=0, enabled=False)
 
-    def owner_configure(self, actor, project, expected_revision, installation_id, session_id, generation, lifetime_seconds):
+    def owner_configure(self, actor, project, expected_revision, installation_id, session_id, generation, lifetime_seconds, role='orchestrator'):
         self.repo._actor(actor, human=True)
         self._owner()
         _canonical_id(installation_id); _canonical_id(session_id)
@@ -75,15 +78,15 @@ class AttentionDelivery:
                 self._owner(); self.repo._project(project, db)
                 if self.repo._paused(db):
                     raise HubError('attention_delivery_paused', 423)
-                role = self.repo._get(db, _identity('orchestrator'), 'coordination_role')
-                lease = role.get('lease') or {}
+                role_record = self.repo._get(db, _identity(role), 'coordination_role')
+                lease = role_record.get('lease') or {}
                 now, boot = self._now()
-                if (project not in role['projects'] or installation_id not in role['installations']
-                        or role.get('generation') != generation or lease.get('generation') != generation
+                if (role_record.get('role_id') != role or project not in role_record['projects'] or installation_id not in role_record['installations']
+                        or role_record.get('generation') != generation or lease.get('generation') != generation
                         or lease.get('installation_id') != installation_id or lease.get('session_id') != session_id
                         or type(lease.get('expires_at')) not in (int, float) or lease['expires_at'] <= now):
                     raise HubError('attention_route_unavailable', 404)
-                identity = _route_id(project)
+                identity = _route_id(project, role)
                 row = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='attention_route'", (identity,)).fetchone()
                 old = json.loads(row['data']) if row else None
                 if expected_revision != (old['revision'] if old else 0):
@@ -91,7 +94,7 @@ class AttentionDelivery:
                 deadline = min(now + lifetime_seconds, lease['expires_at'], principal.expires_at, grant['expires_at'])
                 if deadline <= now:
                     raise HubError('attention_route_unavailable', 404)
-                item = dict(id=identity, revision=expected_revision, project=project, enabled=True,
+                item = dict(id=identity, revision=expected_revision, project=project, role_id=role, enabled=True,
                             installation_id=installation_id, session_id=session_id, generation=generation,
                             grant_revision=grant['revision'], owner_epoch=self.epoch, boot_id=self.boot_id(),
                             approved_at=now, expires_at=deadline, approved_boottime=boot,
@@ -118,22 +121,22 @@ class AttentionDelivery:
                     raise HubError('attention_route_unavailable', 404)
         except (AgentSessionError, HubError):
             raise HubError('attention_route_unavailable', 404) from None
-        role = self.repo._get(db, _identity('orchestrator'), 'coordination_role')
+        role = self.repo._get(db, _identity(route.get('role_id', 'orchestrator')), 'coordination_role')
         for role_project in role['projects']:
             self.repo._project(role_project, db)
         if not set(role['projects']).issubset(set(json.loads(grant['projects']))):
             raise HubError('attention_route_unavailable', 404)
         lease = role.get('lease') or {}
-        if (route['project'] not in role['projects'] or route['installation_id'] not in role['installations']
+        if (role.get('role_id') != route.get('role_id', 'orchestrator') or route['project'] not in role['projects'] or route['installation_id'] not in role['installations']
                 or role.get('generation') != route['generation'] or lease.get('generation') != route['generation']
                 or lease.get('installation_id') != route['installation_id'] or lease.get('session_id') != route['session_id']
                 or type(lease.get('expires_at')) not in (int, float) or lease['expires_at'] <= now):
             raise HubError('attention_route_unavailable', 404)
         return role
 
-    def _route_for(self, db, operation, project, generation):
-        route = self.repo._get(db, _route_id(project), 'attention_route')
-        if (route.get('project') != project or route.get('generation') != generation
+    def _route_for(self, db, operation, project, generation, role='orchestrator'):
+        route = self.repo._get(db, _route_id(project, role), 'attention_route')
+        if (route.get('project') != project or route.get('role_id', 'orchestrator') != role or route.get('generation') != generation
                 or route.get('session_id') != operation.principal.session_id
                 or route.get('installation_id') != operation.principal.installation_id):
             raise HubError('attention_route_unavailable', 404)
@@ -158,7 +161,7 @@ class AttentionDelivery:
             self._validate_target(operation.db, db, route)
             return result
 
-    def owner_revoke(self, actor, project, expected_revision):
+    def owner_revoke(self, actor, project, expected_revision, role='orchestrator'):
         self.repo._actor(actor, human=True)
         self._owner()
         if type(expected_revision) is not int or expected_revision < 1:
@@ -166,7 +169,7 @@ class AttentionDelivery:
         with self.bridge.sessions._transaction():
             with self.repo._transaction() as db:
                 self._owner(); self.repo._project(project, db, require_active=False)
-                route = self.repo._get(db, _route_id(project), 'attention_route')
+                route = self.repo._get(db, _route_id(project, role), 'attention_route')
                 self.repo._cas(route, expected_revision)
                 route['enabled'] = False
                 return self.repo._save(db, actor, 'attention_route.revoked', 'attention_route', route, publish=False)
@@ -222,6 +225,112 @@ class AttentionDelivery:
                                 'orchestration_attention', intent, publish=False)
             self._validate_target(operation.db, db, route)
             return receipt
+
+    def worker_pending(self, actor, project, role, generation, limit=50, after=None):
+        """Discover unacknowledged dispatches bound to this exact role session."""
+        operation = context.current.get()
+        if operation is None or not context.actor_allowed(actor) or role == 'orchestrator':
+            raise HubError('attention_route_unavailable', 404)
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise HubError('invalid_limit', 422)
+        if after is not None:
+            _canonical_id(after)
+        service = DispatchRepository(self.repo)
+        with service._attention_snapshot() as db:
+            route = self._route_for(db, operation, project, generation, role)
+            held, _ = service._held(db, actor, role, generation)
+            service._grant(operation, 'dispatch.read', 'role.read')
+            kinds = []
+            for kind, capability in (('task', 'task.read'), ('tracking_task', 'tracking.read')):
+                try:
+                    service._grant(operation, capability)
+                    kinds.append(kind)
+                except HubError:
+                    pass
+            if not kinds:
+                self._validate_target(operation.db, db, route)
+                return dict(items=[], next_after=None, wake_verified=False, execution_authorization=False)
+            marks = ','.join('?' for _ in kinds)
+            rows = db.execute("SELECT d.id FROM hub_entities d "
+                "JOIN hub_entities t ON t.id=json_extract(d.data,'$.task_id') "
+                "JOIN hub_entities q ON q.id=json_extract(d.data,'$.request_id') AND q.kind='orchestration_request' "
+                "WHERE d.kind='role_dispatch' AND json_extract(d.data,'$.role_id')=? "
+                "AND json_extract(d.data,'$.project')=? AND json_extract(t.data,'$.project')=? "
+                "AND json_extract(q.data,'$.project')=? AND d.id>? AND json_extract(d.data,'$.state')='dispatched' "
+                "AND json_extract(d.data,'$.decision_id') IS NULL "
+                "AND json_extract(t.data,'$.status') IN ('assigned','claimed','in_review','open','completion_claimed') "
+                "AND t.kind IN (" + marks + ") AND t.kind=json_extract(d.data,'$.task_kind') "
+                "AND json_extract(d.data,'$.target_binding.session_id')=? "
+                "AND json_extract(d.data,'$.target_binding.installation_id')=? "
+                "AND json_extract(d.data,'$.target_binding.generation')=? "
+                "AND NOT EXISTS (SELECT 1 FROM hub_entities r WHERE r.kind='worker_dispatch_receipt' "
+                "AND json_extract(r.data,'$.dispatch_id')=d.id AND json_extract(r.data,'$.session_id')=? "
+                "AND json_extract(r.data,'$.generation')=?) ORDER BY d.id LIMIT ?",
+                (role, project, project, project, after or '', *kinds, route['session_id'],
+                 route['installation_id'], generation, route['session_id'], generation, limit + 1)).fetchall()
+            items = []
+            for row in rows:
+                item, task, target, _ = service._dispatch(db, actor, row['id'])
+                if (target.get('role_id') != role or item.get('project') != project
+                        or service._binding(item.get('target_binding')) != service._binding(held.get('lease'))):
+                    raise HubError('attention_route_unavailable', 404)
+                items.append(dict(dispatch_id=item['id'], dispatch_revision=item['revision'],
+                                  task_id=task['id'], project=project, role=role,
+                                  execution_authorization=False, wake_verified=False))
+            self._validate_target(operation.db, db, route)
+            return dict(items=items[:limit], next_after=items[limit-1]['dispatch_id'] if len(items) > limit else None,
+                        wake_verified=False, execution_authorization=False,
+                        note='Refresh UUID paging from the beginning for new dispatches; no execution or wake is implied.')
+
+    def worker_acknowledge(self, actor, project, role, generation, dispatch_id, expected_revision):
+        operation = context.current.get()
+        if operation is None or not context.actor_allowed(actor) or role == 'orchestrator':
+            raise HubError('attention_route_unavailable', 404)
+        _canonical_id(dispatch_id)
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise HubError('invalid_attention_receipt', 422)
+        service = DispatchRepository(self.repo)
+        with self.repo._transaction() as db:
+            route = self._route_for(db, operation, project, generation, role)
+            held, _ = service._held(db, actor, role, generation)
+            service._grant(operation, 'dispatch.read', 'role.read')
+            item, task, target, _ = service._dispatch(db, actor, dispatch_id)
+            if (item.get('project') != project or target.get('role_id') != role
+                    or item.get('state') != 'dispatched' or item.get('decision_id') is not None
+                    or task.get('status') not in ('assigned', 'claimed', 'in_review', 'open', 'completion_claimed')
+                    or service._binding(item.get('target_binding')) != service._binding(held.get('lease'))):
+                raise HubError('attention_route_unavailable', 404)
+            self.repo._cas(item, expected_revision)
+            identity = str(uuid.uuid5(_NAMESPACE, ':'.join(['worker-receipt', dispatch_id,
+                str(expected_revision), route['session_id'], str(generation)])))
+            row = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='worker_dispatch_receipt'", (identity,)).fetchone()
+            if row:
+                return json.loads(row['data'])
+            receipt = dict(id=identity, project=project, role=role, dispatch_id=dispatch_id,
+                           dispatch_revision=expected_revision, installation_id=route['installation_id'],
+                           session_id=route['session_id'], generation=generation, state='agent_acknowledged',
+                           wake_verified=False, execution_authorization=False)
+            receipt = self.repo._save(db, actor, 'worker_dispatch.acknowledged', 'worker_dispatch_receipt', receipt,
+                                      new=True, publish=False)
+            self._validate_target(operation.db, db, route)
+            return receipt
+
+    def owner_worker_receipts(self, actor, project, role, limit=50, after=None):
+        self.repo._actor(actor, human=True)
+        self._owner()
+        _identity(role)
+        if role == 'orchestrator' or type(limit) is not int or not 1 <= limit <= 100:
+            raise HubError('invalid_limit', 422)
+        if after is not None:
+            _canonical_id(after)
+        with self.repo._connection() as db:
+            self.repo._project(project, db, require_active=False)
+            rows = db.execute("SELECT data FROM hub_entities WHERE kind='worker_dispatch_receipt' "
+                              "AND json_extract(data,'$.project')=? AND json_extract(data,'$.role')=? "
+                              "AND id>? ORDER BY id LIMIT ?", (project, role, after or '', limit + 1)).fetchall()
+            items = [json.loads(row['data']) for row in rows[:limit]]
+            return dict(items=items, next_after=items[-1]['id'] if len(rows) > limit else None,
+                        note='Receipt is a client assertion, not proof of wake or execution.')
 
     def owner_receipts(self, actor, project, limit=50, after=None):
         self.repo._actor(actor, human=True)

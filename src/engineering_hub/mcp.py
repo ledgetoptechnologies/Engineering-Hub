@@ -325,6 +325,23 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         return invoke(attention_delivery.acknowledge, identity(ctx), project, generation, intent_id, expected_revision)
 
     @registration.tool()
+    def hub_worker_dispatch_pending(role: str, generation: StrictInt, project: str, ctx: Context,
+                                    limit: StrictInt = 50, after: str | None = None) -> dict:
+        """Read unacknowledged dispatches bound to this exact owner-admitted role session."""
+        if attention_delivery is None:
+            raise ToolError('attention_delivery_unavailable')
+        return invoke(attention_delivery.worker_pending, identity(ctx), project, role, generation, limit, after)
+
+    @registration.tool()
+    def hub_worker_dispatch_ack(role: str, generation: StrictInt, project: str, dispatch_id: str,
+                                expected_revision: StrictInt, ctx: Context) -> dict:
+        """Record a scoped receipt; it does not authorize or prove execution or wake."""
+        if attention_delivery is None:
+            raise ToolError('attention_delivery_unavailable')
+        return invoke(attention_delivery.worker_acknowledge, identity(ctx), project, role, generation,
+                      dispatch_id, expected_revision)
+
+    @registration.tool()
     def hub_orchestrator_attention_reconcile_closed(generation: StrictInt, intent_id: str,
             expected_revision: StrictInt, expected_dispatch_revision: StrictInt,
             client_request_id: str, ctx: Context) -> dict:
