@@ -193,6 +193,7 @@ class StaleEvaluator:
                         raise
                 operation = _TargetOperation(self.bridge, session_db)
                 old_revision = item['revision']
+                previous_intent = item.get('attention_intent_id')
                 try:
                     elapsed, anchor = self._anchor(db, item, task, target, grant)
                     window = item['window_seconds']
@@ -244,7 +245,13 @@ class StaleEvaluator:
                 current, _ = self._config(db, project)
                 if current['revision'] != config['revision']:
                     raise HubError('stale_evaluator_config_changed', 409)
-                return item['revision'] != old_revision
+                changed = item['revision'] != old_revision
+                notify = bool(item.get('attention_intent_id') and item['attention_intent_id'] != previous_intent)
+        if notify:
+            broker = getattr(self.repo, '_attention_hint_broker', None)
+            if broker is not None:
+                broker.signal(project)
+        return changed
 
     def scan_once(self):
         """Visit a bounded batch in one project, rotating projects and UUID cursors."""

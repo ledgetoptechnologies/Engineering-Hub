@@ -48,7 +48,7 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
                   work_queue=None, mcp=None, agent_status=None, image_versions=None,
                   planning_repository=None, label_sets=None, entity_images=None, project_registry=None,
                   staging_controller=None, component_registry=None, interactive_reviews=None,
-                  infrastructure_service=None, infrastructure_collector=None, session_bridge=None) -> FastMCP:
+                  infrastructure_service=None, infrastructure_collector=None, session_bridge=None, attention_delivery=None) -> FastMCP:
     """Call streamable_http_app once, mount its auth wrapper, run session_manager."""
     if mcp is None:
         mcp = FastMCP("Engineering Hub", stateless_http=True, streamable_http_path="/", json_response=True)
@@ -300,6 +300,22 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         """Read pending role-addressed attention intents; routing and wake have not occurred."""
         from .dispatch import DispatchRepository
         return invoke(DispatchRepository(repo).attention, identity(ctx), generation, project, limit, after)
+
+    @registration.tool()
+    def hub_addressed_attention_list(generation: StrictInt, project: str, ctx: Context,
+                                     limit: StrictInt = 50, after: str | None = None) -> dict:
+        """Read pending attention for the exact owner-admitted role session."""
+        if attention_delivery is None:
+            raise ToolError('attention_delivery_unavailable')
+        return invoke(attention_delivery.pending, identity(ctx), project, generation, limit, after)
+
+    @registration.tool()
+    def hub_addressed_attention_ack(generation: StrictInt, project: str, intent_id: str,
+                                     expected_revision: StrictInt, ctx: Context) -> dict:
+        """Record this exact role session's acknowledgment; it does not prove work or wake."""
+        if attention_delivery is None:
+            raise ToolError('attention_delivery_unavailable')
+        return invoke(attention_delivery.acknowledge, identity(ctx), project, generation, intent_id, expected_revision)
 
     @registration.tool()
     def hub_orchestrator_attention_reconcile_closed(generation: StrictInt, intent_id: str,

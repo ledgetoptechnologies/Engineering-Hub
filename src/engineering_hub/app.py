@@ -199,6 +199,14 @@ class StaleEvaluatorWrite(Input):
     enabled: bool
 
 
+class AttentionRouteWrite(Input):
+    expected_revision: int = Field(ge=0)
+    installation_id: str = Field(min_length=36, max_length=36)
+    session_id: str = Field(min_length=36, max_length=36)
+    generation: int = Field(ge=1)
+    lifetime_seconds: int = Field(ge=10, le=3600)
+
+
 class Candidate(Revision):
     commit: str = Field(pattern=r"^[0-9a-f]{40}$")
 
@@ -565,6 +573,14 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             from .stale_service_authority import StaleServiceGrant
             from .stale_evaluator import StaleEvaluator
             stale_evaluator = StaleEvaluator(StaleServiceGrant(repo), session_bridge)
+    attention_delivery = attention_broker = None
+    if session_bridge is not None:
+        from .pilot_ownership import PilotOwner
+        if type(repo.pilot_owner) is PilotOwner:
+            from .attention_delivery import AttentionDelivery
+            from .attention_hints import AttentionHintBroker
+            attention_delivery = AttentionDelivery(repo, session_bridge)
+            attention_broker = AttentionHintBroker()
     try:
         hub_mcp = build_hub_mcp(repo, settings.agent_auth, topic_peers=peers_for,
                           topic_preflight=preflight_for, autonomy_status=autonomy_for,
@@ -575,7 +591,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                           entity_images=entity_images,
                           project_registry=project_registry,
                           component_registry=component_registry,
-                          session_bridge=session_bridge,
+                          session_bridge=session_bridge, attention_delivery=attention_delivery,
                           interactive_reviews=interactive_reviews,
                           infrastructure_service=infrastructure.service,
                           infrastructure_collector=infrastructure.collector,
@@ -619,6 +635,11 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             cleanup_started = True
             from .lifecycle import finish_owned
             async def stop_all():
+                if attention_broker is not None:
+                    attention_broker.close()
+                    await asyncio.to_thread(attention_broker.wait_closed)
+                    if getattr(repo, '_attention_hint_broker', None) is attention_broker:
+                        del repo._attention_hint_broker
                 if stale_evaluator is not None:
                     await asyncio.to_thread(stale_evaluator.stop)
                 shared_error = None
@@ -683,6 +704,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                     await drain()
 
         try:
+            if attention_broker is not None:
+                if getattr(repo, '_attention_hint_broker', None) is not None:
+                    raise ValueError('attention_broker_already_owned')
+                repo._attention_hint_broker = attention_broker
             if stale_evaluator is not None:
                 stale_evaluator.start()
             await feed.start()
@@ -724,6 +749,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     app.state.repository, app.state.sessions, app.state.settings = repo, sessions, settings
     app.state.mcp = hub_mcp
     app.state.session_hub_bridge = session_bridge
+    app.state.attention_delivery = attention_delivery
     app.state.stale_evaluator = stale_evaluator
     app.state.modular_staging = staging_module
     app.state.interactive_service = interactive_service
@@ -751,6 +777,93 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         from .cloudflare_access import install_cloudflare_access
         install_cloudflare_access(app, settings.auth_config.cloudflare_config, verifier=access_verifier)
     app.include_router(build_auth_router(settings.auth_config, sessions, github_client))
+    @app.get('/api/agent-sessions/v1/hub-attention-stream', include_in_schema=False)
+    async def addressed_attention_stream(request: Request, project: str, generation: int):
+        if attention_delivery is None or attention_broker is None or connection_config is None:
+            raise HubError('attention_delivery_unavailable', 503)
+        from agent_message_bus.agent_sessions_transport import bearer, session_origin_allowed, source_allowed
+        if not session_origin_allowed(request, connection_config) or not source_allowed(request, settings.agent_auth):
+            raise HTTPException(403)
+        secret = bearer(request)
+        if not secret.startswith('ehs_'):
+            raise HTTPException(401)
+        from .lifecycle import finish_owned
+
+        def validate(expected_session=None):
+            with session_bridge.admit(secret, 'hub_addressed_attention_list') as operation:
+                if expected_session is not None and operation.principal.session_id != expected_session:
+                    raise HubError('attention_route_unavailable', 404)
+                service = attention_delivery
+                visible = service.pending(operation.principal.actor, project, generation, limit=1, actionable_only=True)
+                from .dispatch import DispatchRepository
+                with DispatchRepository(repo)._attention_snapshot() as db:
+                    route = service._route_for(db, operation, project, generation)
+                    service._validate_target(operation.db, db, route)
+                    return (operation.principal.session_id, route['expires_at'], route['expires_boottime'],
+                            route['revision'], bool(visible['items']))
+
+        admission_key, _ = attention_broker.register(project, 'admission:' + uuid.uuid4().hex)
+        try:
+            session_id, deadline, boot_deadline, route_revision, _ = await finish_owned(asyncio.to_thread(validate))
+        finally:
+            attention_broker.unregister(admission_key)
+
+        async def stream():
+            loop = asyncio.get_running_loop()
+            invalid = False
+            acquired = []
+            queue_ref = []
+            key = None
+            def revoked():
+                nonlocal invalid
+                invalid = True
+                if queue_ref:
+                    try:
+                        loop.call_soon_threadsafe(attention_broker._offer, queue_ref[0])
+                    except RuntimeError:
+                        pass
+            def subscribe():
+                result = session_bridge.sessions.subscribe_session(secret, revoked)
+                acquired.append(result)
+                return result
+            try:
+                key, queue = attention_broker.register(project, session_id)
+                queue_ref.append(queue)
+                principal, unsubscribe = await finish_owned(asyncio.to_thread(subscribe))
+                if principal.session_id != session_id:
+                    return
+                # Registration precedes the catch-up read; no listener exists
+                # until the response generator actually starts.
+                ready = False
+                while not invalid and not attention_broker.closed:
+                    _, deadline, boot_deadline, current_revision, has_visible = await finish_owned(
+                        asyncio.to_thread(validate, session_id))
+                    if current_revision != route_revision:
+                        break
+                    if not ready:
+                        yield b'event: attention-ready\ndata: {}\n\n'
+                        ready = True
+                    if has_visible:
+                        yield b'event: attention-check\ndata: {}\n\n'
+                    remaining = min(deadline - session_bridge.sessions._now(), boot_deadline - attention_delivery.boottime())
+                    if remaining <= 0:
+                        break
+                    try:
+                        await asyncio.wait_for(queue.get(), timeout=remaining)
+                        attention_broker.consumed(key)
+                    except asyncio.TimeoutError:
+                        break
+            except (HubError, AgentSessionError):
+                return
+            finally:
+                try:
+                    if acquired:
+                        await finish_owned(asyncio.to_thread(acquired[0][1]))
+                finally:
+                    if key is not None:
+                        attention_broker.unregister(key)
+        return StreamingResponse(stream(), media_type='text/event-stream', headers={'Cache-Control': 'no-store'})
+
     if bus_app is None:
         app.mount("/mcp", HubMCPAuthMiddleware(mcp_app, settings.agent_auth))
     else:
@@ -1130,6 +1243,38 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         stale_evaluator.stop()
         if payload.enabled:
             stale_evaluator.start()
+        return result
+
+    @app.get('/api/hub/v1/projects/{project}/attention-route')
+    def get_attention_route(project: str, request: Request):
+        owner = role_owner(request)
+        if attention_delivery is None:
+            raise HubError('attention_delivery_unavailable', 503)
+        return attention_delivery.owner_get(owner, project)
+
+    @app.get('/api/hub/v1/projects/{project}/attention-receipts')
+    def list_attention_receipts(project: str, request: Request, limit: int = 50, after: str | None = None):
+        owner = role_owner(request)
+        if attention_delivery is None:
+            raise HubError('attention_delivery_unavailable', 503)
+        return attention_delivery.owner_receipts(owner, project, limit, after)
+
+    @app.put('/api/hub/v1/projects/{project}/attention-route')
+    def configure_attention_route(project: str, payload: AttentionRouteWrite, request: Request):
+        owner = role_owner(request, mutation=True)
+        if attention_delivery is None:
+            raise HubError('attention_delivery_unavailable', 503)
+        result = attention_delivery.owner_configure(owner, project, **payload.model_dump())
+        attention_broker.signal(project)
+        return result
+
+    @app.post('/api/hub/v1/projects/{project}/attention-route/revoke')
+    def revoke_attention_route(project: str, payload: Revision, request: Request):
+        owner = role_owner(request, mutation=True)
+        if attention_delivery is None:
+            raise HubError('attention_delivery_unavailable', 503)
+        result = attention_delivery.owner_revoke(owner, project, payload.expected_revision)
+        attention_broker.signal(project)
         return result
 
     @app.get('/api/hub/v1/roles')

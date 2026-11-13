@@ -315,53 +315,60 @@ class DispatchRepository:
                         note='Pending routing only; no delivery or wake is implied. Restart UUID paging to find new items.')
 
     def attention(self, actor, generation, project, limit, after):
+        with self._attention_snapshot() as db:
+            return self._attention_in(db, actor, generation, project, limit, after)
+
+    def _attention_in(self, db, actor, generation, project, limit, after, *, actionable_only=False):
         operation = self._operation(actor)
         if type(limit) is not int or not 1 <= limit <= 100:
             raise HubError('invalid_limit', 422)
         if after is not None:
             _canonical_id(after)
-        with self._attention_snapshot() as db:
-            role, operation = self._held(db, actor, 'orchestrator', generation)
-            self._grant(operation, 'dispatch.read')
-            self._grant(operation, 'role.read')
-            self.repo._project(project, db)
-            if project not in role['projects']:
-                raise HubError('dispatch_unavailable', 404)
-            kinds = []
-            for kind, capability in (('task', 'task.read'), ('tracking_task', 'tracking.read')):
-                try:
-                    operation.bridge._live(operation.db, operation.secret, operation.principal.authorization_revision,
-                                           capability, session_id=operation.principal.session_id)
-                    kinds.append(kind)
-                except HubError:
-                    pass
-            if not kinds:
-                return dict(items=[], next_after=None, note='Pending routing only; no delivery or wake is implied.')
+        role, operation = self._held(db, actor, 'orchestrator', generation)
+        self._grant(operation, 'dispatch.read')
+        self._grant(operation, 'role.read')
+        self.repo._project(project, db)
+        if project not in role['projects']:
+            raise HubError('dispatch_unavailable', 404)
+        kinds = []
+        for kind, capability in (('task', 'task.read'), ('tracking_task', 'tracking.read')):
             try:
-                self._grant(operation, 'decision.read')
-                decision_read = 1
+                operation.bridge._live(operation.db, operation.secret, operation.principal.authorization_revision,
+                                       capability, session_id=operation.principal.session_id)
+                kinds.append(kind)
             except HubError:
-                decision_read = 0
-            project_marks = ','.join('?' for _ in operation.projects)
-            kind_marks = ','.join('?' for _ in kinds)
-            rows = db.execute("SELECT a.data,t.data AS task_data,d.data AS dispatch_data FROM hub_entities a JOIN hub_entities d ON d.id=json_extract(a.data,'$.dispatch_id') AND d.kind='role_dispatch' "
-                "JOIN hub_entities q ON q.id=json_extract(d.data,'$.request_id') AND q.kind='orchestration_request' "
-                "JOIN hub_entities t ON t.id=json_extract(d.data,'$.task_id') "
-                "JOIN hub_entities r ON r.kind='coordination_role' AND json_extract(r.data,'$.role_id')=json_extract(d.data,'$.role_id') "
-                "WHERE a.kind='orchestration_attention' AND json_extract(a.data,'$.project')=? "
-                "AND json_extract(a.data,'$.recipient_role')='orchestrator' AND json_extract(a.data,'$.state')='pending_routing' AND a.id>? "
-                "AND json_extract(d.data,'$.project')=? AND json_extract(q.data,'$.project')=? AND json_extract(t.data,'$.project')=? "
-                "AND (json_extract(d.data,'$.decision_id') IS NULL OR ?=1) "
-                "AND t.kind IN (" + kind_marks + ") AND t.kind=json_extract(d.data,'$.task_kind') "
-                "AND EXISTS (SELECT 1 FROM json_each(r.data,'$.projects') rp WHERE rp.value=?) "
-                "AND NOT EXISTS (SELECT 1 FROM json_each(r.data,'$.projects') rp LEFT JOIN hub_projects hp ON hp.id=rp.value "
-                "WHERE rp.value NOT IN (" + project_marks + ") OR hp.id IS NULL OR json_extract(hp.data,'$.archived')=1) "
-                "ORDER BY a.id LIMIT ?", (project, after or '', project, project, project, decision_read, *kinds, project, *operation.projects, limit + 1)).fetchall()
-            items = [self._attention_view(row) for row in rows]
-            for item in items:
-                self._dispatch(db, actor, item['dispatch_id'])
-            return dict(items=items[:limit], next_after=items[limit-1]['id'] if len(items) > limit else None,
-                        note='Pending routing only; no delivery or wake is implied. Restart UUID paging to find new items.')
+                pass
+        if not kinds:
+            return dict(items=[], next_after=None, note='Pending routing only; no delivery or wake is implied.')
+        try:
+            self._grant(operation, 'decision.read')
+            decision_read = 1
+        except HubError:
+            decision_read = 0
+        project_marks = ','.join('?' for _ in operation.projects)
+        kind_marks = ','.join('?' for _ in kinds)
+        active_filter = ("AND json_extract(t.data,'$.status') IN ('assigned','claimed','in_review','open','completion_claimed') "
+                         "AND json_extract(d.data,'$.attention_intent_id')=a.id "
+                         "AND json_extract(d.data,'$.coordination_stale')=1 " if actionable_only else '')
+        rows = db.execute("SELECT a.data,t.data AS task_data,d.data AS dispatch_data FROM hub_entities a JOIN hub_entities d ON d.id=json_extract(a.data,'$.dispatch_id') AND d.kind='role_dispatch' "
+            "JOIN hub_entities q ON q.id=json_extract(d.data,'$.request_id') AND q.kind='orchestration_request' "
+            "JOIN hub_entities t ON t.id=json_extract(d.data,'$.task_id') "
+            "JOIN hub_entities r ON r.kind='coordination_role' AND json_extract(r.data,'$.role_id')=json_extract(d.data,'$.role_id') "
+            "WHERE a.kind='orchestration_attention' AND json_extract(a.data,'$.project')=? "
+            "AND json_extract(a.data,'$.recipient_role')='orchestrator' AND json_extract(a.data,'$.state')='pending_routing' AND a.id>? "
+            "AND json_extract(d.data,'$.project')=? AND json_extract(q.data,'$.project')=? AND json_extract(t.data,'$.project')=? "
+            "AND (json_extract(d.data,'$.decision_id') IS NULL OR ?=1) "
+            "AND t.kind IN (" + kind_marks + ") AND t.kind=json_extract(d.data,'$.task_kind') "
+            "AND EXISTS (SELECT 1 FROM json_each(r.data,'$.projects') rp WHERE rp.value=?) "
+            "AND NOT EXISTS (SELECT 1 FROM json_each(r.data,'$.projects') rp LEFT JOIN hub_projects hp ON hp.id=rp.value "
+            "WHERE rp.value NOT IN (" + project_marks + ") OR hp.id IS NULL OR json_extract(hp.data,'$.archived')=1) "
+            + active_filter + "ORDER BY a.id LIMIT ?", (project, after or '', project, project, project, decision_read, *kinds, project, *operation.projects, limit + 1)).fetchall()
+        items = [self._attention_view(row) for row in rows]
+        for item in items:
+            self._dispatch(db, actor, item['dispatch_id'])
+        return dict(items=items[:limit], next_after=items[limit-1]['id'] if len(items) > limit else None,
+                    note='Pending routing only; no delivery or wake is implied. Restart UUID paging to find new items.')
+
 
     @staticmethod
     def _attention_view(row, *, project_archived=False):
@@ -668,6 +675,12 @@ class DispatchRepository:
             if prior:
                 return prior
             self.repo._cas(item, expected_revision)
+            previous_intent = item.get('attention_intent_id')
             item = self._evaluate_checkpoint(db, actor, item, target, operation)
             self._save_receipt(db, actor, key, fingerprint, item)
-            return item
+            notify = bool(item.get('attention_intent_id') and item['attention_intent_id'] != previous_intent)
+        if notify:
+            broker = getattr(self.repo, '_attention_hint_broker', None)
+            if broker is not None:
+                broker.signal(item['project'])
+        return item

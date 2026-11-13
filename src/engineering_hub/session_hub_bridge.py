@@ -44,6 +44,7 @@ TOOLS = {
     'hub_dispatch_list': 'dispatch.read', 'hub_dispatch_report': 'dispatch.report',
     'hub_dispatch_checkpoint': 'dispatch.write', 'hub_dispatch_decisions': 'dispatch.read', 'hub_dispatch_reports': 'dispatch.read',
     'hub_orchestrator_attention_list': 'dispatch.read', 'hub_orchestrator_attention_reconcile_closed': 'dispatch.write',
+    'hub_addressed_attention_list': 'dispatch.read', 'hub_addressed_attention_ack': 'dispatch.read',
     'hub_staging_task_propose': 'task.propose', 'hub_task_claim': 'task.claim',
     'hub_task_candidate': 'task.candidate', 'hub_task_review': 'task.review',
     'hub_planning_list': 'planning.read', 'hub_planning_get': 'planning.read',
