@@ -50,6 +50,9 @@ with the same client_request_id; never invent a new ID for an uncertain retry.
 The client checks the exact session identity, uses its protected local profile,
 refuses redirects and environment proxies, and makes one bounded operation.
 It sends no notification and does not imply another agent has received it.
+Tracking changes do not publish generic bus pointers or feed invalidations;
+authorized clients must explicitly refresh the project task list. Previously
+accepted or already in-flight bus pointers cannot be recalled.
 
 ## Explicit durable outbox
 

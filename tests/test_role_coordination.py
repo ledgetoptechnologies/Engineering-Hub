@@ -253,7 +253,7 @@ def test_claim_listing_and_release_require_underlying_read_capability(env):
 
 def test_role_changes_never_publish_unscoped_bus_or_sse_events(env):
     roles, role, first, _ = setup_role(env)
-    task = env.repo.propose_tracking_task('codex', PROJECT, 'Visible existing event', 'task')
+    task = env.repo.propose_tracking_task('codex', PROJECT, 'Private tracking task', 'task')
     with env.repo._connection() as db:
         _, before = HubOutboxCursorReader()(db, None)
     lease = op(env, first, 'hub_role_acquire', lambda actor: roles.acquire(actor, role['role_id'], 1, 60))
@@ -265,9 +265,8 @@ def test_role_changes_never_publish_unscoped_bus_or_sse_events(env):
         actions = [row[0] for row in db.execute('SELECT action FROM hub_outbox ORDER BY sequence')]
         audits = [row[0] for row in db.execute("SELECT action FROM hub_audit WHERE action LIKE 'role.%'")]
     assert after == before and events == ()
-    assert actions == ['tracking_task.proposed'] and len(audits) >= 5
+    assert actions == [] and len(audits) >= 5
     bus = FakeBus()
     result = asyncio.run(HubOutboxPublisher(env.repo, bus).drain_batch())
-    assert result['failed'] == 0 and result['accepted'] == 2
-    assert {request['body']['event'] for request in bus.requests} == {'tracking_task.proposed'}
-    assert all(request['body']['entity_id'] == task['id'] for request in bus.requests)
+    assert result['failed'] == 0 and result['accepted'] == 0
+    assert bus.requests == []

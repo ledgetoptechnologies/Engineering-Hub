@@ -312,8 +312,10 @@ def test_mixed_outbox_delivers_normal_events_without_dispatch_pointers(env):
     call(env, worker, 'hub_dispatch_report', lambda actor: service.report(actor, item['id'], 1, 1, 'ask', 'Question', 'ask', 'Choose', ['Yes', 'No']))
     with env.repo._connection() as db:
         actions = [row[0] for row in db.execute('SELECT action FROM hub_outbox ORDER BY sequence')]
-    assert actions == ['tracking_task.proposed']
+    assert actions == []
+    ordinary = env.repo.create_decision(OWNER, PROJECT, 'Ordinary decision', ['Yes', 'No'])
     bus = FakeBus()
     result = asyncio.run(HubOutboxPublisher(env.repo, bus).drain_batch())
     assert result['failed'] == 0 and result['accepted'] == 2
-    assert {request['body']['event'] for request in bus.requests} == {'tracking_task.proposed'}
+    assert {request['body']['event'] for request in bus.requests} == {'decision.created'}
+    assert all(request['body']['entity_id'] == ordinary['id'] for request in bus.requests)

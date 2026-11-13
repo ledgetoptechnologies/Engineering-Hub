@@ -234,11 +234,11 @@ def test_attention_filters_decision_grant_before_pagination(env):
 def test_attention_intent_never_enters_generic_outbox(env):
     _, _, _, _, _, _, _, _ = stale(env)
     with env.repo._connection() as db:
-        assert [row[0] for row in db.execute('SELECT action FROM hub_outbox ORDER BY sequence')] == ['tracking_task.proposed']
+        assert [row[0] for row in db.execute('SELECT action FROM hub_outbox ORDER BY sequence')] == []
     bus = FakeBus()
     result = asyncio.run(HubOutboxPublisher(env.repo, bus).drain_batch())
-    assert result['failed'] == 0 and result['accepted'] == 2
-    assert {request['body']['event'] for request in bus.requests} == {'tracking_task.proposed'}
+    assert result['failed'] == 0 and result['accepted'] == 0
+    assert bus.requests == []
 
 
 def test_real_mcp_and_owner_http_show_pending_not_wake(unified, monkeypatch):

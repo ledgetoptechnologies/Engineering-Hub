@@ -184,11 +184,11 @@ def test_activity_and_stale_never_publish_unscoped_pointers(env):
     checkpoint(env, orch, service, item, 1, 'check')
     with env.repo._connection() as db:
         actions = [row[0] for row in db.execute('SELECT action FROM hub_outbox ORDER BY sequence')]
-    assert actions == ['tracking_task.proposed']
+    assert actions == []
     bus = FakeBus()
     result = asyncio.run(HubOutboxPublisher(env.repo, bus).drain_batch())
-    assert result['failed'] == 0 and result['accepted'] == 2
-    assert {request['body']['event'] for request in bus.requests} == {'tracking_task.proposed'}
+    assert result['failed'] == 0 and result['accepted'] == 0
+    assert bus.requests == []
 
 
 @pytest.mark.parametrize('first', ['heartbeat', 'checkpoint'])

@@ -261,7 +261,9 @@ class HubRepository:
         # Treat even incomplete origin metadata as private, on every mutation.
         private_dispatch_decision = (kind == 'decision' and
             ('origin_dispatch_id' in item or 'origin_dispatch_revision' in item))
-        if publish and not private_dispatch_decision:
+        # Tracking records are project-scoped. The legacy bus publisher has no
+        # project or tracking-grant filter, so even an ID/revision is private.
+        if publish and not private_dispatch_decision and kind != 'tracking_task':
             self._emit(db, action, item)
         return item
 

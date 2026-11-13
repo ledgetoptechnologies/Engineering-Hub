@@ -17,10 +17,11 @@ def _valid_route(topic, correlation):
             and all(correlation.split('/')))
 
 
-# A dispatch-origin decision is coordination-private even if an older Hub
-# already queued a pointer or prepared a receipt. Unknown/malformed decision
-# rows are held rather than sent to unscoped recipients.
-_VISIBLE_EVENT = """CASE WHEN o.action LIKE 'decision.%' THEN
+# Tracking pointers and dispatch-origin decisions are private even if an older
+# Hub queued them or prepared a receipt. Filter before LIMIT so held events do
+# not starve ordinary events. Missing tracking entities remain private by action.
+_VISIBLE_EVENT = """CASE WHEN o.action GLOB 'tracking_task.*' OR e.kind='tracking_task' THEN 0
+    WHEN o.action LIKE 'decision.%' THEN
     CASE WHEN e.kind='decision' AND json_valid(e.data) THEN
         json_type(e.data)='object' AND json_type(e.data,'$.origin_dispatch_id') IS NULL AND
         json_type(e.data,'$.origin_dispatch_revision') IS NULL
