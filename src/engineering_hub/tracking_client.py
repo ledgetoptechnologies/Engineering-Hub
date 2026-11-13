@@ -17,7 +17,8 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 from agent_message_bus.agent_session_client import ClientError
-from engineering_hub.attention_client import _call, _profile
+from engineering_hub.attention_client import _call, _profile, _installation_profile
+from engineering_hub import tracking_outbox
 
 _MAX_INPUT = 65536
 _TOOLS = {
@@ -62,9 +63,11 @@ async def invoke(session, installation, session_id, action, arguments):
             'execution_authorization': False, 'result': result}
 
 
-async def _run(args, arguments):
+async def _run(args, arguments, *, binding=None, action=None):
     origin, token, installation, session_id, expires = _profile(
         args.profile_dir.expanduser().absolute(), args.session, args.private_vpn)
+    if binding is not None and (binding['origin'] != origin or binding['installation_id'] != installation):
+        raise ClientError('tracking_outbox_binding_mismatch')
     headers = {'Authorization': 'Bearer ' + token, 'Accept-Encoding': 'identity'}
     async with asyncio.timeout(max(1, min(60, expires - time.time()))):
         async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(15),
@@ -72,7 +75,7 @@ async def _run(args, arguments):
             async with streamable_http_client(origin + '/mcp', http_client=http, terminate_on_close=True) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await asyncio.wait_for(session.initialize(), timeout=15)
-                    return await invoke(session, installation, session_id, args.action, arguments)
+                    return await invoke(session, installation, session_id, action or args.action, arguments)
 
 
 def main(argv=None):
@@ -80,15 +83,48 @@ def main(argv=None):
     parser.add_argument('--profile-dir', type=Path, required=True)
     parser.add_argument('--session', required=True)
     parser.add_argument('--private-vpn', action='store_true')
-    parser.add_argument('action', choices=sorted(_TOOLS))
+    parser.add_argument('--outbox-dir', type=Path)
+    parser.add_argument('action', choices=sorted((*_TOOLS, 'stage', 'send-staged', 'list-staged', 'inspect-staged')))
     try:
         args = parser.parse_args(argv)
         raw = sys.stdin.buffer.read(_MAX_INPUT + 1)
         if len(raw) > _MAX_INPUT:
             raise ClientError('invalid_tracking_request')
         arguments = json.loads(raw)
-        _arguments(args.action, arguments)
-        result = asyncio.run(_run(args, arguments))
+        if args.action in ('stage', 'send-staged', 'list-staged', 'inspect-staged'):
+            if args.outbox_dir is None or type(arguments) is not dict:
+                raise ClientError('invalid_tracking_request')
+            if args.action == 'list-staged':
+                if arguments:
+                    raise ClientError('invalid_tracking_request')
+                result = {'type': 'tracking_outbox_references', 'record_ids': tracking_outbox.references(args.outbox_dir)}
+            elif args.action == 'stage':
+                if set(arguments) != {'action', 'arguments'} or arguments['action'] not in ('propose', 'update'):
+                    raise ClientError('invalid_tracking_request')
+                _arguments(arguments['action'], arguments['arguments'])
+                origin, installation = _installation_profile(
+                    args.profile_dir.expanduser().absolute(), args.private_vpn)
+                record_id = tracking_outbox.stage(args.outbox_dir, origin, installation, None,
+                                                   arguments['action'], arguments['arguments'])
+                result = {'type': 'tracking_outbox_staged', 'record_id': record_id,
+                          'sent': False, 'execution_authorization': False}
+            else:
+                if set(arguments) != {'record_id'}:
+                    raise ClientError('invalid_tracking_request')
+                record = tracking_outbox.read(args.outbox_dir, arguments['record_id'])
+                if record['action'] not in ('propose', 'update'):
+                    raise ClientError('invalid_tracking_request')
+                _arguments(record['action'], record['arguments'])
+                if args.action == 'inspect-staged':
+                    result = {'type': 'tracking_outbox_record', 'trust': 'private_local_data',
+                              'execution_authorization': False, 'record': record}
+                else:
+                    result = asyncio.run(_run(args, record['arguments'], binding=record, action=record['action']))
+        else:
+            if args.outbox_dir is not None:
+                raise ClientError('invalid_tracking_request')
+            _arguments(args.action, arguments)
+            result = asyncio.run(_run(args, arguments))
         print(json.dumps(result, ensure_ascii=True, separators=(',', ':')))
     except (Exception, KeyboardInterrupt):
         # A lost response may follow a commit. Retry a write only with its same

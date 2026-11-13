@@ -23,6 +23,7 @@ _FILES = {
     'src/engineering_hub/__init__.py': 'src/engineering_hub/__init__.py',
     'src/engineering_hub/attention_client.py': 'src/engineering_hub/attention_client.py',
     'src/engineering_hub/tracking_client.py': 'src/engineering_hub/tracking_client.py',
+    'src/engineering_hub/tracking_outbox.py': 'src/engineering_hub/tracking_outbox.py',
 }
 
 

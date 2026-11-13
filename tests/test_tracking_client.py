@@ -78,6 +78,23 @@ async def test_loopback_session_tracking_scope_retry_and_independent_review(owne
         with monkeypatch.context() as patch:
             patch.setattr(tracking_client.httpx, 'AsyncClient', TestClient)
             assert (await _run(args, {'project': PROJECT}))['result']['tasks'] == []
+            from engineering_hub import tracking_outbox
+            outbox = tmp_path / 'outbox'; outbox.mkdir(mode=0o700)
+            body = dict(project=PROJECT, title='Outbox synthetic', client_request_id='outbox-stable')
+            rid = tracking_outbox.stage(outbox, url.removesuffix('/mcp'), writer_id, None, 'propose', body)
+            saved = tracking_outbox.read(outbox, rid)
+            attempts = await asyncio.gather(*[_run(args, saved['arguments'], binding=saved, action=saved['action'])
+                                              for _ in range(2)], return_exceptions=True)
+            successful = [item['result'] for item in attempts if isinstance(item, dict)]
+            assert successful
+            retry = (await _run(args, saved['arguments'], binding=saved, action=saved['action']))['result']
+            assert all(item['id'] == retry['id'] for item in successful)
+            all_items = (await _run(args, {'project': PROJECT}))['result']['tasks']
+            assert len([item for item in all_items if item['title'] == 'Outbox synthetic']) == 1
+            # MCP transport may wrap the denial in an AnyIO ExceptionGroup.
+            with pytest.raises(Exception):
+                await _run(args, dict(body, title='changed'), binding=saved, action='propose')
+            assert tracking_outbox.read(outbox, rid) == saved
             with pytest.raises(ClientError):
                 await _run(SimpleNamespace(**dict(vars(args), private_vpn=True)), {'project': PROJECT})
             _write(profile / 'first.session.private', dict(token=writer, installation_id=reviewer_id,

@@ -50,3 +50,32 @@ with the same client_request_id; never invent a new ID for an uncertain retry.
 The client checks the exact session identity, uses its protected local profile,
 refuses redirects and environment proxies, and makes one bounded operation.
 It sends no notification and does not imply another agent has received it.
+
+## Explicit durable outbox
+
+For a write that must survive a lost response, first create an existing private,
+exclusively user-controlled outbox directory (0700 on POSIX; private user ACL
+on Windows). Use `--outbox-dir` with `stage` and stdin
+`{"action":"propose","arguments":{...}}` or `update` with the exact ordinary
+write arguments and a stable `client_request_id`. Stage requires the protected
+installation profile but no session or network; it returns a record ID only
+after file flush and atomic publication (and directory flush on POSIX). Windows
+directory metadata durability after power loss depends on the filesystem and
+is not established by this client. Files use DPAPI on Windows and owner-only modes on POSIX.
+Protect the directory and parent from other users and do not place secrets in
+task content. These records are immutable by client convention, not against a
+same-user attacker. An interruption before stage returns is unconfirmed.
+
+On a later turn, `list-staged` with `{}` lists opaque IDs. `inspect-staged`
+with `{"record_id":"..."}` explicitly prints the private local payload so it
+can be checked in a protected channel; `send-staged` with the same input sends
+the saved unchanged payload.
+Send requires a currently valid session and verifies its identity; the current
+profile must be the same Hub origin and installation that staged the record.
+An explicitly renewed session on that installation may be used because server
+idempotency is installation-scoped. Neither listing nor staging sends work;
+nothing is automatically replayed, cleared or treated as verified. A returned
+send error may follow a committed write; retry the same record unchanged or
+read back the Hub state. An outbox entry is a local handoff, not a Hub task
+until the server accepts it. Reconcile it with the project task list before
+creating another record, and protect or retain the files under your policy.

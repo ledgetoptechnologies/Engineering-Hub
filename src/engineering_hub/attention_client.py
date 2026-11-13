@@ -32,11 +32,8 @@ def _uuid(value):
     return value
 
 
-def _profile(directory, name, private_vpn):
-    if type(name) is not str or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,47}', name):
-        raise ClientError('invalid_attention_profile')
+def _installation_profile(directory, private_vpn):
     profile = _read(directory / 'installation.private')
-    session = _read(directory / (name + '.session.private'))
     selected_private = profile.get('private_vpn', False)
     if type(selected_private) is not bool or selected_private != private_vpn:
         raise ClientError('private_vpn_profile_mismatch')
@@ -48,7 +45,15 @@ def _profile(directory, name, private_vpn):
         if profile.get('private_origin') is not None:
             raise ClientError('invalid_private_profile')
         origin = _origin(profile.get('origin'))
-    installation, session_id = _uuid(profile.get('installation_id')), _uuid(session.get('session_id'))
+    return origin, _uuid(profile.get('installation_id'))
+
+
+def _profile(directory, name, private_vpn):
+    if type(name) is not str or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,47}', name):
+        raise ClientError('invalid_attention_profile')
+    origin, installation = _installation_profile(directory, private_vpn)
+    session = _read(directory / (name + '.session.private'))
+    session_id = _uuid(session.get('session_id'))
     token, expires = session.get('token'), session.get('expires_at')
     if (session.get('installation_id') != installation or type(token) is not str
             or not re.fullmatch(r'ehs_[A-Za-z0-9_-]{43}', token)
