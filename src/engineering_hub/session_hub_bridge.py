@@ -38,6 +38,7 @@ TOOLS = {
     'hub_role_list': 'role.read', 'hub_role_get': 'role.read', 'hub_role_acquire': 'role.lease', 'hub_role_renew': 'role.lease',
     'hub_role_release': 'role.lease', 'hub_role_claim': 'role.claim',
     'hub_role_claims': 'role.read', 'hub_role_claim_release': 'role.claim',
+    'hub_task_progress_get': 'progress.read', 'hub_task_progress_update': 'progress.write',
     'hub_staging_task_propose': 'task.propose', 'hub_task_claim': 'task.claim',
     'hub_task_candidate': 'task.candidate', 'hub_task_review': 'task.review',
     'hub_planning_list': 'planning.read', 'hub_planning_get': 'planning.read',
@@ -414,6 +415,10 @@ class SessionHubBridge:
                 # A tracking ID is not a capability to discover a task in an
                 # ungranted, archived, or nonexistent project.
                 raise HubError('hub_tracking_task_unavailable', 404) from None
+            return
+        elif tool in {'hub_task_progress_get', 'hub_task_progress_update'}:
+            # TaskProgress resolves the exact task kind and independently checks
+            # project scope and underlying task-read capability under this guard.
             return
         elif tool == 'hub_decision_get':
             try:

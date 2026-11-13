@@ -1079,6 +1079,11 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         from .roles import RoleRepository
         return RoleRepository(repo).owner_list(role_owner(request), limit, after)
 
+    @app.get('/api/hub/v1/task-progress/{task_id}')
+    def get_task_progress(task_id: str, request: Request):
+        from .task_progress import TaskProgress
+        return TaskProgress(repo).owner_get(role_owner(request), task_id)
+
     @app.get('/api/hub/v1/roles/{role}')
     def get_role(role: str, request: Request):
         from .roles import RoleRepository

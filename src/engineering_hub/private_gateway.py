@@ -123,6 +123,7 @@ def browser_route_allowed(method, path, *, allow_bound_oauth_callback=False):
     if method in {'GET', 'HEAD'}:
         return (path in _GET or client_page_allowed(method, path)
                 or path == '/api/hub/v1/roles'
+                or re.fullmatch(r'/api/hub/v1/task-progress/' + _UUID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/roles/' + _PROJECT_ID, path) is not None
                 or path == '/api/hub/v1/infrastructure/devices'
                 or path == '/api/hub/v1/infrastructure/metrics'

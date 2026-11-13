@@ -2875,6 +2875,43 @@
         }
       }
     },
+    "/api/hub/v1/task-progress/{task_id}": {
+      "get": {
+        "summary": "Get Task Progress",
+        "operationId": "get_task_progress_api_hub_v1_task_progress__task_id__get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/roles/{role}": {
       "get": {
         "summary": "Get Role",

@@ -229,6 +229,22 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         return invoke(read)
 
     @registration.tool()
+    def hub_task_progress_get(task_id: str, ctx: Context) -> dict:
+        """Read separately versioned task progress; it is not completion proof."""
+        from .task_progress import TaskProgress
+        return invoke(TaskProgress(repo).get, identity(ctx), task_id)
+
+    @registration.tool()
+    def hub_task_progress_update(task_id: str, expected_revision: StrictInt, client_request_id: str, checklist: list[dict],
+                                 status_line: str, blocked_on: str, ctx: Context,
+                                 agent_eta_guess: StrictInt | None = None, role: str | None = None,
+                                 generation: StrictInt | None = None) -> dict:
+        """Update separate CAS progress. Percentage is derived; completion still needs independent review."""
+        from .task_progress import TaskProgress
+        return invoke(TaskProgress(repo).update, identity(ctx), task_id, expected_revision, client_request_id, checklist,
+                      status_line, blocked_on, agent_eta_guess, role, generation)
+
+    @registration.tool()
     def hub_role_list(project: str, ctx: Context, limit: StrictInt = 50, after: str | None = None) -> dict:
         """List bounded roles fully visible to this session's current project grants."""
         from .roles import RoleRepository
