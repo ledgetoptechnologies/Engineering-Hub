@@ -30,6 +30,17 @@ def test_release_evidence_github_reader_must_match_configured_owner():
     assert release_evidence_owner_allowed('human:42', AuthConfig('https://hub.invalid'), None) is False
 
 
+def test_release_evidence_bound_reader_requires_exact_access_owner():
+    config = AuthConfig('https://hub.invalid', github_client_id='id', github_client_secret='secret',
+        beau_github_id=42, human_auth_mode='github_cloudflare',
+        cloudflare_issuer='https://fixture.cloudflareaccess.com', cloudflare_audience='aud',
+        cloudflare_allowed_emails=('owner@example.com',), bound_access_subject='subject')
+    assert release_evidence_owner_allowed('human:cf:owner', config, 'human:cf:owner') is True
+    assert release_evidence_owner_allowed('human:cf:other', config, 'human:cf:owner') is False
+    assert release_evidence_owner_allowed('human:cf:owner', config, None) is False
+    assert release_evidence_owner_allowed('human:42', config, 'human:42') is False
+
+
 def test_release_evidence_rejects_non_actor_principal_shapes():
     config = AuthConfig('https://hub.invalid', beau_github_id=42)
 

@@ -19,7 +19,7 @@ def release_evidence_owner_allowed(principal, auth_config, owner_actor):
     if auth_config.human_auth_mode == 'github':
         owner_id = auth_config.beau_github_id
         return owner_id is not None and principal == f'human:{owner_id}'
-    if auth_config.human_auth_mode == 'cloudflare_access':
+    if auth_config.human_auth_mode in {'cloudflare_access', 'github_cloudflare'}:
         return (isinstance(owner_actor, str) and owner_actor.startswith('human:cf:')
                 and principal == owner_actor)
     return False

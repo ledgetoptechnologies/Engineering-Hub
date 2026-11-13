@@ -19,13 +19,18 @@ from tests.test_hub_frontends import Feed
 
 
 @pytest.mark.asyncio
-async def test_real_bus_owner_pairing_with_bound_human(tmp_path):
+@pytest.mark.parametrize('owner_matches', [True, False])
+async def test_real_bus_owner_pairing_with_bound_human(tmp_path, owner_matches):
+    from engineering_hub.container_pilot import ContainerPilotTarget
+    from engineering_hub.repository import HubRepository
+    from tests.test_hub_container_pilot import PRINCIPAL, pilot_manifest, ready_run
     origin = 'https://hub.example'
     issuer = 'https://fixture.cloudflareaccess.com'
     audience, subject = 'aud', 'subject'
     owner = 'human:cf:' + hashlib.sha256((issuer+'\0'+audience+'\0'+subject).encode()).hexdigest()
     auth = AuthSettings('test-hermes','test-codex',claude_token='test-claude')
-    sessions = AgentSessionsConfig((tmp_path/'connections.db').absolute(), owner, origin)
+    configured_owner = owner if owner_matches else 'human:cf:' + 'a' * 64
+    sessions = AgentSessionsConfig((tmp_path/'connections.db').absolute(), configured_owner, origin)
     bus = create_bus(db_path=tmp_path/'bus.db', audit_path=tmp_path/'audit.jsonl', file_root=tmp_path/'files',
         auth=auth, push_events_operational=False,
         transport_security_settings=TransportSecuritySettings(allowed_hosts=['hub.example'],allowed_origins=[origin]),
@@ -38,20 +43,34 @@ async def test_real_bus_owner_pairing_with_bound_human(tmp_path):
     checker = CloudflareAccessVerifier(config.cloudflare_config,transport=httpx.MockTransport(lambda _:httpx.Response(200,json={'keys':[jwk]})))
     class Github:
         async def exchange(self, code, verifier): return 123
-    core = create_app(Settings(tmp_path/'hub.db',auth,config),bus_app=bus,event_feed=Feed(),github_client=Github())
+    repo = HubRepository(tmp_path/'hub.db', execution_principal=PRINCIPAL)
+    workflow, run = ready_run(repo, ContainerPilotTarget.from_manifest(pilot_manifest()))
+    core = create_app(Settings(tmp_path/'hub.db',auth,config),repository=repo,
+                      container_pilot_workflow=workflow,bus_app=bus,event_feed=Feed(),github_client=Github())
     pair = HubFrontends(core,access_verifier=checker)
     now = int(time.time())
     assertion = jwt.encode({'iss':issuer,'aud':[audience],'sub':subject,'email':'owner@example.com','type':'app','iat':now-1,'exp':now+120},key,algorithm='RS256',headers={'kid':'fixture'})
     headers = {'CF-Access-Jwt-Assertion':assertion}
     async with pair.lifespan():
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=pair.browser),base_url=origin,follow_redirects=False) as client:
+            evidence_path = f'/api/hub/v1/container-pilot/runs/{run["id"]}/release-evidence'
+            assert (await client.get(evidence_path, headers=headers)).status_code == 401
             login = await client.get('/api/hub/v1/auth/login',headers=headers)
             state = parse_qs(urlsplit(login.headers['location']).query)['state'][0]
             assert (await client.get('/api/hub/v1/auth/callback',params={'state':state,'code':'ok'},headers=headers)).status_code == 303
             me = (await client.get('/api/hub/v1/auth/me',headers=headers)).json()
             assert me['actor'] == owner
             cap = await client.get('/api/hub/v1/agent-connections/capabilities',headers=headers)
+            evidence = await client.get(evidence_path, headers=headers)
+            if not owner_matches:
+                assert cap.status_code == 403
+                assert evidence.status_code == 403
+                return
             assert cap.status_code == 200 and cap.json()['owner'] is True
+            assert evidence.status_code == 200
+            assert evidence.json()['run_id'] == run['id']
+            assert evidence.json()['independently_verified'] is False
+            assert (await client.get(evidence_path, headers={'Authorization':'Bearer test-codex'})).status_code in (401, 403)
             secret='ehi_'+'A'*43
             record=bus.state.agent_sessions.request_enrollment('codex','fixture','fixture',hashlib.sha256(secret.encode()).hexdigest())
             path='/api/hub/v1/agent-connections/installations/'+record['id']+'/approve'
