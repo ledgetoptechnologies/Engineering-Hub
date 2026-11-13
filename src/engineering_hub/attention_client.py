@@ -221,6 +221,36 @@ class AttentionAdapter:
                        receipt_id=_uuid(result.get('id')), wake_verified=False, task_completion_verified=False))
 
 
+    async def inspect_answer(self, dispatch_id, dispatch_revision, decision_id, decision_revision):
+        if self.role == 'orchestrator':
+            raise ClientError('invalid_attention_reference')
+        _uuid(dispatch_id); _uuid(decision_id)
+        if (type(dispatch_revision) is not int or dispatch_revision < 1
+                or type(decision_revision) is not int or decision_revision < 1):
+            raise ClientError('invalid_attention_reference')
+        await self.verify_identity()
+        result = await _call(self.session, 'hub_worker_decision_inspect', dict(
+            project=self.project, role=self.role, generation=self.generation, dispatch_id=dispatch_id,
+            expected_dispatch_revision=dispatch_revision, decision_id=decision_id,
+            expected_decision_revision=decision_revision))
+        answer = result.get('answer')
+        if (result.get('project') != self.project or result.get('role') != self.role
+                or type(result.get('generation')) is not int or result.get('generation') != self.generation
+                or result.get('dispatch_id') != dispatch_id or type(result.get('dispatch_revision')) is not int
+                or result.get('dispatch_revision') != dispatch_revision or result.get('decision_id') != decision_id
+                or type(result.get('decision_revision')) is not int or result.get('decision_revision') != decision_revision
+                or result.get('status') != 'answered'
+                or result.get('trust') != 'untrusted_hub_data' or result.get('execution_authorization') is not False
+                or result.get('wake_verified') is not False or type(answer) is not str or not answer.strip()
+                or len(answer) > 4096 or len(answer.encode('utf-8')) > 16384):
+            raise ClientError('invalid_attention_response')
+        self.emit(dict(type='worker_decision_answer', trust='untrusted_hub_data', project=self.project,
+                       role=self.role, role_generation=self.generation, dispatch_id=dispatch_id,
+                       dispatch_revision=dispatch_revision, decision_id=decision_id,
+                       decision_revision=decision_revision, answer=answer,
+                       execution_authorization=False, wake_verified=False))
+
+
 async def _events(response):
     buffer = bytearray()
     event = data = None
@@ -296,6 +326,9 @@ async def _run(args):
                     await use_mcp(consume)
             elif args.command == 'read':
                 await use_mcp(lambda adapter: adapter.catch_up(args.after))
+            elif args.command == 'inspect-answer':
+                await use_mcp(lambda adapter: adapter.inspect_answer(args.dispatch_id, args.revision,
+                    args.decision_id, args.decision_revision))
             else:
                 reference = getattr(args, 'intent_id', None) if role == 'orchestrator' else getattr(args, 'dispatch_id', None)
                 if (role == 'orchestrator' and getattr(args, 'dispatch_id', None) is not None
@@ -317,6 +350,11 @@ def main(argv=None):
     commands.add_parser('listen')
     read = commands.add_parser('read')
     read.add_argument('--after')
+    inspect = commands.add_parser('inspect-answer')
+    inspect.add_argument('--dispatch-id', required=True)
+    inspect.add_argument('--revision', type=int, required=True)
+    inspect.add_argument('--decision-id', required=True)
+    inspect.add_argument('--decision-revision', type=int, required=True)
     ack = commands.add_parser('ack')
     reference = ack.add_mutually_exclusive_group(required=True)
     reference.add_argument('--intent-id')

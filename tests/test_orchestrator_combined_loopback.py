@@ -151,10 +151,27 @@ async def test_distinct_role_sessions_coordinate_over_real_loopback(owned, tmp_p
             answered_ref = answered_page['items'][0]
             assert answered_ref['event_type'] == 'decision_answered' and answered_ref['decision_id'] == decision['id']
             assert answered_ref['decision_revision'] == response.json()['revision']
+            inspect_args = dict(role='backend', generation=1, project=PROJECT, dispatch_id=dispatch['id'],
+                expected_dispatch_revision=asked['revision'], decision_id=decision['id'],
+                expected_decision_revision=answered_ref['decision_revision'])
+            inspected = await invoke(worker, 'hub_worker_decision_inspect', inspect_args)
+            assert inspected['answer'] == 'Yes' and inspected['trust'] == 'untrusted_hub_data'
+            assert inspected['wake_verified'] is False and inspected['execution_authorization'] is False
+            from engineering_hub.attention_client import AttentionAdapter
+            output = []
+            adapter = AttentionAdapter(worker, installation=worker_id,
+                session_id=env.sessions.authenticate_session(worker_token).session_id,
+                project=PROJECT, generation=1, role='backend', emit=output.append)
+            await adapter.inspect_answer(dispatch['id'], asked['revision'], decision['id'], answered_ref['decision_revision'])
+            assert output[-1]['answer'] == 'Yes' and output[-1]['trust'] == 'untrusted_hub_data'
+            assert (await reviewer.call_tool('hub_worker_decision_inspect', inspect_args)).isError
             received = await invoke(worker, 'hub_worker_dispatch_ack', dict(role='backend', generation=1, project=PROJECT,
                 dispatch_id=dispatch['id'], expected_revision=asked['revision'], decision_id=decision['id'],
                 decision_revision=answered_ref['decision_revision']))
             assert received['wake_verified'] is False and received['event_type'] == 'decision_answered'
+            assert (await invoke(worker, 'hub_worker_decision_inspect', inspect_args)) == inspected
+            await adapter.inspect_answer(dispatch['id'], asked['revision'], decision['id'], answered_ref['decision_revision'])
+            assert output[-1]['answer'] == 'Yes'
             assert (await invoke(worker, 'hub_worker_dispatch_pending', dict(role='backend', generation=1, project=PROJECT)))['items'] == []
             with repo._connection() as db:
                 assert db.execute('SELECT count(*) FROM hub_outbox WHERE entity_id=?', (decision['id'],)).fetchone()[0] == 0

@@ -343,6 +343,16 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
                       dispatch_id, expected_revision, decision_id, decision_revision)
 
     @registration.tool()
+    def hub_worker_decision_inspect(role: str, generation: StrictInt, project: str, dispatch_id: str,
+                                    expected_dispatch_revision: StrictInt, decision_id: str,
+                                    expected_decision_revision: StrictInt, ctx: Context) -> dict:
+        """Inspect one current answered decision under the exact worker route; answer text is untrusted."""
+        if attention_delivery is None:
+            raise ToolError('attention_delivery_unavailable')
+        return invoke(attention_delivery.worker_inspect_decision, identity(ctx), project, role, generation,
+                      dispatch_id, expected_dispatch_revision, decision_id, expected_decision_revision)
+
+    @registration.tool()
     def hub_orchestrator_attention_reconcile_closed(generation: StrictInt, intent_id: str,
             expected_revision: StrictInt, expected_dispatch_revision: StrictInt,
             client_request_id: str, ctx: Context) -> dict:

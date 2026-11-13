@@ -365,6 +365,56 @@ class AttentionDelivery:
             self._validate_target(operation.db, db, route)
             return receipt
 
+    def worker_inspect_decision(self, actor, project, role, generation, dispatch_id,
+                                expected_dispatch_revision, decision_id, expected_decision_revision):
+        """Read one current answered decision under the exact owner-admitted worker route."""
+        operation = context.current.get()
+        if operation is None or not context.actor_allowed(actor) or role == 'orchestrator':
+            raise HubError('attention_route_unavailable', 404)
+        _canonical_id(dispatch_id); _canonical_id(decision_id)
+        if (type(expected_dispatch_revision) is not int or expected_dispatch_revision < 1
+                or type(expected_decision_revision) is not int or expected_decision_revision < 1):
+            raise HubError('invalid_attention_reference', 422)
+        service = DispatchRepository(self.repo)
+        def read_current(db, route):
+            self._validate_target(operation.db, db, route)
+            service._grant(operation, 'dispatch.read', 'role.read', 'decision.read')
+            try:
+                item, task, target, _ = service._dispatch(db, actor, dispatch_id)
+                binding = dict(generation=generation, session_id=route['session_id'], installation_id=route['installation_id'])
+                if (item.get('project') != project or target.get('role_id') != role
+                        or item.get('state') != 'asked' or item.get('decision_id') != decision_id
+                        or type(item.get('revision')) is not int or item['revision'] != expected_dispatch_revision
+                        or task.get('status') not in ('assigned', 'claimed', 'in_review', 'open', 'completion_claimed')
+                        or service._binding(item.get('target_binding')) != binding):
+                    raise HubError('attention_route_unavailable', 404)
+                decision = self.repo._get(db, decision_id, 'decision')
+                answer = decision.get('answer')
+                if (decision.get('id') != decision_id or decision.get('project') != project
+                        or decision.get('origin_dispatch_id') != dispatch_id
+                        or type(decision.get('origin_dispatch_revision')) is not int
+                        or not 1 <= decision['origin_dispatch_revision'] <= item['revision']
+                        or decision.get('status') != 'answered' or type(decision.get('revision')) is not int
+                        or decision['revision'] != expected_decision_revision or type(answer) is not str
+                        or not answer.strip() or len(answer) > 4096 or len(answer.encode('utf-8')) > 16384):
+                    raise HubError('attention_route_unavailable', 404)
+                return answer
+            except (HubError, KeyError, TypeError, ValueError, UnicodeError):
+                raise HubError('attention_route_unavailable', 404) from None
+        with service._attention_snapshot() as db:
+            route = self._route_for(db, operation, project, generation, role)
+            service._held(db, actor, role, generation)
+            answer = read_current(db, route)
+        def recheck(_db):
+            with service._attention_snapshot() as current:
+                if read_current(current, route) != answer:
+                    raise HubError('attention_route_unavailable', 404)
+        operation.commit_checks.append(recheck)
+        return dict(project=project, role=role, generation=generation, dispatch_id=dispatch_id,
+                    dispatch_revision=expected_dispatch_revision, decision_id=decision_id,
+                    decision_revision=expected_decision_revision, status='answered', answer=answer,
+                    trust='untrusted_hub_data', execution_authorization=False, wake_verified=False)
+
     def owner_worker_receipts(self, actor, project, role, limit=50, after=None):
         self.repo._actor(actor, human=True)
         self._owner()
