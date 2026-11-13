@@ -24,6 +24,8 @@ from tests.test_stale_service_authority import owned
 
 def test_explicit_bounded_tool_arguments_only():
     assert _arguments('list', {'project': PROJECT})[0] == 'hub_tracking_task_list'
+    assert _arguments('origin', {'task_id': 'task'})[0] == 'hub_tracking_task_origin'
+    assert _arguments('request-summary', {'project': PROJECT, 'request_id': 'req'})[0] == 'hub_orchestration_request_origin_task_summary'
     for action, value in [('other', {}), ('list', {'project': PROJECT, 'token': 'secret'}),
                           ('update', {'task_id': 'x'}), ('list', [])]:
         with pytest.raises(ClientError):
@@ -43,7 +45,7 @@ async def test_loopback_session_tracking_scope_retry_and_independent_review(owne
     bridge = app.state.session_hub_bridge
     env = SimpleNamespace(repo=repo, bridge=bridge, sessions=bridge.sessions)
     writer_id, writer, _ = pair(env, name='tracking-client-writer', family='codex',
-        caps=('tracking.propose', 'tracking.read', 'tracking.update', 'tracking.review'))
+        caps=('tracking.propose', 'tracking.read', 'tracking.update', 'tracking.review', 'dispatch.read'))
     reviewer_id, reviewer, _ = pair(env, name='tracking-client-reviewer', family='claude',
         caps=('tracking.read', 'tracking.review'))
     wp = env.sessions.authenticate_session(writer)
@@ -82,6 +84,8 @@ async def test_loopback_session_tracking_scope_retry_and_independent_review(owne
                 session_id=wp.session_id, expires_at=wp.expires_at))
             with pytest.raises(ClientError):
                 await _run(args, {'project': PROJECT})
+        from tests.test_dispatch_coordination import setup_dispatch
+        _, _, _, _, _, _, source_request, _ = setup_dispatch(env)
         async with connected(url, writer) as w, connected(url, reviewer) as r:
             async def action(session, principal, name, payload):
                 return (await invoke(session, principal.installation_id, principal.session_id, name, payload))['result']
@@ -95,7 +99,19 @@ async def test_loopback_session_tracking_scope_retry_and_independent_review(owne
                 await action(w, wp, 'propose', dict(request, title='changed'))
             with pytest.raises(ClientError):
                 await action(w, wp, 'list', {'project': 'project-alpha'})
-            assert (await action(w, wp, 'list', {'project': PROJECT, 'unfinished': True}))['tasks'][0]['id'] == task['id']
+            assert task['id'] in [item['id'] for item in (await action(w, wp, 'list', {'project': PROJECT, 'unfinished': True}))['tasks']]
+            linked = await action(w, wp, 'propose', dict(project=PROJECT, title='Linked synthetic work',
+                client_request_id='linked', origin_request_id=source_request['id']))
+            assert (await action(w, wp, 'origin', {'task_id': linked['id']}))['origin_request_id'] == source_request['id']
+            assert (await action(w, wp, 'origin', {'task_id': task['id']}))['origin_request_id'] is None
+            summary = await action(w, wp, 'request-summary', {'project': PROJECT, 'request_id': source_request['id']})
+            assert summary['scope'] == 'origin_linked_tracking_tasks_only'
+            assert not summary['dispatch_only_tasks_included']
+            assert [item['id'] for item in summary['tasks']] == [linked['id']]
+            with pytest.raises(ClientError):
+                await action(r, rp, 'request-summary', {'project': PROJECT, 'request_id': source_request['id']})
+            with pytest.raises(ClientError):
+                await action(w, wp, 'request-summary', {'project': 'project-alpha', 'request_id': source_request['id']})
             links = [{'label': 'Synthetic evidence', 'url': 'https://example.com/evidence'}]
             claim = await action(w, wp, 'update', dict(task_id=task['id'], expected_revision=task['revision'],
                 client_request_id='claim', progress='Synthetic evidence ready', evidence_links=links, completion_claim=True))

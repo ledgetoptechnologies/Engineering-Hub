@@ -29,6 +29,9 @@ _TOOLS = {
     'review': ('hub_tracking_task_review', {'task_id', 'expected_revision', 'client_request_id', 'verdict', 'note', 'evidence_links'},
                set()),
     'history': ('hub_tracking_task_history', {'task_id', 'kind'}, {'before'}),
+    'origin': ('hub_tracking_task_origin', {'task_id'}, set()),
+    'request-summary': ('hub_orchestration_request_origin_task_summary', {'project', 'request_id'},
+                        {'limit', 'after'}),
 }
 
 
