@@ -173,6 +173,19 @@ class TrackingReview(Revision):
     evidence_links: list[dict[str, str]] = Field(max_length=8)
 
 
+class RoleWrite(Input):
+    expected_revision: int = Field(ge=0)
+    projects: list[str] = Field(min_length=1, max_length=32)
+    installations: list[str] = Field(min_length=1, max_length=32)
+    paths: list[str] = Field(max_length=64)
+    standing_rules: str = Field(min_length=1, max_length=4096)
+    tool_scope: list[str] = Field(max_length=64)
+
+
+class RoleRecovery(Revision):
+    reason: str = Field(min_length=1, max_length=1000)
+
+
 class Candidate(Revision):
     commit: str = Field(pattern=r"^[0-9a-f]{40}$")
 
@@ -1052,6 +1065,36 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     def image_versions(request: Request):
         actor(request)
         return image_versions_for(notes_repository)
+
+    def role_owner(request, *, mutation=False):
+        actor_id = human(request, mutation=mutation)
+        if session_bridge is None:
+            raise HubError('role_service_unavailable', 503)
+        if actor_id != session_bridge.sessions.owner:
+            raise HubError('role_owner_required', 403)
+        return actor_id
+
+    @app.get('/api/hub/v1/roles')
+    def list_roles(request: Request, limit: int = 50, after: str | None = None):
+        from .roles import RoleRepository
+        return RoleRepository(repo).owner_list(role_owner(request), limit, after)
+
+    @app.get('/api/hub/v1/roles/{role}')
+    def get_role(role: str, request: Request):
+        from .roles import RoleRepository
+        return RoleRepository(repo).owner_get(role_owner(request), role)
+
+    @app.put('/api/hub/v1/roles/{role}')
+    def configure_role(role: str, payload: RoleWrite, request: Request):
+        actor_id = role_owner(request, mutation=True)
+        from .roles import RoleRepository
+        return RoleRepository(repo).configure(actor_id, role, **payload.model_dump())
+
+    @app.post('/api/hub/v1/roles/{role}/clear-expired')
+    def clear_expired_role(role: str, payload: RoleRecovery, request: Request):
+        actor_id = role_owner(request, mutation=True)
+        from .roles import RoleRepository
+        return RoleRepository(repo).owner_clear_expired(actor_id, role, payload.expected_revision, payload.reason, session_bridge.sessions._now)
 
     @app.get("/api/hub/v1/projects/{project}/tracking-tasks")
     def project_tracking_tasks(project: str, request: Request, limit: int = 50, after_task_id: str | None = None,

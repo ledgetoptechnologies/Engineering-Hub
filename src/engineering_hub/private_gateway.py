@@ -111,6 +111,8 @@ def browser_route_allowed(method, path, *, allow_bound_oauth_callback=False):
         return True
     if method == 'PUT' and re.fullmatch(installation + r'/(?:hub-grant|scope)', path) is not None:
         return True
+    if method == 'PUT' and re.fullmatch(r'/api/hub/v1/roles/' + _PROJECT_ID, path) is not None:
+        return True
     if method == 'PATCH' and re.fullmatch(installation, path) is not None:
         return True
     if method == 'POST' and (
@@ -120,6 +122,8 @@ def browser_route_allowed(method, path, *, allow_bound_oauth_callback=False):
         return True
     if method in {'GET', 'HEAD'}:
         return (path in _GET or client_page_allowed(method, path)
+                or path == '/api/hub/v1/roles'
+                or re.fullmatch(r'/api/hub/v1/roles/' + _PROJECT_ID, path) is not None
                 or path == '/api/hub/v1/infrastructure/devices'
                 or path == '/api/hub/v1/infrastructure/metrics'
                 or path == '/api/hub/v1/infrastructure/metrics/history'
@@ -148,6 +152,7 @@ def browser_route_allowed(method, path, *, allow_bound_oauth_callback=False):
         return (re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/components/' + _UUID, path) is not None)
     return method == 'POST' and (path in _POST
+        or re.fullmatch(r'/api/hub/v1/roles/' + _PROJECT_ID + '/clear-expired', path) is not None
         or re.fullmatch(r'/api/hub/v1/tracking-tasks/' + _UUID + '/review', path) is not None
         or re.fullmatch(r'/api/hub/v1/infrastructure/devices/' + _PROJECT_ID + '/maintenance', path) is not None
         or re.fullmatch(r'/api/hub/v1/infrastructure/maintenance/' + _UUID + '/resolve', path) is not None

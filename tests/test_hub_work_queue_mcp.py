@@ -137,7 +137,7 @@ def test_unconfigured_mcp_queue_never_claims_readiness(rig):
         names = {tool['name'] for tool in rpc(client, 'tools/list').json()['result']['tools']}
         assert names == {
             'hub_overview', 'hub_project_tasks', 'hub_tracking_task_propose', 'hub_tracking_task_update',
-            'hub_tracking_task_list', 'hub_tracking_task_review', 'hub_tracking_task_history',
+            'hub_tracking_task_list', 'hub_tracking_task_review', 'hub_role_list', 'hub_role_get', 'hub_role_acquire', 'hub_role_renew', 'hub_role_release', 'hub_role_claim', 'hub_role_claims', 'hub_role_claim_release', 'hub_tracking_task_history',
             'hub_tracking_task_compact', 'hub_task_get', 'hub_task_claim', 'hub_task_candidate',
             'hub_task_review', 'hub_decision_request', 'hub_decision_get', 'hub_run_list',
             'hub_topic_peers', 'hub_topic_preflight', 'hub_staging_task_propose',

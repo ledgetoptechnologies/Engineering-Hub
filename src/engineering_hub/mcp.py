@@ -229,6 +229,55 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         return invoke(read)
 
     @registration.tool()
+    def hub_role_list(project: str, ctx: Context, limit: StrictInt = 50, after: str | None = None) -> dict:
+        """List bounded roles fully visible to this session's current project grants."""
+        from .roles import RoleRepository
+        return invoke(RoleRepository(repo).list, identity(ctx), project, limit, after)
+
+    @registration.tool()
+    def hub_role_get(role: str, ctx: Context) -> dict:
+        """Read one granted coordination role; no execution authority is conferred."""
+        from .roles import RoleRepository
+        return invoke(RoleRepository(repo).get, identity(ctx), role)
+
+    @registration.tool()
+    def hub_role_acquire(role: str, expected_revision: StrictInt, lease_seconds: StrictInt, ctx: Context) -> dict:
+        """Acquire an expired or unheld coordination role for this authenticated session."""
+        from .roles import RoleRepository
+        return invoke(RoleRepository(repo).acquire, identity(ctx), role, expected_revision, lease_seconds)
+
+    @registration.tool()
+    def hub_role_renew(role: str, expected_revision: StrictInt, generation: StrictInt, lease_seconds: StrictInt, ctx: Context) -> dict:
+        """Renew this exact session and generation's role lease."""
+        from .roles import RoleRepository
+        return invoke(RoleRepository(repo).renew, identity(ctx), role, expected_revision, generation, lease_seconds)
+
+    @registration.tool()
+    def hub_role_release(role: str, expected_revision: StrictInt, generation: StrictInt,
+                         expected_handoff_revision: StrictInt, handoff: str, ctx: Context) -> dict:
+        """Record a handoff and release the role lease atomically."""
+        from .roles import RoleRepository
+        return invoke(RoleRepository(repo).release, identity(ctx), role, expected_revision, generation, expected_handoff_revision, handoff)
+
+    @registration.tool()
+    def hub_role_claim(role: str, generation: StrictInt, task_id: str, client_request_id: str, ctx: Context) -> dict:
+        """Attach an inert role-owned coordination claim; never claims executable work."""
+        from .roles import RoleRepository
+        return invoke(RoleRepository(repo).claim, identity(ctx), role, generation, task_id, client_request_id)
+
+    @registration.tool()
+    def hub_role_claims(role: str, ctx: Context, limit: StrictInt = 50, after: str | None = None) -> dict:
+        """Read a bounded page of this role's outstanding coordination claims."""
+        from .roles import RoleRepository
+        return invoke(RoleRepository(repo).claims, identity(ctx), role, limit, after)
+
+    @registration.tool()
+    def hub_role_claim_release(role: str, generation: StrictInt, task_id: str, expected_revision: StrictInt, reason: str, ctx: Context) -> dict:
+        """Release a coordination claim without asserting that work completed."""
+        from .roles import RoleRepository
+        return invoke(RoleRepository(repo).release_claim, identity(ctx), role, generation, task_id, expected_revision, reason)
+
+    @registration.tool()
     def hub_tracking_task_propose(project: str, title: str, client_request_id: str, ctx: Context,
                                   details: str | None = None, links: list[dict[str, str]] | None = None) -> dict:
         """Propose an inert project tracking record; this never authorizes or dispatches work."""

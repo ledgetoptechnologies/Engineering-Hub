@@ -247,7 +247,7 @@ class HubRepository:
         if type(expected) is not int or item['revision'] != expected:
             raise HubError('revision_conflict', 409)
 
-    def _save(self, db, actor, action, kind, item, new=False):
+    def _save(self, db, actor, action, kind, item, new=False, *, publish=True):
         item['revision'] = 1 if new else item['revision'] + 1
         item['updated_at'] = datetime.now(timezone.utc).isoformat()
         db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data',
@@ -255,7 +255,8 @@ class HubRepository:
         db.execute('INSERT INTO hub_audit(actor,action,entity_id,revision,created_at) VALUES(?,?,?,?,?)',
                    (actor, action, item['id'], item['revision'], item['updated_at']))
         session_context.provenance(db, db.execute("SELECT last_insert_rowid()").fetchone()[0])
-        self._emit(db, action, item)
+        if publish:
+            self._emit(db, action, item)
         return item
 
     def _emit(self, db, action, item):

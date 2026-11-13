@@ -5,7 +5,7 @@ permitted inside admission. An OS lock refuses a second bridge process; the
 session SQLite writer also serializes revocation from independent connections.
 """
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 import inspect
 import hashlib
@@ -35,6 +35,9 @@ TOOLS = {
     'hub_tracking_task_list': 'tracking.read', 'hub_tracking_task_history': 'tracking.read',
     'hub_tracking_task_compact': 'tracking.update',
     'hub_tracking_task_review': 'tracking.review',
+    'hub_role_list': 'role.read', 'hub_role_get': 'role.read', 'hub_role_acquire': 'role.lease', 'hub_role_renew': 'role.lease',
+    'hub_role_release': 'role.lease', 'hub_role_claim': 'role.claim',
+    'hub_role_claims': 'role.read', 'hub_role_claim_release': 'role.claim',
     'hub_staging_task_propose': 'task.propose', 'hub_task_claim': 'task.claim',
     'hub_task_candidate': 'task.candidate', 'hub_task_review': 'task.review',
     'hub_planning_list': 'planning.read', 'hub_planning_get': 'planning.read',
@@ -72,6 +75,7 @@ class _Operation:
     capability: str
     projects: tuple
     used_projects: set = None
+    commit_checks: list = field(default_factory=list)
 
     def project(self, project):
         if project not in self.projects:
@@ -89,6 +93,8 @@ class _Operation:
                           self.capability, session_id=self.principal.session_id)
         for project in tuple(self.used_projects or ()):
             self.project(project)
+        for check in self.commit_checks:
+            check(db)
         if Path(storage_path).resolve() == self.bridge.knowledge_path:
             # Planning is committed in the separate shared knowledge database.
             # Record exact session attribution in that same transaction.
@@ -392,6 +398,13 @@ class SessionHubBridge:
                 if error.code not in {'not_found', 'hub_project_forbidden', 'project_archived'}:
                     raise
                 raise HubError('hub_task_unavailable', 404) from None
+            return
+        elif tool in {'hub_role_get', 'hub_role_acquire', 'hub_role_renew', 'hub_role_release', 'hub_role_claim', 'hub_role_claims', 'hub_role_claim_release'}:
+            try:
+                from .roles import RoleRepository
+                RoleRepository(self.repo).get(operation.principal.actor, arguments['role'])
+            except HubError:
+                raise HubError('role_unavailable', 404) from None
             return
         elif tool in {'hub_tracking_task_update', 'hub_tracking_task_review', 'hub_tracking_task_history', 'hub_tracking_task_compact'}:
             try:
