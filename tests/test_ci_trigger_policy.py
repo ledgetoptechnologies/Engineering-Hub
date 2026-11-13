@@ -89,7 +89,7 @@ def test_protected_image_profile_runs_before_upload_and_latest_promotion():
     assert '--commit "$GITHUB_SHA"' in verify[0]
     steps = jobs['publish']['steps']
     local = next(i for i, step in enumerate(steps)
-                 if helper + ' --image "$BUILD_IMAGE"' in step.get('run', ''))
+                 if helper + ' --image "$TESTED_CONFIG"' in step.get('run', ''))
     upload = next(i for i, step in enumerate(steps)
                   if 'docker push "$BUILD_IMAGE"' in step.get('run', ''))
     registry = next(i for i, step in enumerate(steps)
@@ -97,6 +97,10 @@ def test_protected_image_profile_runs_before_upload_and_latest_promotion():
     promote = next(i for i, step in enumerate(steps)
                    if 'imagetools create' in step.get('run', ''))
     assert local < upload == registry < promote
+    assert steps[local]['run'].index('TESTED_CONFIG="$(docker image inspect "$BUILD_IMAGE"') < (
+        steps[local]['run'].index(helper + ' --image "$TESTED_CONFIG"'))
+    assert steps[upload]['run'].index('test "$(docker image inspect "$BUILD_IMAGE"') < (
+        steps[upload]['run'].index('docker push "$BUILD_IMAGE"'))
     assert '--commit "$GITHUB_SHA" > hub-local-protected-startup.json' in steps[local]['run']
     assert '--commit "$GITHUB_SHA" > hub-registry-protected-startup.json' in steps[registry]['run']
     assert any('hub-*-startup.json' in step.get('with', {}).get('path', '') for step in steps)
