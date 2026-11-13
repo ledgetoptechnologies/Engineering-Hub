@@ -92,11 +92,12 @@ async def test_client_inspects_explicitly_and_rejects_wrong_role():
     with pytest.raises(ClientError): await worker.inspect_report(INTENT, 1, report_id, 2)
 
 
-def test_acknowledged_report_is_not_exposed_to_replacement_session(evaluator_env):
+@pytest.mark.parametrize('kind', ['blocked', 'ask'])
+def test_acknowledged_report_is_not_exposed_to_replacement_session(evaluator_env, kind):
     from tests.test_session_hub_bridge import call
     env = evaluator_env
     orch, worker, _, roles, service, item, delivery, route = routed(env)
-    report(env, worker, service, item, 'blocked', 'blocked')
+    report(env, worker, service, item, kind, 'report', **({'ask_title': 'Choose', 'ask_options': ['A', 'B']} if kind == 'ask' else {}))
     intent = pending(env, orch, delivery)['items'][0]
     acknowledge(env, orch, delivery, intent)
     installation, other, _ = pair(env, name='new-orchestrator')
@@ -112,10 +113,11 @@ def test_acknowledged_report_is_not_exposed_to_replacement_session(evaluator_env
                                     intent['report_id'], intent['report_revision'])
 
 
-def test_cross_project_and_missing_report_are_indistinguishable(evaluator_env):
+@pytest.mark.parametrize('kind', ['blocked', 'ask'])
+def test_cross_project_and_missing_report_are_indistinguishable(evaluator_env, kind):
     env = evaluator_env
     orch, worker, _, _, service, item, delivery, _ = routed(env)
-    report(env, worker, service, item, 'blocked', 'blocked')
+    report(env, worker, service, item, kind, 'report', **({'ask_title': 'Choose', 'ask_options': ['A', 'B']} if kind == 'ask' else {}))
     intent = pending(env, orch, delivery)['items'][0]
     observed = []
     with env.bridge.admit(orch, 'hub_orchestrator_report_inspect') as op:
@@ -126,3 +128,81 @@ def test_cross_project_and_missing_report_are_indistinguishable(evaluator_env):
                                         intent['report_id'], intent['report_revision'])
             observed.append((failure.value.code, failure.value.status))
     assert observed == [('attention_route_unavailable', 404)] * 2
+
+
+@pytest.mark.parametrize('status', ['open', 'answered', 'withdrawn'])
+def test_ask_report_includes_current_bounded_question(evaluator_env, status):
+    env = evaluator_env
+    orch, worker, _, _, service, item, delivery, _ = routed(env)
+    asked = report(env, worker, service, item, 'ask', 'ask', ask_title='Choose', ask_options=['A', 'B'])
+    intent = pending(env, orch, delivery)['items'][0]
+    decision = env.repo.get_decision(asked['decision_id'])
+    if status == 'answered':
+        decision = env.repo.answer_decision(OWNER, decision['id'], decision['revision'], 'A')
+    elif status == 'withdrawn':
+        decision = env.repo.withdraw(OWNER, 'decision', decision['id'], decision['revision'], 'Not needed')
+    result = inspect(env, orch, delivery, intent)
+    assert result['question'] == dict(id=decision['id'], revision=decision['revision'], title='Choose',
+                                      options=['A', 'B'], status=status, answer='A' if status == 'answered' else None)
+    assert result['trust'] == 'untrusted_hub_data' and result['execution_authorization'] is False
+    acknowledge(env, orch, delivery, intent)
+    assert inspect(env, orch, delivery, intent)['question'] == result['question']
+
+
+def test_decision_change_is_rechecked_before_report_inspection_response(evaluator_env):
+    env = evaluator_env
+    orch, worker, _, _, service, item, delivery, _ = routed(env)
+    asked = report(env, worker, service, item, 'ask', 'ask', ask_title='Choose', ask_options=['A', 'B'])
+    intent = pending(env, orch, delivery)['items'][0]
+    with env.bridge.admit(orch, 'hub_orchestrator_report_inspect') as op:
+        result = delivery.inspect_report(op.principal.actor, PROJECT, 1, intent['id'], intent['revision'],
+                                         intent['report_id'], intent['report_revision'])
+        assert result['question']['status'] == 'open'
+        with sqlite3.connect(env.repo.path) as db:
+            data = json.loads(db.execute('SELECT data FROM hub_entities WHERE id=?', (asked['decision_id'],)).fetchone()[0])
+            data.update(status='answered', answer='A', revision=data['revision'] + 1)
+            db.execute('UPDATE hub_entities SET data=? WHERE id=?', (json.dumps(data), asked['decision_id']))
+        with pytest.raises(HubError, match='attention_route_unavailable'):
+            op.before_commit(env.repo.path, None)
+
+
+@pytest.mark.parametrize('field,value', [('title', 'x' * 201), ('options', ['A']), ('revision', True), ('status', 'unknown')])
+def test_malformed_linked_question_fails_closed(evaluator_env, field, value):
+    env = evaluator_env
+    orch, worker, _, _, service, item, delivery, _ = routed(env)
+    asked = report(env, worker, service, item, 'ask', 'ask', ask_title='Choose', ask_options=['A', 'B'])
+    intent = pending(env, orch, delivery)['items'][0]
+    with env.repo._transaction() as db:
+        decision = env.repo._get(db, asked['decision_id'], 'decision')
+        decision[field] = value
+        db.execute('UPDATE hub_entities SET data=? WHERE id=?', (json.dumps(decision), asked['decision_id']))
+    with pytest.raises(HubError, match='attention_route_unavailable'):
+        inspect(env, orch, delivery, intent)
+
+
+@pytest.mark.asyncio
+async def test_client_validates_question_before_emitting():
+    report_id = '77777777-7777-4777-8777-777777777777'
+    decision_id = '88888888-8888-4888-8888-888888888888'
+    output = []
+    class Session:
+        malformed = False
+        async def call_tool(self, name, args):
+            if name == 'session_identity':
+                value = dict(installation_id=INSTALLATION, session_id=SESSION)
+            else:
+                question = dict(id=decision_id, revision=1, title='Choose', options=['A', 'B'], status='open', answer=None)
+                if self.malformed: question['options'] = ['A']
+                value = dict(project=PROJECT, intent_id=INTENT, intent_revision=1, dispatch_id=DISPATCH,
+                    report_id=report_id, report_revision=2, report_kind='ask', note='Untrusted', decision_id=decision_id,
+                    question=question, trust='untrusted_hub_data', execution_authorization=False, wake_verified=False)
+            return SimpleNamespace(isError=False, structuredContent=value, content=[])
+    session = Session()
+    client = AttentionAdapter(session, installation=INSTALLATION, session_id=SESSION,
+                              project=PROJECT, generation=1, emit=output.append)
+    await client.inspect_report(INTENT, 1, report_id, 2)
+    assert output[0]['question']['options'] == ['A', 'B'] and output[0]['trust'] == 'untrusted_hub_data'
+    session.malformed = True
+    with pytest.raises(ClientError, match='invalid_attention_response'):
+        await client.inspect_report(INTENT, 1, report_id, 2)
+    assert len(output) == 1

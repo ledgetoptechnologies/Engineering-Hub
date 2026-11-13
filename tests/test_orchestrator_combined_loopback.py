@@ -122,6 +122,8 @@ async def test_distinct_role_sessions_coordinate_over_real_loopback(owned, tmp_p
                 expected_report_revision=item['report_revision'])
             worker_report = await invoke(orch, 'hub_orchestrator_report_inspect', inspect_report_args)
             assert worker_report['note'] == 'Synthetic question' and worker_report['trust'] == 'untrusted_hub_data'
+            assert worker_report['question'] == dict(id=asked['decision_id'], revision=1, title='Continue?',
+                                                     options=['Yes', 'No'], status='open', answer=None)
             assert (await reviewer.call_tool('hub_orchestrator_report_inspect', inspect_report_args)).isError
             from engineering_hub.attention_client import AttentionAdapter
             report_output = []
@@ -133,6 +135,7 @@ async def test_distinct_role_sessions_coordinate_over_real_loopback(owned, tmp_p
             assert 'Synthetic question' not in json.dumps(report_output)
             await orch_adapter.inspect_report(item['id'], item['revision'], item['report_id'], item['report_revision'])
             assert report_output[-1]['note'] == 'Synthetic question'
+            assert report_output[-1]['question'] == worker_report['question']
             ack = await invoke(orch, 'hub_addressed_attention_ack', dict(project=PROJECT, generation=1,
                 intent_id=item['id'], expected_revision=item['revision']))
             assert ack['wake_verified'] is False and ack['task_completion_verified'] is False

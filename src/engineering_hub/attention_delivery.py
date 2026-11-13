@@ -271,6 +271,7 @@ class AttentionDelivery:
                 else:
                     raise HubError('attention_route_unavailable', 404)
                 decision_id = report.get('decision_id')
+                question = None
                 if intent.get('report_kind') == 'ask':
                     _canonical_id(decision_id)
                     service._grant(operation, 'decision.read')
@@ -280,15 +281,31 @@ class AttentionDelivery:
                             or type(decision.get('origin_dispatch_revision')) is not int
                             or decision.get('origin_dispatch_revision') != expected_report_revision):
                         raise HubError('attention_route_unavailable', 404)
+                    title, options, status, answer = (decision.get('title'), decision.get('options'),
+                                                     decision.get('status'), decision.get('answer'))
+                    if (type(decision.get('revision')) is not int or decision['revision'] < 1
+                            or type(title) is not str or not title.strip() or len(title) > 200
+                            or len(title.encode('utf-8')) > 800 or type(options) is not list
+                            or not 2 <= len(options) <= 5 or any(type(value) is not str or not value.strip()
+                                or len(value) > 200 or len(value.encode('utf-8')) > 800 for value in options)
+                            or len(set(options)) != len(options) or status not in ('open', 'answered', 'withdrawn')
+                            or (status == 'answered' and (type(answer) is not str or answer not in options))
+                            or (status != 'answered' and answer is not None)):
+                        raise HubError('attention_route_unavailable', 404)
+                    question = dict(id=decision_id, revision=decision['revision'], title=title,
+                                    options=options, status=status, answer=answer)
                 elif decision_id is not None:
                     raise HubError('attention_route_unavailable', 404)
                 note = report.get('note')
                 if type(note) is not str or not note.strip() or len(note) > 2000 or len(note.encode('utf-8')) > 8000:
                     raise HubError('attention_route_unavailable', 404)
-                return dict(project=project, intent_id=intent_id, intent_revision=expected_intent_revision,
+                result = dict(project=project, intent_id=intent_id, intent_revision=expected_intent_revision,
                             dispatch_id=item['id'], report_id=report_id, report_revision=expected_report_revision,
                             report_kind=intent['report_kind'], note=note, decision_id=decision_id,
                             trust='untrusted_hub_data', execution_authorization=False, wake_verified=False)
+                if question is not None:
+                    result['question'] = question
+                return result
             except (HubError, KeyError, TypeError, ValueError, UnicodeError):
                 raise HubError('attention_route_unavailable', 404) from None
         with service._attention_snapshot() as db:

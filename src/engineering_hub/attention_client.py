@@ -254,12 +254,31 @@ class AttentionAdapter:
         dispatch_id = _uuid(result.get('dispatch_id'))
         if kind == 'ask':
             _uuid(decision)
+            question = result.get('question')
+            if type(question) is not dict or set(question) != {'id', 'revision', 'title', 'options', 'status', 'answer'}:
+                raise ClientError('invalid_attention_response')
+            title, options, status, answer = (question.get('title'), question.get('options'),
+                                              question.get('status'), question.get('answer'))
+            if (question.get('id') != decision or type(question.get('revision')) is not int or question['revision'] < 1
+                    or type(title) is not str or not title.strip() or len(title) > 200 or len(title.encode('utf-8')) > 800
+                    or type(options) is not list or not 2 <= len(options) <= 5
+                    or any(type(value) is not str or not value.strip() or len(value) > 200
+                           or len(value.encode('utf-8')) > 800 for value in options)
+                    or len(set(options)) != len(options) or status not in ('open', 'answered', 'withdrawn')
+                    or (status == 'answered' and (type(answer) is not str or answer not in options))
+                    or (status != 'answered' and answer is not None)):
+                raise ClientError('invalid_attention_response')
         elif decision is not None:
             raise ClientError('invalid_attention_response')
-        self.emit(dict(type='orchestrator_worker_report', trust='untrusted_hub_data', project=self.project,
+        elif 'question' in result:
+            raise ClientError('invalid_attention_response')
+        output = dict(type='orchestrator_worker_report', trust='untrusted_hub_data', project=self.project,
                        intent_id=intent_id, intent_revision=intent_revision, dispatch_id=dispatch_id,
                        report_id=report_id, report_revision=report_revision, report_kind=kind, note=note,
-                       decision_id=decision, execution_authorization=False, wake_verified=False))
+                       decision_id=decision, execution_authorization=False, wake_verified=False)
+        if kind == 'ask':
+            output['question'] = question
+        self.emit(output)
 
     async def inspect_answer(self, dispatch_id, dispatch_revision, decision_id, decision_revision):
         if self.role == 'orchestrator':
