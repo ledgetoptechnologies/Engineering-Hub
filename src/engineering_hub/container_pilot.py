@@ -330,6 +330,12 @@ class ContainerPilotWorkflow:
         if state not in {'succeeded', 'failed'}:
             return 'held'
         if state == 'failed':
+            if command.action == 'smoke_container' and (
+                    response.reason != 'health_failed' or response.evidence.health != 'unhealthy'
+                    or response.evidence.evidence_verified is not True
+                    or response.evidence.image_config_id != target.artifact_digest
+                    or not response.evidence.container_id):
+                return 'held'
             return 'failed'
         evidence = response.evidence
         rollback = command.action in {'rollback_container', 'smoke_container_rollback', 'cleanup_rollback'}
@@ -350,6 +356,40 @@ class ContainerPilotWorkflow:
             run_id=run['id'], target_id=run['target'], action=action,
             manifest_digest=target.manifest_digest, candidate_commit=target.candidate_commit,
             policy_revision=target.policy_revision, fencing_generation=run['fencing_generation'])
+
+    def _terminal_evidence_matches(self, run, target, expected):
+        """Require the same phase identity chain before reporting a terminal run."""
+        from .pilot_recovery import ACTIONS, PilotRecovery
+        try:
+            with self.repo._connection() as db:
+                rows = PilotRecovery._rows(db, run['id'])
+            evidence = []
+            for saved in rows:
+                if saved['action'] not in ACTIONS or saved['response_json'] is None:
+                    return False
+                command = self._request(run, target, saved['action'])
+                payload = json.dumps(command.model_dump(), sort_keys=True, separators=(',', ':'))
+                if saved['payload'] != payload:
+                    return False
+                response = self._validated_response(ContainerPilotResponse.model_validate_json(
+                    saved['response_json'], strict=True))
+                state = self._verified_state(response, command, target)
+                if state != saved['state']:
+                    return False
+                if (saved['action'] == 'smoke_container' and state == 'failed'
+                        and response.evidence.evidence_verified is not True):
+                    return False
+                evidence.append(dict(action=saved['action'], state=state,
+                                     container_id=response.evidence.container_id))
+            phases = {item['action']: item for item in evidence}
+            deploy, smoke = phases.get('deploy_container'), phases.get('smoke_container')
+            if (smoke is not None and smoke['state'] == 'failed'
+                    and (deploy is None or not deploy['container_id']
+                         or smoke['container_id'] != deploy['container_id'])):
+                return False
+            return PilotRecovery._derive(evidence) == expected
+        except Exception:
+            return False
 
     @staticmethod
     def _store_ack_receipt(db, run_id, action, payload, digest):
@@ -555,6 +595,8 @@ class ContainerPilotWorkflow:
                         run = self._event(run, 'failed', phase=action)
                         break
                 else:
+                    if not self._terminal_evidence_matches(run, target, 'succeeded'):
+                        return self._hold(run, 'candidate_outcome_uncertain', phase='smoke_container')
                     if target.validated_manifest().disposable_final_cleanup:
                         if self.repo.get_paused():
                             raise HubError('paused', 423)
@@ -563,6 +605,9 @@ class ContainerPilotWorkflow:
                                           else 'disposable_cleanup_outcome_uncertain', phase='cleanup_candidate')
                     return self._event(run, 'succeeded', phase='smoke_container')
             if run['status'] == 'failed':
+                if not (self._terminal_evidence_matches(run, target, 'failed')
+                        or self._terminal_evidence_matches(run, target, 'rolled_back')):
+                    return self._hold(run, 'candidate_outcome_uncertain', phase='smoke_container')
                 for action in ('rollback_container', 'smoke_container_rollback'):
                     if self.repo.get_paused():
                         raise HubError('paused', 423)
@@ -571,6 +616,12 @@ class ContainerPilotWorkflow:
                         phase = 'rollback' if action == 'rollback_container' else 'rollback_smoke'
                         reason = phase + ('_failed' if state == 'failed' else '_outcome_uncertain')
                         return self._hold(run, reason, phase=action)
+                    if (action == 'rollback_container'
+                            and not (self._terminal_evidence_matches(run, target, 'failed')
+                                     or self._terminal_evidence_matches(run, target, 'rolled_back'))):
+                        return self._hold(run, 'rollback_outcome_uncertain', phase=action)
+                if not self._terminal_evidence_matches(run, target, 'rolled_back'):
+                    return self._hold(run, 'rollback_smoke_outcome_uncertain', phase='smoke_container_rollback')
                 if target.validated_manifest().disposable_final_cleanup:
                     if self.repo.get_paused():
                         raise HubError('paused', 423)

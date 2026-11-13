@@ -118,7 +118,7 @@ class PilotRecovery:
                 return 'held'
             failed = True
         else:
-            if smoke and smoke['state'] == 'succeeded' and smoke['container_id'] != deploy['container_id']:
+            if smoke and (not deploy['container_id'] or smoke['container_id'] != deploy['container_id']):
                 return 'held'
             failed = bool(smoke and smoke['state'] == 'failed')
             if not failed:

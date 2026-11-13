@@ -60,10 +60,13 @@ class FakeClient:
             raise outcome
         rollback = command.action in ACTIONS[2:]
         response = ContainerPilotResponse(
-            **command.model_dump(), state=outcome, reason=None, replayed=False,
-            evidence=ContainerPilotEvidence(container_id='e' * 64,
+            **command.model_dump(), state=outcome,
+            reason='health_failed' if command.action == 'smoke_container' and outcome == 'failed' else None,
+            replayed=False,
+            evidence=ContainerPilotEvidence(container_id=('f' if rollback else 'e') * 64,
                 image_config_id=ROLLBACK_IMAGE if rollback else IMAGE,
-                health='healthy', evidence_verified=True))
+                health='unhealthy' if command.action == 'smoke_container' and outcome == 'failed' else 'healthy',
+                evidence_verified=True))
         return response
 
     async def submit_command(self, command):
@@ -135,6 +138,74 @@ async def test_smoke_failure_requires_four_distinct_commands_and_rollback_health
     assert repo.get_task(run['task_id'])['repair_count'] == 1
     assert (await workflow.advance(run['id']))['status'] == 'rolled_back'
     assert len(client.submissions) == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mismatch', ['candidate_smoke', 'failed_smoke', 'rollback_smoke', 'rollback_reuses_candidate'])
+async def test_mismatched_phase_identity_never_records_terminal_run(repo, target, mismatch):
+    class MismatchedClient(FakeClient):
+        def response(self, command):
+            response = super().response(command)
+            if ((mismatch in {'candidate_smoke', 'failed_smoke'} and command.action == 'smoke_container')
+                    or (mismatch == 'rollback_smoke' and command.action == 'smoke_container_rollback')):
+                return response.model_copy(update={'evidence': response.evidence.model_copy(
+                    update={'container_id': '9' * 64})})
+            if mismatch == 'rollback_reuses_candidate' and command.action in ACTIONS[2:]:
+                return response.model_copy(update={'evidence': response.evidence.model_copy(
+                    update={'container_id': 'e' * 64})})
+            return response
+
+    outcomes = {} if mismatch == 'candidate_smoke' else {'smoke_container': 'failed'}
+    client = MismatchedClient(outcomes)
+    workflow, run = ready_run(repo, target, client)
+    result = await workflow.advance(run['id'])
+    assert result['status'] == 'held'
+    assert result['events'][-1]['reason'] == (
+        'candidate_outcome_uncertain' if mismatch in {'candidate_smoke', 'failed_smoke'}
+        else 'rollback_outcome_uncertain' if mismatch == 'rollback_reuses_candidate'
+        else 'rollback_smoke_outcome_uncertain')
+    assert repo.get_run(run['id'])['status'] == 'held'
+    assert (await workflow.advance(run['id']))['status'] == 'held'
+    assert len(client.submissions) == (2 if mismatch in {'candidate_smoke', 'failed_smoke'}
+                                       else 3 if mismatch == 'rollback_reuses_candidate' else 4)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('damage', [
+    {'evidence_verified': False}, {'image_config_id': ROLLBACK_IMAGE}, {'health': 'healthy'},
+])
+async def test_unverified_failed_smoke_never_starts_rollback(repo, target, damage):
+    class Client(FakeClient):
+        def response(self, command):
+            response = super().response(command)
+            if command.action == 'smoke_container':
+                response = response.model_copy(update={'evidence': response.evidence.model_copy(update=damage)})
+            return response
+    client = Client({'smoke_container': 'failed'})
+    workflow, run = ready_run(repo, target, client)
+    assert (await workflow.advance(run['id']))['status'] == 'held'
+    assert [command.action for command in client.submissions] == ACTIONS[:2]
+
+
+@pytest.mark.asyncio
+async def test_interrupted_terminal_event_reuses_verified_rollback_without_new_posts(repo, target):
+    client = FakeClient({'smoke_container': 'failed'})
+    workflow, run = ready_run(repo, target, client)
+    original_event = workflow._event
+
+    def interrupt_before_terminal(run, event, **kwargs):
+        if event == 'rolled_back':
+            raise RuntimeError('test interruption before terminal event')
+        return original_event(run, event, **kwargs)
+
+    workflow._event = interrupt_before_terminal
+    with pytest.raises(RuntimeError, match='test interruption'):
+        await workflow.advance(run['id'])
+    assert repo.get_run(run['id'])['status'] == 'failed'
+    assert [command.action for command in client.submissions] == ACTIONS
+    workflow._event = original_event
+    assert (await workflow.advance(run['id']))['status'] == 'rolled_back'
+    assert [command.action for command in client.submissions] == ACTIONS
 
 
 @pytest.mark.asyncio
@@ -228,8 +299,10 @@ async def test_paused_preexisting_failed_run_is_resumable_without_effect(repo, t
     assert workflow.client.submissions == []
     assert repo.get_task(run['task_id'])['repair_count'] == 1
     repo.set_pause('human:1234', False)
-    assert (await workflow.advance(run['id']))['status'] == 'rolled_back'
-    assert [command.action for command in workflow.client.submissions] == ACTIONS[2:]
+    # A manually fabricated failure lacks the original command evidence and
+    # must not authorize a new rollback effect after the pause is lifted.
+    assert (await workflow.advance(run['id']))['status'] == 'held'
+    assert workflow.client.submissions == []
 
 
 @pytest.mark.asyncio

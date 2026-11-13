@@ -382,7 +382,33 @@ async def test_mismatched_typed_host_evidence_never_releases_capacity(rig, misma
     result = await rig.bridge.run_once()
     assert result["state"] == "held"
     assert machine_job(rig) == job["id"]
+    assert rig.repo.list_runs()[0]["status"] == "held"
     assert rig.repo.get_task(job["target"]["task_id"])["status"] == "verified"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mismatch', ['rollback_smoke', 'rollback_reuses_candidate'])
+async def test_mismatched_rollback_holds_run_and_machine(rig, mismatch):
+    rig.client.outcomes['smoke_container'] = 'failed'
+    original = rig.client.response
+
+    def altered(command):
+        response = original(command)
+        if ((mismatch == 'rollback_smoke' and command.action == 'smoke_container_rollback')
+                or (mismatch == 'rollback_reuses_candidate' and command.action == 'rollback_container')):
+            container = '9' * 64 if mismatch == 'rollback_smoke' else 'e' * 64
+            response = response.model_copy(update={'evidence': response.evidence.model_copy(
+                update={'container_id': container})})
+        return response
+
+    rig.client.response = altered
+    _, job = submit(rig)
+    result = await rig.bridge.run_once()
+    assert result['state'] == 'held'
+    assert machine_job(rig) == job['id']
+    assert rig.repo.list_runs()[0]['status'] == 'held'
+    if mismatch == 'rollback_reuses_candidate':
+        assert [command.action for command in rig.client.submissions] == ACTIONS[:3]
 
 
 @pytest.mark.parametrize("changed", ["machine", "manifest"])

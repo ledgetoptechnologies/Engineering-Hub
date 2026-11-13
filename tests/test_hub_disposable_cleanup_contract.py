@@ -115,6 +115,42 @@ async def test_hub_opted_cleanup_holds_after_exact_ack_and_does_not_repost(tmp_p
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('mismatch', ['candidate_smoke', 'failed_smoke', 'rollback_smoke', 'rollback_reuses_candidate'])
+async def test_inconsistent_phase_identity_blocks_later_cleanup(tmp_path, mismatch):
+    class Client(FakeClient):
+        single_pilot_protocol = True
+
+        def response(self, command):
+            response = super().response(command)
+            if mismatch != 'candidate_smoke' and command.action == 'smoke_container':
+                response = response.model_copy(update={'state': 'failed', 'reason': 'health_failed',
+                    'evidence': response.evidence.model_copy(update={'health': 'unhealthy'})})
+            if ((mismatch in {'candidate_smoke', 'failed_smoke'} and command.action == 'smoke_container')
+                    or (mismatch == 'rollback_smoke' and command.action == 'smoke_container_rollback')):
+                response = response.model_copy(update={'evidence': response.evidence.model_copy(
+                    update={'container_id': '9' * 64})})
+            if mismatch == 'rollback_reuses_candidate' and command.action in {'rollback_container', 'smoke_container_rollback'}:
+                response = response.model_copy(update={'evidence': response.evidence.model_copy(
+                    update={'container_id': 'e' * 64})})
+            return response
+
+        async def acknowledge_command(self, command, digest):
+            return self.response(command)
+
+    value = json.loads(pilot_manifest().canonical_bytes()); value['disposable_final_cleanup'] = True
+    target = ContainerPilotTarget.from_manifest(PilotManifest.from_bytes(json.dumps(value).encode()))
+    repo = HubRepository(tmp_path/'hub.sqlite3', execution_principal=PRINCIPAL)
+    client = Client(); workflow = ContainerPilotWorkflow(repo, client, [target], single_pilot_protocol=True)
+    task = reviewed_task(repo)
+    run = workflow.create_run('codex', task['id'], task['revision'], IMAGE, target.target_id)
+    result = await workflow.advance(run['id'])
+    assert result['status'] == 'held'
+    assert not any(item.action.startswith('cleanup_') for item in client.submissions)
+    if mismatch == 'failed_smoke':
+        assert [item.action for item in client.submissions] == ['deploy_container', 'smoke_container']
+
+
+@pytest.mark.asyncio
 async def test_hub_rollback_cleanup_uses_rollback_role_and_retains_hold(tmp_path):
     class Client(FakeClient):
         single_pilot_protocol = True
