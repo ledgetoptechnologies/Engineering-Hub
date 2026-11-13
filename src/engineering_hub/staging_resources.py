@@ -14,6 +14,8 @@ import time
 import uuid
 
 from .repository import AGENTS, HubError, HubRepository
+from .staging_action_key import staging_action_key
+from .staging_source_binding import valid_source_binding
 
 
 KINDS = frozenset({'workspace', 'build', 'test_run', 'preview'})
@@ -98,6 +100,7 @@ class StagingResourceStore:
                 'CREATE TABLE IF NOT EXISTS hub_staging_resource_ownership (id TEXT PRIMARY KEY, job_id TEXT NOT NULL, project TEXT NOT NULL, created_by TEXT NOT NULL, source_commit TEXT NOT NULL)',
                 'CREATE TABLE IF NOT EXISTS hub_staging_cleanup_plans (id TEXT PRIMARY KEY, actor TEXT NOT NULL, data TEXT NOT NULL)',
                 'CREATE TABLE IF NOT EXISTS hub_staging_cleanup_receipts (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, data TEXT NOT NULL)',
+                'CREATE INDEX IF NOT EXISTS hub_audit_terminal_lookup ON hub_audit(entity_id,revision,action)',
             ):
                 db.execute(sql)
 
@@ -452,16 +455,63 @@ class StagingResourceStore:
                 item['protected'].append({'reason': 'active_job', 'ref': job['id']})
             return self._save(db, item['created_by'], 'staging.resource_protection', item)
 
-    def supersede_latest_failure(self, principal, job_id):
-        """Remove only this terminal job's own latest-failure reference atomically.
+    def supersede_latest_failure(self, principal, job_id, *, superseded_by):
+        """Remove an older terminal failure's protection only with ordered evidence.
 
-        Already superseded jobs cause no writes. Deleting/deleted resources are
-        never revised by this maintenance operation or a stale caller snapshot.
+        A delayed controller may resume after a newer failure has completed.
+        Ordering, bindings and removal are checked in this same writer. Missing
+        or ambiguous terminal evidence preserves all protections.
         """
         self._trusted(principal)
+        _uuid(job_id); _uuid(superseded_by)
+        if job_id == superseded_by:
+            return
         with self.repo._transaction() as db:
-            job = self._job(db, _uuid(job_id))
-            if job['terminal'] is not True:
+            def terminal_failure(identity):
+                row = db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (identity,)).fetchone()
+                if row is None or row['state'] != 'failed':
+                    return None
+                try:
+                    target = json.loads(row['target'])
+                    submission_id = target['submission_id']
+                    entry = db.execute('SELECT id,data FROM hub_staging_submissions WHERE id=?', (submission_id,)).fetchone()
+                    if entry is None:
+                        return None
+                    submission = json.loads(entry['data'])
+                    job = self._job(db, identity)
+                    if (submission.get('id') != entry['id'] or submission.get('job_id') != identity
+                            or submission.get('phase') != 'verified' or submission.get('outcome') != 'failed'
+                            or not valid_source_binding(submission) or job.get('terminal') is not True
+                            or row['environment'] != 'staging' or row['requires_execution_proof'] != 1
+                            or job.get('project') != row['project'] or submission.get('project') != row['project']
+                            or job.get('created_by') != submission.get('actor') or row['actor'] != submission.get('actor')
+                            or job.get('source_commit') != submission.get('source_commit')
+                            or target.get('source_commit') != submission.get('source_commit')
+                            or target.get('task_id') != submission.get('review_task_id')
+                            or target.get('review_revision') != submission.get('review_task_revision')
+                            or target.get('artifact_digest') != 'sha256:' + submission.get('source_digest', '')
+                            or row['action_key'] != staging_action_key(submission['project'], submission['recipe'])):
+                        return None
+                    events = db.execute("SELECT sequence FROM hub_audit WHERE entity_id=? AND revision=? AND action IN ('work.failed','work.reconciled') ORDER BY sequence LIMIT 2",
+                                        (identity, row['revision'])).fetchall()
+                    if len(events) != 1:
+                        return None
+                    return submission, job, events[0]['sequence']
+                except (KeyError, TypeError, ValueError, HubError):
+                    return None
+
+            older = terminal_failure(job_id)
+            newer = terminal_failure(superseded_by)
+            if older is None or newer is None:
+                return
+            prior_submission, job, prior_sequence = older
+            next_submission, next_job, next_sequence = newer
+            if (prior_submission['project'] != next_submission['project']
+                    or prior_submission['recipe'] != next_submission['recipe']
+                    or prior_sequence >= next_sequence
+                    or type(next_job.get('protected')) is not list
+                    or type(job.get('protected')) is not list
+                    or {'reason': 'latest_failure', 'ref': superseded_by} not in next_job['protected']):
                 return
             reference = {'reason': 'latest_failure', 'ref': job_id}
             rows = [json.loads(row['data']) for row in db.execute(

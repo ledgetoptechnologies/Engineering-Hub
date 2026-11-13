@@ -843,3 +843,105 @@ async def test_cancel_during_submit_resource_registration_never_abandons_deposit
     assert submitted['source_id'] and len(submitted['resource_ids'])==4
     assert client.deposits==1 and client.posts==0
     assert (await controller.run_once())['job']['state']=='succeeded'
+
+@pytest.mark.asyncio
+async def test_late_old_failure_reconciliation_never_unprotects_newer_failure(env):
+    controller, client, resources, _, repo = env
+    client.fail = True
+    first = await controller.submit('codex', payload(repo))
+    assert (await controller.run_once())['job']['state'] == 'failed'
+    second = await controller.submit('codex', payload(repo))
+    assert (await controller.run_once())['job']['state'] == 'failed'
+    newest_id = second['resource_ids']['test_run']
+    newest = resources.inspect_resource(controller.principal, newest_id)
+    assert {'reason': 'latest_failure', 'ref': second['job']['id']} in newest['protected']
+    # The first controller may be delayed after it released the queue, while a
+    # second controller completes a newer failure. Resume the stale callback.
+    controller._supersede_failures(controller._read(job_id=first['job']['id']))
+    assert resources.inspect_resource(controller.principal, newest_id) == newest
+
+@pytest.mark.asyncio
+async def test_two_controller_late_failure_callback_preserves_newest_protection(env):
+    import threading
+    controller, client, resources, _, repo = env
+    client.fail = True
+    first = await controller.submit('codex', payload(repo))
+    second = await controller.submit('codex', payload(repo))
+    waiting, resume = threading.Event(), threading.Event()
+    original = controller._supersede_failures
+
+    def delayed(item):
+        if item['job_id'] == first['job']['id']:
+            waiting.set()
+            if not resume.wait(15):
+                raise RuntimeError('test callback not released')
+        return original(item)
+
+    controller._supersede_failures = delayed
+    first_task = asyncio.create_task(asyncio.to_thread(lambda: asyncio.run(controller.run_once())))
+    try:
+        assert await asyncio.to_thread(waiting.wait, 10), 'first did not release before callback'
+        assert controller.queue.get_job(first['job']['id'])['state'] == 'failed'
+        second_controller = StagingController(repo, controller.queue, client, resources=resources,
+            control_principal=controller.principal, actions=controller.actions,
+            poll_interval=0.001, max_poll_seconds=0.1)
+        result = await second_controller.run_once()
+        assert result['job']['id'] == second['job']['id'] and result['job']['state'] == 'failed'
+        newest_id = second['resource_ids']['test_run']
+        newest = resources.inspect_resource(controller.principal, newest_id)
+        assert {'reason': 'latest_failure', 'ref': second['job']['id']} in newest['protected']
+    finally:
+        resume.set()
+        await first_task
+    assert resources.inspect_resource(controller.principal, newest_id) == newest
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('uncertain', ['missing_event', 'duplicate_event', 'unprotected_newer', 'wrong_binding'])
+async def test_failure_supersession_retains_protection_when_order_evidence_uncertain(env, uncertain):
+    controller, client, resources, _, repo = env
+    client.fail = True
+    first = await controller.submit('codex', payload(repo))
+    assert (await controller.run_once())['job']['state'] == 'failed'
+    second = await controller.submit('codex', payload(repo))
+    assert (await controller.run_once())['job']['state'] == 'failed'
+    old_id, new_job_id = first['resource_ids']['test_run'], second['job']['id']
+    old = resources.inspect_resource(controller.principal, old_id)
+    marker = {'reason': 'latest_failure', 'ref': first['job']['id']}
+    old = resources.set_protection(controller.principal, old_id, old['revision'], old['protected'] + [marker])
+    with repo._transaction() as db:
+        if uncertain == 'missing_event':
+            db.execute("DELETE FROM hub_audit WHERE entity_id=? AND action IN ('work.failed','work.reconciled')", (new_job_id,))
+        elif uncertain == 'duplicate_event':
+            db.execute("INSERT INTO hub_audit(actor,action,entity_id,revision,created_at) SELECT actor,action,entity_id,revision,created_at FROM hub_audit WHERE entity_id=? AND action IN ('work.failed','work.reconciled') LIMIT 1", (new_job_id,))
+        elif uncertain == 'unprotected_newer':
+            row = db.execute('SELECT data FROM hub_staging_resource_jobs WHERE id=?', (new_job_id,)).fetchone()
+            data = json.loads(row['data']); data['protected'] = []
+            db.execute('UPDATE hub_staging_resource_jobs SET data=? WHERE id=?', (json.dumps(data), new_job_id))
+        else:
+            row = db.execute('SELECT target FROM hub_work_jobs WHERE id=?', (new_job_id,)).fetchone()
+            target = json.loads(row['target']); target['submission_id'] = str(uuid.uuid4())
+            db.execute('UPDATE hub_work_jobs SET target=? WHERE id=?', (json.dumps(target), new_job_id))
+    controller._supersede_failures(controller._read(job_id=new_job_id))
+    assert resources.inspect_resource(controller.principal, old_id) == old
+
+@pytest.mark.asyncio
+async def test_failure_supersession_error_never_rewrites_terminal_job_as_held(env, monkeypatch, caplog):
+    controller, client, resources, _, repo = env
+    client.fail = True
+    submitted = await controller.submit('codex', payload(repo))
+    def broken(item):
+        raise RuntimeError('synthetic maintenance failure')
+    monkeypatch.setattr(controller, '_supersede_failures', broken)
+    result = await controller.run_once()
+    assert result['job']['state'] == 'failed' and result['phase'] == 'verified'
+    assert controller.queue.get_job(submitted['job']['id'])['state'] == 'failed'
+    resource = resources.inspect_resource(controller.principal, submitted['resource_ids']['test_run'])
+    assert {'reason': 'latest_failure', 'ref': submitted['job']['id']} in resource['protected']
+    assert 'staging_failure_retention_maintenance_deferred' in caplog.text
+
+
+def test_failure_terminal_audit_lookup_uses_index(env):
+    repo = env[4]
+    with repo._connection() as db:
+        detail = db.execute("EXPLAIN QUERY PLAN SELECT sequence FROM hub_audit WHERE entity_id=? AND revision=? AND action IN ('work.failed','work.reconciled') ORDER BY sequence LIMIT 2", (str(uuid.uuid4()), 1)).fetchall()
+    assert any('hub_audit_terminal_lookup' in row['detail'] for row in detail)

@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 import base64
 import hashlib
 import json
+import logging
 import re
 import time
 import uuid
@@ -591,7 +592,12 @@ class StagingController:
             self.queue.complete(job_id=item['job_id'], worker=self.worker, fence=claim['fence'],
                                 outcome=outcome, evidence_id=item['evidence_id'])
         if outcome == 'failed':
-            self._supersede_failures(item)
+            try:
+                self._supersede_failures(item)
+            except Exception:
+                # Completion already committed. Leave remaining protections
+                # intact on error; never rewrite a terminal job as held.
+                logging.getLogger(__name__).warning('staging_failure_retention_maintenance_deferred')
         return self._view(item)
 
     def _supersede_failures(self, newest):
@@ -601,7 +607,8 @@ class StagingController:
             if (prior['id'] == newest['id'] or prior['project'] != newest['project'] or
                     prior['recipe'] != newest['recipe'] or prior.get('phase') != 'verified' or prior.get('outcome') != 'failed'):
                 continue
-            self.resources.supersede_latest_failure(self.principal, prior['job_id'])
+            self.resources.supersede_latest_failure(self.principal, prior['job_id'],
+                                                    superseded_by=newest['job_id'])
 
     async def reconcile(self, identity):
         async with self._short_lock():

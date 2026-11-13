@@ -194,3 +194,13 @@ offline TEST filesystem remain intact. No permanent service activation, secret
 rotation or public route change follows merely from a test passing. Publish
 tested code, make required operator steps concrete in EH, and distinguish local
 integration from the actual NAS-connected pilot/rollback/reboot acceptance.
+
+Failure-protection maintenance uses an index on the Hub audit ledger to verify
+committed terminal ordering before removing an older failure's protection. The
+index is created if absent when the staging resource store starts. On a large
+existing ledger its first creation takes a SQLite writer lock and may delay
+startup; plan the migration in an appropriate maintenance window and retain the
+normal backup. If creation fails, staging initialization fails closed rather
+than dropping history.
+A failure after some independently validated older protections were removed
+leaves the remaining protections intact and reports a maintenance warning.
