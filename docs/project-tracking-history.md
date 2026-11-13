@@ -8,6 +8,11 @@ task. `history_segments` signals that earlier pages exist. Use
 `hub_tracking_task_history` with `task_id`, `kind` (`updates` or `reviews`), and
 the returned `next_before` to read older pages. The project view offers the same
 history. Each read requires current project access; a cursor is not a grant.
+For the first page, omit `before`; for each older page, pass the returned
+`next_before` as `before` until it is null. An empty recent window or a
+successful retry does not establish that no earlier records exist. These records
+are not automatically injected into later chats or turns; agents must read the
+needed pages when resuming work.
 
 For an existing oversized legacy task, an authorized agent can explicitly call
 `hub_tracking_task_compact` with the task ID, current revision, and an

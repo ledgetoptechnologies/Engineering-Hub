@@ -239,7 +239,12 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
     def hub_tracking_task_update(task_id: str, expected_revision: StrictInt, client_request_id: str,
                                  progress: str, evidence_links: list[dict[str, str]], ctx: Context,
                                  completion_claim: StrictBool = False) -> dict:
-        """Append attributed evidence; completion is an unverified claim, not approval or proof."""
+        """Append attributed evidence; completion is an unverified claim, not approval or proof.
+
+        Returned updates and reviews are recent windows. If history_segments shows
+        older entries, use hub_tracking_task_history with task_id and kind; omit
+        before for the first page, then pass next_before as before for older pages.
+        """
         return invoke(lambda: repo.update_tracking_task(identity(ctx), task_id, expected_revision,
                       client_request_id, progress=progress, evidence_links=evidence_links,
                       completion_claim=completion_claim))
@@ -247,26 +252,47 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
     @registration.tool()
     def hub_tracking_task_review(task_id: str, expected_revision: StrictInt, client_request_id: str,
                                  verdict: str, note: str, evidence_links: list[dict[str, str]], ctx: Context) -> dict:
-        """Independently verify a specific claim or reopen it; never grants execution authority."""
+        """Independently verify a specific claim or reopen it; never grants execution authority.
+
+        Returned updates and reviews are recent windows. If history_segments shows
+        older entries, use hub_tracking_task_history with task_id and kind; omit
+        before for the first page, then pass next_before as before for older pages.
+        """
         return invoke(lambda: repo.review_tracking_task(identity(ctx), task_id, expected_revision,
                       client_request_id, verdict=verdict, note=note, evidence_links=evidence_links))
 
     @registration.tool()
     def hub_tracking_task_compact(task_id: str, expected_revision: StrictInt, client_request_id: str, ctx: Context) -> dict:
-        """Explicitly compact old tracking history, preserving it in bounded pages."""
+        """Explicitly compact old tracking history, preserving it in bounded pages.
+
+        Returned updates and reviews are recent windows. If history_segments shows
+        older entries, use hub_tracking_task_history with task_id and kind; omit
+        before for the first page, then pass next_before as before for older pages.
+        """
         return invoke(repo.compact_tracking_history, identity(ctx), task_id, expected_revision, client_request_id)
 
     @registration.tool()
     def hub_tracking_task_history(task_id: str, kind: str, ctx: Context,
                                   before: StrictInt | None = None) -> dict:
-        """Read one bounded page of older tracking updates or reviews."""
+        """Read one bounded page of older tracking updates or reviews.
+
+        Pass task_id and kind (updates or reviews). Omit before for the newest
+        earlier page; pass next_before as before to continue toward older entries.
+        A session needs tracking.read and current project access for each page.
+        """
         identity(ctx)
         return invoke(repo.tracking_history, task_id, kind, before)
 
     @registration.tool()
     def hub_tracking_task_list(project: str, ctx: Context, limit: StrictInt = 100,
                                after_task_id: str | None = None, unfinished: StrictBool = False) -> dict:
-        """Read inert tracking records; unfinished includes open work and unverified claims."""
+        """Read inert tracking records; unfinished includes open work and unverified claims.
+
+        Each task's updates and reviews are recent windows. If history_segments
+        shows older entries, use hub_tracking_task_history with task_id and kind;
+        omit before for the first page, then pass next_before as before for older
+        pages. A session needs tracking.read and current project access.
+        """
         identity(ctx)
         if not 1 <= limit <= 200:
             raise ToolError('invalid_limit')

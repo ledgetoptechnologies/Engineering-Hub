@@ -480,6 +480,21 @@ def test_tracking_history_and_compaction_obey_live_project_grants(unified):
                   'client_request_id': 'after-revoke'})['isError']
 
 
+def test_tracking_history_guidance_is_visible_in_session_tool_discovery(unified):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    _, token, _ = pair(env, caps=('tracking.read', 'tracking.update', 'tracking.review'), projects=(PROJECT,))
+    _, headers = sdk(client, token)
+    result = client.post('/mcp', headers=headers, json={'jsonrpc': '2.0', 'id': 3,
+                         'method': 'tools/list', 'params': {}})
+    assert result.status_code == 200
+    tools = result.json()['result']['tools']
+    descriptions = {tool['name']: tool.get('description', '') for tool in tools}
+    for name in ('hub_tracking_task_list', 'hub_tracking_task_update', 'hub_tracking_task_review', 'hub_tracking_task_compact'):
+        assert all(word in descriptions[name] for word in ('recent windows', 'history_segments', 'hub_tracking_task_history', 'next_before'))
+    assert all(word in descriptions['hub_tracking_task_history'] for word in ('task_id', 'kind', 'updates', 'reviews', 'before', 'next_before'))
+
+
 def test_session_id_tools_do_not_disclose_unavailable_entities(unified):
     client, app, bus, _ = unified
     env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)

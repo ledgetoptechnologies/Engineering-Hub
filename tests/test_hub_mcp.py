@@ -59,6 +59,10 @@ def test_real_initialize_discovery_and_auth_on_every_request(hub):
         "hub_planning_list", "hub_planning_get", "hub_planning_put", "hub_entity_withdraw"}
     for tool in tools:
         assert not {"actor", "reviewer", "identity", "github_id"} & set(tool["inputSchema"].get("properties", {}))
+    descriptions = {tool['name']: tool.get('description', '') for tool in tools}
+    for name in ('hub_tracking_task_list', 'hub_tracking_task_update', 'hub_tracking_task_review', 'hub_tracking_task_compact'):
+        assert all(word in descriptions[name] for word in ('recent windows', 'history_segments', 'hub_tracking_task_history', 'next_before'))
+    assert all(word in descriptions['hub_tracking_task_history'] for word in ('task_id', 'kind', 'updates', 'reviews', 'before', 'next_before'))
 
 
 def test_real_transport_task_lifecycle_uses_token_identity(hub):
