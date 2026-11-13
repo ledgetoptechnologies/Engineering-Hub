@@ -114,7 +114,10 @@ def fixture_document():
                 raise HubError('csrf_required', 403)
             return 'human:1'
 
-        attach_staging_routes(app, Controller(), human, human)
+        # Synthetic fixture identity has no cookie-backed session. Its guard is
+        # deliberately inert; production supplies the same-ledger session guard.
+        attach_staging_routes(app, Controller(), human, human,
+                              human_admission=lambda request, principal: lambda db: None)
         headers = {'X-Synthetic-Actor': 'human:1', 'X-Synthetic-Mutation': 'verified'}
         with TestClient(app) as client:
             status = client.get('/api/hub/v1/staging/status', headers=headers)
