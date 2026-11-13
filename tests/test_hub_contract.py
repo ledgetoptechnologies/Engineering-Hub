@@ -30,6 +30,14 @@ def test_metric_history_contract_declares_required_query_parameters():
     assert params['range']['schema']['enum'] == ['1h', '6h', '24h', '7d']
 
 
+def test_infrastructure_devices_contract_declares_retired_filter():
+    contract = json.loads((Path(__file__).parents[1] / 'contracts/hub-v1.openapi.json').read_text())
+    params = contract['paths']['/api/hub/v1/infrastructure/devices']['get']['parameters']
+    assert params == [{'name': 'include_retired', 'in': 'query', 'required': False,
+                       'description': 'Include retired devices when true.',
+                       'schema': {'type': 'boolean', 'default': False}}]
+
+
 def test_contract_survives_typing_cache_eviction_and_equivalent_literal_order(tmp_path):
     # Project routes import lazily. Earlier tests can evict typing's caches;
     # equal Literal unions may then retain a different insertion order. Reuse

@@ -88,7 +88,11 @@ def attach_infrastructure_routes(app,service,actor,*,metrics=None,metrics_identi
         service.require(identity,action)
         return identity
 
-    @app.get('/api/hub/v1/infrastructure/devices')
+    @app.get('/api/hub/v1/infrastructure/devices', openapi_extra={'parameters': [
+        {'name': 'include_retired', 'in': 'query', 'required': False,
+         'description': 'Include retired devices when true.',
+         'schema': {'type': 'boolean', 'default': False}},
+    ]})
     def devices(request:Request):
         identity=authorized(request)
         values=request.query_params.getlist('include_retired')

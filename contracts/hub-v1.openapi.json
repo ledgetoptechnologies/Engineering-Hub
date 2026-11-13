@@ -534,7 +534,19 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "include_retired",
+            "in": "query",
+            "required": false,
+            "description": "Include retired devices when true.",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ]
       }
     },
     "/api/hub/v1/infrastructure/metrics": {
