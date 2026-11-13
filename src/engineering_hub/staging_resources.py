@@ -98,11 +98,24 @@ class StagingResourceStore:
                 'CREATE TABLE IF NOT EXISTS hub_staging_policy (project TEXT PRIMARY KEY, data TEXT NOT NULL)',
                 'CREATE TABLE IF NOT EXISTS hub_staging_resource_jobs (id TEXT PRIMARY KEY, data TEXT NOT NULL)',
                 'CREATE TABLE IF NOT EXISTS hub_staging_resource_ownership (id TEXT PRIMARY KEY, job_id TEXT NOT NULL, project TEXT NOT NULL, created_by TEXT NOT NULL, source_commit TEXT NOT NULL)',
+                'CREATE INDEX IF NOT EXISTS hub_staging_resource_ownership_job ON hub_staging_resource_ownership(job_id,id)',
+                "CREATE INDEX IF NOT EXISTS hub_staging_resource_job_ref ON hub_entities((CASE WHEN json_valid(data) THEN json_extract(data,'$.job_id') END),id) WHERE kind='staging_resource'",
+                "CREATE INDEX IF NOT EXISTS hub_staging_resource_bad_job_ref ON hub_entities((CASE WHEN json_valid(data) THEN CASE WHEN json_type(data,'$.job_id')='text' THEN 0 ELSE 1 END ELSE 1 END),id) WHERE kind='staging_resource'",
                 'CREATE TABLE IF NOT EXISTS hub_staging_cleanup_plans (id TEXT PRIMARY KEY, actor TEXT NOT NULL, data TEXT NOT NULL)',
                 'CREATE TABLE IF NOT EXISTS hub_staging_cleanup_receipts (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, data TEXT NOT NULL)',
                 'CREATE INDEX IF NOT EXISTS hub_audit_terminal_lookup ON hub_audit(entity_id,revision,action)',
             ):
                 db.execute(sql)
+            # IF NOT EXISTS does not check an existing index definition. A name
+            # collision could silently turn the guarded bounded lookups into scans.
+            for name, table, expected in (
+                ('hub_staging_resource_ownership_job', 'hub_staging_resource_ownership', 'CREATE INDEX hub_staging_resource_ownership_job ON hub_staging_resource_ownership(job_id,id)'),
+                ('hub_staging_resource_job_ref', 'hub_entities', "CREATE INDEX hub_staging_resource_job_ref ON hub_entities((CASE WHEN json_valid(data) THEN json_extract(data,'$.job_id') END),id) WHERE kind='staging_resource'"),
+                ('hub_staging_resource_bad_job_ref', 'hub_entities', "CREATE INDEX hub_staging_resource_bad_job_ref ON hub_entities((CASE WHEN json_valid(data) THEN CASE WHEN json_type(data,'$.job_id')='text' THEN 0 ELSE 1 END ELSE 1 END),id) WHERE kind='staging_resource'"),
+            ):
+                actual = db.execute('SELECT type,tbl_name,sql FROM sqlite_master WHERE name=?', (name,)).fetchone()
+                if actual is None or tuple(actual) != ('index', table, expected):
+                    raise HubError('staging_resource_index_invalid', 503)
 
     def _trusted(self, principal):
         if self._control is None or principal is not self._control:
@@ -419,7 +432,19 @@ class StagingResourceStore:
             if job['terminal'] and not terminal:
                 raise HubError('staging_job_terminal', 409)
             protections = job['protected'] if normalized is None else normalized
-            for row in db.execute("SELECT data FROM hub_entities WHERE kind='staging_resource'"):
+            from . import reconciliation_context
+            active_guard = reconciliation_context.current.get()
+            if active_guard is not None:
+                if active_guard.job_id != job_id:
+                    raise reconciliation_context.Changed()
+                # The same writer's guard has already checked malformed data,
+                # ownership and the complete, bounded job-reference set.
+                rows = db.execute("SELECT data FROM hub_entities WHERE kind='staging_resource' AND (CASE WHEN json_valid(data) THEN json_extract(data,'$.job_id') END)=? ORDER BY id LIMIT ?", (job_id, active_guard.max_resources + 1)).fetchall()
+                if len(rows) > active_guard.max_resources:
+                    raise reconciliation_context.Changed()
+            else:
+                rows = db.execute("SELECT data FROM hub_entities WHERE kind='staging_resource'")
+            for row in rows:
                 item = json.loads(row['data'])
                 if item['job_id'] != job_id or item['state'] == 'deleted':
                     continue

@@ -86,7 +86,7 @@ def fixture_document():
                             'id': JOB_ID, 'project': PROJECT, 'recipe': 'static',
                             'state': 'held', 'phase': 'held', 'source_commit': 'a' * 40}]}
 
-            async def reconcile_for(self, actor, job_id):
+            async def reconcile_for(self, actor, job_id, *, admission_guard=None):
                 if actor != 'human:1':
                     raise HubError('staging_admin_required', 403)
                 binding = store.inspect_job(control, job_id)

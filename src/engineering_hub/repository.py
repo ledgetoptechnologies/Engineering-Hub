@@ -13,6 +13,7 @@ from .pilot_ownership import PilotOwner
 from .image_state_boundary import ImageStateBoundaryError, require_image_state_mount
 from .entity_context import bounded_text, validated_context
 from .decision_projection import public_decision
+from . import reconciliation_context
 
 
 PROJECTS = frozenset({'engineering-hub', '3d-viewer', 'project-alpha', 'ledge-top-ops', 'treedar'})
@@ -158,14 +159,20 @@ class HubRepository:
         self._assert_pilot_owner(None)
         with self._write_connection() as db:
             db.execute('BEGIN IMMEDIATE')
+            guard = reconciliation_context.current.get()
             try:
                 self._assert_pilot_owner(db)
+                if guard is not None:
+                    guard.before_write(self.path, db)
                 yield db
                 self._assert_pilot_owner(db)
                 session_context.before_commit(self.path, db)
                 if before_commit is not None:
                     before_commit(db)
+                snapshot = guard.prepare_commit(self.path, db) if guard is not None else None
                 db.commit()
+                if guard is not None:
+                    guard.committed(snapshot)
             except Exception:
                 db.rollback()
                 raise

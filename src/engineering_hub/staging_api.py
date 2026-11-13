@@ -260,7 +260,7 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         service = configured()
         await _payload(request, ClosedInput)
         revalidate(request, principal, human_only=True)
-        return await service.reconcile_for(principal, job_id)
+        return await service.reconcile_for(principal, job_id, admission_guard=admission(request, principal))
 
     @app.get('/api/hub/v1/staging/projects/{project}/policy')
     def get_policy(project: Project, request: Request):

@@ -49,7 +49,7 @@ class Controller:
         self.resources.authorize(actor, PROJECT, 'read')
         return {'job_id': job_id, 'state': 'queued'}
 
-    async def reconcile_for(self, actor, job_id):
+    async def reconcile_for(self, actor, job_id, *, admission_guard=None):
         if actor not in self.resources.admin_actors:
             raise HubError('staging_admin_required', 403)
         self.resources.authorize(actor, PROJECT, 'read')

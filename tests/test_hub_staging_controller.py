@@ -618,14 +618,460 @@ async def test_owner_rechecks_original_receipt_without_rerun(env):
         await controller.reconcile_for('codex', submitted['job']['id'])
     with pytest.raises(HubError, match='staging_admin_required'):
         await controller.reconcile_for('human:2', submitted['job']['id'])
-    result = await controller.reconcile_for('human:1', submitted['job']['id'])
+    result = await controller.reconcile_for('human:1', submitted['job']['id'], admission_guard=lambda db: None)
     assert result['job']['state'] == 'succeeded' and client.posts == 1
-    assert (await controller.reconcile_for('human:1', submitted['job']['id']))['job']['state'] == 'succeeded'
+    assert (await controller.reconcile_for('human:1', submitted['job']['id'], admission_guard=lambda db: None))['job']['state'] == 'succeeded'
     assert client.posts == 1
     policy = controller.resources.get_policy('human:1', 'engineering-hub')
     controller.resources.set_policy('human:1', 'engineering-hub', policy['revision'],
                                     {'human:1': ['read']})
-    assert (await controller.reconcile_for('human:1', submitted['job']['id']))['job']['state'] == 'succeeded'
+    assert (await controller.reconcile_for('human:1', submitted['job']['id'], admission_guard=lambda db: None))['job']['state'] == 'succeeded'
+    assert client.posts == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_competing_pause_during_worker_read_fails_without_rewriting(env):
+    controller, client, _, _, repo = env
+    client.lost_ack = True
+    submitted = await controller.submit('codex', payload(repo))
+    assert (await controller.run_once())['phase'] == 'held'
+    before = controller._read(job_id=submitted['job']['id'])
+    original = client.job
+
+    async def change_during_read(identity):
+        repo.set_pause('human:1', True)
+        return await original(identity)
+
+    client.job = change_during_read
+    with pytest.raises(HubError, match='staging_reconciliation_changed'):
+        await controller.reconcile_for('human:1', submitted['job']['id'], admission_guard=lambda db: None)
+    assert controller._read(job_id=submitted['job']['id']) == before
+    assert controller.queue.get_job(submitted['job']['id'])['state'] == 'held'
+    assert client.posts == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('drift', ['fence', 'lease', 'machine_generation', 'submission', 'resource'])
+async def test_reconcile_generation_drift_during_remote_read_fails_closed(env, drift):
+    controller, client, _, _, repo = env
+    client.lost_ack = True
+    submitted = await controller.submit('codex', payload(repo))
+    await controller.run_once()
+    identity = submitted['job']['id']
+    original = client.job
+    async def change_during_read(job_id):
+        with repo._transaction() as db:
+            if drift == 'fence':
+                db.execute('UPDATE hub_work_jobs SET fence=COALESCE(fence,0)+1 WHERE id=?', (identity,))
+            elif drift == 'lease':
+                db.execute('UPDATE hub_work_jobs SET lease_until=COALESCE(lease_until,0)+1 WHERE id=?', (identity,))
+            elif drift == 'machine_generation':
+                db.execute('UPDATE hub_work_machines SET generation=generation+1 WHERE machine_id=(SELECT machine_id FROM hub_work_jobs WHERE id=?)', (identity,))
+            elif drift == 'submission':
+                db.execute("UPDATE hub_staging_submissions SET fingerprint=fingerprint || 'changed' WHERE id=?", (controller._read(job_id=identity)['id'],))
+            else:
+                db.execute("UPDATE hub_entities SET data=json_set(data,'$.state','changed') WHERE id=?", (submitted['resource_ids']['build'],))
+        return await original(job_id)
+    client.job = change_during_read
+    with pytest.raises(HubError, match='staging_reconciliation_changed'):
+        await controller.reconcile_for('human:1', identity, admission_guard=lambda db: None)
+    assert controller.queue.get_job(identity)['state'] == 'held'
+    assert client.posts == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['submission', 'target', 'resource'])
+async def test_reconcile_corrupt_json_during_remote_read_does_not_mutate(env, kind):
+    controller, client, _, _, repo = env
+    client.lost_ack = True
+    submitted = await controller.submit('codex', payload(repo))
+    await controller.run_once()
+    identity = submitted['job']['id']
+    submission_id = controller._read(job_id=identity)['id']
+    original = client.job
+    async def corrupt(job_id):
+        with repo._transaction() as db:
+            if kind == 'submission':
+                db.execute("UPDATE hub_staging_submissions SET data='null' WHERE id=?", (submission_id,))
+            elif kind == 'target':
+                db.execute("UPDATE hub_work_jobs SET target='{' WHERE id=?", (identity,))
+            else:
+                db.execute("UPDATE hub_entities SET data='{' WHERE id=?", (submitted['resource_ids']['build'],))
+        return await original(job_id)
+    client.job = corrupt
+    with pytest.raises(HubError, match='staging_reconciliation_changed'):
+        await controller.reconcile_for('human:1', identity, admission_guard=lambda db: None)
+    with repo._connection() as db:
+        row = db.execute('SELECT state FROM hub_work_jobs WHERE id=?', (identity,)).fetchone()
+        assert row[0] == 'held'
+    assert client.posts == 1
+
+
+@pytest.mark.asyncio
+async def test_queued_reconcile_competes_with_real_claim(env, monkeypatch):
+    from engineering_hub import reconciliation_context
+    controller, client, _, _, repo = env
+    submitted = await controller.submit('codex', payload(repo))
+    identity = submitted['job']['id']
+    other, actions = compose_queue(repo, None, {'engineering-hub': ['static'], 'landscripting': ['static']}, 'staging-pc')
+    StagingController(repo, other, client, resources=controller.resources, control_principal=controller.principal, actions=actions, worker=controller.worker)
+    original = controller._reconcile_locked
+    async def claim_after_admission(job_id, *, item, current):
+        with reconciliation_context.suspended():
+            claimed = other.claim(worker=controller.worker)
+        assert claimed['id'] == identity
+        return await original(job_id, item=item, current=current)
+    monkeypatch.setattr(controller, '_reconcile_locked', claim_after_admission)
+    with pytest.raises(HubError):
+        await controller.reconcile_for('human:1', identity, admission_guard=lambda db: None)
+    job = other.get_job(identity)
+    assert job['state'] == 'claimed' and client.posts == 0
+    with repo._connection() as db:
+        assert db.execute('SELECT job_id FROM hub_work_machines WHERE machine_id=?', (job['machine_id'],)).fetchone()[0] == identity
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('interleave', ['renew', 'expire'])
+async def test_reconcile_competes_with_real_queue_lease_api(env, interleave):
+    from engineering_hub import reconciliation_context
+    controller, client, resources, _, repo = env
+    clock = [1000.0]
+    controller.queue.clock = lambda: clock[0]
+    submitted = await controller.submit('codex', payload(repo))
+    identity = submitted['job']['id']
+    submit_original, job_original = client.submit, client.job
+    entered = asyncio.Event()
+    async def running(request):
+        receipt = await submit_original(request)
+        return dict(receipt, state='running')
+    async def waiting(job_id):
+        entered.set()
+        await asyncio.Event().wait()
+    client.submit, client.job = running, waiting
+    task = asyncio.create_task(controller._run_once())
+    await asyncio.wait_for(entered.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    item = controller._read(job_id=identity)
+    claim = item['claim']
+    other_queue, _ = compose_queue(repo, None, {'engineering-hub': ['static'], 'landscripting': ['static']}, 'staging-pc')
+    other_queue.clock = lambda: clock[0]
+    async def competing(job_id):
+        with reconciliation_context.suspended():
+            if interleave == 'renew':
+                other_queue.renew(job_id=identity, worker=controller.worker, fence=claim['fence'], lease_seconds=120)
+            else:
+                clock[0] += 601
+                assert other_queue.claim(worker=controller.worker) is None
+        return await job_original(job_id)
+    client.job = competing
+    with pytest.raises(HubError, match='staging_reconciliation_changed'):
+        await controller.reconcile_for('human:1', identity, admission_guard=lambda db: None)
+    job = other_queue.get_job(identity)
+    assert job['state'] == ('claimed' if interleave == 'renew' else 'held')
+    with repo._connection() as db:
+        assert db.execute('SELECT job_id FROM hub_work_machines WHERE machine_id=?', (job['machine_id'],)).fetchone()[0] == identity
+    assert client.posts == 1
+
+
+@pytest.mark.asyncio
+async def test_two_controllers_reconcile_same_held_job_without_stale_rewrite(env):
+    first, client, resources, _, repo = env
+    client.lost_ack = True
+    submitted = await first.submit('codex', payload(repo))
+    await first.run_once()
+    identity = submitted['job']['id']
+    original = client.job
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def blocked_read(job_id):
+        entered.set()
+        await resume.wait()
+        return await original(job_id)
+
+    # A separate controller has an independent lock, but shares the ledger.
+    other_client = Client()
+    other_client.jobs, other_client.facts = client.jobs, client.facts
+    other = StagingController(repo, first.queue, other_client, resources=resources,
+        control_principal=first.principal, actions=first.actions, poll_interval=0.001)
+    client.job = blocked_read
+    pending = asyncio.create_task(first.reconcile_for('human:1', identity, admission_guard=lambda db: None))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        winner = await other.reconcile_for('human:1', identity, admission_guard=lambda db: None)
+        assert winner['job']['state'] == 'succeeded'
+        committed = first._read(job_id=identity)
+        resume.set()
+        with pytest.raises(HubError, match='staging_reconciliation_changed'):
+            await pending
+        assert first._read(job_id=identity) == committed
+        assert first.queue.get_job(identity)['state'] == 'succeeded'
+        assert client.posts == 1 and other_client.posts == 0
+    finally:
+        resume.set()
+        if not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_admission_rolls_back_if_session_guard_rejects(env):
+    controller, client, _, _, repo = env
+    client.lost_ack = True
+    submitted = await controller.submit('codex', payload(repo))
+    await controller.run_once()
+    def revoked(db):
+        raise HubError('human_session_required', 401)
+    with pytest.raises(HubError, match='human_session_required'):
+        await controller.reconcile_for('human:1', submitted['job']['id'], admission_guard=revoked)
+    with repo._connection() as db:
+        assert db.execute('SELECT count(*) FROM hub_staging_reconcile_admissions').fetchone()[0] == 0
+    assert controller.queue.get_job(submitted['job']['id'])['state'] == 'held'
+    assert client.posts == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_rogue_job_resource_during_worker_read_fails_closed(env):
+    controller, client, _, _, repo = env
+    client.lost_ack = True
+    submitted = await controller.submit('codex', payload(repo))
+    await controller.run_once()
+    before = controller._read(job_id=submitted['job']['id'])
+    original = client.job
+    rogue_id = str(uuid.uuid4())
+
+    async def insert_during_read(identity):
+        with repo._transaction() as db:
+            db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
+                       (rogue_id, 'staging_resource', json.dumps({'id': rogue_id, 'job_id': identity})))
+        return await original(identity)
+
+    client.job = insert_during_read
+    with pytest.raises(HubError, match='staging_reconciliation_changed'):
+        await controller.reconcile_for('human:1', submitted['job']['id'], admission_guard=lambda db: None)
+    assert controller._read(job_id=submitted['job']['id']) == before
+    assert controller.queue.get_job(submitted['job']['id'])['state'] == 'held'
+    assert client.posts == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('drift', ['missing_kind', 'swapped_kinds', 'owner_mismatch'])
+async def test_reconcile_inconsistent_resource_binding_cannot_release(env, drift):
+    controller, client, _, _, repo = env
+    client.lost_ack = True
+    submitted = await controller.submit('codex', payload(repo))
+    await controller.run_once()
+    identity = submitted['job']['id']
+    item = controller._read(job_id=identity)
+    kinds = sorted(item['resource_ids'])
+    with repo._transaction() as db:
+        if drift == 'missing_kind':
+            item['resource_ids'].pop(kinds[0])
+        elif drift == 'swapped_kinds':
+            item['resource_ids'][kinds[0]], item['resource_ids'][kinds[1]] = item['resource_ids'][kinds[1]], item['resource_ids'][kinds[0]]
+        else:
+            db.execute('UPDATE hub_staging_resource_ownership SET project=? WHERE id=?',
+                       ('other-project', item['resource_ids'][kinds[0]]))
+        db.execute('UPDATE hub_staging_submissions SET data=? WHERE id=?', (json.dumps(item), item['id']))
+    with pytest.raises(HubError, match='staging_reconciliation_changed'):
+        await controller.reconcile_for('human:1', identity, admission_guard=lambda db: None)
+    assert controller.queue.get_job(identity)['state'] == 'held'
+    assert client.posts == 1
+
+
+@pytest.mark.asyncio
+async def test_unbound_partial_queued_submission_remains_held_without_release(env):
+    controller, client, _, _, repo = env
+    submitted = await controller.submit('codex', payload(repo))
+    identity = submitted['job']['id']
+    item = controller._read(job_id=identity)
+    item['source_binding'] = None
+    item['resource_ids'].pop(sorted(item['resource_ids'])[0])
+    controller._save(item)
+    result = await controller.reconcile_for('human:1', identity, admission_guard=lambda db: None)
+    assert result['phase'] == 'held'
+    assert result['job']['state'] == 'queued'
+    assert client.posts == 0
+
+
+@pytest.mark.asyncio
+async def test_unrelated_malformed_resource_blocks_unbound_queued_recovery(env):
+    controller, client, _, _, repo = env
+    submitted = await controller.submit('codex', payload(repo))
+    identity = submitted['job']['id']
+    item = controller._read(job_id=identity)
+    item['source_binding'] = None
+    controller._save(item)
+    corrupt_id = str(uuid.uuid4())
+    with repo._transaction() as db:
+        db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)', (corrupt_id, 'staging_resource', '{'))
+    with pytest.raises(HubError, match='staging_reconciliation_changed'):
+        await controller.reconcile_for('human:1', identity, admission_guard=lambda db: None)
+    with repo._connection() as db:
+        assert db.execute('SELECT data FROM hub_entities WHERE id=?', (corrupt_id,)).fetchone()[0] == '{'
+        assert db.execute('SELECT state FROM hub_work_jobs WHERE id=?', (identity,)).fetchone()[0] == 'queued'
+    assert client.posts == 0
+
+
+@pytest.mark.asyncio
+async def test_malformed_legacy_resource_remains_intact_and_blocks_reconcile(env):
+    controller, client, _, _, repo = env
+    client.lost_ack = True
+    submitted = await controller.submit('codex', payload(repo))
+    await controller.run_once()
+    corrupt_id = str(uuid.uuid4())
+    with repo._transaction() as db:
+        db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)', (corrupt_id, 'staging_resource', '{'))
+        db.execute('DROP INDEX hub_staging_resource_job_ref')
+        db.execute('DROP INDEX hub_staging_resource_bad_job_ref')
+    # Initializing the indexes tolerates malformed retained rows; reconciliation
+    # must fail closed, without deleting or adopting them.
+    StagingResourceStore(repo, admin_actors=frozenset({'human:1'}), control_principal=controller.principal)
+    with pytest.raises(HubError, match='staging_reconciliation_changed'):
+        await controller.reconcile_for('human:1', submitted['job']['id'], admission_guard=lambda db: None)
+    with repo._connection() as db:
+        assert db.execute('SELECT data FROM hub_entities WHERE id=?', (corrupt_id,)).fetchone()[0] == '{'
+    assert controller.queue.get_job(submitted['job']['id'])['state'] == 'held'
+    assert client.posts == 1
+
+
+def test_reconciliation_indexes_reject_collision_and_use_selective_queries(env):
+    controller, _, _, _, repo = env
+    with repo._transaction() as db:
+        for n in range(1000):
+            db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
+                       (f'legacy-resource-{n}', 'staging_resource', json.dumps({'job_id': f'legacy-job-{n}'})))
+        queries = (
+            ("SELECT id FROM hub_entities WHERE kind='staging_resource' AND (CASE WHEN json_valid(data) THEN json_extract(data,'$.job_id') END)=? ORDER BY id LIMIT ?", ('legacy-job-3', 5), 'hub_staging_resource_job_ref'),
+            ("SELECT id FROM hub_entities WHERE kind='staging_resource' AND (CASE WHEN json_valid(data) THEN CASE WHEN json_type(data,'$.job_id')='text' THEN 0 ELSE 1 END ELSE 1 END)=1 LIMIT 1", (), 'hub_staging_resource_bad_job_ref'),
+            ('SELECT * FROM hub_staging_resource_ownership WHERE job_id=? ORDER BY id LIMIT ?', ('legacy-job-3', 5), 'hub_staging_resource_ownership_job'),
+            ("SELECT data FROM hub_entities WHERE kind='staging_resource' AND (CASE WHEN json_valid(data) THEN json_extract(data,'$.job_id') END)=? ORDER BY id LIMIT ?", ('legacy-job-3', 5), 'hub_staging_resource_job_ref'),
+        )
+        for query, args, expected in queries:
+            plan = ' '.join(row[3] for row in db.execute('EXPLAIN QUERY PLAN ' + query, args))
+            assert expected in plan and 'SEARCH' in plan
+        db.execute('DROP INDEX hub_staging_resource_job_ref')
+        db.execute('CREATE INDEX hub_staging_resource_job_ref ON hub_entities(kind)')
+    with pytest.raises(HubError, match='staging_resource_index_invalid'):
+        StagingResourceStore(repo, admin_actors=frozenset({'human:1'}), control_principal=controller.principal)
+    with repo._connection() as db:
+        assert db.execute("SELECT sql FROM sqlite_master WHERE name='hub_staging_resource_job_ref'").fetchone()[0] == 'CREATE INDEX hub_staging_resource_job_ref ON hub_entities(kind)'
+        assert db.execute("SELECT count(*) FROM hub_entities WHERE id LIKE 'legacy-resource-%'").fetchone()[0] == 1000
+
+
+@pytest.mark.asyncio
+async def test_terminal_reconcile_retry_reuses_exact_admission_receipt(env):
+    controller, client, _, _, repo = env
+    client.lost_ack = True
+    submitted = await controller.submit('codex', payload(repo))
+    await controller.run_once()
+    await controller.reconcile_for('human:1', submitted['job']['id'], admission_guard=lambda db: None)
+    await controller.reconcile_for('human:1', submitted['job']['id'], admission_guard=lambda db: None)
+    with repo._connection() as db:
+        before = db.execute('SELECT count(*) FROM hub_staging_reconcile_admissions').fetchone()[0]
+    await controller.reconcile_for('human:1', submitted['job']['id'], admission_guard=lambda db: None)
+    with repo._connection() as db:
+        assert db.execute('SELECT count(*) FROM hub_staging_reconcile_admissions').fetchone()[0] == before
+    assert client.posts == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_receipt_capacity_fails_closed_without_deleting_history(env, monkeypatch):
+    import engineering_hub.staging_controller as module
+    controller, client, _, _, repo = env
+    client.lost_ack = True
+    submitted = await controller.submit('codex', payload(repo))
+    await controller.run_once()
+    async def unavailable(identity):
+        raise HubError('staging_connection_unavailable', 503)
+    client.job = unavailable
+    monkeypatch.setattr(module, '_MAX_RECONCILIATION_ADMISSIONS', 1)
+    identity = submitted['job']['id']
+    await controller.reconcile_for('human:1', identity, admission_guard=lambda db: None)
+    # Identical retries do not consume an additional receipt.
+    await controller.reconcile_for('human:1', identity, admission_guard=lambda db: None)
+    with repo._connection() as db:
+        before = [tuple(row) for row in db.execute('SELECT * FROM hub_staging_reconcile_admissions')]
+    assert len(before) == 1
+    repo.set_pause('human:1', True)  # A genuinely different snapshot cannot reuse it.
+    with pytest.raises(HubError, match='staging_reconciliation_admission_limit'):
+        await controller.reconcile_for('human:1', identity, admission_guard=lambda db: None)
+    with repo._connection() as db:
+        assert [tuple(row) for row in db.execute('SELECT * FROM hub_staging_reconcile_admissions')] == before
+    assert controller.queue.get_job(identity)['state'] == 'held'
+    # Background recovery does not require a human admission, even at capacity.
+    await controller.reconcile(identity)
+    with repo._connection() as db:
+        assert [tuple(row) for row in db.execute('SELECT * FROM hub_staging_reconcile_admissions')] == before
+    assert client.posts == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_session_revocation_before_and_after_admission(env):
+    from fastapi import HTTPException
+    from engineering_hub.auth import SessionStore
+    controller, client, _, _, repo = env
+    client.lost_ack = True
+    submitted = await controller.submit('codex', payload(repo))
+    await controller.run_once()
+    identity = submitted['job']['id']
+    sessions = SessionStore(repo.path, repository=repo)
+    session, guard = human_cleanup_guard(repo, sessions)
+    sessions.delete_session(session['cookie_token'])
+    with pytest.raises(HTTPException):
+        await controller.reconcile_for('human:1', identity, admission_guard=guard)
+    with repo._connection() as db:
+        assert db.execute('SELECT count(*) FROM hub_staging_reconcile_admissions').fetchone()[0] == 0
+    session, guard = human_cleanup_guard(repo, sessions)
+    original = client.job
+    async def logout_after_admission(job_id):
+        sessions.delete_session(session['cookie_token'])
+        return await original(job_id)
+    client.job = logout_after_admission
+    await controller.reconcile_for('human:1', identity, admission_guard=guard)
+    assert controller.queue.get_job(identity)['state'] == 'succeeded'
+    assert client.posts == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stop_after', range(1, 9))
+async def test_reconcile_interrupted_after_each_local_commit_recovers_without_repost(env, monkeypatch, stop_after):
+    from contextlib import contextmanager
+    controller, client, resources, _, repo = env
+    client.lost_ack = True
+    submitted = await controller.submit('codex', payload(repo))
+    await controller.run_once()
+    identity = submitted['job']['id']
+    original = repo._transaction
+    commits = [0]
+    class SimulatedCrash(BaseException):
+        pass
+    @contextmanager
+    def interrupted(*args, **kwargs):
+        with original(*args, **kwargs) as db:
+            yield db
+        commits[0] += 1
+        if commits[0] == stop_after:
+            raise SimulatedCrash()
+    monkeypatch.setattr(repo, '_transaction', interrupted)
+    with pytest.raises(SimulatedCrash):
+        await controller.reconcile_for('human:1', identity, admission_guard=lambda db: None)
+    monkeypatch.setattr(repo, '_transaction', original)
+    with repo._connection() as db:
+        state = db.execute('SELECT state,machine_id FROM hub_work_jobs WHERE id=?', (identity,)).fetchone()
+        machine = db.execute('SELECT job_id FROM hub_work_machines WHERE machine_id=?', (state['machine_id'],)).fetchone()
+        if state['state'] not in ('succeeded', 'failed'):
+            assert machine['job_id'] == identity
+    fresh = HubRepository(repo.path)
+    principal = object()
+    reopened_resources = StagingResourceStore(fresh, admin_actors=frozenset({'human:1'}),
+        control_principal=principal, clock=resources.clock)
+    reopened_queue, actions = compose_queue(fresh, None, {'engineering-hub': ['static'], 'landscripting': ['static']}, 'staging-pc')
+    restarted = StagingController(fresh, reopened_queue, client, resources=reopened_resources,
+        control_principal=principal, actions=actions, poll_interval=0.001)
+    result = await restarted.reconcile_for('human:1', identity, admission_guard=lambda db: None)
+    assert result['job']['state'] == 'succeeded'
     assert client.posts == 1
 
 
@@ -694,7 +1140,7 @@ async def test_claim_crash_before_dispatch_is_proven_unstarted_after_expiry(env)
     # Simulate process death between the queue commit and dispatch-intent save.
     assert controller._read(job_id=submitted['job']['id'])['phase'] == 'queued'
     now[0] += 11
-    result = await controller.reconcile_for('human:1', submitted['job']['id'])
+    result = await controller.reconcile_for('human:1', submitted['job']['id'], admission_guard=lambda db: None)
     assert result['job']['state'] == 'failed' and client.posts == 0
     with controller.repo._connection() as db:
         assert db.execute('SELECT job_id FROM hub_work_machines').fetchone()[0] is None
@@ -711,8 +1157,8 @@ async def test_unchanged_unknown_hold_does_not_grow_audit_history(env):
         raise HubError('staging_connection_unavailable', 503)
     client.job = unavailable
     before = controller.repo.list_audit()
-    await controller.reconcile_for('human:1', submitted['job']['id'])
-    await controller.reconcile_for('human:1', submitted['job']['id'])
+    await controller.reconcile_for('human:1', submitted['job']['id'], admission_guard=lambda db: None)
+    await controller.reconcile_for('human:1', submitted['job']['id'], admission_guard=lambda db: None)
     assert controller.repo.list_audit() == before and client.posts == 1
 
 
@@ -727,7 +1173,7 @@ async def test_public_operations_report_busy_without_waiting_for_long_job(env):
             for operation in (controller.submit('codex', payload(repo)),
                               controller.cleanup_apply('human:1', str(uuid.uuid4()), 'sha256:' + 'a' * 64,
                                                        admission_guard=lambda db: None),
-                              controller.reconcile_for('human:1', submitted['job']['id'])):
+                              controller.reconcile_for('human:1', submitted['job']['id'], admission_guard=lambda db: None)):
                 with pytest.raises(HubError, match='staging_busy'):
                     await operation
     finally:
