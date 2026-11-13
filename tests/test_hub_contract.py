@@ -20,6 +20,16 @@ def test_checked_in_openapi_matches_app(tmp_path):
     assert not {'session_id', 'observer_id', 'observer_epoch', 'connector_generation'} & public.keys()
 
 
+def test_metric_history_contract_declares_required_query_parameters():
+    contract = json.loads((Path(__file__).parents[1] / 'contracts/hub-v1.openapi.json').read_text())
+    operation = contract['paths']['/api/hub/v1/infrastructure/metrics/history']['get']
+    params = {parameter['name']: parameter for parameter in operation['parameters']}
+    assert set(params) == {'host', 'range'}
+    assert all(item['in'] == 'query' and item['required'] for item in params.values())
+    assert params['host']['schema']['pattern'] == r'^(?:host|target):[0-9a-f]{64}$'
+    assert params['range']['schema']['enum'] == ['1h', '6h', '24h', '7d']
+
+
 def test_contract_survives_typing_cache_eviction_and_equivalent_literal_order(tmp_path):
     # Project routes import lazily. Earlier tests can evict typing's caches;
     # equal Literal unions may then retain a different insertion order. Reuse

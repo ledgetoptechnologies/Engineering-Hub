@@ -566,7 +566,34 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "host",
+            "in": "query",
+            "required": true,
+            "description": "Opaque host key returned by infrastructure metrics discovery.",
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:host|target):[0-9a-f]{64}$"
+            }
+          },
+          {
+            "name": "range",
+            "in": "query",
+            "required": true,
+            "description": "Fixed history interval.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1h",
+                "6h",
+                "24h",
+                "7d"
+              ]
+            }
+          }
+        ]
       }
     },
     "/api/hub/v1/infrastructure/devices/{device_id}": {

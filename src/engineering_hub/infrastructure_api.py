@@ -106,7 +106,14 @@ def attach_infrastructure_routes(app,service,actor,*,metrics=None,metrics_identi
             raise HubError('infrastructure_metrics_not_configured',404)
         return await metrics.read(identity)
 
-    @app.get('/api/hub/v1/infrastructure/metrics/history')
+    @app.get('/api/hub/v1/infrastructure/metrics/history', openapi_extra={'parameters': [
+        {'name': 'host', 'in': 'query', 'required': True,
+         'description': 'Opaque host key returned by infrastructure metrics discovery.',
+         'schema': {'type': 'string', 'pattern': '^(?:host|target):[0-9a-f]{64}$'}},
+        {'name': 'range', 'in': 'query', 'required': True,
+         'description': 'Fixed history interval.',
+         'schema': {'type': 'string', 'enum': ['1h', '6h', '24h', '7d']}},
+    ]})
     async def machine_metric_history(request:Request):
         identity=metrics_identity(request) if metrics_identity is not None else authorized(request,'metrics_read')
         params=request.query_params
