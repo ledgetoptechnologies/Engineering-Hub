@@ -123,6 +123,56 @@ def env(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('case', ['missing', 'uncertain', 'unknown', 'preview', 'build', 'test', 'build_failed_before_test', 'extra'])
+async def test_contradictory_failed_receipt_keeps_original_reservation(env, case):
+    controller, client, resources, _, repo = env
+    original = client.submit
+
+    async def contradict(value):
+        receipt = await original(value)
+        receipt['state'] = 'failed'
+        result = receipt['result']
+        result.pop('resource_ids')
+        result['error'] = 'stage_build_failed' if case == 'build' else 'stage_test_failed'
+        if case == 'missing':
+            del result['error']
+            result.pop('preview_ready')
+            result.pop('stages')
+        elif case == 'uncertain':
+            result['error'] = 'execution_uncertain'
+            result.pop('preview_ready')
+            result.pop('stages')
+        elif case == 'unknown':
+            result['error'] = 'unknown_future_reason'
+            result.pop('preview_ready')
+            result.pop('stages')
+        elif case in ('build', 'test'):
+            result.pop('preview_ready')
+        elif case == 'build_failed_before_test':
+            result.pop('preview_ready')
+            result['stages']['build']['exit_code'] = 1
+            result['stages']['test']['exit_code'] = 1
+        elif case == 'extra':
+            result.pop('preview_ready')
+            result.pop('stages')
+            result['extra'] = 'unexpected'
+        return receipt
+
+    client.submit = contradict
+    submitted = await controller.submit('codex', payload(repo))
+    held = await controller.run_once()
+    assert held['job']['state'] == 'held'
+    assert controller.queue.get_job(submitted['job']['id'])['state'] == 'held'
+    assert all(resources.get_resource('codex', identity)['state'] == 'provisioning'
+               for identity in submitted['resource_ids'].values())
+    with repo._connection() as db:
+        reservation = db.execute('SELECT job_id FROM hub_work_machines WHERE machine_id=?', ('staging-pc',)).fetchone()
+    assert reservation is not None and reservation['job_id'] == submitted['job']['id']
+    assert (await controller.reconcile(submitted['job']['id']))['job']['state'] == 'held'
+    assert client.posts == 1
+
+
+@pytest.mark.asyncio
 async def test_success_with_failure_reason_is_held_before_finalization(env):
     controller, client, resources, _, repo = env
     original = client.submit

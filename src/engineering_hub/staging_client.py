@@ -47,6 +47,27 @@ class StagingClientError(HubError):
         super().__init__(code, status)
 
 
+# Known terminal reasons in the installed worker's _execute_operation path:
+# extraction/source validation and post-run tree validation (core.py), or a
+# stage failure (docker.py). Unknown and uncertain reasons never release a job.
+_DEFINITIVE_STAGING_FAILURES = frozenset({
+    'unsafe_path', 'archive_file_count', 'duplicate_archive_path',
+    'unsupported_archive_entry', 'archive_size', 'archive_expansion_limit',
+    'archive_size_drift', 'invalid_archive', 'invalid_source_executable_paths',
+    'output_file_count', 'output_symlink', 'output_special_file', 'output_size_limit',
+    'stage_build_failed', 'stage_test_failed',
+})
+_FAILED_RESULT_FIELDS = frozenset({'error', 'source_commit', 'source_digest',
+    'source_commit_verification', 'source_binding', 'diagnostic'})
+
+
+def _failed_result_consistent(details):
+    """Accept only documented worker failure shapes, not a claim of host fencing."""
+    return (type(details) is dict and not set(details) - _FAILED_RESULT_FIELDS
+            and type(details.get('error')) is str
+            and details['error'] in _DEFINITIVE_STAGING_FAILURES)
+
+
 _NOT_ACCEPTED = {
     '/v1/jobs': {
         409: frozenset({'worker_busy_or_held', 'worker_storage_capacity', 'resource_conflict'}),
@@ -429,6 +450,7 @@ class StagingClient:
         # A successful receipt cannot simultaneously carry a failure reason.
         # Preserve uncertainty rather than accepting contradictory terminal facts.
         _check(result['state'] != 'succeeded' or 'error' not in details)
+        _check(result['state'] != 'failed' or _failed_result_consistent(details))
         _check(not set(details) - {'error', 'stages', 'preview_ready', 'source_commit',
                'source_commit_verification', 'source_digest', 'source_binding', 'resource_ids',
                'deleted_resource_ids', 'diagnostic', 'profile_digest'})

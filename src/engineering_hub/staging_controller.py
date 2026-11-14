@@ -21,7 +21,7 @@ from . import reconciliation_context
 from .staging_action_key import staging_action_key
 from .staging_source_binding import UNBOUND_HOLD as _UNBOUND_HOLD, valid_source_binding as _valid_source_binding
 from .staging_resources import KINDS
-from .staging_client import _FILE_TYPES, StagingNotAccepted
+from .staging_client import _FILE_TYPES, StagingNotAccepted, _failed_result_consistent
 from .work_queue import WorkAction, WorkQueue, WorkTarget, WorkWorker, STAGING_SERVICE_EXECUTOR
 
 _PROOF_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix='staging-proof')
@@ -663,6 +663,8 @@ class StagingController:
                  'staging_source_binding_required', 409)
         outcome = receipt['state']
         result = receipt['result']
+        if outcome == 'failed':
+            _require(_failed_result_consistent(result), 'staging_completion_proof_invalid', 502)
         _require(result.get('source_commit') == item['source_commit']
                  and result.get('source_digest') == item['source_digest']
                  and result.get('source_commit_verification') == 'git-sha1-tree-v1'
