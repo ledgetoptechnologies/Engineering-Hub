@@ -89,14 +89,14 @@ def main(argv=None):
     parser.add_argument('--session')
     parser.add_argument('--private-vpn', action='store_true')
     parser.add_argument('--outbox-dir', type=Path)
-    parser.add_argument('action', choices=sorted((*(set(_TOOLS) - {'propose-draft'}), 'stage', 'draft', 'bind-staged', 'recover-staged', 'send-staged', 'list-staged', 'inspect-staged', 'status-staged')))
+    parser.add_argument('action', choices=sorted((*(set(_TOOLS) - {'propose-draft'}), 'stage', 'draft', 'bind-staged', 'recover-staged', 'send-staged', 'list-staged', 'inventory-staged', 'inspect-staged', 'status-staged')))
     try:
         args = parser.parse_args(argv)
         raw = sys.stdin.buffer.read(_MAX_INPUT + 1)
         if len(raw) > _MAX_INPUT:
             raise ClientError('invalid_tracking_request')
         arguments = json.loads(raw)
-        if args.action in ('stage', 'draft', 'bind-staged', 'recover-staged', 'send-staged', 'list-staged', 'inspect-staged', 'status-staged'):
+        if args.action in ('stage', 'draft', 'bind-staged', 'recover-staged', 'send-staged', 'list-staged', 'inventory-staged', 'inspect-staged', 'status-staged'):
             if args.outbox_dir is None or type(arguments) is not dict:
                 raise ClientError('invalid_tracking_request')
             if args.action == 'list-staged':
@@ -108,6 +108,13 @@ def main(argv=None):
                 # Preserve the original {}/small-outbox response shape.
                 if arguments or page['next_after'] is not None:
                     result['next_after'] = page['next_after']
+            elif args.action == 'inventory-staged':
+                if arguments.keys() - {'limit', 'after'}:
+                    raise ClientError('invalid_tracking_request')
+                page = tracking_outbox.inventory_page(args.outbox_dir, limit=arguments.get('limit', 25),
+                                                       after=arguments.get('after'))
+                result = {'type': 'tracking_outbox_inventory', 'trust': 'private_untrusted_local_data',
+                          'execution_authorization': False, **page}
             elif args.action == 'stage':
                 if set(arguments) != {'action', 'arguments'} or arguments['action'] not in ('propose', 'update', 'review', 'withdraw-claim'):
                     raise ClientError('invalid_tracking_request')
@@ -188,6 +195,9 @@ def main(argv=None):
             result = asyncio.run(_run(args, arguments))
         print(json.dumps(result, ensure_ascii=True, separators=(',', ':')))
     except ClientError as error:
+        if str(error) == 'tracking_inventory_too_many_entries':
+            print('tracking_inventory_too_many_entries; use list-staged and inspect-staged', file=sys.stderr)
+            return 1
         if str(error) == 'tracking_binding_durability_unavailable':
             print('tracking_draft_binding_unavailable_on_this_platform; retain the local draft', file=sys.stderr)
             return 1

@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import json
+import errno
 import heapq
 import hashlib
 import base64
 import os
+import re
 import secrets
 import stat
 import tempfile
+import unicodedata
 import uuid
 from pathlib import Path
 
@@ -37,6 +40,17 @@ def _id(value):
     except (ValueError, TypeError, AttributeError):
         raise ClientError('invalid_tracking_outbox_reference') from None
     return value
+
+
+def _open_regular(path):
+    """Reject special files before open and avoid blocking on a FIFO race."""
+    info = path.lstat()
+    if (stat.S_ISLNK(info.st_mode)
+            or getattr(info, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)):
+        raise OSError(errno.ELOOP, 'invalid_tracking_outbox')
+    if not stat.S_ISREG(info.st_mode):
+        raise ClientError('invalid_tracking_outbox')
+    return os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
 
 
 def stage(directory, origin, installation, session_id, action, arguments):
@@ -86,7 +100,7 @@ def _stage_record(directory, record):
 
 def read(directory, record_id):
     directory, record_id = _directory(directory), _id(record_id)
-    fd = os.open(directory / (record_id + '.tracking'), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    fd = _open_regular(directory / (record_id + '.tracking'))
     try:
         info = os.fstat(fd)
         reparse = getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)
@@ -252,7 +266,7 @@ def binding(directory, record):
     if not is_draft(record):
         raise ClientError('invalid_tracking_binding')
     try:
-        fd = os.open(directory / (identity + '.binding'), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        fd = _open_regular(directory / (identity + '.binding'))
     except FileNotFoundError:
         return None
     try:
@@ -356,7 +370,7 @@ def receipt(directory, record):
     directory = _directory(directory)
     identity = _id(record['id'])
     try:
-        fd = os.open(directory / (identity + '.accepted'), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        fd = _open_regular(directory / (identity + '.accepted'))
     except FileNotFoundError:
         return None
     try:
@@ -465,3 +479,66 @@ def references(directory):
     if page['next_after'] is not None:
         raise ClientError('tracking_outbox_too_many')
     return page['record_ids']
+
+
+def inventory_page(directory, *, limit=25, after=None):
+    """Explicit private local summary; bounded enumeration and record reads."""
+    directory = _directory(directory)
+    if type(limit) is not int or not 1 <= limit <= 50:
+        raise ClientError('invalid_tracking_outbox_limit')
+    if after is not None:
+        _id(after)
+    candidates, unrecognized = [], 0
+    with os.scandir(directory) as entries:
+        for count, entry in enumerate(entries, 1):
+            if count > 4096:
+                raise ClientError('tracking_inventory_too_many_entries')
+            if not entry.name.endswith('.tracking'):
+                continue
+            try:
+                identity = _id(entry.name[:-9])
+            except ClientError:
+                unrecognized += 1
+                continue
+            if after is None or identity > after:
+                candidates.append(identity)
+    selected = heapq.nsmallest(limit + 1, candidates)
+    ids = selected[:limit]
+    items = []
+    for identity in ids:
+        try:
+            info = (directory / (identity + '.tracking')).lstat()
+            if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                    or getattr(info, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)):
+                raise ClientError('invalid_tracking_outbox')
+            record = read(directory, identity)
+            action, args = record['action'], record['arguments']
+            if action not in ('propose', 'propose-draft', 'update', 'review', 'withdraw-claim') or type(args) is not dict:
+                raise ClientError('invalid_tracking_outbox')
+            project, title = args.get('project'), args.get('title')
+            if action in ('propose', 'propose-draft'):
+                if type(project) is not str or re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', project) is None:
+                    raise ClientError('invalid_tracking_outbox')
+                if type(title) is not str or not 1 <= len(title) <= 200:
+                    raise ClientError('invalid_tracking_outbox')
+                title = ''.join(character for character in title if not unicodedata.category(character).startswith('C')).strip()
+                if not title:
+                    raise ClientError('invalid_tracking_outbox')
+            else:
+                project = title = None
+            known = validate_recovery(directory, record)
+            bound = binding(directory, record) if is_draft(record) else record
+            accepted = receipt(directory, record)
+            if accepted is not None and ((known is not None and accepted['task_id'] != known)
+                    or (record.get('expected_task_id') is not None and accepted['task_id'] != record['expected_task_id'])):
+                raise ClientError('tracking_recovery_task_mismatch')
+            items.append(dict(record_id=identity, project=project, title=title, action=action,
+                state='hub_accepted' if accepted is not None else 'unbound' if bound is None else 'unconfirmed',
+                task_id=accepted['task_id'] if accepted is not None else None,
+                source_record_id=record.get('source_id'), accepted_attempt_id=record.get('prior_id')))
+        except Exception:
+            # Names remain visible even if a file disappeared or its contents,
+            # binding, receipt or recovery evidence could not be validated.
+            items.append(dict(record_id=identity, state='unreadable'))
+    return dict(items=items, next_after=ids[-1] if len(selected) > limit else None,
+                unrecognized_tracking_entries=unrecognized)

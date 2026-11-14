@@ -162,6 +162,25 @@ identity. Inspect the draft and binding in a protected channel and reconcile
 against existing Hub tasks before sending. This is not automatic capture, wake,
 cross-agent transfer, or proof that the Hub accepted anything.
 
+For an explicit private local overview, `inventory-staged` accepts `{}` or
+`{"limit":25,"after":"<cursor>"}`. Pages contain at most 50 records and
+show the saved project, sanitized title, action, local acceptance state and
+recovery links when available. Update/review envelopes do not carry a project
+or title and therefore show null for them. Output includes private, untrusted
+task titles; use a protected channel and do not put secrets in task content.
+An `unreadable` entry is not skipped and does not indicate whether a Hub write
+occurred. `hub_accepted` is a retained response, not a current Hub read or
+verified completion. The command counts noncanonical `.tracking` names without
+printing their arbitrary names. It reads no Hub and does not send work.
+
+Each inventory call permits at most 4,096 directory entries, including sidecars
+and unrelated names, and reads one additional entry to detect overflow. Above
+that limit it fails without a partial page; use the
+existing paginated `list-staged` and `inspect-staged` commands, or separate
+outboxes, to review the larger directory. UUID order is not creation order,
+and pages and sidecars are not an atomic snapshot; restart from the beginning
+on later turns. Windows local directory metadata durability remains unverified.
+
 On a later turn, `list-staged` with `{}` lists up to 1,000 opaque IDs. If
 `next_after` is returned, pass it as `after` in the next call; an optional
 integer `limit` from 1 to 1,000 requests a smaller page. The default response
