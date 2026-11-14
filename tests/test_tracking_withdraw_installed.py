@@ -2,14 +2,14 @@
 
 Set EH_TRACKING_INSTALLED_PYTHON to a private venv containing a separately
 verified source-matched tracking-client wheel. This test does not verify that
-external precondition. Run this test in an isolated, serial pytest process; its
-server watcher hook is module-global. No production profiles, grants, or endpoints are used.
+external precondition. No production profiles, grants, or endpoints are used.
 """
 import asyncio
 import json
 import os
 import socket
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -93,8 +93,11 @@ async def test_installed_outbox_withdrawal_against_real_ehs(owned, tmp_path, mon
     # Track only a watcher created by this test's server. An existing shared
     # watcher belongs to the surrounding loop and is never cancelled here.
     owned_watchers = set()
+    watcher_owner = ContextVar('withdraw_test_server_watcher', default=False)
     original_start_watcher = sse._ensure_watcher_started_on_this_loop
     def track_new_watcher():
+        if not watcher_owner.get():
+            return original_start_watcher()
         before = asyncio.all_tasks()
         original_start_watcher()
         owned_watchers.update(task for task in asyncio.all_tasks() - before
@@ -104,7 +107,11 @@ async def test_installed_outbox_withdrawal_against_real_ehs(owned, tmp_path, mon
     @asynccontextmanager
     async def serve():
         server = ReadyServer(uvicorn.Config(app, log_level='critical', lifespan='on'))
-        task = asyncio.create_task(server.serve(sockets=[listener]))
+        marker = watcher_owner.set(True)
+        try:
+            task = asyncio.create_task(server.serve(sockets=[listener]))
+        finally:
+            watcher_owner.reset(marker)
         try:
             await asyncio.wait_for(server.ready.wait(), 5)
             yield origin
