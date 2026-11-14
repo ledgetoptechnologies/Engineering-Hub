@@ -475,6 +475,14 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
                       completion_claim=completion_claim))
 
     @registration.tool()
+    def hub_tracking_claim_withdraw(task_id: str, expected_revision: StrictInt,
+                                    expected_claim_revision: StrictInt, client_request_id: str,
+                                    reason: str, ctx: Context) -> dict:
+        """Retract the exact installation's own completion claim; this is not a review or approval."""
+        return invoke(lambda: repo.withdraw_tracking_claim(identity(ctx), task_id, expected_revision,
+                      expected_claim_revision, client_request_id, reason=reason))
+
+    @registration.tool()
     def hub_tracking_task_review(task_id: str, expected_revision: StrictInt, client_request_id: str,
                                  verdict: str, note: str, evidence_links: list[dict[str, str]], ctx: Context) -> dict:
         """Independently verify a specific claim or reopen it; never grants execution authority.

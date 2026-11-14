@@ -119,3 +119,22 @@ def test_cli_stages_and_explicitly_sends_review(tmp_path, monkeypatch, capsys):
     assert tracking_client.main(argv + ['send-staged']) == 0
     assert calls == [(payload, record, 'review')]
     assert json.loads(capsys.readouterr().out)['result']['status'] == 'completion_verified'
+
+
+def test_cli_stages_claim_withdrawal_without_sending(tmp_path, monkeypatch, capsys):
+    import io
+    profile = tmp_path / 'profile'; profile.mkdir(mode=0o700)
+    outbox = tmp_path / 'outbox'; outbox.mkdir(mode=0o700)
+    installation = 'b39e3ea5-567c-45cb-a184-01dd1c6352bb'
+    _write(profile / 'installation.private', {'origin': 'https://hub.example', 'installation_id': installation})
+    payload = {'task_id': 'task', 'expected_revision': 4, 'expected_claim_revision': 3,
+               'client_request_id': 'withdraw-stable', 'reason': 'Incomplete'}
+    class Input:
+        buffer = io.BytesIO(json.dumps({'action': 'withdraw-claim', 'arguments': payload}).encode())
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input())
+    argv = ['--profile-dir', str(profile), '--session', 'first', '--outbox-dir', str(outbox)]
+    assert tracking_client.main(argv + ['stage']) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert not result['sent'] and not result['execution_authorization']
+    record = tracking_outbox.read(outbox, result['record_id'])
+    assert record['action'] == 'withdraw-claim' and record['arguments'] == payload

@@ -27,6 +27,8 @@ _TOOLS = {
                 {'details', 'links', 'origin_request_id'}),
     'update': ('hub_tracking_task_update', {'task_id', 'expected_revision', 'client_request_id', 'progress', 'evidence_links'},
                {'completion_claim'}),
+    'withdraw-claim': ('hub_tracking_claim_withdraw', {'task_id', 'expected_revision', 'expected_claim_revision',
+                                                       'client_request_id', 'reason'}, set()),
     'review': ('hub_tracking_task_review', {'task_id', 'expected_revision', 'client_request_id', 'verdict', 'note', 'evidence_links'},
                set()),
     'history': ('hub_tracking_task_history', {'task_id', 'kind'}, {'before'}),
@@ -99,7 +101,7 @@ def main(argv=None):
                     raise ClientError('invalid_tracking_request')
                 result = {'type': 'tracking_outbox_references', 'record_ids': tracking_outbox.references(args.outbox_dir)}
             elif args.action == 'stage':
-                if set(arguments) != {'action', 'arguments'} or arguments['action'] not in ('propose', 'update', 'review'):
+                if set(arguments) != {'action', 'arguments'} or arguments['action'] not in ('propose', 'update', 'review', 'withdraw-claim'):
                     raise ClientError('invalid_tracking_request')
                 _arguments(arguments['action'], arguments['arguments'])
                 origin, installation = _installation_profile(
@@ -112,7 +114,7 @@ def main(argv=None):
                 if set(arguments) != {'record_id'}:
                     raise ClientError('invalid_tracking_request')
                 record = tracking_outbox.read(args.outbox_dir, arguments['record_id'])
-                if record['action'] not in ('propose', 'update', 'review'):
+                if record['action'] not in ('propose', 'update', 'review', 'withdraw-claim'):
                     raise ClientError('invalid_tracking_request')
                 _arguments(record['action'], record['arguments'])
                 if args.action == 'inspect-staged':

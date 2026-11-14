@@ -9,7 +9,7 @@ evidence, or authorize work. Existing session and independent-review rules
 remain enforced by the server. An older Hub may not support these tools.
 
 Select `--profile-dir`, `--session`, optionally `--private-vpn`, and exactly one
-action: `list`, `propose`, `update`, `review`, `history`, `origin`, or
+action: `list`, `propose`, `update`, `withdraw-claim`, `review`, `history`, `origin`, or
 `request-summary`. Supply one JSON
 object containing that MCP operation's arguments on standard input. Never put
 credentials or private task content in command arguments or logs. For example,
@@ -30,6 +30,21 @@ and kind, with optional before. For `list`, project is required; limit,
 after_task_id and unfinished are optional. Page from the beginning on later
 turns because task IDs are not chronological. Keep private content out of
 terminal transcripts and use a protected input channel in actual workflows.
+
+If work previously claimed complete is found incomplete, the exact EHS
+installation that made the latest claim may use `withdraw-claim` with task_id,
+expected_revision, expected_claim_revision, client_request_id and a nonempty
+reason. This is an attributed downgrade to open, not an independent review; it
+preserves prior claim and review history. It requires `tracking.update`, the
+current task revision and an explicitly recorded latest claim revision.
+Legacy claims without a recorded claim revision need a human or independently
+authorized reviewer to reopen them. A renewed session of the same installation
+may retry the exact unchanged request; another installation cannot withdraw it,
+even in the same family. A new completion claim still needs its own independent
+verification. A successful retry returns the current task (or the write-only
+receipt), which may have changed since the withdrawal.
+The existing tracking UI displays prior verification as historical review text;
+it does not explicitly connect that review to the withdrawn claim revision.
 
 When an existing orchestration request ID is known, `request-summary` accepts
 `project` and `request_id`, with optional `limit` and `after`, to inspect
@@ -77,7 +92,7 @@ accepted or already in-flight bus pointers cannot be recalled.
 For a write that must survive a lost response, first create an existing private,
 exclusively user-controlled outbox directory (0700 on POSIX; private user ACL
 on Windows). Use `--outbox-dir` with `stage` and stdin
-`{"action":"propose","arguments":{...}}`, `update`, or `review` with the exact ordinary
+`{"action":"propose","arguments":{...}}`, `update`, `withdraw-claim`, or `review` with the exact ordinary
 write arguments and a stable `client_request_id`. Stage requires the protected
 installation profile but no session or network; it returns a record ID only
 after file flush and atomic publication (and directory flush on POSIX). Windows

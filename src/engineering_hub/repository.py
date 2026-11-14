@@ -621,6 +621,42 @@ class HubRepository:
             db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
             return item
 
+    def withdraw_tracking_claim(self, actor, identity, expected_revision, expected_claim_revision,
+                                client_request_id, *, reason):
+        """The exact EHS claimant may retract its own claim; this is not a review."""
+        self._actor(actor, agent=True)
+        if not session_context.actor_allowed(actor):
+            raise HubError('tracking_claim_unavailable', 404)
+        if type(expected_claim_revision) is not int or expected_claim_revision < 1:
+            raise HubError('invalid_input', 422)
+        key, reason = self._text(client_request_id, 128), self._text(reason, 4096)
+        fingerprint = hashlib.sha256(_json(['tracking_claim_withdraw', identity, expected_revision,
+                                             expected_claim_revision, reason]).encode()).hexdigest()
+        with self._transaction() as db:
+            item = self._get(db, identity, 'tracking_task')
+            self._project(item['project'], db)
+            prior = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
+            if prior:
+                if prior['fingerprint'] != fingerprint:
+                    raise HubError('idempotency_conflict', 409)
+                return self._get(db, prior['entity_id'], 'tracking_task')
+            updates = item.get('updates')
+            claim = updates[-1] if type(updates) is list and updates else None
+            if (item.get('status') not in ('completion_claimed', 'completion_verified')
+                    or type(claim) is not dict or claim.get('completion_claim') is not True
+                    or claim.get('actor') != actor or type(claim.get('revision')) is not int
+                    or claim['revision'] != expected_claim_revision):
+                raise HubError('tracking_claim_unavailable', 404)
+            self._cas(item, expected_revision)
+            self._tracking_rollover(db, item, 'updates')
+            item['updates'].append(dict(actor=actor, actor_family=session_context.family(actor),
+                progress=reason, evidence_links=[], completion_claim=False, claim_withdrawal=True,
+                withdrawn_claim_revision=expected_claim_revision, revision=expected_revision + 1))
+            item['status'] = 'open'
+            item = self._save(db, actor, 'tracking_task.claim_withdrawn', 'tracking_task', item)
+            db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
+            return item
+
     def review_tracking_task(self, actor, identity, expected_revision, client_request_id, *,
                              verdict, note, evidence_links):
         """Record an independent review of the exact latest claim, or reopen it."""
