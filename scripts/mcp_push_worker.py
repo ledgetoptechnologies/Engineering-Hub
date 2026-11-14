@@ -27,7 +27,7 @@ import subprocess
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 import httpx
@@ -911,6 +911,79 @@ def _is_network_error(exc: BaseException) -> bool:
     return False
 
 
+class _LiveStream(httpx.AsyncByteStream):
+    """Invalidate only the generation whose authenticated stream actually ended."""
+
+    def __init__(self, inner: httpx.AsyncByteStream, ended: Callable[[], None]):
+        self.inner, self.ended = inner, ended
+
+    async def __aiter__(self):
+        try:
+            async for chunk in self.inner:
+                yield chunk
+        finally:
+            self.ended()
+
+    async def aclose(self):
+        self.ended()
+        await self.inner.aclose()
+
+
+
+class _StreamReadiness:
+    """Track the latest GET; older responses and closes cannot restore readiness."""
+
+    def __init__(self, url: str, ready: asyncio.Event):
+        self.url = httpx.URL(url)
+        self.ready = ready
+        self.changed = asyncio.Event()
+        self.generation = 0
+        self.live_generation = None
+
+    async def on_request(self, request: httpx.Request) -> None:
+        if request.method == "GET" and request.url == self.url and request.headers.get("mcp-session-id"):
+            self.generation += 1
+            request.extensions["hub_stream_generation"] = self.generation
+            self.live_generation = None
+            self.ready.clear()
+            self.changed.set()
+
+    async def on_response(self, response: httpx.Response) -> None:
+        request = response.request
+        if request.method != "GET" or request.url != self.url or not request.headers.get("mcp-session-id"):
+            return
+        generation = request.extensions.get("hub_stream_generation")
+        if (generation is not None and generation == self.generation and response.status_code == 200
+                and response.headers.get("content-type", "").split(";", 1)[0].strip().lower() == "text/event-stream"):
+            self.live_generation = generation
+            self.changed.set()
+
+        def ended() -> None:
+            if generation is not None and self.live_generation == generation:
+                self.live_generation = None
+                self.ready.clear()
+                self.changed.set()
+
+        response.stream = _LiveStream(response.stream, ended)
+
+def _is_recoverable_connection_error(exc: BaseException, *, endpoint: str, _seen: frozenset[int] = frozenset()) -> bool:
+    if id(exc) in _seen:
+        return False
+    seen = _seen | {id(exc)}
+    if isinstance(exc, BaseExceptionGroup):
+        return bool(exc.exceptions) and all(
+            _is_recoverable_connection_error(child, endpoint=endpoint, _seen=seen) for child in exc.exceptions
+        )
+    if _is_network_error(exc):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        request = exc.request
+        return (exc.response.status_code == 404 and bool(request.headers.get('mcp-session-id'))
+                and request.method in {'GET', 'POST', 'DELETE'} and request.url == httpx.URL(endpoint))
+    return any(isinstance(linked, BaseException) and _is_recoverable_connection_error(linked, endpoint=endpoint, _seen=seen)
+               for linked in (exc.__cause__, exc.__context__))
+
+
 class PushWorker:
     """Subscribe once, read on push/catch-up events, persist before dispatch, and never poll."""
 
@@ -942,6 +1015,7 @@ class PushWorker:
         self.drain_event = asyncio.Event()
         self.stop_event = asyncio.Event()
         self.subscription_failure_event = asyncio.Event()
+        self.ready_event = asyncio.Event()
         self._catchup_pending = False
         self._active_session: ClientSession | None = None
 
@@ -959,6 +1033,7 @@ class PushWorker:
         data = getattr(params, "data", None)
         if isinstance(data, dict) and data.get("event") == "resource_subscriptions_unavailable":
             logging.error("MCP server reported native resource subscriptions unavailable")
+            self.ready_event.clear()
             self.subscription_failure_event.set()
 
     def _raise_if_subscription_unavailable(self) -> None:
@@ -977,7 +1052,7 @@ class PushWorker:
         except CapabilityError:
             raise
         except Exception as exc:
-            if _is_network_error(exc):
+            if _is_recoverable_connection_error(exc, endpoint=self.url):
                 raise
             raise CapabilityError("one-time inbox head snapshot is unavailable") from exc
         snapshot_messages = payload.get("messages", [])
@@ -997,11 +1072,12 @@ class PushWorker:
         self._catchup_pending = True
         base_uri = BASE_INBOX_URI.format(self.identity)
         pages = 0
+        page_limit = min(PAGE_SIZE, self.state.max_queue)
         while pages < MAX_PAGES_PER_CATCHUP and not self.stop_event.is_set():
             cursor = self.state.cursor
             if cursor is None:
                 raise WorkerError("durable cursor is not initialized")
-            uri = AnyUrl(f"{base_uri}?after={cursor}&limit={PAGE_SIZE}")
+            uri = AnyUrl(f"{base_uri}?after={cursor}&limit={page_limit}")
             result = await session.read_resource(uri)
             payload = _resource_payload(result)
             messages = payload.get("messages")
@@ -1016,12 +1092,13 @@ class PushWorker:
                     allowed_hubs=self.allowed_hubs,
                 )
             except QueueFull:
-                # Keep the catch-up pending; resume only after an already-queued task drains.
+                # The page transaction is rolled back, including its cursor. Existing
+                # jobs are older and drain in sequence; a completion retries this page.
                 return
             if accepted:
                 self.queue_event.set()
             pages += 1
-            if len(messages) < PAGE_SIZE:
+            if len(messages) < page_limit:
                 self._catchup_pending = False
                 return
         # Bounded pagination continues as part of this catch-up, without an idle timer/read loop.
@@ -1029,7 +1106,10 @@ class PushWorker:
             self.drain_event.set()
 
     async def _dispatch_queue(self) -> None:
+        # Readiness gates admission. A job admitted before a disconnect may
+        # still start or finish afterward; it is never replayed automatically.
         while not self.stop_event.is_set():
+            await self.ready_event.wait()
             job = self.state.next_job()
             if job is None:
                 self.queue_event.clear()
@@ -1063,10 +1143,10 @@ class PushWorker:
             if self.state.queued_count():
                 self.queue_event.set()
 
-    async def _wait_for_input(self) -> None:
+    async def _wait_for_input(self, stream_changed: asyncio.Event) -> None:
         tasks = [asyncio.create_task(event.wait()) for event in (
             self.notification_event, self.drain_event, self.stop_event,
-            self.subscription_failure_event,
+            self.subscription_failure_event, stream_changed,
         )]
         try:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -1082,7 +1162,11 @@ class PushWorker:
     async def run_connection(self) -> None:
         timeout = httpx.Timeout(connect=15, read=SSE_READ_IDLE_TIMEOUT_SECONDS, write=15, pool=15)
         headers = {"Authorization": f"Bearer {self.token}"}
-        async with httpx.AsyncClient(headers=headers, timeout=timeout, trust_env=False) as http_client:
+        readiness = _StreamReadiness(self.url, self.ready_event)
+        stream_changed = readiness.changed
+
+        async with httpx.AsyncClient(headers=headers, timeout=timeout, trust_env=False,
+                                     event_hooks={'request': [readiness.on_request], 'response': [readiness.on_response]}) as http_client:
             async with streamable_http_client(
                 self.url, http_client=http_client, terminate_on_close=True,
             ) as (read_stream, write_stream, _get_session_id):
@@ -1092,7 +1176,6 @@ class PushWorker:
                 ) as session:
                     inbox_uri = AnyUrl(BASE_INBOX_URI.format(self.identity))
                     subscribed = False
-                    dispatcher: asyncio.Task | None = None
                     self.notification_event.clear()
                     try:
                         initialized = await session.initialize()
@@ -1104,31 +1187,43 @@ class PushWorker:
                         if not self.subscription_failure_event.is_set():
                             await self._bootstrap_cursor(session)
                         if not self.subscription_failure_event.is_set():
-                            await self._read_catchup(session)
-                        if not self.subscription_failure_event.is_set():
-                            dispatcher = asyncio.create_task(self._dispatch_queue())
+                            # Every live GET generation requires its own subscription and catch-up.
                             while not self.stop_event.is_set():
-                                await self._wait_for_input()
+                                await self._wait_for_input(stream_changed)
                                 if (self.stop_event.is_set()
                                         or self.subscription_failure_event.is_set()):
                                     break
-                                if self.notification_event.is_set() or self.drain_event.is_set():
+                                if stream_changed.is_set():
+                                    stream_changed.clear()
+                                    generation = readiness.live_generation
+                                    if generation is None:
+                                        continue
+                                    await session.subscribe_resource(inbox_uri)
+                                    await self._read_catchup(session)
+                                    # A full queue may leave catch-up pending. Older
+                                    # persisted jobs must drain so the page can be retried.
+                                    if readiness.live_generation == generation:
+                                        self.ready_event.set()
+                                elif self.notification_event.is_set() or self.drain_event.is_set():
                                     self.notification_event.clear()
                                     self.drain_event.clear()
+                                    generation = readiness.live_generation
+                                    if generation is None:
+                                        continue
                                     await self._read_catchup(session)
+                                    if readiness.live_generation == generation:
+                                        self.ready_event.set()
                         if subscribed and not self.subscription_failure_event.is_set():
                             await session.unsubscribe_resource(inbox_uri)
                     except Exception:
                         if not self.subscription_failure_event.is_set():
                             raise
                     finally:
-                        if dispatcher is not None:
-                            dispatcher.cancel()
-                            await asyncio.gather(dispatcher, return_exceptions=True)
+                        self.ready_event.clear()
                         self._active_session = None
         self._raise_if_subscription_unavailable()
 
-    async def run_forever(self) -> None:
+    async def _run_connections(self) -> None:
         delay = self.reconnect_base_seconds
         while not self.stop_event.is_set():
             try:
@@ -1142,7 +1237,8 @@ class PushWorker:
             except WorkerError:
                 raise
             except Exception as exc:
-                if not _is_network_error(exc):
+                self.ready_event.clear()
+                if not _is_recoverable_connection_error(exc, endpoint=self.url):
                     raise WorkerError("MCP push connection failed for a non-network reason") from None
                 logging.warning("MCP push network unavailable; reconnecting in %.1f seconds", delay)
                 try:
@@ -1151,6 +1247,25 @@ class PushWorker:
                 except asyncio.TimeoutError:
                     pass
                 delay = min(self.reconnect_max_seconds, delay * 2)
+
+    async def run_forever(self) -> None:
+        dispatcher = asyncio.create_task(self._dispatch_queue())
+        connections = asyncio.create_task(self._run_connections())
+        try:
+            done, _ = await asyncio.wait({dispatcher, connections}, return_when=asyncio.FIRST_COMPLETED)
+            if dispatcher in done:
+                dispatcher.result()
+                if not self.stop_event.is_set():
+                    raise WorkerError('durable queue dispatcher stopped unexpectedly')
+            else:
+                connections.result()
+                if not self.stop_event.is_set():
+                    raise WorkerError('MCP connection loop stopped unexpectedly')
+        finally:
+            self.stop_event.set()
+            dispatcher.cancel()
+            connections.cancel()
+            await asyncio.gather(dispatcher, connections, return_exceptions=True)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
