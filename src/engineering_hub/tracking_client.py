@@ -26,6 +26,8 @@ _TOOLS = {
     'list': ('hub_tracking_task_list', {'project'}, {'limit', 'after_task_id', 'unfinished'}),
     'propose': ('hub_tracking_task_propose', {'project', 'title', 'client_request_id'},
                 {'details', 'links', 'origin_request_id'}),
+    'propose-draft': ('hub_tracking_draft_propose', {'project', 'title', 'client_request_id', 'intake_id'},
+                      {'details', 'links', 'origin_request_id'}),
     'update': ('hub_tracking_task_update', {'task_id', 'expected_revision', 'client_request_id', 'progress', 'evidence_links'},
                {'completion_claim'}),
     'withdraw-claim': ('hub_tracking_claim_withdraw', {'task_id', 'expected_revision', 'expected_claim_revision',
@@ -87,7 +89,7 @@ def main(argv=None):
     parser.add_argument('--session')
     parser.add_argument('--private-vpn', action='store_true')
     parser.add_argument('--outbox-dir', type=Path)
-    parser.add_argument('action', choices=sorted((*_TOOLS, 'stage', 'draft', 'bind-staged', 'send-staged', 'list-staged', 'inspect-staged', 'status-staged')))
+    parser.add_argument('action', choices=sorted((*(set(_TOOLS) - {'propose-draft'}), 'stage', 'draft', 'bind-staged', 'send-staged', 'list-staged', 'inspect-staged', 'status-staged')))
     try:
         args = parser.parse_args(argv)
         raw = sys.stdin.buffer.read(_MAX_INPUT + 1)
@@ -128,14 +130,14 @@ def main(argv=None):
                         or type(payload['client_request_id']) is not str or not payload['client_request_id'].strip()
                         or len(payload['client_request_id']) > 128):
                     raise ClientError('invalid_tracking_request')
-                record_id = tracking_outbox.stage(args.outbox_dir, None, None, None, 'propose', payload)
+                record_id = tracking_outbox.stage(args.outbox_dir, None, None, None, 'propose-draft', payload)
                 result = {'type': 'tracking_outbox_draft', 'record_id': record_id,
                           'state': 'unbound', 'sent': False, 'execution_authorization': False}
             else:
                 if set(arguments) != {'record_id'}:
                     raise ClientError('invalid_tracking_request')
                 record = tracking_outbox.read(args.outbox_dir, arguments['record_id'])
-                if record['action'] not in ('propose', 'update', 'review', 'withdraw-claim'):
+                if record['action'] not in ('propose', 'propose-draft', 'update', 'review', 'withdraw-claim'):
                     raise ClientError('invalid_tracking_request')
                 _arguments(record['action'], record['arguments'])
                 if args.action == 'inspect-staged':

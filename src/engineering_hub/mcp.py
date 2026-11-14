@@ -444,6 +444,14 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
                                                          details=details, links=links, origin_request_id=origin_request_id))
 
     @registration.tool()
+    def hub_tracking_draft_propose(project: str, title: str, client_request_id: str, intake_id: str, ctx: Context,
+                                   details: str | None = None, links: list[dict[str, str]] | None = None,
+                                   origin_request_id: str | None = None) -> dict:
+        """Submit an EHS v2 draft idempotently across installations of the same Hub ledger."""
+        return invoke(lambda: repo.propose_tracking_draft(identity(ctx), project, title, client_request_id, intake_id,
+                                                         details=details, links=links, origin_request_id=origin_request_id))
+
+    @registration.tool()
     def hub_tracking_task_origin(task_id: str, ctx: Context) -> dict:
         """Read task request provenance with project-scoped EHS tracking.read and dispatch.read grants."""
         return invoke(repo.tracking_task_origin, identity(ctx), task_id)

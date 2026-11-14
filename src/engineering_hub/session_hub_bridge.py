@@ -31,7 +31,8 @@ TOOLS = {
     'hub_component_list': 'component.read', 'hub_component_get': 'component.read',
     'hub_component_create': 'component.write', 'hub_component_update': 'component.write',
     'hub_component_retire': 'component.write', 'hub_task_get': 'task.read', 'hub_project_tasks': 'task.list',
-    'hub_tracking_task_propose': 'tracking.propose', 'hub_tracking_task_update': 'tracking.update',
+    'hub_tracking_task_propose': 'tracking.propose', 'hub_tracking_draft_propose': 'tracking.propose',
+    'hub_tracking_task_update': 'tracking.update',
     'hub_tracking_claim_withdraw': 'tracking.update',
     'hub_tracking_task_list': 'tracking.read', 'hub_tracking_task_history': 'tracking.read',
     'hub_tracking_task_origin': 'tracking.read',
@@ -502,7 +503,8 @@ class SessionHubBridge:
                                 else:
                                     result = fn(*args, **kwargs)
                                 read_required = {
-                                    'hub_tracking_task_propose': 'tracking.read', 'hub_tracking_task_update': 'tracking.read',
+                                    'hub_tracking_task_propose': 'tracking.read', 'hub_tracking_draft_propose': 'tracking.read',
+                                    'hub_tracking_task_update': 'tracking.read',
                                     'hub_tracking_claim_withdraw': 'tracking.read',
                                     'hub_tracking_task_review': 'tracking.read', 'hub_tracking_task_compact': 'tracking.read',
                                     'hub_staging_task_propose': 'task.read', 'hub_task_claim': 'task.read',

@@ -286,7 +286,7 @@ def test_profile_free_draft_bind_and_send_is_explicit_and_one_time(tmp_path, mon
     draft = json.loads(capsys.readouterr().out)
     assert draft['state'] == 'unbound' and not draft['sent']
     ident = draft['record_id']; record = tracking_outbox.read(outbox, ident)
-    assert tracking_outbox.is_draft(record) and record['arguments'] == payload
+    assert tracking_outbox.is_draft(record) and {k: v for k, v in record['arguments'].items() if k != 'intake_id'} == payload
     monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': ident}))
     assert tracking_client.main(base + ['status-staged']) == 0
     assert json.loads(capsys.readouterr().out)['state'] == 'unbound'
@@ -309,7 +309,7 @@ def test_profile_free_draft_bind_and_send_is_explicit_and_one_time(tmp_path, mon
     assert tracking_client.main(base + ['status-staged']) == 0
     assert json.loads(capsys.readouterr().out)['state'] == 'unconfirmed'
     async def send(args, arguments, *, binding, action):
-        assert binding == bound and arguments == payload and action == 'propose'
+        assert binding == bound and arguments == record['arguments'] and action == 'propose-draft'
         return {'type': 'tracking_result', 'operation': action, 'execution_authorization': False,
                 'result': {'id': task_id, 'project': payload['project']}}
     monkeypatch.setattr(tracking_client, '_run', send)
@@ -484,7 +484,7 @@ def test_profile_free_draft_and_status_need_no_installation(tmp_path, monkeypatc
     monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': ident}))
     assert tracking_client.main(['--outbox-dir', str(directory), 'status-staged']) == 0
     assert json.loads(capsys.readouterr().out)['state'] == 'unbound'
-    assert tracking_outbox.read(directory, ident)['arguments'] == payload
+    assert {k: v for k, v in tracking_outbox.read(directory, ident)['arguments'].items() if k != 'intake_id'} == payload
 
 
 def test_reference_pagination_recovers_large_outbox_without_opening_or_deleting(tmp_path, monkeypatch):
@@ -550,3 +550,20 @@ def test_cli_list_staged_legacy_shape_and_explicit_cursor(tmp_path, monkeypatch,
     monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'limit': 2}))
     assert tracking_client.main(argv) == 0
     assert json.loads(capsys.readouterr().out)['record_ids'][0] == older
+
+
+def test_v2_draft_binds_when_v1_durability_is_unavailable(tmp_path, monkeypatch):
+    directory = tmp_path / 'outbox'; directory.mkdir(mode=0o700)
+    args = {'project': 'engineering-hub', 'title': 'synthetic', 'client_request_id': 'stable-v2'}
+    new_id = tracking_outbox.stage(directory, None, None, None, 'propose-draft', args)
+    new = tracking_outbox.read(directory, new_id)
+    old_id = tracking_outbox.stage(directory, None, None, None, 'propose', args)
+    old = tracking_outbox.read(directory, old_id)
+    assert new['version'] == 2 and len(new['arguments']['intake_id']) == 43
+    assert old['version'] == 1 and 'intake_id' not in old['arguments']
+    monkeypatch.setattr(tracking_outbox, '_draft_binding_supported', lambda: False)
+    installation = 'b39e3ea5-567c-45cb-a184-01dd1c6352bb'
+    with pytest.raises(ClientError, match='tracking_binding_durability_unavailable'):
+        tracking_outbox.bind(directory, old, 'https://hub.example', installation)
+    tracking_outbox.bind(directory, new, 'https://hub.example', installation)
+    assert tracking_outbox.bound_for_send(directory, new)['installation_id'] == installation

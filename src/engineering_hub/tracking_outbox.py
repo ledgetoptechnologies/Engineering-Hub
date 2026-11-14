@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 import heapq
 import hashlib
+import base64
 import os
+import secrets
 import stat
 import tempfile
 import uuid
@@ -41,7 +43,13 @@ def stage(directory, origin, installation, session_id, action, arguments):
     """Persist one immutable write before any network operation; return opaque ID."""
     directory = _directory(directory)
     record_id = str(uuid.uuid4())
-    record = dict(version=1, id=record_id, origin=origin, installation_id=installation,
+    version = 1
+    if action == 'propose-draft':
+        if origin is not None or installation is not None or session_id is not None or type(arguments) is not dict or 'intake_id' in arguments:
+            raise ClientError('invalid_tracking_outbox')
+        arguments = {**arguments, 'intake_id': secrets.token_urlsafe(32)}
+        version = 2
+    record = dict(version=version, id=record_id, origin=origin, installation_id=installation,
                   staged_session_id=session_id, action=action, arguments=arguments)
     payload = json.dumps(record, ensure_ascii=True, sort_keys=True, separators=(',', ':')).encode()
     if len(payload) > _LIMIT:
@@ -86,7 +94,8 @@ def read(directory, record_id):
             raw = source.read(_LIMIT + 1)
         record = json.loads(_protect(raw, decrypt=True))
         if (type(record) is not dict or set(record) != {'version', 'id', 'origin', 'installation_id',
-                    'staged_session_id', 'action', 'arguments'} or record['version'] != 1 or record['id'] != record_id):
+                    'staged_session_id', 'action', 'arguments'} or record['version'] not in (1, 2) or record['id'] != record_id
+                or (record['version'] == 2 and not is_draft(record))):
             raise ClientError('invalid_tracking_outbox')
         return record
     finally:
@@ -101,19 +110,34 @@ def _fingerprint(value):
 
 def is_draft(record):
     """Only a proposal with neither routing identity is a profile-free draft."""
-    return (record.get('origin') is None and record.get('installation_id') is None
-            and record.get('staged_session_id') is None and record.get('action') == 'propose')
+    if (record.get('origin') is not None or record.get('installation_id') is not None
+            or record.get('staged_session_id') is not None):
+        return False
+    if record.get('version') == 1:
+        return record.get('action') == 'propose'
+    if record.get('version') != 2 or record.get('action') != 'propose-draft' or type(record.get('arguments')) is not dict:
+        return False
+    intake = record['arguments'].get('intake_id')
+    try:
+        if type(intake) is not str or len(intake) != 43:
+            return False
+        raw = base64.urlsafe_b64decode(intake + '=')
+        return len(raw) == 32 and base64.urlsafe_b64encode(raw).decode().rstrip('=') == intake
+    except (ValueError, TypeError):
+        return False
 
 
 def _draft_binding_supported():
     return os.name != 'nt'
 
 
-def _require_durable_draft_binding():
+def _require_durable_draft_binding(record):
     # The current Windows writer does not flush directory metadata, so it
     # cannot prove that a first binding survives power loss. Fail closed until
     # a supported, independently qualified durability boundary exists.
-    if not _draft_binding_supported():
+    # V2 uses a separately versioned Hub-global intake ID as the duplicate
+    # barrier when a local binding is lost; v1 has only actor-scoped keys.
+    if record.get('version') != 2 and not _draft_binding_supported():
         raise ClientError('tracking_binding_durability_unavailable')
 
 
@@ -160,7 +184,7 @@ def binding(directory, record):
 
 def bind(directory, record, origin, installation):
     """Atomically bind a draft once; never change a selected installation."""
-    _require_durable_draft_binding()
+    _require_durable_draft_binding(record)
     directory = _directory(directory); identity = _id(record['id'])
     if read(directory, identity) != record:
         raise ClientError('tracking_outbox_changed')
@@ -193,7 +217,7 @@ def bind(directory, record, origin, installation):
 
 def bound_for_send(directory, record):
     """Require a qualified durability boundary and an existing first binding."""
-    _require_durable_draft_binding()
+    _require_durable_draft_binding(record)
     value = binding(directory, record)
     if value is None:
         raise ClientError('tracking_outbox_unbound')
@@ -204,9 +228,9 @@ def _receipt_value(record, task_id, bound=None):
     """Bind acceptance to the exact saved request, never to task completion."""
     _id(record['id']); _id(task_id)
     action, arguments = record.get('action'), record.get('arguments')
-    if action not in ('propose', 'update', 'review', 'withdraw-claim') or type(arguments) is not dict:
+    if action not in ('propose', 'propose-draft', 'update', 'review', 'withdraw-claim') or type(arguments) is not dict:
         raise ClientError('invalid_tracking_receipt')
-    if action != 'propose' and (arguments.get('task_id') != task_id or _id(arguments['task_id']) != task_id):
+    if action not in ('propose', 'propose-draft') and (arguments.get('task_id') != task_id or _id(arguments['task_id']) != task_id):
         raise ClientError('invalid_tracking_receipt')
     if is_draft(record):
         if type(bound) is not dict or bound != _binding_value(record, bound.get('origin'), bound.get('installation_id')):
@@ -279,7 +303,7 @@ def record_acceptance(directory, record, response):
     result = response['result']
     bound = bound_for_send(directory, record) if is_draft(record) else None
     value = _receipt_value(record, result.get('id'), bound)
-    if (record['action'] == 'propose' and 'project' in result
+    if (record['action'] in ('propose', 'propose-draft') and 'project' in result
             and result['project'] != record['arguments'].get('project')):
         raise ClientError('invalid_tracking_receipt')
     existing = receipt(directory, record)

@@ -1,5 +1,6 @@
 """Local, transactional Hub state. This module never dispatches work."""
 from contextlib import contextmanager
+import base64
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -18,6 +19,9 @@ from . import reconciliation_context
 
 PROJECTS = frozenset({'engineering-hub', '3d-viewer', 'project-alpha', 'ledge-top-ops', 'treedar'})
 AGENTS = frozenset({'hermes', 'codex', 'claude'})
+_TRACKING_DRAFT_TOTAL_LIMIT = 100000
+_TRACKING_DRAFT_PROJECT_LIMIT = 10000
+_TRACKING_DRAFT_REGISTRATION_LIMIT = 64
 # Audit actions that set a task's status. Run bookkeeping saves the task without
 # changing it, so those actions must not reset how long a task has been waiting.
 TASK_STATUS_ACTIONS = ('task.created', 'task.proposed', 'task.claimed', 'task.claim_recovered', 'task.candidate', 'task.reviewed',
@@ -492,6 +496,82 @@ class HubRepository:
                 db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
                            (identity, 'tracking_origin', _json(dict(task_id=item['id'], project=project,
                                                                    request_id=origin_request_id))))
+            db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
+            return item
+
+    def propose_tracking_draft(self, actor, project, title, client_request_id, intake_id, *,
+                               details=None, links=None, origin_request_id=None):
+        """Deduplicate an explicitly versioned draft across EHS installations in one Hub ledger."""
+        self._actor(actor, agent=True)
+        if not session_context.actor_allowed(actor):
+            raise HubError('tracking_draft_unavailable', 404)
+        try:
+            if type(intake_id) is not str or not re.fullmatch(r'[A-Za-z0-9_-]{43}', intake_id):
+                raise ValueError()
+            raw = base64.urlsafe_b64decode(intake_id + '=')
+            if len(raw) != 32 or base64.urlsafe_b64encode(raw).decode().rstrip('=') != intake_id:
+                raise ValueError()
+        except (ValueError, TypeError):
+            raise HubError('invalid_tracking_intake', 422) from None
+        title, key = self._text(title), self._text(client_request_id, 128)
+        context = self._context(details, links)
+        dispatch = None
+        if origin_request_id is not None:
+            from .dispatch import DispatchRepository, _canonical_id
+            dispatch = DispatchRepository(self)
+            operation = dispatch._operation(actor)
+            dispatch._grant(operation, 'tracking.propose', 'dispatch.read')
+            _canonical_id(origin_request_id)
+        fingerprint = hashlib.sha256(_json(['tracking_draft_v2', project, title, key, context,
+                                             origin_request_id, intake_id]).encode()).hexdigest()
+        identity = 'tracking-intake:' + hashlib.sha256(_json(['tracking_draft_v2', project, intake_id]).encode()).hexdigest()
+        with self._transaction() as db:
+            self._project(project, db)
+            if dispatch is not None:
+                request = dispatch._request(db, origin_request_id)
+                if request['project'] != project:
+                    raise HubError('dispatch_unavailable', 404)
+            actor_receipt = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
+            if actor_receipt and actor_receipt['fingerprint'] != fingerprint:
+                raise HubError('idempotency_conflict', 409)
+            row = db.execute('SELECT kind,data FROM hub_entities WHERE id=?', (identity,)).fetchone()
+            if row is not None:
+                try:
+                    saved = json.loads(row['data'])
+                    if (row['kind'] != 'tracking_intake_receipt' or type(saved) is not dict
+                            or set(saved) != {'project', 'fingerprint', 'task_id', 'registrations'}
+                            or type(saved['registrations']) is not int or not 1 <= saved['registrations'] <= _TRACKING_DRAFT_REGISTRATION_LIMIT
+                            or saved['project'] != project or saved['fingerprint'] != fingerprint):
+                        raise ValueError()
+                    item = self._get(db, saved['task_id'], 'tracking_task')
+                    if item['project'] != project or (actor_receipt and actor_receipt['entity_id'] != item['id']):
+                        raise ValueError()
+                except (ValueError, TypeError, KeyError, HubError):
+                    raise HubError('tracking_draft_conflict', 409) from None
+                if actor_receipt is None:
+                    if saved['registrations'] >= _TRACKING_DRAFT_REGISTRATION_LIMIT:
+                        raise HubError('tracking_draft_capacity', 409)
+                    db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
+                    saved['registrations'] += 1
+                    db.execute('UPDATE hub_entities SET data=? WHERE id=?', (_json(saved), identity))
+                return item
+            if actor_receipt is not None:
+                raise HubError('tracking_draft_conflict', 409)
+            if (db.execute("SELECT count(*) FROM hub_entities WHERE kind='tracking_intake_receipt'").fetchone()[0] >= _TRACKING_DRAFT_TOTAL_LIMIT
+                    or db.execute("SELECT count(*) FROM hub_entities WHERE kind='tracking_intake_receipt' "
+                                  "AND json_extract(data,'$.project')=?", (project,)).fetchone()[0] >= _TRACKING_DRAFT_PROJECT_LIMIT):
+                raise HubError('tracking_draft_capacity', 409)
+            item = self._save(db, actor, 'tracking_task.proposed', 'tracking_task', dict(
+                id=str(uuid.uuid4()), project=project, title=title, status='open',
+                created_by=actor, execution_authorization=False, updates=[], **context), new=True)
+            if origin_request_id is not None:
+                origin_id = str(uuid.uuid5(uuid.UUID('61a577b0-3296-4b36-9303-83c24ec3ab37'), item['id']))
+                db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
+                           (origin_id, 'tracking_origin', _json(dict(task_id=item['id'], project=project,
+                                                                   request_id=origin_request_id))))
+            db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
+                       (identity, 'tracking_intake_receipt', _json(dict(project=project, fingerprint=fingerprint,
+                                                                       task_id=item['id'], registrations=1))))
             db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
             return item
 

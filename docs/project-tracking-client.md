@@ -109,21 +109,23 @@ title as an **unbound local handoff**, not a Hub task. Drafts support proposals
 only; they do not perform updates or reviews. Listing and `inspect-staged` do
 not require a profile. `send-staged` refuses an unbound draft.
 
-On a qualified POSIX filesystem that supports directory fsync, prepare a draft
-for an authorized Hub later by explicitly calling `bind-staged`
-with the record ID and the selected protected `--profile-dir` (and
-`--private-vpn` if that profile requires it). No session or network is used for
-binding, and binding does not establish approval or a grant. The first binding
-to the selected origin and installation wins atomically; repeating the same
-binding is safe, and a different origin or installation is refused even if a
-later send had an ambiguous outcome. The original draft and its exact request
-ID remain unchanged, within the filesystem's flush guarantees. On Windows,
-draft creation and inspection remain available, but binding and sending a
-profile-free draft fail closed: the current client has no qualified way to
-flush directory metadata and cannot ensure the binding survives power loss.
-Existing profile-bound outbox entries are unchanged. Do not copy a Windows
-draft or re-stage it under another identity as a shortcut; retain it for an
-operator-reviewed recovery or a future qualified Windows binding mechanism.
+New drafts contain a client-generated random 256-bit intake ID. Explicitly call
+`bind-staged` with the record ID and selected protected `--profile-dir` (and
+`--private-vpn` if needed); binding does not contact the Hub or grant authority.
+The saved binding refuses a different origin or installation. Windows cannot
+flush directory metadata here, and restored or copied filesystem state can
+lose a binding on any platform. For new v2 drafts, the Hub independently
+recognizes the intake ID across installations in the same project and intact
+Hub ledger: a matching accepted retry returns the original task and retains its
+creator and review history. Changed payloads conflict. This is not a guarantee
+across a restored Hub database, a different Hub authority, or a newly created
+ID. Retain the original private draft; do not deliberately rebind or expose its
+intake ID. The server allows at most 64 distinct installation registrations per intake,
+10,000 intakes per project and 100,000 across the ledger. At capacity, new
+registrations or intakes are refused; already registered exact retries remain
+available. Older v1 drafts are not migrated; their binding and sending remain
+unavailable on Windows. A server without the new tool rejects v2 sends rather
+than falling back to weaker deduplication.
 A fresh valid session and server grant are still required
 for explicit `send-staged`; accepted sidecars also bind the selected routing
 identity. Inspect the draft and binding in a protected channel and reconcile
