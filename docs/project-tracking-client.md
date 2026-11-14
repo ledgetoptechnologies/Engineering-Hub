@@ -102,6 +102,34 @@ Protect the directory and parent from other users and do not place secrets in
 task content. These records are immutable by client convention, not against a
 same-user attacker. An interruption before stage returns is unconfirmed.
 
+When there is no approved installation profile yet, `draft` accepts the same
+`{"action":"propose","arguments":{...}}` JSON without a profile, session or
+network; the client itself must already be available locally. It records a caller-supplied stable `client_request_id`, project and
+title as an **unbound local handoff**, not a Hub task. Drafts support proposals
+only; they do not perform updates or reviews. Listing and `inspect-staged` do
+not require a profile. `send-staged` refuses an unbound draft.
+
+On a qualified POSIX filesystem that supports directory fsync, prepare a draft
+for an authorized Hub later by explicitly calling `bind-staged`
+with the record ID and the selected protected `--profile-dir` (and
+`--private-vpn` if that profile requires it). No session or network is used for
+binding, and binding does not establish approval or a grant. The first binding
+to the selected origin and installation wins atomically; repeating the same
+binding is safe, and a different origin or installation is refused even if a
+later send had an ambiguous outcome. The original draft and its exact request
+ID remain unchanged, within the filesystem's flush guarantees. On Windows,
+draft creation and inspection remain available, but binding and sending a
+profile-free draft fail closed: the current client has no qualified way to
+flush directory metadata and cannot ensure the binding survives power loss.
+Existing profile-bound outbox entries are unchanged. Do not copy a Windows
+draft or re-stage it under another identity as a shortcut; retain it for an
+operator-reviewed recovery or a future qualified Windows binding mechanism.
+A fresh valid session and server grant are still required
+for explicit `send-staged`; accepted sidecars also bind the selected routing
+identity. Inspect the draft and binding in a protected channel and reconcile
+against existing Hub tasks before sending. This is not automatic capture, wake,
+cross-agent transfer, or proof that the Hub accepted anything.
+
 On a later turn, `list-staged` with `{}` lists up to 1,000 opaque IDs. If
 `next_after` is returned, pass it as `after` in the next call; an optional
 integer `limit` from 1 to 1,000 requests a smaller page. The default response
@@ -116,9 +144,10 @@ with `{"record_id":"..."}` explicitly prints the private local payload so it
 can be checked in a protected channel; `send-staged` with the same input sends
 the saved unchanged payload. After an identity-bound successful Hub response,
 the client validates the returned task ID and atomically stores a protected
-local acceptance sidecar bound to the exact saved envelope. `status-staged`
-with that same record ID reports either `hub_accepted` and the reported task
-ID, or `unconfirmed`. This is a local record of a successful response, not a
+local acceptance sidecar bound to the exact saved envelope and, for a draft,
+its immutable binding. `status-staged` with that same record ID reports
+`unbound`, `hub_accepted` and the reported task ID, or `unconfirmed`. This is a
+local record of a successful response, not a
 current Hub read, completion verification, execution authority or proof that
 another agent acted. Older sends have no sidecar and therefore remain
 unconfirmed. A missing sidecar does not prove that the Hub rejected the write.

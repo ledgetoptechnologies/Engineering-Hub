@@ -10,7 +10,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from agent_message_bus.agent_session_client import ClientError, _protect
+from agent_message_bus.agent_session_client import ClientError, _origin, _private_origin, _protect
 
 _LIMIT = 131072
 
@@ -94,7 +94,113 @@ def read(directory, record_id):
             os.close(fd)
 
 
-def _receipt_value(record, task_id):
+def _fingerprint(value):
+    return hashlib.sha256(json.dumps(value, ensure_ascii=True, sort_keys=True,
+                                     separators=(',', ':')).encode()).hexdigest()
+
+
+def is_draft(record):
+    """Only a proposal with neither routing identity is a profile-free draft."""
+    return (record.get('origin') is None and record.get('installation_id') is None
+            and record.get('staged_session_id') is None and record.get('action') == 'propose')
+
+
+def _draft_binding_supported():
+    return os.name != 'nt'
+
+
+def _require_durable_draft_binding():
+    # The current Windows writer does not flush directory metadata, so it
+    # cannot prove that a first binding survives power loss. Fail closed until
+    # a supported, independently qualified durability boundary exists.
+    if not _draft_binding_supported():
+        raise ClientError('tracking_binding_durability_unavailable')
+
+
+def _binding_value(record, origin, installation):
+    _id(record['id']); _id(installation)
+    if not is_draft(record) or type(origin) is not str:
+        raise ClientError('invalid_tracking_binding')
+    try:
+        _origin(origin)
+    except ClientError:
+        _private_origin(origin)
+    return dict(version=1, record_id=record['id'], envelope_sha256=_fingerprint(record),
+                origin=origin, installation_id=installation)
+
+
+def binding(directory, record):
+    """Read the one-time binding for an unbound draft, without network I/O."""
+    directory = _directory(directory); identity = _id(record['id'])
+    if not is_draft(record):
+        raise ClientError('invalid_tracking_binding')
+    try:
+        fd = os.open(directory / (identity + '.binding'), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(fd)
+        reparse = getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)
+        if (not stat.S_ISREG(info.st_mode) or info.st_size > _LIMIT
+                or getattr(info, 'st_file_attributes', 0) & reparse
+                or (os.name != 'nt' and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077))):
+            raise ClientError('invalid_tracking_binding')
+        with os.fdopen(fd, 'rb') as source:
+            fd = -1
+            raw = source.read(_LIMIT + 1)
+        value = json.loads(_protect(raw, decrypt=True))
+        if type(value) is not dict or value != _binding_value(record, value.get('origin'), value.get('installation_id')):
+            raise ClientError('invalid_tracking_binding')
+        _sync_directory(directory)
+        return value
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def bind(directory, record, origin, installation):
+    """Atomically bind a draft once; never change a selected installation."""
+    _require_durable_draft_binding()
+    directory = _directory(directory); identity = _id(record['id'])
+    if read(directory, identity) != record:
+        raise ClientError('tracking_outbox_changed')
+    value = _binding_value(record, origin, installation)
+    existing = binding(directory, record)
+    if existing is not None:
+        if existing != value:
+            raise ClientError('tracking_outbox_already_bound')
+        return existing
+    payload = _protect(json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(',', ':')).encode())
+    if len(payload) > _LIMIT:
+        raise ClientError('invalid_tracking_binding')
+    fd, temporary = tempfile.mkstemp(prefix='.tracking-binding-', dir=directory)
+    try:
+        with os.fdopen(fd, 'wb') as target:
+            fd = -1
+            target.write(payload); target.flush(); os.fsync(target.fileno())
+        try:
+            os.link(temporary, directory / (identity + '.binding'))
+        except FileExistsError:
+            if binding(directory, record) != value:
+                raise ClientError('tracking_outbox_already_bound') from None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.unlink(temporary)
+    _sync_directory(directory)
+    return value
+
+
+def bound_for_send(directory, record):
+    """Require a qualified durability boundary and an existing first binding."""
+    _require_durable_draft_binding()
+    value = binding(directory, record)
+    if value is None:
+        raise ClientError('tracking_outbox_unbound')
+    return value
+
+
+def _receipt_value(record, task_id, bound=None):
     """Bind acceptance to the exact saved request, never to task completion."""
     _id(record['id']); _id(task_id)
     action, arguments = record.get('action'), record.get('arguments')
@@ -102,14 +208,21 @@ def _receipt_value(record, task_id):
         raise ClientError('invalid_tracking_receipt')
     if action != 'propose' and (arguments.get('task_id') != task_id or _id(arguments['task_id']) != task_id):
         raise ClientError('invalid_tracking_receipt')
-    if type(record.get('origin')) is not str or type(record.get('installation_id')) is not str:
-        raise ClientError('invalid_tracking_receipt')
-    fingerprint = hashlib.sha256(json.dumps(record, ensure_ascii=True, sort_keys=True,
-                                           separators=(',', ':')).encode()).hexdigest()
-    return dict(version=1, record_id=record['id'], envelope_sha256=fingerprint,
-                origin=record['origin'], installation_id=record['installation_id'],
+    if is_draft(record):
+        if type(bound) is not dict or bound != _binding_value(record, bound.get('origin'), bound.get('installation_id')):
+            raise ClientError('invalid_tracking_receipt')
+        origin, installation = bound['origin'], bound['installation_id']
+    else:
+        origin, installation = record.get('origin'), record.get('installation_id')
+        if type(origin) is not str or type(installation) is not str:
+            raise ClientError('invalid_tracking_receipt')
+    value = dict(version=1, record_id=record['id'], envelope_sha256=_fingerprint(record),
+                origin=origin, installation_id=installation,
                 action=action, task_id=task_id, state='hub_accepted',
                 execution_authorization=False)
+    if is_draft(record):
+        value['binding_sha256'] = _fingerprint(bound)
+    return value
 
 
 def _sync_directory(directory):
@@ -140,7 +253,8 @@ def receipt(directory, record):
             fd = -1
             raw = source.read(_LIMIT + 1)
         value = json.loads(_protect(raw, decrypt=True))
-        if type(value) is not dict or value != _receipt_value(record, value.get('task_id')):
+        bound = bound_for_send(directory, record) if is_draft(record) else None
+        if type(value) is not dict or value != _receipt_value(record, value.get('task_id'), bound):
             raise ClientError('invalid_tracking_receipt')
         # A previous writer may have failed after publishing but before the
         # directory flush; never report acceptance if that flush still fails.
@@ -163,7 +277,8 @@ def record_acceptance(directory, record, response):
             or type(response.get('result')) is not dict):
         raise ClientError('invalid_tracking_receipt')
     result = response['result']
-    value = _receipt_value(record, result.get('id'))
+    bound = bound_for_send(directory, record) if is_draft(record) else None
+    value = _receipt_value(record, result.get('id'), bound)
     if (record['action'] == 'propose' and 'project' in result
             and result['project'] != record['arguments'].get('project')):
         raise ClientError('invalid_tracking_receipt')

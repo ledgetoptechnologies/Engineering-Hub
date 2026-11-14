@@ -266,6 +266,227 @@ def test_cli_lost_response_and_receipt_failure_remain_unconfirmed(tmp_path, monk
     assert tracking_outbox.receipt(outbox, record)['task_id'] == task_id
 
 
+@pytest.mark.skipif(os.name == 'nt', reason='draft binding requires qualified POSIX directory fsync')
+def test_profile_free_draft_bind_and_send_is_explicit_and_one_time(tmp_path, monkeypatch, capsys):
+    import io
+    outbox = tmp_path / 'outbox'; outbox.mkdir(mode=0o700)
+    first = tmp_path / 'first'; first.mkdir(mode=0o700)
+    other = tmp_path / 'other'; other.mkdir(mode=0o700)
+    install_a = '11111111-1111-4111-8111-111111111111'
+    install_b = '22222222-2222-4222-8222-222222222222'
+    task_id = '33333333-3333-4333-8333-333333333333'
+    _write(first / 'installation.private', {'origin': 'https://hub.example', 'installation_id': install_a})
+    _write(other / 'installation.private', {'origin': 'https://hub.example', 'installation_id': install_b})
+    payload = {'project': 'engineering-hub', 'title': 'Remember this', 'client_request_id': 'stable-draft'}
+    class Input:
+        def __init__(self, value): self.buffer = io.BytesIO(json.dumps(value).encode())
+    base = ['--outbox-dir', str(outbox)]
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'action': 'propose', 'arguments': payload}))
+    assert tracking_client.main(base + ['draft']) == 0
+    draft = json.loads(capsys.readouterr().out)
+    assert draft['state'] == 'unbound' and not draft['sent']
+    ident = draft['record_id']; record = tracking_outbox.read(outbox, ident)
+    assert tracking_outbox.is_draft(record) and record['arguments'] == payload
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': ident}))
+    assert tracking_client.main(base + ['status-staged']) == 0
+    assert json.loads(capsys.readouterr().out)['state'] == 'unbound'
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': ident}))
+    assert tracking_client.main(base + ['send-staged']) == 1
+    assert capsys.readouterr().out == ''
+    assert tracking_outbox.binding(outbox, record) is None
+
+    bind_args = base + ['--profile-dir', str(first), 'bind-staged']
+    for _ in range(2):
+        monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': ident}))
+        assert tracking_client.main(bind_args) == 0
+        assert not json.loads(capsys.readouterr().out)['sent']
+    bound = tracking_outbox.binding(outbox, record)
+    assert bound['installation_id'] == install_a and bound['origin'] == 'https://hub.example'
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': ident}))
+    assert tracking_client.main(base + ['--profile-dir', str(other), 'bind-staged']) == 1
+    capsys.readouterr()
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': ident}))
+    assert tracking_client.main(base + ['status-staged']) == 0
+    assert json.loads(capsys.readouterr().out)['state'] == 'unconfirmed'
+    async def send(args, arguments, *, binding, action):
+        assert binding == bound and arguments == payload and action == 'propose'
+        return {'type': 'tracking_result', 'operation': action, 'execution_authorization': False,
+                'result': {'id': task_id, 'project': payload['project']}}
+    monkeypatch.setattr(tracking_client, '_run', send)
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': ident}))
+    assert tracking_client.main(base + ['--profile-dir', str(first), '--session', 'session', 'send-staged']) == 0
+    capsys.readouterr()
+    receipt = tracking_outbox.receipt(outbox, record)
+    assert receipt['installation_id'] == install_a and receipt['task_id'] == task_id and receipt['binding_sha256']
+    assert tracking_outbox.read(outbox, ident) == record
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': ident}))
+    assert tracking_client.main(base + ['status-staged']) == 0
+    assert json.loads(capsys.readouterr().out)['state'] == 'hub_accepted'
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': ident}))
+    assert tracking_client.main(base + ['--profile-dir', str(other), 'bind-staged']) == 1
+    capsys.readouterr()
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='draft binding requires qualified POSIX directory fsync')
+def test_draft_binding_first_wins_under_concurrent_different_installations(tmp_path):
+    directory = tmp_path / 'outbox'; directory.mkdir(mode=0o700)
+    ident = tracking_outbox.stage(directory, None, None, None, 'propose',
+        {'project': 'engineering-hub', 'title': 'Work', 'client_request_id': 'stable'})
+    record = tracking_outbox.read(directory, ident)
+    ids = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222']
+    def attempt(value):
+        try: return tracking_outbox.bind(directory, record, 'https://hub.example', value)['installation_id']
+        except ClientError as error: return str(error)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(attempt, ids))
+    winners = [value for value in results if value in ids]
+    assert len(winners) == 1 and 'tracking_outbox_already_bound' in results
+    assert tracking_outbox.binding(directory, record)['installation_id'] == winners[0]
+    assert tracking_outbox.bind(directory, record, 'https://hub.example', winners[0])['installation_id'] == winners[0]
+    assert tracking_outbox.read(directory, ident) == record
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='draft binding requires qualified POSIX directory fsync')
+def test_draft_ambiguous_send_never_rebinds_or_sends_as_another_installation(tmp_path, monkeypatch, capsys):
+    import io
+    directory = tmp_path / 'outbox'; directory.mkdir(mode=0o700)
+    first = tmp_path / 'first'; first.mkdir(mode=0o700)
+    other = tmp_path / 'other'; other.mkdir(mode=0o700)
+    a = '11111111-1111-4111-8111-111111111111'; b = '22222222-2222-4222-8222-222222222222'
+    _write(first / 'installation.private', {'origin': 'https://hub.example', 'installation_id': a})
+    _write(other / 'installation.private', {'origin': 'https://hub.example', 'installation_id': b})
+    arguments = {'project': 'engineering-hub', 'title': 'Work', 'client_request_id': 'stable-key'}
+    ident = tracking_outbox.stage(directory, None, None, None, 'propose', arguments)
+    record = tracking_outbox.read(directory, ident)
+    bound = tracking_outbox.bind(directory, record, 'https://hub.example', a)
+    class Input:
+        def __init__(self): self.buffer = io.BytesIO(json.dumps({'record_id': ident}).encode())
+    base = ['--outbox-dir', str(directory)]
+    original_run = tracking_client._run
+    calls = []
+    async def ambiguous(args, payload, *, binding, action):
+        calls.append((payload, binding, action))
+        raise OSError('response lost after possible commit')
+    monkeypatch.setattr(tracking_client, '_run', ambiguous)
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input())
+    assert tracking_client.main(base + ['--profile-dir', str(first), '--session', 'first', 'send-staged']) == 1
+    capsys.readouterr()
+    assert calls == [(arguments, bound, 'propose')] and tracking_outbox.receipt(directory, record) is None
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input())
+    assert tracking_client.main(base + ['--profile-dir', str(other), 'bind-staged']) == 1
+    capsys.readouterr()
+    monkeypatch.setattr(tracking_client, '_run', original_run)
+    monkeypatch.setattr(tracking_client, '_profile', lambda *_: ('https://hub.example', 'synthetic-token', b,
+                                                                'session-id', 9999999999))
+    def network_forbidden(*args, **kwargs): raise AssertionError('wrong installation reached network')
+    monkeypatch.setattr(tracking_client.httpx, 'AsyncClient', network_forbidden)
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input())
+    assert tracking_client.main(base + ['--profile-dir', str(other), '--session', 'other', 'send-staged']) == 1
+    capsys.readouterr()
+    assert len(calls) == 1 and tracking_outbox.read(directory, ident) == record
+    assert tracking_outbox.binding(directory, record) == bound and record['arguments'] == arguments
+    assert tracking_outbox.receipt(directory, record) is None
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='draft binding requires qualified POSIX directory fsync')
+def test_draft_binding_publication_failure_and_postlink_flush_recovery(tmp_path, monkeypatch):
+    directory = tmp_path / 'outbox'; directory.mkdir(mode=0o700)
+    ident = tracking_outbox.stage(directory, None, None, None, 'propose',
+        {'project': 'engineering-hub', 'title': 'Work', 'client_request_id': 'stable'})
+    record = tracking_outbox.read(directory, ident); installation = '11111111-1111-4111-8111-111111111111'
+    original_link = tracking_outbox.os.link
+    monkeypatch.setattr(tracking_outbox.os, 'link', lambda *_: (_ for _ in ()).throw(OSError('publication failed')))
+    with pytest.raises(OSError): tracking_outbox.bind(directory, record, 'https://hub.example', installation)
+    assert tracking_outbox.binding(directory, record) is None and tracking_outbox.read(directory, ident) == record
+    monkeypatch.setattr(tracking_outbox.os, 'link', original_link)
+    original_sync = tracking_outbox._sync_directory
+    monkeypatch.setattr(tracking_outbox, '_sync_directory', lambda *_: (_ for _ in ()).throw(OSError('flush failed')))
+    with pytest.raises(OSError): tracking_outbox.bind(directory, record, 'https://hub.example', installation)
+    with pytest.raises(OSError): tracking_outbox.binding(directory, record)
+    monkeypatch.setattr(tracking_outbox, '_sync_directory', original_sync)
+    assert tracking_outbox.binding(directory, record)['installation_id'] == installation
+    with pytest.raises(ClientError, match='tracking_outbox_already_bound'):
+        tracking_outbox.bind(directory, record, 'https://other.example', installation)
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX no-follow semantics')
+def test_draft_binding_symlink_is_never_followed(tmp_path):
+    directory = tmp_path / 'outbox'; directory.mkdir(mode=0o700)
+    ident = tracking_outbox.stage(directory, None, None, None, 'propose',
+        {'project': 'engineering-hub', 'title': 'Work', 'client_request_id': 'stable'})
+    record = tracking_outbox.read(directory, ident)
+    (directory / (ident + '.binding')).symlink_to(tmp_path / 'elsewhere')
+    with pytest.raises(OSError): tracking_outbox.binding(directory, record)
+
+
+def test_draft_binding_without_qualified_durability_is_denied(tmp_path, monkeypatch):
+    directory = tmp_path / 'outbox'; directory.mkdir(mode=0o700)
+    ident = tracking_outbox.stage(directory, None, None, None, 'propose',
+        {'project': 'engineering-hub', 'title': 'Work', 'client_request_id': 'stable'})
+    record = tracking_outbox.read(directory, ident)
+    monkeypatch.setattr(tracking_outbox, '_draft_binding_supported', lambda: False)
+    with pytest.raises(ClientError, match='tracking_binding_durability_unavailable'):
+        tracking_outbox.bind(directory, record, 'https://hub.example', '11111111-1111-4111-8111-111111111111')
+    with pytest.raises(ClientError, match='tracking_binding_durability_unavailable'):
+        tracking_outbox.bound_for_send(directory, record)
+    assert tracking_outbox.binding(directory, record) is None and tracking_outbox.read(directory, ident) == record
+
+
+def test_unsupported_host_never_sends_bound_draft_and_legacy_still_works(tmp_path, monkeypatch, capsys):
+    import io
+    directory = tmp_path / 'outbox'; directory.mkdir(mode=0o700)
+    profile = tmp_path / 'profile'; profile.mkdir(mode=0o700)
+    installation = '11111111-1111-4111-8111-111111111111'
+    task_id = '22222222-2222-4222-8222-222222222222'
+    _write(profile / 'installation.private', {'origin': 'https://hub.example', 'installation_id': installation})
+    payload = {'project': 'engineering-hub', 'title': 'Work', 'client_request_id': 'stable'}
+    ident = tracking_outbox.stage(directory, None, None, None, 'propose', payload)
+    draft = tracking_outbox.read(directory, ident)
+    if os.name == 'nt':
+        # A copied/pre-existing sidecar must not bypass the native Windows gate.
+        assert not tracking_outbox._draft_binding_supported()
+        _write(directory / (ident + '.binding'), tracking_outbox._binding_value(draft, 'https://hub.example', installation))
+    else:
+        tracking_outbox.bind(directory, draft, 'https://hub.example', installation)
+    legacy_id = tracking_outbox.stage(directory, 'https://hub.example', installation, None, 'propose',
+                                      {**payload, 'client_request_id': 'legacy'})
+    class Input:
+        def __init__(self, identity): self.buffer = io.BytesIO(json.dumps({'record_id': identity}).encode())
+    calls = []
+    async def send(args, arguments, *, binding, action):
+        calls.append((arguments, binding, action))
+        return {'type': 'tracking_result', 'operation': action, 'execution_authorization': False,
+                'result': {'id': task_id, 'project': 'engineering-hub'}}
+    monkeypatch.setattr(tracking_client, '_run', send)
+    monkeypatch.setattr(tracking_outbox, '_draft_binding_supported', lambda: False)
+    base = ['--profile-dir', str(profile), '--session', 'first', '--outbox-dir', str(directory)]
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input(ident))
+    assert tracking_client.main(base + ['send-staged']) == 1
+    denied = capsys.readouterr()
+    assert denied.out == '' and 'tracking_draft_binding_unavailable_on_this_platform' in denied.err and not calls
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input(ident))
+    assert tracking_client.main(base + ['status-staged']) == 0
+    assert json.loads(capsys.readouterr().out)['state'] == 'unconfirmed'
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input(legacy_id))
+    assert tracking_client.main(base + ['send-staged']) == 0
+    assert json.loads(capsys.readouterr().out)['result']['id'] == task_id and len(calls) == 1
+
+
+def test_profile_free_draft_and_status_need_no_installation(tmp_path, monkeypatch, capsys):
+    import io
+    directory = tmp_path / 'outbox'; directory.mkdir(mode=0o700)
+    class Input:
+        def __init__(self, value): self.buffer = io.BytesIO(json.dumps(value).encode())
+    payload = {'project': 'engineering-hub', 'title': 'Remember', 'client_request_id': 'stable'}
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'action': 'propose', 'arguments': payload}))
+    assert tracking_client.main(['--outbox-dir', str(directory), 'draft']) == 0
+    ident = json.loads(capsys.readouterr().out)['record_id']
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': ident}))
+    assert tracking_client.main(['--outbox-dir', str(directory), 'status-staged']) == 0
+    assert json.loads(capsys.readouterr().out)['state'] == 'unbound'
+    assert tracking_outbox.read(directory, ident)['arguments'] == payload
+
+
 def test_reference_pagination_recovers_large_outbox_without_opening_or_deleting(tmp_path, monkeypatch):
     import uuid
     directory = tmp_path / 'outbox'; directory.mkdir(mode=0o700)

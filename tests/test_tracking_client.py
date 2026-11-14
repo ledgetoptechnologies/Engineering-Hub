@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -99,8 +100,29 @@ async def test_loopback_session_tracking_scope_retry_and_independent_review(owne
             assert await asyncio.to_thread(tracking_client.main, argv) == 0
             assert json.loads(capsys.readouterr().out)['result']['id'] == retry['id']
             assert tracking_outbox.receipt(outbox, saved)['task_id'] == retry['id']
+            if os.name != 'nt':  # Windows lacks qualified directory-flush binding.
+                # A profile-free proposal remains local until explicitly bound;
+                # after binding, send uses the same real EHS identity and key.
+                class DraftInput:
+                    def __init__(self, value): self.buffer = io.BytesIO(json.dumps(value).encode())
+                draft_body = dict(project=PROJECT, title='Offline draft', client_request_id='offline-stable')
+                monkeypatch.setattr(tracking_client.sys, 'stdin', DraftInput({'action': 'propose', 'arguments': draft_body}))
+                assert await asyncio.to_thread(tracking_client.main, ['--outbox-dir', str(outbox), 'draft']) == 0
+                draft_id = json.loads(capsys.readouterr().out)['record_id']
+                draft_record = tracking_outbox.read(outbox, draft_id)
+                assert tracking_outbox.is_draft(draft_record) and tracking_outbox.binding(outbox, draft_record) is None
+                monkeypatch.setattr(tracking_client.sys, 'stdin', DraftInput({'record_id': draft_id}))
+                assert await asyncio.to_thread(tracking_client.main, ['--outbox-dir', str(outbox), '--profile-dir', str(profile), 'bind-staged']) == 0
+                capsys.readouterr()
+                for _ in range(2):
+                    monkeypatch.setattr(tracking_client.sys, 'stdin', DraftInput({'record_id': draft_id}))
+                    assert await asyncio.to_thread(tracking_client.main, ['--outbox-dir', str(outbox), '--profile-dir', str(profile), '--session', 'first', 'send-staged']) == 0
+                    capsys.readouterr()
+                assert tracking_outbox.receipt(outbox, draft_record)['installation_id'] == writer_id
             all_items = (await _run(args, {'project': PROJECT}))['result']['tasks']
             assert len([item for item in all_items if item['title'] == 'Outbox synthetic']) == 1
+            if os.name != 'nt':
+                assert len([item for item in all_items if item['title'] == 'Offline draft']) == 1
             # MCP transport may wrap the denial in an AnyIO ExceptionGroup.
             with pytest.raises(Exception):
                 await _run(args, dict(body, title='changed'), binding=saved, action='propose')
