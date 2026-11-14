@@ -6,7 +6,7 @@ import sys
 from engineering_hub.trusted_queued_session import parse_enrollment, MAX_ENROLLMENT_BYTES
 from engineering_hub.unified_pilot_startup import read_protected_file
 from hub_container_executor.colocated_session import validate_colocated_session
-from hub_container_executor.installed_coordinator import parse_configuration as coordinator_config, MAX_CONFIG_BYTES as COORDINATOR_LIMIT
+from hub_container_executor.installed_coordinator import parse_configuration as coordinator_config, MAX_CONFIG_BYTES as COORDINATOR_LIMIT, _task_scope_valid
 from hub_container_executor.installed_runner import parse_configuration as runner_config, MAX_CONFIG_BYTES as RUNNER_LIMIT
 
 
@@ -15,6 +15,8 @@ def validate_pair(runner_raw, coordinator_raw, session_raw):
     try:
         runner = runner_config(runner_raw)
         coordinator = coordinator_config(coordinator_raw)
+        if not _task_scope_valid(coordinator.allowed_task_ids):
+            raise ValueError()
         session = parse_enrollment(session_raw)
         session, _, _ = validate_colocated_session(coordinator, session)
         if runner.manifest.digest() != coordinator.manifest.digest():

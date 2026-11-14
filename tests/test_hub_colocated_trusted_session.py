@@ -24,7 +24,7 @@ from tests.test_hub_queued_pilot import DistinctContainerClient, ACTION, MACHINE
 from engineering_hub.trusted_queued_session import parse_enrollment
 from hub_container_executor.colocated_session import ColocatedTrustedSession
 from tests.test_hub_container_executor_installed_coordinator import configuration, canonical
-from hub_container_executor.installed_coordinator import parse_configuration, SCHEMA_SINGLE_PILOT
+from hub_container_executor.installed_coordinator import parse_configuration, SCHEMA_TASK_SCOPED
 from tests.test_hub_trusted_queued_session import document
 from tests.test_hub_unified_pilot_startup import encode
 from tests.test_hub_current_observation_end_to_end import owned_supervisor_wait
@@ -72,7 +72,7 @@ def test_signed_executor_relay_requires_matching_key_and_manual_acceptance(synth
     old = ownership._local_filesystem
     monkeypatch.setattr(ownership, '_local_filesystem', lambda fd, **_: old(fd))
     authority, issuer_path, _ = synthetic_issuer
-    raw = configuration(); raw['schema'] = SCHEMA_SINGLE_PILOT; raw['single_pilot_protocol'] = True
+    raw = configuration(); raw['schema'] = SCHEMA_TASK_SCOPED; raw['single_pilot_protocol'] = True
     database_root = issuer_path.parent / 'database'; database_root.mkdir(mode=0o700)
     raw['database_path'] = str(database_root / 'hub.sqlite3')
     socket_root = issuer_path.parent / 'executor'; socket_root.mkdir(mode=0o700)
@@ -212,7 +212,7 @@ def test_cli_session_preflight_rejects_writable_mount(tmp_path, monkeypatch):
 
 def test_expired_session_reconciliation_refuses_observation(tmp_path, monkeypatch):
     from engineering_hub import trusted_queued_session as trusted
-    raw = configuration(); raw['schema'] = SCHEMA_SINGLE_PILOT; raw['single_pilot_protocol'] = True
+    raw = configuration(); raw['schema'] = SCHEMA_TASK_SCOPED; raw['single_pilot_protocol'] = True
     database_root = tmp_path / 'database'; database_root.mkdir(mode=0o700)
     raw['database_path'] = str(database_root / 'hub.sqlite3')
     config = parse_configuration(canonical(raw)); data = document()
@@ -238,7 +238,7 @@ def test_expired_session_reconciliation_refuses_observation(tmp_path, monkeypatc
 def test_cli_supplies_both_owned_factories_and_v2(monkeypatch):
     from hub_container_executor import installed_coordinator as module
     from engineering_hub import unified_pilot_startup
-    raw = configuration(); raw['schema'] = SCHEMA_SINGLE_PILOT; raw['single_pilot_protocol'] = True
+    raw = configuration(); raw['schema'] = SCHEMA_TASK_SCOPED; raw['single_pilot_protocol'] = True
     config = parse_configuration(canonical(raw)); data = document()
     data['report']['manifest_digest'] = config.manifest.digest()
     data['release']['implementation_commit'] = config.manifest.driver.implementation_commit
@@ -277,7 +277,7 @@ def test_old_core_without_fd_readonly_support_is_rejected(monkeypatch):
 
 def test_owned_coordinator_composes_v2_with_same_socket_and_bearer(monkeypatch):
     from hub_container_executor import installed_coordinator as module
-    raw = configuration(); raw['schema'] = SCHEMA_SINGLE_PILOT; raw['single_pilot_protocol'] = True
+    raw = configuration(); raw['schema'] = SCHEMA_TASK_SCOPED; raw['single_pilot_protocol'] = True
     config = parse_configuration(canonical(raw)); data = document()
     data['report']['manifest_digest'] = config.manifest.digest()
     data['release']['implementation_commit'] = config.manifest.driver.implementation_commit

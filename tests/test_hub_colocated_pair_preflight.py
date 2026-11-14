@@ -16,7 +16,7 @@ from engineering_hub.container_pilot_manifest import PilotManifest
 def fixture_documents():
     runner=runner_configuration(); coordinator=coordinator_configuration()
     runner['schema']=installed_runner.SCHEMA_SINGLE_PILOT; runner['resources']['single_pilot_protocol']=True
-    coordinator['schema']=installed_coordinator.SCHEMA_SINGLE_PILOT; coordinator['single_pilot_protocol']=True
+    coordinator['schema']=installed_coordinator.SCHEMA_TASK_SCOPED; coordinator['single_pilot_protocol']=True
     coordinator['manifest']=runner['manifest']
     manifest=PilotManifest.from_bytes(canonical(runner['manifest']))
     session=document(); session['release']=dict(runner['release_enrollment'])
@@ -36,6 +36,14 @@ def test_static_pair_accepts_same_pins_without_host_access(monkeypatch):
     monkeypatch.setattr(socket, 'socket', lambda *a, **k: pytest.fail('unexpected socket'))
     result=check(runner,coordinator,session)
     assert result['state']=='static_pair_consistent_not_approved' and result['single_pilot_protocol'] is True
+
+
+def test_legacy_pair_is_not_reported_ready_without_task_scope():
+    runner, coordinator, session = fixture_documents()
+    coordinator['schema'] = installed_coordinator.SCHEMA_SINGLE_PILOT
+    del coordinator['allowed_task_ids']
+    with pytest.raises(ValueError, match='^colocated pair validation failed$'):
+        check(runner, coordinator, session)
 
 
 @pytest.mark.parametrize('mismatch', ['protocol','manifest','bearer','issuer','key','image','profile'])

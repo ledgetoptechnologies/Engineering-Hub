@@ -43,7 +43,8 @@ def canonical(value):
 
 
 def configuration():
-    return dict(schema=module.SCHEMA, manifest=make_manifest_data(),
+    return dict(schema=module.SCHEMA_TASK_SCOPED, single_pilot_protocol=False,
+        allowed_task_ids=['1398cf6d-cebd-4f79-a913-be70321970c9'], manifest=make_manifest_data(),
         database_path='/pilot/controller/hub.sqlite3',
         coordinator_socket_path='/pilot/browser/hub.sock', executor_socket_path='/pilot/executor/host.sock',
         agent_port=18870, machine_id='staging-pc', action_key=module.ACTION,
@@ -70,12 +71,34 @@ def test_pure_parse_and_exact_additional_policy():
     assert not module.target_allowed(config, 'codex', module.ACTION, 'production', target)
     assert not module.target_allowed(config, 'codex', 'different', 'staging', target)
     assert not module.target_allowed(config, 'codex', module.ACTION, 'staging',
+        replace(target, task_id='d0d85409-b123-49ee-8f53-1dd2dd02669b'))
+    assert not module.target_allowed(config, 'codex', module.ACTION, 'staging',
         replace(target, source_commit='f' * 40))
     assert not module.target_allowed(config, 'codex', module.ACTION, 'staging',
         replace(target, artifact_digest='sha256:' + 'f' * 64))
     assert not module.target_allowed(config, 'codex', module.ACTION, 'staging', target.__dict__)
     with pytest.raises(TypeError):
         config.roles['admin'] = ('test-admin', 1)
+
+
+@pytest.mark.parametrize('scope', [[], ['NOT-A-UUID'],
+    ['1398CF6D-CEBD-4F79-A913-BE70321970C9'],
+    ['1398cf6d-cebd-4f79-a913-be70321970c9'] * 2,
+    [str(__import__('uuid').UUID(int=i)) for i in range(65)], None, '1398cf6d-cebd-4f79-a913-be70321970c9'])
+def test_task_scope_rejects_invalid_empty_duplicate_or_oversized(scope):
+    value = configuration(); value['allowed_task_ids'] = scope
+    with pytest.raises(module.InstalledCoordinatorError):
+        parse(value)
+
+
+def test_legacy_validate_and_serve_fail_before_session_or_secret_access(monkeypatch):
+    value = configuration(); value['schema'] = module.SCHEMA
+    del value['allowed_task_ids']; del value['single_pilot_protocol']
+    legacy = parse(value)
+    monkeypatch.setattr(module, 'load_configuration', lambda _: legacy)
+    monkeypatch.setattr(module, 'ImmutableTestSecretResolver', lambda *a, **k: pytest.fail('secret access'))
+    for op in ('validate', 'serve'):
+        assert module.main([op, '--config', '/unused', '--session-config', '/unused-session']) == 2
 
 
 @pytest.mark.parametrize('key,value', [
@@ -332,19 +355,27 @@ def test_file_denials_without_providers(tmp_path, monkeypatch, kind):
         module.load_configuration(str(path))
 
 
-def test_single_pilot_coordinator_requires_explicit_v2_and_passes_opt_in(monkeypatch):
+def test_legacy_profiles_parse_but_cannot_activate_and_v3_passes_opt_in(monkeypatch):
     legacy=configuration()
+    legacy['schema']=module.SCHEMA
+    del legacy['allowed_task_ids']; del legacy['single_pilot_protocol']
     assert module.parse_configuration(canonical(legacy)).single_pilot_protocol is False
     legacy['single_pilot_protocol']=True
     with pytest.raises(module.InstalledCoordinatorError): module.parse_configuration(canonical(legacy))
     legacy['schema']=module.SCHEMA_SINGLE_PILOT
-    config=module.parse_configuration(canonical(legacy))
-    assert config.single_pilot_protocol is True
+    legacy_config=module.parse_configuration(canonical(legacy))
+    assert legacy_config.single_pilot_protocol is True
     for wrong in (False, 1, 'true'):
         legacy['single_pilot_protocol']=wrong
         with pytest.raises(module.InstalledCoordinatorError): module.parse_configuration(canonical(legacy))
     events=[]; captured=[]
     install_fakes(monkeypatch,events)
+    with pytest.raises(module.InstalledCoordinatorError):
+        run_owned_loop(module.run_installed_coordinator(legacy_config, reconciliation_factory=synthetic_reconciliation))
+    assert events == ['process']
+    events.clear()
+    scoped=configuration(); scoped['single_pilot_protocol']=True
+    config=module.parse_configuration(canonical(scoped))
     class CaptureClient:
         @staticmethod
         def for_private_unix(path, token, **kwargs):

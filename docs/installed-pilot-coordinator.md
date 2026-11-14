@@ -44,7 +44,7 @@ The executor wheel also requires a core with the protected reader's
 older core before reading session material. Use a separately reviewed matching
 core image, not merely the same package version.
 
-The closed `engineering-hub.installed-coordinator.v1` configuration contains:
+The closed `engineering-hub.installed-coordinator.v3` configuration contains:
 
 - `manifest`: the complete existing canonical pilot manifest.
 - `database_path`, `coordinator_socket_path`, `executor_socket_path`, and
@@ -56,6 +56,10 @@ The closed `engineering-hub.installed-coordinator.v1` configuration contains:
 - `machine_id`: exactly `staging-pc`; `action_key`: exactly
   `engineering-hub:container-pilot`; `allowed_actors`: a unique nonempty subset
   of `codex`, `hermes`, `claude`.
+- `allowed_task_ids`: a nonempty unique list of at most 64 canonical lowercase
+  UUID task IDs, selected and approved by the operator. `single_pilot_protocol`
+  is an explicit boolean. The task list is an additional veto; it neither
+  approves a task nor replaces review, manual acceptance or fencing.
 - `public_auth`: existing Cloudflare Access configuration fields `base_url`,
   `cloudflare_issuer`, `cloudflare_audience`, `cloudflare_allowed_emails`.
   This configures no Access application/policy and does not reuse or alter Ops.
@@ -68,13 +72,29 @@ The closed `engineering-hub.installed-coordinator.v1` configuration contains:
 
 ## Existing authority remains mandatory
 
-The concrete additional target policy only permits an allowed actor, this action,
-staging, and the exact manifest candidate commit/config digest. It is a veto,
+The concrete additional target policy only permits an allowed actor and task ID,
+this action, staging, and the exact manifest candidate commit/config digest. It is a veto,
 not a substitute for the existing repository task ownership, independent review,
 queue fencing, physical-machine reservation, manifest/build enrollment or current
 host approval. The existing event-driven runtime and cancellation/drain ownership
 remain in control. No automatic recovery, replay, lease-based reassignment or
 production authority is introduced.
+
+### Migrating an existing configuration
+
+Versions v1 and v2 remain parseable for structural inspection, but cannot be
+validated as activation-ready or served without an explicit task scope. Preserve
+the existing protected configuration. Prepare a separate canonical v3 document
+using its independently verified fields, an explicit `single_pilot_protocol`
+boolean matching the approved runner, and the operator's reviewed task IDs.
+Do not infer IDs from pending work. Have the operator review the complete
+candidate and approve the separate protected read-only file before replacing or
+mounting any active configuration. Validate the coordinator and colocated pair;
+these checks do not approve the host, fence old writers or start work. Existing
+held records must not be deleted or automatically replayed during migration.
+An omitted held task stays held with its reservation; resolve it only through
+the existing authorized process, including a separately approved scope change
+if that task must be included. Do not silently include it or replay it.
 
 `ContainerPilotClient.for_private_unix` creates a fresh client using the existing
 private path checks: current-UID mode0700 parent, trusted no-follow ancestors and
