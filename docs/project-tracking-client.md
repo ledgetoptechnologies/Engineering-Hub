@@ -126,6 +126,26 @@ registrations or intakes are refused; already registered exact retries remain
 available. Older v1 drafts are not migrated; their binding and sending remain
 unavailable on Windows. A server without the new tool rejects v2 sends rather
 than falling back to weaker deduplication.
+
+If the original installation becomes unavailable after an ambiguous send,
+`recover-staged` with `{"record_id":"..."}` and an explicitly selected
+replacement `--profile-dir` stages a separate local attempt. It requires an
+intact v2 draft and original binding and the same exact origin. It preserves
+the original draft, binding and any acceptance receipt; the attempt carries
+the same project, payload and intake ID. `recover-staged` does not send. Use
+`send-staged` on the returned attempt ID with a current session and grant to
+explicitly create or retry the task. If the original did not commit, that send
+can create it. Each attempt has its own local acceptance receipt. Repeating
+recovery can create multiple local attempts, but the same intact Hub ledger
+deduplicates the intake within its project. V1 and missing, corrupt or changed
+source records/bindings fail closed. When a known original receipt names a
+different task, the client refuses to record replacement acceptance. Receipt
+checks are not atomic across files: an original receipt can appear after the
+replacement's last check, so a later status check may be needed to detect a
+conflict. These checks happen after a response and cannot undo a duplicate
+on a restored or different server. An identical origin does not prove ledger
+identity or protect against server rollback; Windows local sidecars remain
+subject to filesystem durability limitations.
 A fresh valid session and server grant are still required
 for explicit `send-staged`; accepted sidecars also bind the selected routing
 identity. Inspect the draft and binding in a protected channel and reconcile

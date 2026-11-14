@@ -180,6 +180,60 @@ async def test_lost_acceptance_holds_then_original_get_reconciles_without_repost
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('failed,drift', [(False, False), (False, True), (True, False), (True, True)])
+async def test_partial_finalization_revalidates_previously_recorded_resources(env, monkeypatch, failed, drift):
+    controller, client, resources, _, repo = env
+    client.fail = failed
+    original_submit = client.submit
+    if failed:
+        async def submit_with_diagnostic(request):
+            receipt = await original_submit(request)
+            identity = request['resource_ids']['test_run']
+            fact = client.facts[identity]
+            receipt['result']['diagnostic'] = {
+                'resource_id': identity, 'bytes': fact['bytes'], 'stage': 'test',
+                'manifest_sha256': hashlib.sha256(json.dumps(fact['manifest'], sort_keys=True,
+                    separators=(',', ':')).encode()).hexdigest(),
+                'scope': 'original_engine_owned_writers_exporters_volumes_absent',
+            }
+            return receipt
+        monkeypatch.setattr(client, 'submit', submit_with_diagnostic)
+    submitted = await controller.submit('codex', payload(repo))
+    selected = submitted['resource_ids']['test_run' if failed else 'build']
+    original_mark = resources.mark_resource_ready
+    def interrupt_after_record(principal, identity, revision, **kwargs):
+        result = original_mark(principal, identity, revision, **kwargs)
+        if identity == selected:
+            raise RuntimeError('synthetic interruption after committed resource record')
+        return result
+    monkeypatch.setattr(resources, 'mark_resource_ready', interrupt_after_record)
+    held = await controller.run_once()
+    assert held['job']['state'] == 'held' and client.posts == 1
+    monkeypatch.setattr(resources, 'mark_resource_ready', original_mark)
+    before = {identity: resources.inspect_resource(controller.principal, identity)
+              for identity in submitted['resource_ids'].values()}
+    assert before[selected]['state'] == ('failed' if failed else 'ready')
+    if drift:
+        fact = client.facts[selected]
+        fact['manifest'] = {'changed.txt': {'bytes': 3, 'sha256': hashlib.sha256(b'new').hexdigest()}}
+        fact['bytes'] = 3
+        if failed:
+            diagnostic = client.jobs[submitted['job']['id']]['result']['diagnostic']
+            diagnostic['bytes'] = 3
+            diagnostic['manifest_sha256'] = hashlib.sha256(json.dumps(fact['manifest'], sort_keys=True,
+                separators=(',', ':')).encode()).hexdigest()
+    resumed = await controller.reconcile(submitted['job']['id'])
+    assert client.posts == 1  # Original command is inspected, never reposted.
+    if drift:
+        assert resumed['job']['state'] == 'held'
+        assert {identity: resources.inspect_resource(controller.principal, identity)
+                for identity in submitted['resource_ids'].values()} == before
+        with repo._connection() as db:
+            machine = db.execute('SELECT job_id FROM hub_work_machines WHERE machine_id=?', ('staging-pc',)).fetchone()
+        assert machine['job_id'] == submitted['job']['id']
+    else:
+        assert resumed['job']['state'] == ('failed' if failed else 'succeeded')
+@pytest.mark.asyncio
 async def test_same_machine_existing_production_priority_and_verifiers_preserved(tmp_path):
     repo = HubRepository(tmp_path / 'hub.db')
     original = WorkQueue(repo, {'production': WorkAction('same-host', frozenset({'production'}), project='engineering-hub')},

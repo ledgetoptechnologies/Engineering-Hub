@@ -89,14 +89,14 @@ def main(argv=None):
     parser.add_argument('--session')
     parser.add_argument('--private-vpn', action='store_true')
     parser.add_argument('--outbox-dir', type=Path)
-    parser.add_argument('action', choices=sorted((*(set(_TOOLS) - {'propose-draft'}), 'stage', 'draft', 'bind-staged', 'send-staged', 'list-staged', 'inspect-staged', 'status-staged')))
+    parser.add_argument('action', choices=sorted((*(set(_TOOLS) - {'propose-draft'}), 'stage', 'draft', 'bind-staged', 'recover-staged', 'send-staged', 'list-staged', 'inspect-staged', 'status-staged')))
     try:
         args = parser.parse_args(argv)
         raw = sys.stdin.buffer.read(_MAX_INPUT + 1)
         if len(raw) > _MAX_INPUT:
             raise ClientError('invalid_tracking_request')
         arguments = json.loads(raw)
-        if args.action in ('stage', 'draft', 'bind-staged', 'send-staged', 'list-staged', 'inspect-staged', 'status-staged'):
+        if args.action in ('stage', 'draft', 'bind-staged', 'recover-staged', 'send-staged', 'list-staged', 'inspect-staged', 'status-staged'):
             if args.outbox_dir is None or type(arguments) is not dict:
                 raise ClientError('invalid_tracking_request')
             if args.action == 'list-staged':
@@ -140,6 +140,7 @@ def main(argv=None):
                 if record['action'] not in ('propose', 'propose-draft', 'update', 'review', 'withdraw-claim'):
                     raise ClientError('invalid_tracking_request')
                 _arguments(record['action'], record['arguments'])
+                known_recovery_task = tracking_outbox.validate_recovery(args.outbox_dir, record)
                 if args.action == 'inspect-staged':
                     result = {'type': 'tracking_outbox_record', 'trust': 'private_local_data',
                               'execution_authorization': False, 'record': record}
@@ -152,9 +153,20 @@ def main(argv=None):
                     tracking_outbox.bind(args.outbox_dir, record, origin, installation)
                     result = {'type': 'tracking_outbox_bound', 'record_id': record['id'],
                               'sent': False, 'execution_authorization': False}
+                elif args.action == 'recover-staged':
+                    if args.profile_dir is None:
+                        raise ClientError('invalid_tracking_request')
+                    origin, installation = _installation_profile(args.profile_dir.expanduser().absolute(), args.private_vpn)
+                    attempt = tracking_outbox.stage_recovery(args.outbox_dir, record, origin, installation)
+                    result = {'type': 'tracking_outbox_recovery', 'record_id': attempt,
+                              'source_record_id': record['id'], 'sent': False, 'execution_authorization': False}
                 elif args.action == 'status-staged':
                     bound = tracking_outbox.binding(args.outbox_dir, record) if tracking_outbox.is_draft(record) else record
                     receipt = tracking_outbox.receipt(args.outbox_dir, record)
+                    if receipt is not None and ((known_recovery_task is not None and receipt['task_id'] != known_recovery_task)
+                                                or (record.get('expected_task_id') is not None
+                                                    and receipt['task_id'] != record['expected_task_id'])):
+                        raise ClientError('tracking_recovery_task_mismatch')
                     result = {'type': 'tracking_outbox_status', 'record_id': record['id'],
                               'state': 'hub_accepted' if receipt is not None else 'unbound' if bound is None else 'unconfirmed',
                               'task_id': receipt['task_id'] if receipt is not None else None,

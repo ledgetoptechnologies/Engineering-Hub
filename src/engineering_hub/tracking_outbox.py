@@ -51,6 +51,11 @@ def stage(directory, origin, installation, session_id, action, arguments):
         version = 2
     record = dict(version=version, id=record_id, origin=origin, installation_id=installation,
                   staged_session_id=session_id, action=action, arguments=arguments)
+    return _stage_record(directory, record)
+
+
+def _stage_record(directory, record):
+    record_id = _id(record['id'])
     payload = json.dumps(record, ensure_ascii=True, sort_keys=True, separators=(',', ':')).encode()
     if len(payload) > _LIMIT:
         raise ClientError('tracking_outbox_too_large')
@@ -93,10 +98,23 @@ def read(directory, record_id):
             fd = -1
             raw = source.read(_LIMIT + 1)
         record = json.loads(_protect(raw, decrypt=True))
-        if (type(record) is not dict or set(record) != {'version', 'id', 'origin', 'installation_id',
-                    'staged_session_id', 'action', 'arguments'} or record['version'] not in (1, 2) or record['id'] != record_id
-                or (record['version'] == 2 and not is_draft(record))):
+        fields = {'version', 'id', 'origin', 'installation_id', 'staged_session_id', 'action', 'arguments'}
+        if (type(record) is not dict or record.get('version') not in (1, 2, 3)
+                or set(record) != (fields | {'source_id', 'source_sha256', 'source_binding_sha256', 'expected_task_id'} if record.get('version') == 3 else fields)
+                or record.get('id') != record_id or (record['version'] == 2 and not is_draft(record))):
             raise ClientError('invalid_tracking_outbox')
+        if record['version'] == 3:
+            _id(record['source_id']); _id(record['installation_id'])
+            if (record['source_id'] == record_id or record['action'] != 'propose-draft'
+                    or record['staged_session_id'] is not None or type(record['source_sha256']) is not str
+                    or len(record['source_sha256']) != 64
+                    or any(c not in '0123456789abcdef' for c in record['source_sha256'])
+                    or type(record['source_binding_sha256']) is not str or len(record['source_binding_sha256']) != 64
+                    or any(c not in '0123456789abcdef' for c in record['source_binding_sha256'])
+                    or type(record['origin']) is not str or type(record['arguments']) is not dict):
+                raise ClientError('invalid_tracking_outbox')
+            if record['expected_task_id'] is not None:
+                _id(record['expected_task_id'])
         return record
     finally:
         if fd >= 0:
@@ -106,6 +124,41 @@ def read(directory, record_id):
 def _fingerprint(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=True, sort_keys=True,
                                      separators=(',', ':')).encode()).hexdigest()
+
+
+def stage_recovery(directory, source, origin, installation):
+    """Stage a separate explicit v2 retry while retaining the original draft."""
+    directory = _directory(directory)
+    if source.get('version') != 2 or not is_draft(source) or read(directory, source['id']) != source:
+        raise ClientError('invalid_tracking_recovery')
+    original = bound_for_send(directory, source)
+    prior = receipt(directory, source)
+    _id(installation)
+    if origin != original['origin'] or installation == original['installation_id']:
+        raise ClientError('invalid_tracking_recovery')
+    record = dict(version=3, id=str(uuid.uuid4()), origin=origin, installation_id=installation,
+                  staged_session_id=None, action='propose-draft', arguments=source['arguments'],
+                  source_id=source['id'], source_sha256=_fingerprint(source),
+                  source_binding_sha256=_fingerprint(original),
+                  expected_task_id=prior['task_id'] if prior else None)
+    return _stage_record(directory, record)
+
+
+def validate_recovery(directory, record):
+    """Fail closed if the original draft, routing or known acceptance changed."""
+    if record.get('version') != 3:
+        return
+    source = read(directory, record['source_id'])
+    if source.get('version') != 2 or not is_draft(source) or _fingerprint(source) != record['source_sha256']:
+        raise ClientError('invalid_tracking_recovery')
+    original = bound_for_send(directory, source)
+    prior = receipt(directory, source)
+    if (_fingerprint(original) != record['source_binding_sha256']
+            or original['origin'] != record['origin'] or original['installation_id'] == record['installation_id']
+            or source['arguments'] != record['arguments']
+            or (prior is not None and record['expected_task_id'] not in (None, prior['task_id']))):
+        raise ClientError('invalid_tracking_recovery')
+    return prior['task_id'] if prior is not None else None
 
 
 def is_draft(record):
@@ -301,6 +354,12 @@ def record_acceptance(directory, record, response):
             or type(response.get('result')) is not dict):
         raise ClientError('invalid_tracking_receipt')
     result = response['result']
+    if record.get('version') == 3:
+        known_task = validate_recovery(directory, record)
+        if record['expected_task_id'] is not None and result.get('id') != record['expected_task_id']:
+            raise ClientError('tracking_recovery_task_mismatch')
+        if known_task is not None and result.get('id') != known_task:
+            raise ClientError('tracking_recovery_task_mismatch')
     bound = bound_for_send(directory, record) if is_draft(record) else None
     value = _receipt_value(record, result.get('id'), bound)
     if (record['action'] in ('propose', 'propose-draft') and 'project' in result

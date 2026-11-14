@@ -703,15 +703,27 @@ class StagingController:
                      and hashlib.sha256(_json(fact['manifest']).encode()).hexdigest() == diagnostic['manifest_sha256'],
                      'staging_diagnostic_proof_invalid', 502)
             metadata['test_run'] = fact
+        # An interrupted finalization may already have recorded some facts.
+        # Revalidate every recorded fact against this exact terminal receipt
+        # and current worker metadata before changing any remaining resources.
+        pending = []
         for kind, identity in item['resource_ids'].items():
             resource = self.resources.inspect_resource(self.principal, identity)
-            if resource['state'] != 'provisioning':
-                continue  # Previously recorded fact from interrupted read-only reconciliation.
             fact = metadata.get(kind)
             digest = 'sha256:' + hashlib.sha256(_json(fact['manifest']).encode()).hexdigest() if fact else None
-            self.resources.mark_resource_ready(self.principal, identity, resource['revision'],
-                artifact_digest=digest, size_bytes=fact['bytes'] if fact else None,
-                preview_path='/staging/previews/' + identity if kind == 'preview' and fact else None,
+            size = fact['bytes'] if fact else None
+            preview = '/staging/previews/' + identity if kind == 'preview' and fact else None
+            if resource['state'] != 'provisioning':
+                _require(resource['state'] == ('failed' if outcome == 'failed' else 'ready')
+                         and resource.get('artifact_digest') == digest
+                         and resource.get('size_bytes') == size
+                         and resource.get('preview_path') == preview,
+                         'staging_resource_proof_invalid', 502)
+                continue
+            pending.append((identity, resource['revision'], digest, size, preview))
+        for identity, revision, digest, size, preview in pending:
+            self.resources.mark_resource_ready(self.principal, identity, revision,
+                artifact_digest=digest, size_bytes=size, preview_path=preview,
                 failed=outcome == 'failed')
         binding = self.resources.inspect_job(self.principal, item['job_id'])
         protected = [p for p in binding['protected'] if not(p['reason'] == 'held_campaign' and p['ref'] == item['job_id'])]

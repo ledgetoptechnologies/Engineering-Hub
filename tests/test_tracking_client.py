@@ -119,6 +119,36 @@ async def test_loopback_session_tracking_scope_retry_and_independent_review(owne
                     assert await asyncio.to_thread(tracking_client.main, ['--outbox-dir', str(outbox), '--profile-dir', str(profile), '--session', 'first', 'send-staged']) == 0
                     capsys.readouterr()
                 assert tracking_outbox.receipt(outbox, draft_record)['installation_id'] == writer_id
+                # The original server commit can precede a lost response or
+                # local receipt; explicitly stage a replacement installation
+                # without modifying that original draft or binding.
+                _, replacement, _ = pair(env, name='recovery-replacement', family='claude',
+                                          caps=('tracking.propose', 'tracking.read'))
+                replacement_principal = env.sessions.authenticate_session(replacement)
+                replacement_profile = tmp_path / 'replacement-profile'; replacement_profile.mkdir()
+                _write(replacement_profile / 'installation.private', dict(origin=url.removesuffix('/mcp'),
+                       installation_id=replacement_principal.installation_id))
+                _write(replacement_profile / 'first.session.private', dict(token=replacement,
+                       installation_id=replacement_principal.installation_id,
+                       session_id=replacement_principal.session_id, expires_at=replacement_principal.expires_at))
+                lost_body = dict(project=PROJECT, title='Ambiguous recovery', client_request_id='recovery-stable')
+                lost_id = tracking_outbox.stage(outbox, None, None, None, 'propose-draft', lost_body)
+                lost = tracking_outbox.read(outbox, lost_id)
+                tracking_outbox.bind(outbox, lost, url.removesuffix('/mcp'), writer_id)
+                first_result = await _run(args, lost['arguments'],
+                                          binding=tracking_outbox.bound_for_send(outbox, lost), action=lost['action'])
+                assert tracking_outbox.receipt(outbox, lost) is None
+                monkeypatch.setattr(tracking_client.sys, 'stdin', DraftInput({'record_id': lost_id}))
+                assert await asyncio.to_thread(tracking_client.main, ['--outbox-dir', str(outbox),
+                    '--profile-dir', str(replacement_profile), 'recover-staged']) == 0
+                attempt_id = json.loads(capsys.readouterr().out)['record_id']
+                monkeypatch.setattr(tracking_client.sys, 'stdin', DraftInput({'record_id': attempt_id}))
+                assert await asyncio.to_thread(tracking_client.main, ['--outbox-dir', str(outbox),
+                    '--profile-dir', str(replacement_profile), '--session', 'first', 'send-staged']) == 0
+                recovered = json.loads(capsys.readouterr().out)
+                assert recovered['result']['id'] == first_result['result']['id']
+                assert tracking_outbox.receipt(outbox, tracking_outbox.read(outbox, attempt_id))['task_id'] == recovered['result']['id']
+                assert tracking_outbox.read(outbox, lost_id) == lost and tracking_outbox.receipt(outbox, lost) is None
             all_items = (await _run(args, {'project': PROJECT}))['result']['tasks']
             assert len([item for item in all_items if item['title'] == 'Outbox synthetic']) == 1
             if os.name != 'nt':
