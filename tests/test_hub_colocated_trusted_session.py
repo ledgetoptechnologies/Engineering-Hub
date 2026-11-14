@@ -37,6 +37,11 @@ from tests.test_hub_container_executor_launch_supervisor import (
     short_root, root_journal, synthetic_issuer, current_ready, current_pins,
 )
 
+def colocated_document():
+    data = document()
+    data['scope'] = {'actors': ['codex'], 'task_ids': configuration()['allowed_task_ids']}
+    return data
+
 
 @contextmanager
 def relay_server(path, app, replay=False):
@@ -83,7 +88,7 @@ def test_signed_executor_relay_requires_matching_key_and_manual_acceptance(synth
     authority._daemon_pin = replace(authority._daemon_pin, daemon_id=config.manifest.runner_binding.daemon_identity)
     current_ready(authority)
     release, launch = current_pins(authority)
-    data = document()
+    data = colocated_document()
     data['release'] = {name: getattr(release, name) for name in release.__dataclass_fields__
                        if name not in {'public_key', 'platform'}}
     data['release'].update(public_key_hex=release.public_key.hex(), platform=release.platform.model_dump(mode='json'))
@@ -175,8 +180,9 @@ def test_readonly_requirement_is_checked_on_open_file(tmp_path, monkeypatch):
 def test_cli_session_preflight_is_static_and_opens_no_authority(tmp_path, monkeypatch, change):
     from hub_container_executor import installed_coordinator as module
     from engineering_hub import unified_pilot_startup as startup
-    config = parse_configuration(canonical(configuration()))
-    data = document()
+    raw = configuration(); raw['schema'] = SCHEMA_TASK_SCOPED; raw['single_pilot_protocol'] = True
+    config = parse_configuration(canonical(raw))
+    data = colocated_document()
     data['report']['manifest_digest'] = config.manifest.digest()
     data['release']['implementation_commit'] = config.manifest.driver.implementation_commit
     data['release']['platform'] = config.manifest.runner_binding.platform.model_dump(mode='json')
@@ -215,7 +221,7 @@ def test_expired_session_reconciliation_refuses_observation(tmp_path, monkeypatc
     raw = configuration(); raw['schema'] = SCHEMA_TASK_SCOPED; raw['single_pilot_protocol'] = True
     database_root = tmp_path / 'database'; database_root.mkdir(mode=0o700)
     raw['database_path'] = str(database_root / 'hub.sqlite3')
-    config = parse_configuration(canonical(raw)); data = document()
+    config = parse_configuration(canonical(raw)); data = colocated_document()
     data['report']['manifest_digest'] = config.manifest.digest()
     data['release']['implementation_commit'] = config.manifest.driver.implementation_commit
     data['release']['platform'] = config.manifest.runner_binding.platform.model_dump(mode='json')
@@ -239,7 +245,7 @@ def test_cli_supplies_both_owned_factories_and_v2(monkeypatch):
     from hub_container_executor import installed_coordinator as module
     from engineering_hub import unified_pilot_startup
     raw = configuration(); raw['schema'] = SCHEMA_TASK_SCOPED; raw['single_pilot_protocol'] = True
-    config = parse_configuration(canonical(raw)); data = document()
+    config = parse_configuration(canonical(raw)); data = colocated_document()
     data['report']['manifest_digest'] = config.manifest.digest()
     data['release']['implementation_commit'] = config.manifest.driver.implementation_commit
     data['release']['platform'] = config.manifest.runner_binding.platform.model_dump(mode='json')
@@ -278,7 +284,7 @@ def test_old_core_without_fd_readonly_support_is_rejected(monkeypatch):
 def test_owned_coordinator_composes_v2_with_same_socket_and_bearer(monkeypatch):
     from hub_container_executor import installed_coordinator as module
     raw = configuration(); raw['schema'] = SCHEMA_TASK_SCOPED; raw['single_pilot_protocol'] = True
-    config = parse_configuration(canonical(raw)); data = document()
+    config = parse_configuration(canonical(raw)); data = colocated_document()
     data['report']['manifest_digest'] = config.manifest.digest()
     data['release']['implementation_commit'] = config.manifest.driver.implementation_commit
     data['release']['platform'] = config.manifest.runner_binding.platform.model_dump(mode='json')
@@ -300,13 +306,36 @@ def test_owned_coordinator_composes_v2_with_same_socket_and_bearer(monkeypatch):
     monkeypatch.setattr(module, 'ContainerPilotClient', Client)
     calls=[]
     async def serve(_settings, _manifest, factory, **kwargs):
+        from engineering_hub.work_queue import WorkTarget
         composition = kwargs['reconciliation_factory'].__self__
         assert kwargs['single_pilot_protocol'] is True
         assert kwargs['session_acceptance_factory'].__self__ is composition
         assert str(composition._transport._path) == config.executor_socket
         assert composition._transport._credential == b'fixture-test-executor'
+        allowed = WorkTarget(data['scope']['task_ids'][0], config.manifest.candidate.source_commit,
+                             config.manifest.candidate.image_config_id)
+        assert kwargs['target_verifier']('codex', module.ACTION, 'staging', allowed)
+        assert not kwargs['target_verifier']('hermes', module.ACTION, 'staging', allowed)
         factory(); calls.append(composition)
     monkeypatch.setattr(module, 'serve_owned_queued_pilot', serve)
     with asyncio.Runner(loop_factory=asyncio.new_event_loop) as runner:
         runner.run(module.run_installed_coordinator(config, session_enrollment=enrollment))
     assert len(calls) == 1 and calls[0]._closed
+
+
+def test_legacy_session_denied_before_test_secret_resolution(monkeypatch):
+    from hub_container_executor import installed_coordinator as module
+    from engineering_hub.trusted_queued_session import SCHEMA
+    raw = configuration(); raw['schema'] = SCHEMA_TASK_SCOPED; raw['single_pilot_protocol'] = True
+    config = parse_configuration(canonical(raw)); data = colocated_document()
+    data['schema'] = SCHEMA; del data['scope']
+    data['report']['manifest_digest'] = config.manifest.digest()
+    data['release']['implementation_commit'] = config.manifest.driver.implementation_commit
+    data['release']['platform'] = config.manifest.runner_binding.platform.model_dump(mode='json')
+    data['launch']['engine_id'] = config.manifest.runner_binding.daemon_identity
+    data['report']['executor'] = dict(data['launch'], image_config_id=data['release']['image_config_id'])
+    monkeypatch.setattr(module, '_process', lambda: None)
+    monkeypatch.setattr(module, 'ImmutableTestSecretResolver', lambda *_a, **_kw: pytest.fail('secret read'))
+    with asyncio.Runner(loop_factory=asyncio.new_event_loop) as runner:
+        with pytest.raises(module.InstalledCoordinatorError):
+            runner.run(module.run_installed_coordinator(config, session_enrollment=parse_enrollment(encode(data))))

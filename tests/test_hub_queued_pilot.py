@@ -347,6 +347,11 @@ async def test_original_target_authorization_revocation_between_phases_stops_pos
         assert [c.action for c in client.submissions] == ["deploy_container"]
         assert queue.get_job(job["id"])["state"] == "held"
         assert await bridge.run_once() is None
+        with pytest.raises(HubError, match='queued_pilot_review_changed'):
+            await bridge.recover(job['id'])
+        assert queue.get_job(job['id'])['state'] == 'held'
+        assert machine_job(SimpleNamespace(repo=repo)) == job['id']
+        assert client.inspections == []
         assert len(client.submissions) == 1
 
 

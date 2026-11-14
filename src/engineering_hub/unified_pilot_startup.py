@@ -253,6 +253,13 @@ async def serve_configuration(config_path, profile_path, *, reconciliation_facto
         deployment, profile = validate_configuration(config_path, profile_path)
         from .app import Settings
         settings = Settings.from_env(deployment)
+        if session_enrollment_path is not None:
+            from .trusted_queued_session import (parse_enrollment, MAX_ENROLLMENT_BYTES,
+                                                 TrustedQueuedSessionComposition,
+                                                 validate_unified_session)
+            enrollment = parse_enrollment(read_protected_file(Path(session_enrollment_path),
+                                                               maximum_bytes=MAX_ENROLLMENT_BYTES))
+            validate_unified_session(profile, enrollment)
         # Must precede credentials, TLS transport allocation and listener binds.
         owner = PilotOwner(settings.database, require_existing=True)
         credential = read_protected_file(profile.credential_file, maximum_bytes=4096)
@@ -262,10 +269,6 @@ async def serve_configuration(config_path, profile_path, *, reconciliation_facto
         ca = read_protected_file(profile.ca_file, maximum_bytes=1024 * 1024, private=False)
         _require('sha256:' + hashlib.sha256(ca).hexdigest() == profile.ca_sha256)
         if session_enrollment_path is not None:
-            from .trusted_queued_session import (parse_enrollment, MAX_ENROLLMENT_BYTES,
-                                                 TrustedQueuedSessionComposition)
-            enrollment = parse_enrollment(read_protected_file(Path(session_enrollment_path),
-                                                               maximum_bytes=MAX_ENROLLMENT_BYTES))
             composition = TrustedQueuedSessionComposition(profile=profile, database=settings.database,
                 enrollment=enrollment, ca_pem=ca, credential=credential)
             reconciliation_factory = composition.reconciliation_factory
@@ -280,7 +283,8 @@ async def serve_configuration(config_path, profile_path, *, reconciliation_facto
             return (actor in profile.actors and action == ACTION and environment == 'staging'
                 and type(target) is WorkTarget and target.task_id in profile.task_ids
                 and target.source_commit == profile.manifest.candidate.source_commit
-                and target.artifact_digest == profile.manifest.candidate.image_config_id)
+                and target.artifact_digest == profile.manifest.candidate.image_config_id
+                and (composition is None or composition.scope_allows(actor, target.task_id)))
         await serve_owned_unified_queued_pilot(settings, profile.manifest, client_factory,
             owner=owner, bus_paths=deployment.bus_paths, action_key=ACTION,
             machine_id=profile.machine_id, target_verifier=target_verifier,

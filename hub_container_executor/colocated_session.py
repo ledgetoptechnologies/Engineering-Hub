@@ -1,6 +1,7 @@
 """Fixed issuer-UDS composition of an independently approved manual session."""
 import os
 import inspect
+import threading
 from pathlib import Path
 
 from engineering_hub.current_executor_observation import CurrentExecutorObserver
@@ -22,6 +23,8 @@ def validate_colocated_session(config, enrollment):
              and config.manifest.driver.implementation_commit == e.release.implementation_commit
              and config.manifest.runner_binding.platform == e.release.platform
              and config.manifest.runner_binding.daemon_identity == e.launch.engine_id
+             and bool(e.actors) and bool(e.task_ids)
+             and set(e.actors) <= config.actors and set(e.task_ids) <= config.allowed_task_ids
              and Path(config.database).is_absolute())
     mono, wall = _clock()
     _require(0 <= wall - e.observed_at_ms <= MAX_REPORT_AGE_MS
@@ -43,6 +46,7 @@ class ColocatedTrustedSession(TrustedQueuedSessionComposition):
     """Same report/challenge checks as the unified selector, via pinned issuer UDS."""
     def __init__(self, *, config, enrollment, credential):
         self._pid, self._closed = os.getpid(), False
+        self._clock_lock = threading.Lock()
         self._observer = self._audit = self._gate = self._broker = self._owner = self._target = None
         self._transport = None
         try:

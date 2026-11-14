@@ -24,7 +24,8 @@ mounts storage, installs services, changes Cloudflare policy or starts an execut
 
 The ordinary protected pilot profile retains its existing manifest, exact allowed
 tasks/agents, machine, literal-IP HTTPS executor origin, CA and dedicated executor
-credential paths/hashes. The selector first obtains the existing `PilotOwner`,
+credential paths/hashes. The manual-session selector first checks the closed
+session data, static scope and freshness, obtains the existing `PilotOwner`,
 then captures CA/credential bytes once. Both the command client and synchronous
 current-identity transport use that same captured profile/material. Neither
 reopens those paths for network requests. The credential must not match any agent
@@ -34,14 +35,31 @@ The additional manual-session file is protected data: current-UID mode0600,
 private mode0700 parent and trusted ancestors, read through the existing stable
 no-follow reader. It is never a public Hub note, code/module name, arbitrary
 factory, executable file or an executor-supplied enrollment response. Its closed
-schema is `engineering-hub.manual-staging-session.v1`:
+activation schema is `engineering-hub.manual-staging-session.v2`. The earlier
+v1 remains readable as retained data but lacks scope and is rejected by both
+manual-session compositions. Prepare and independently review a new scoped file;
+the software does not modify or migrate the existing protected file.
 
 | Field | Independently retained content |
 |---|---|
 | `release` | Exact `CurrentExecutorReleasePins` fields; `public_key_hex` replaces `public_key`, platform is its closed platform object |
 | `launch` | Exact `CurrentLaunchPins` fields, including original approval expiry, boot/process/Engine identities and launch/container IDs |
 | `operator_actor` | Exact independently enrolled `human:cf:<64 lowercase hex>` actor; not the first visitor or the global allowlist |
+| `scope` | Closed object with exactly `actors` and `task_ids`, described below |
 | `report` | Exact fields below; original observations, not newly generated facts |
+
+`scope.actors` is a nonempty JSON array of one to three unique agent names
+(`claude`, `codex`, `hermes`), sorted lexicographically. `scope.task_ids` is a
+nonempty array of at most 32 unique canonical lowercase UUID strings, sorted
+lexicographically. For example, the shape is `{"actors":["codex"],"task_ids":["00000000-0000-4000-8000-000000000001"]}`;
+the example UUID is synthetic and must not be used as an approved task. Both
+sets must be subsets of the separately protected selector profile/configuration.
+The exact scope is shown in the acceptance evidence and therefore bound to its
+report digest and challenge. It is an additional veto on new and retained work;
+already held work omitted from the scope or affected by expiry retains its
+reservation rather than being replayed or released. Scope and reconciliation acceptance are not task execution
+approval. Explicit trusted Python callback compositions are a separate API and
+do not acquire this manual-enrollment scope automatically.
 
 The report has `target_id`, `manifest_digest`, `machine_id`, `source` (bounded
 source identifier), `observed_at_ms`, `expires_at_ms`, `executor`, `evidence` (1–6000 UTF-8

@@ -20,6 +20,7 @@ def fixture_documents():
     coordinator['manifest']=runner['manifest']
     manifest=PilotManifest.from_bytes(canonical(runner['manifest']))
     session=document(); session['release']=dict(runner['release_enrollment'])
+    session['scope']={'actors': ['codex'], 'task_ids': coordinator['allowed_task_ids']}
     session['launch']['engine_id']=manifest.runner_binding.daemon_identity
     session['report']['executor']=dict(session['launch'], image_config_id=session['release']['image_config_id'])
     session['report']['manifest_digest']=manifest.digest()

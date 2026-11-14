@@ -262,6 +262,9 @@ async def run_installed_coordinator(config, *, reconciliation_factory=None,
         # reading TEST secrets. API presence is compatibility, not attestation
         # or permission to substitute an unapproved core artifact.
         _require(callable(getattr(ContainerPilotClient, 'for_private_unix', None)))
+        if session_enrollment is not None:
+            from .colocated_session import validate_colocated_session
+            validate_colocated_session(config, session_enrollment)
         with ImmutableTestSecretResolver(config.secret_root, bindings=config.bindings) as secrets:
             tokens = {name: secrets.resolve_test_secret(*slot) for name, slot in config.roles.items()}
         _require(len(set(tokens.values())) == 4 and all(
@@ -284,7 +287,8 @@ async def run_installed_coordinator(config, *, reconciliation_factory=None,
                 **({'single_pilot_protocol':True} if config.single_pilot_protocol else {}))
 
         def policy(actor, action_key, environment, target):
-            return target_allowed(config, actor, action_key, environment, target)
+            return (target_allowed(config, actor, action_key, environment, target)
+                    and (composition is None or composition.scope_allows(actor, target.task_id)))
 
         await serve_owned_queued_pilot(settings, config.manifest, fresh_client,
             action_key=ACTION, machine_id='staging-pc', target_verifier=policy,

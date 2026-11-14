@@ -1,6 +1,6 @@
 # Manual staging session: evidence-to-field worksheet
 
-Status: preparation worksheet only. It does not authorize staging, change a session grant, select a project, start a service, or assert any report value. Use it only for the existing `engineering-hub.manual-staging-session.v1` described in [Trusted manual staging startup](trusted-manual-staging-startup.md). Normal Hub startup and Compose remain unchanged.
+Status: preparation worksheet only. It does not authorize staging, change a session grant, select a project, start a service, or assert any report value. Use it for `engineering-hub.manual-staging-session.v2` as described in [Trusted manual staging startup](trusted-manual-staging-startup.md). Retained v1 files can be read but cannot activate a manual session. Normal Hub startup and Compose remain unchanged.
 
 This worksheet maps the current source schema and [live operator gates](live-staging-operator-gates.md) to the evidence an operator would need before constructing a fresh manual-session report. Keep completed evidence in the approved protected record location; do not place credentials, bearer tokens, private keys, or a ready-to-activate enrollment JSON in this repository.
 
@@ -8,7 +8,7 @@ This worksheet maps the current source schema and [live operator gates](live-sta
 
 | Existing field | Required binding | Evidence to retain | Collection / authority boundary |
 |---|---|---|---|
-| `schema` | Exact literal `engineering-hub.manual-staging-session.v1` | Schema/version reference only | Data-format check; conveys no approval. |
+| `schema` | Exact literal `engineering-hub.manual-staging-session.v2` | Schema/version reference only | Data-format check; conveys no approval. |
 | `release.issuer_id` | Independently enrolled executor issuer | Enrollment record and source path/version | Read the retained enrollment. Never choose an issuer based on the executor response. |
 | `release.public_key_hex` | Enrolled Ed25519 public key, 64 lowercase hex characters | Enrollment record fingerprint and independent key comparison | Public key material is not a credential, but keep the full enrollment protected as documented. |
 | `release.implementation_commit` | Exact 40-character source commit | Retained release enrollment and immutable artifact metadata | Compare to the enrolled release; do not infer from a mutable tag. |
@@ -19,6 +19,7 @@ This worksheet maps the current source schema and [live operator gates](live-sta
 | `launch.engine_id`, `launch.engine_pid`, `launch.engine_start_ticks` | Exact enrolled Engine and process identity | Original launch receipt plus current Engine peer/process observation | Read-only Engine inspection is possible only through an already authorized, identified endpoint. Do not start or adopt an Engine to collect evidence. |
 | `launch.approval_expires_at_ms` | Original approval expiry | Original launch receipt | Preserve the original value; report expiry must not exceed it. |
 | `operator_actor` | Exact independently enrolled `human:cf:<64 lowercase hex>` operator | Existing operator enrollment/identity record | This is not the first visitor, global allowlist, an agent identity, or an operator choice supplied by the request. No credential or session cookie belongs in the worksheet. |
+| `scope.actors`, `scope.task_ids` | Nonempty, unique and lexicographically sorted arrays of allowed agent names and canonical lowercase task UUIDs | Independently reviewed session scope, within the protected selector's existing actor/task ceiling | The exact scope appears in the challenge evidence. This is a veto, not task execution approval; omitted held work stays reserved. |
 
 The `executor` object under `report` is closed: it must exactly repeat every `launch` field above plus `image_config_id` from the enrolled release, with exact types. Do not mint fresh identities or rebind a report by editing enrollment.
 
