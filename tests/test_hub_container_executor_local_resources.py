@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import httpx
+_ORIGINAL_HTTPX_SEND = httpx.Client.send
 import pytest
 
 pytest.importorskip("fcntl", reason="Owned local resources require Linux")
@@ -26,8 +27,9 @@ from hub_container_executor import local_resources as module
 from hub_container_executor.adapter import HostAdapter
 from hub_container_executor.build_enrollment import BuildEnrollment
 from hub_container_executor.daemon_backend import DockerEngineBackend, DockerEngineBinding
-from hub_container_executor.state_provider import StateProvisionError
+from hub_container_executor.state_provider import StateProvisionError, FrozenSQLiteStateProvisioner
 from tests.test_hub_container_executor_build_record import canonical, digest, make_record
+from tests.test_hub_current_executor_observation import setup as signed_observer_setup, Signer
 
 pytestmark = pytest.mark.skipif(os.getuid() != 10001 or os.getgid() != 10001,
                                 reason="Actual app UID/GID10001 required")
@@ -426,3 +428,448 @@ async def test_concrete_factory_runs_in_owned_listener_and_exits_off_loop(rig):
     assert observed["exit_thread"] != main_thread
     assert observed["adapter"]._closed and observed["adapter"].backend._client.is_closed
     assert all(any(closed is obj for _, closed in rig.closed) for _, obj in rig.constructed)
+
+
+def test_opt_in_resources_enable_protocol_without_contacting_daemon(rig):
+    params=dict(rig.params, single_pilot_protocol=True)
+    with module.local_host_adapter_resources(**params) as adapter:
+        assert type(adapter) is HostAdapter
+        assert adapter.ledger.single_pilot_enabled()
+        assert adapter.ledger.inspect_single_pilot() is None
+        assert type(adapter.backend) is DockerEngineBackend
+        assert adapter.backend.operation_journal is not None
+        assert type(adapter.state_provisioner) is FrozenSQLiteStateProvisioner
+
+
+def test_bound_resources_reopen_only_with_real_signed_observer_and_existing_key(rig, signed_observer_setup, monkeypatch):
+    from engineering_hub.current_executor_observation import CurrentExecutorObserver
+    from hub_container_executor.bound_installed_config import InstalledBoundProfile
+    from hub_container_executor.effect_mac_key import create_for_new_journal
+    from hub_container_executor.postlaunch_delivery import ProtectedApprovalLease
+    from hub_container_executor.runtime_identity import LaunchReceiptIdentityVerifier
+    from tests.test_hub_container_effect_binding_canonical import fixture
+    clock, release, launch, signer, old_observer = signed_observer_setup
+    class Driver:
+        def implementation_commit(self): return rig.params['manifest'].driver.implementation_commit
+    path = rig.params['journal_database']
+    key_id = create_for_new_journal(path.parent, path.name)
+    params = dict(rig.params, single_pilot_protocol=True, driver_identity_verifier=Driver())
+    with module.local_host_adapter_resources(**params) as adapter:
+        adapter.backend.operation_journal.enable_bindings()
+    release = replace(release, implementation_commit=rig.params['manifest'].driver.implementation_commit,
+                      platform=rig.params['binding'].platform)
+    launch = replace(launch, engine_id=rig.params['binding'].daemon_identity)
+    observer = CurrentExecutorObserver(release=release, launch=launch, transport=Signer(release, launch, signer.key, clock))
+    profile = InstalledBoundProfile(key_id, '/fixture/approval.json', bytes(32), 30000, (fixture(),))
+    # This resource-lifecycle fixture isolates sequencing; crypto/delivery
+    # checks are covered by postlaunch approval tests, not this synthetic lease.
+    lease = ProtectedApprovalLease('/fixture/approval.json', bytes(32), SimpleNamespace(launch=launch),
+                                   object.__new__(LaunchReceiptIdentityVerifier), release, bytes(32), launch.engine_id)
+    monkeypatch.setattr(ProtectedApprovalLease, 'check', lambda self: self.approval)
+    params.update(journal_create=False, state_reservations_create=False,
+                  bound_profile=profile, bound_observer=observer, bound_release=release, bound_approval_lease=lease)
+    try:
+        with module.local_host_adapter_resources(**params) as adapter:
+            assert adapter.effect_context_guard.scope.__self__ is adapter.backend
+            assert adapter.backend.effect_binding_provider.source_ledger is adapter.ledger
+            adapter.backend.operation_journal.require_no_pending(allow_bound=True)
+        with pytest.raises(module.LocalResourcesError):
+            with module.local_host_adapter_resources(**(params | {'bound_observer': object()})):
+                pass
+    finally:
+        observer.close()
+        old_observer.close()
+
+
+def _attach_synthetic_engine(adapter, params, *, lose_stop=False, resurrect_candidate=False, resurrect_final=False,
+                             candidate_unhealthy=True):
+    from tests.test_hub_container_executor_daemon_backend import container_inspect, docker_config, oci_archive, json_bytes
+    backend=adapter.backend; manifest=adapter.manifest
+    images={role:adapter._verified_image(role) for role in ('candidate','rollback')}
+    image_by_ref={image.runnable_reference:image for image in images.values()}
+    blobs={('sha256:'+path.name):path.read_bytes() for path in params['metadata_root'].iterdir()}
+    secrets=adapter._resolve_secrets(); baseline=adapter.baseline_provider.enrolled_baseline(manifest)
+    defaults=adapter._defaults_from_record(images['rollback'])
+    profile=adapter._profile(images['rollback'],defaults,baseline.state_generation_id,secrets)
+    containers={baseline.container_id:container_inspect(images['rollback'],profile,
+        str(params['binding'].generation_root + '/' + baseline.state_generation_id),baseline.container_id,'running')}
+    if backend.app_cgroup_observer is not None:
+        containers[baseline.container_id]['HostConfig']['CgroupParent'] = backend.app_cgroup_observer._pins.parent
+    executions={}; posts=[]; counter=0; stopped_rollback_inspections=0
+    def handler(request):
+        nonlocal counter, stopped_rollback_inspections
+        path=request.url.raw_path.decode('ascii').split('?',1)[0]
+        if request.method == 'POST': posts.append(path)
+        if path.endswith('/info'):
+            return httpx.Response(200,json={'ID':manifest.runner_binding.daemon_identity,'OSType':'linux','Architecture':'amd64'})
+        if '/images/' in path and path.endswith('/json'):
+            image=next(v for k,v in image_by_ref.items() if k.replace(':','%3A') in path)
+            return httpx.Response(200,json=docker_config(image))
+        if '/images/' in path and path.endswith('/get'):
+            image=next(v for k,v in image_by_ref.items() if k.replace(':','%3A') in path)
+            return httpx.Response(200,content=oci_archive(image,blobs))
+        if '/containers/' in path and path.endswith('/json'):
+            cid=path.split('/containers/',1)[1].removesuffix('/json')
+            if resurrect_final and cid == ('d' if resurrect_final == 'candidate' else 'e')*64 and cid in containers and containers[cid]['State']['Status'] == 'exited':
+                stopped_rollback_inspections += 1
+                if stopped_rollback_inspections >= 3:
+                    containers[cid]['State']['Status'] = 'running'
+            return httpx.Response(200,json=containers[cid]) if cid in containers else httpx.Response(404,json={'message':'absent'})
+        if path.endswith('/containers/create'):
+            body=json.loads(request.content); image=image_by_ref[body['Image']]
+            cid='d'*64 if image.role=='candidate' else 'e'*64
+            source=body['HostConfig']['Mounts'][0]['Source']; generation=source.rsplit('/',1)[1]
+            active=adapter._profile(image,adapter._defaults_from_record(image),generation,secrets)
+            if resurrect_candidate and image.role == 'rollback':
+                containers['d'*64]['State']['Status']='running'
+            containers[cid]=container_inspect(image,active,source,cid,'created')
+            if backend.app_cgroup_observer is not None:
+                containers[cid]['HostConfig']['CgroupParent'] = backend.app_cgroup_observer._pins.parent
+            return httpx.Response(201,json={'Id':cid,'Warnings':[]})
+        if path.endswith('/stop') and '/containers/' in path:
+            cid=path.split('/containers/',1)[1].removesuffix('/stop')
+            if lose_stop is True or (lose_stop == 'rollback' and cid == 'e'*64):
+                raise httpx.ReadTimeout('synthetic lost stop response', request=request)
+            containers[cid]['State']['Status']='exited'
+            return httpx.Response(204)
+        if path.endswith('/start') and '/containers/' in path:
+            cid=path.split('/containers/',1)[1].removesuffix('/start'); containers[cid]['State']['Status']='running'
+            return httpx.Response(204)
+        if path.endswith('/exec') and '/containers/' in path:
+            cid=path.split('/containers/',1)[1].removesuffix('/exec'); counter+=1; eid=f'{counter:064x}'
+            argv=json.loads(request.content)['Cmd']; failed=candidate_unhealthy and cid=='d'*64 and argv[4]=='health_json'
+            executions[eid]={'report':{'expectation_id':argv[7],'ok':not failed,'status':503 if failed else int(argv[6])},'exit':1 if failed else 0}
+            return httpx.Response(201,json={'Id':eid})
+        if path.endswith('/start') and '/exec/' in path:
+            eid=path.split('/exec/',1)[1].removesuffix('/start'); raw=json_bytes(executions[eid]['report'])
+            return httpx.Response(200,content=bytes([1,0,0,0])+len(raw).to_bytes(4,'big')+raw)
+        if path.endswith('/json') and '/exec/' in path:
+            eid=path.split('/exec/',1)[1].removesuffix('/json')
+            return httpx.Response(200,json={'ID':eid,'Running':False,'ExitCode':executions[eid]['exit']})
+        raise AssertionError('unexpected synthetic route '+path)
+    backend._client.close(); backend._client=httpx.Client(transport=httpx.MockTransport(handler),base_url='http://docker')
+    backend._client.send = _ORIGINAL_HTTPX_SEND.__get__(backend._client, httpx.Client)
+    backend._using_test_transport=True
+    return posts
+
+
+def test_single_pilot_concrete_resources_four_phases_and_ack_with_synthetic_engine(rig):
+    from engineering_hub.container_pilot_client import single_pilot_outcome_digest
+    from tests.test_hub_container_executor_adapter import command
+    class Driver:
+        def implementation_commit(self): return rig.params['manifest'].driver.implementation_commit
+    params=dict(rig.params, single_pilot_protocol=True, driver_identity_verifier=Driver())
+    with module.local_host_adapter_resources(**params) as adapter:
+        manifest=adapter.manifest
+        posts=_attach_synthetic_engine(adapter,params)
+        run=str(uuid4())
+        for action, state, health in [('deploy_container','succeeded','unknown'),('smoke_container','failed','unhealthy'),
+                                      ('rollback_container','succeeded','unknown'),('smoke_container_rollback','succeeded','healthy')]:
+            req=command(manifest,action,run_id=run)
+            result=adapter.submit(req)
+            assert (result.state,result.evidence.health)==(state,health), (action,result)
+            assert adapter.ledger.inspect_single_pilot()['state']=='awaiting_ack'
+            acknowledged=adapter.acknowledge_single_pilot(req,single_pilot_outcome_digest(result))
+            assert acknowledged.state == state
+        assert sum(path.endswith('/containers/create') for path in posts)==2
+
+
+@pytest.mark.parametrize('deny_start', [False, True])
+def test_bound_single_pilot_submit_derives_start_target_from_create(rig, deny_start):
+    """Actual v2 submit, real ledgers/key/state, synthetic Engine and verifier."""
+    from uuid import UUID, uuid5
+    from hub_container_executor.adapter import TrustedEffectContextGuard
+    from hub_container_executor.effect_mac_key import create_for_new_journal, EffectMacKey
+    from hub_container_executor.enrolled_effect_provider import enrolled_effect_provider, DeferredTargetEffect
+    from tests.test_hub_container_effect_binding_canonical import fixture
+    from tests.test_hub_container_executor_adapter import command
+    class Driver:
+        def implementation_commit(self): return rig.params['manifest'].driver.implementation_commit
+    journal_path = rig.params['journal_database']
+    key_id = create_for_new_journal(journal_path.parent, journal_path.name)
+    params = dict(rig.params, single_pilot_protocol=True, driver_identity_verifier=Driver())
+    with module.local_host_adapter_resources(**params) as adapter:
+        journal = adapter.backend.operation_journal
+        journal.enable_bindings()
+        key = EffectMacKey(journal_path.parent, journal_path.name, expected_key_id=key_id)
+        try:
+            posts = _attach_synthetic_engine(adapter, params)
+            req = command(adapter.manifest, 'deploy_container')
+            op_state = str(uuid5(UUID(req.command_id), 'state_copy'))
+            op_create = str(uuid5(UUID(req.command_id), 'create_candidate'))
+            op_start = str(uuid5(UUID(req.command_id), 'start_candidate'))
+            generation = adapter.state_provisioner._generation(req.run_id, op_state, 'candidate')
+            image = adapter._verified_image('candidate')
+            profile = adapter._profile(image, adapter._defaults_from_record(image), generation,
+                                       adapter._resolve_secrets())
+            create = replace(fixture(), operation_id=op_create, run_id=req.run_id,
+                kind='create_candidate', fence=req.fencing_generation, owner_epoch=journal._owner.epoch,
+                resource_name=f'{adapter.manifest.runtime.resource_name_prefix}-{req.run_id[:12]}-candidate',
+                container_id=None, image_index_digest=image.runnable_reference,
+                platform_manifest_digest=image.platform_manifest_digest, image_config_id=image.image_config_id,
+                state_generation_id=generation, environment_names=tuple(n for n, _ in profile.environment),
+                memory_bytes=profile.memory_bytes, cpu_millicores=profile.cpu_millicores,
+                pids_limit=profile.pids_limit, tmpfs_bytes=profile.tmpfs[0][1])
+            start = replace(create, operation_id=op_start, kind='start', resource_name=None)
+            adapter.backend.effect_binding_provider = enrolled_effect_provider(journal, key,
+                (create, DeferredTargetEffect(start, req.command_id)), source_ledger=adapter.ledger,
+                verify_generation=lambda actual, _: not (deny_start and actual.context.kind == 'start_candidate'))
+            adapter.effect_context_guard = TrustedEffectContextGuard(lambda _: True, adapter.backend.effect_context_scope)
+            result = adapter.submit(req)
+            if deny_start:
+                assert result.state == 'held'
+                assert sum(path.endswith('/containers/create') for path in posts) == 1
+                assert not any('/containers/' in path and path.endswith('/start') for path in posts)
+                before = list(posts)
+                assert adapter.submit(req).state == 'held'
+                assert posts == before
+            else:
+                assert result.state == 'succeeded'
+                assert result.evidence.container_id == 'd' * 64
+                assert journal.inspect_binding(op_start).target_id == 'd' * 64
+                assert sum(path.endswith('/containers/create') for path in posts) == 1
+                assert sum('/containers/' in path and path.endswith('/start') for path in posts) == 1
+        finally:
+            key.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('lost', ['submit', 'ack'])
+async def test_concrete_controller_asgi_recovers_lost_response_without_effect_replay(rig, lost):
+    from engineering_hub.container_pilot import ContainerPilotTarget, ContainerPilotWorkflow
+    from engineering_hub.container_pilot_client import ContainerPilotClient
+    from engineering_hub.pilot_ownership import PilotOwner
+    from engineering_hub.pilot_recovery import PilotRecovery
+    from engineering_hub.repository import HubRepository
+    from hub_container_executor.asgi import create_app
+    class Driver:
+        def implementation_commit(self): return rig.params['manifest'].driver.implementation_commit
+    class LoseOnce(httpx.AsyncBaseTransport):
+        def __init__(self, app): self.inner=httpx.ASGITransport(app=app); self.lost=False
+        async def handle_async_request(self, request):
+            response=await self.inner.handle_async_request(request)
+            path=request.url.path
+            selected=(lost=='submit' and path=='/v2/container-pilot/commands') or (lost=='ack' and path.endswith('/acknowledge'))
+            if request.method=='POST' and selected and not self.lost:
+                self.lost=True
+                await response.aclose()
+                raise httpx.ReadError('synthetic response loss after server completed',request=request)
+            return response
+        async def aclose(self): await self.inner.aclose()
+    params=dict(rig.params,single_pilot_protocol=True,driver_identity_verifier=Driver())
+    controller_dir=rig.paths['adapter'].parent / 'controller'; controller_dir.mkdir(mode=0o700)
+    db=controller_dir/'hub.sqlite'
+    with module.local_host_adapter_resources(**params) as adapter:
+        posts=_attach_synthetic_engine(adapter,params)
+        app=create_app(adapter,bearer_token='synthetic-only')
+        transport=LoseOnce(app)
+        client=ContainerPilotClient('http://127.0.0.1','synthetic-only',transport=transport,single_pilot_protocol=True)
+        owner=PilotOwner(db,allow_ephemeral_test_storage=True)
+        try:
+            repo=HubRepository(db,execution_principal='executor:container-pilot',pilot_owner=owner)
+            target=ContainerPilotTarget.from_manifest(adapter.manifest)
+            workflow=ContainerPilotWorkflow(repo,client,[target],pilot_owner=owner,single_pilot_protocol=True)
+            task=repo.create_task('human:1234','engineering-hub','Synthetic pilot','synthetic')
+            task=repo.claim_task('codex',task['id'],task['revision'])
+            commit=adapter.manifest.candidate.source_commit
+            task=repo.set_candidate('codex',task['id'],task['revision'],commit)
+            task=repo.review_task('claude',task['id'],task['revision'],commit,'approve')
+            run=workflow.create_run('codex',task['id'],task['revision'],adapter.manifest.candidate.image_config_id,target.target_id)
+            held=await workflow.advance(run['id'])
+            assert held['status']=='held' and transport.lost
+            assert sum(path.endswith('/containers/create') for path in posts)==1
+            before_recovery = tuple(posts)
+        finally:
+            owner.close(); await client.aclose()
+        owner=PilotOwner(db,allow_ephemeral_test_storage=True)
+        client=ContainerPilotClient('http://127.0.0.1','synthetic-only',transport=httpx.ASGITransport(app=app),single_pilot_protocol=True)
+        try:
+            repo=HubRepository(db,execution_principal='executor:container-pilot',pilot_owner=owner)
+            resumed=ContainerPilotWorkflow(repo,client,[target],pilot_owner=owner,single_pilot_protocol=True)
+            recovered=await PilotRecovery(resumed).recover(run['id'])
+            assert recovered['recovery']=='recovered' and recovered['run']['status']=='running'
+            assert tuple(posts) == before_recovery  # no create/start/exec effect during recovery
+            final=await resumed.advance(run['id'])
+            assert final['status']=='rolled_back'
+            assert sum(path.endswith('/containers/create') for path in posts)==2
+        finally:
+            owner.close(); await client.aclose()
+
+@pytest.mark.parametrize('scenario', ['success', 'lost_stop', 'restarted_candidate', 'revoked_stop'])
+def test_bound_v3_rollback_stops_candidate_before_replacement(rig, monkeypatch, scenario):
+    """Real local journals, fake Engine and synthetic verifier; no host assurance."""
+    import time
+    from uuid import UUID, uuid5
+    from engineering_hub.container_pilot_client import single_pilot_outcome_digest
+    from hub_container_executor.adapter import TrustedEffectContextGuard
+    from hub_container_executor.app_cgroup_observation import AppCgroupObserver, AppCgroupPins, AppCgroupObservation
+    from hub_container_executor.effect_response_recorder import DurableEffectResponseRecorder
+    from hub_container_executor.effect_mac_key import create_for_new_journal, EffectMacKey
+    from hub_container_executor.enrolled_effect_provider import enrolled_effect_provider, DeferredTargetEffect
+    from tests.test_hub_container_effect_binding_canonical import fixture
+    from tests.test_hub_container_executor_adapter import command
+    class Driver:
+        def implementation_commit(self): return rig.params['manifest'].driver.implementation_commit
+    journal_path=rig.params['journal_database']
+    key_id=create_for_new_journal(journal_path.parent,journal_path.name)
+    params=dict(rig.params,single_pilot_protocol=True,driver_identity_verifier=Driver())
+    with module.local_host_adapter_resources(**params) as adapter:
+        journal=adapter.backend.operation_journal; journal.enable_bindings(); journal.enable_response_records()
+        key=EffectMacKey(journal_path.parent,journal_path.name,expected_key_id=key_id)
+        try:
+            observer=object.__new__(AppCgroupObserver)
+            observer._pins=AppCgroupPins('test.slice',1,2,3,4)
+            monkeypatch.setattr(AppCgroupObserver, 'verify', lambda self, cid, *, deadline:
+                AppCgroupObservation(cid,int(time.time()*1000)+5000,min(deadline,time.monotonic()+5)))
+            adapter.backend.app_cgroup_observer=observer
+            adapter.backend.effect_response_recorder=DurableEffectResponseRecorder(journal,key)
+            adapter._stop_failed_candidate_before_rollback=True
+            posts=_attach_synthetic_engine(adapter,params,lose_stop=(scenario=='lost_stop'),
+                                           resurrect_candidate=(scenario=='restarted_candidate'))
+            run=str(uuid4())
+            deploy=command(adapter.manifest,'deploy_container',run_id=run)
+            smoke=command(adapter.manifest,'smoke_container',run_id=run)
+            rollback=command(adapter.manifest,'rollback_container',run_id=run)
+            smoke_rollback=command(adapter.manifest,'smoke_container_rollback',run_id=run)
+            effects=[]
+            for req,role,probe_req in ((deploy,'candidate',smoke),(rollback,'rollback',smoke_rollback)):
+                state_kind='state_copy' if role=='candidate' else 'rollback_state'
+                generation=adapter.state_provisioner._generation(run,str(uuid5(UUID(req.command_id),state_kind)),role)
+                image=adapter._verified_image(role)
+                profile=adapter._profile(image,adapter._defaults_from_record(image),generation,adapter._resolve_secrets())
+                create=replace(fixture(),operation_id=str(uuid5(UUID(req.command_id),'create_'+role)),run_id=run,
+                    kind='create_'+role,fence=req.fencing_generation,owner_epoch=journal._owner.epoch,
+                    resource_name=f'{adapter.manifest.runtime.resource_name_prefix}-{run[:12]}-{role}',
+                    container_id=None,image_index_digest=image.runnable_reference,
+                    platform_manifest_digest=image.platform_manifest_digest,image_config_id=image.image_config_id,
+                    state_generation_id=generation,environment_names=tuple(n for n,_ in profile.environment),
+                    memory_bytes=profile.memory_bytes,cpu_millicores=profile.cpu_millicores,
+                    pids_limit=profile.pids_limit,tmpfs_bytes=profile.tmpfs[0][1])
+                start=replace(create,operation_id=str(uuid5(UUID(req.command_id),'start_'+role)),kind='start',resource_name=None)
+                probes=adapter.manifest.probes.candidate if role=='candidate' else adapter.manifest.probes.rollback
+                probe=replace(create,operation_id=str(uuid5(UUID(probe_req.command_id),'probe')),kind='probe',
+                    resource_name=None,probe_set_digest=adapter._probe_digest(probes))
+                effects.extend((create,DeferredTargetEffect(start,req.command_id),DeferredTargetEffect(probe,req.command_id)))
+                if role=='candidate':
+                    stop=replace(create,operation_id=str(uuid5(UUID(rollback.command_id),'stop')),kind='stop',resource_name=None)
+                    effects.append(DeferredTargetEffect(stop,req.command_id))
+            adapter.backend.effect_binding_provider=enrolled_effect_provider(journal,key,tuple(effects),
+                source_ledger=adapter.ledger,verify_generation=lambda actual, _: not (
+                    scenario=='revoked_stop' and actual.context.kind=='stop'))
+            adapter.effect_context_guard=TrustedEffectContextGuard(lambda _: True,adapter.backend.effect_context_scope)
+            for req,expected in ((deploy,'succeeded'),(smoke,'failed')):
+                result=adapter.submit(req)
+                assert result.state==expected, result
+                adapter.acknowledge_single_pilot(req,single_pilot_outcome_digest(result))
+            result=adapter.submit(rollback)
+            if scenario in ('lost_stop','revoked_stop'):
+                assert result.state=='held',result
+                assert adapter.ledger.target_snapshot(rollback.target_id)['container_id']=='d'*64
+                before=list(posts)
+                assert adapter.submit(rollback).state=='held'
+                assert posts==before
+                assert sum(p.endswith('/containers/create') for p in posts)==1
+                if scenario=='revoked_stop':
+                    assert not any(p.endswith('/stop') for p in posts)
+            elif scenario=='restarted_candidate':
+                assert result.state=='held',result
+                before=list(posts)
+                assert adapter.submit(rollback).state=='held'
+                assert posts==before
+            else:
+                assert result.state=='succeeded',result
+                stop_index=next(i for i,p in enumerate(posts) if p.endswith('/stop'))
+                creates=[i for i,p in enumerate(posts) if p.endswith('/containers/create')]
+                assert len(creates)==2 and creates[0]<stop_index<creates[1]
+                assert '/'+('d'*64)+'/stop' in posts[stop_index]
+                adapter.acknowledge_single_pilot(rollback,single_pilot_outcome_digest(result))
+                assert adapter.submit(smoke_rollback).state=='succeeded'
+        finally:
+            key.close()
+
+
+@pytest.mark.parametrize('scenario', ['success', 'revoked', 'lost_response', 'restarted'])
+@pytest.mark.parametrize('final_role', ['candidate', 'rollback'])
+def test_bound_v3_disposable_final_stop(rig, monkeypatch, scenario, final_role):
+    """Real journals and fake Engine; this is not a host or quiescence proof."""
+    import time
+    from uuid import UUID, uuid5
+    from engineering_hub.container_pilot_client import single_pilot_outcome_digest
+    from hub_container_executor.adapter import TrustedEffectContextGuard
+    from hub_container_executor.app_cgroup_observation import AppCgroupObserver, AppCgroupPins, AppCgroupObservation
+    from hub_container_executor.effect_response_recorder import DurableEffectResponseRecorder
+    from hub_container_executor.effect_mac_key import create_for_new_journal, EffectMacKey
+    from hub_container_executor.enrolled_effect_provider import enrolled_effect_provider, DeferredTargetEffect
+    from tests.test_hub_container_effect_binding_canonical import fixture
+    from tests.test_hub_container_executor_adapter import command
+
+    class Driver:
+        def implementation_commit(self): return rig.params['manifest'].driver.implementation_commit
+
+    journal_path = rig.params['journal_database']
+    key_id = create_for_new_journal(journal_path.parent, journal_path.name)
+    params = dict(rig.params, single_pilot_protocol=True, driver_identity_verifier=Driver())
+    with module.local_host_adapter_resources(**params) as adapter:
+        journal = adapter.backend.operation_journal
+        journal.enable_bindings(); journal.enable_response_records()
+        key = EffectMacKey(journal_path.parent, journal_path.name, expected_key_id=key_id)
+        try:
+            observer = object.__new__(AppCgroupObserver); observer._pins = AppCgroupPins('test.slice',1,2,3,4)
+            monkeypatch.setattr(AppCgroupObserver, 'verify', lambda self, cid, *, deadline:
+                AppCgroupObservation(cid,int(time.time()*1000)+5000,min(deadline,time.monotonic()+5)))
+            adapter.backend.app_cgroup_observer = observer
+            adapter.backend.effect_response_recorder = DurableEffectResponseRecorder(journal,key)
+            adapter._stop_failed_candidate_before_rollback = True
+            # Exercise the guarded stop path with the existing historical rig;
+            # separate manifest tests cover explicit digest-bound opt in.
+            adapter.ledger._disposable_final_cleanup = True
+            posts = _attach_synthetic_engine(adapter,params,lose_stop=(True if final_role == 'candidate' else 'rollback')
+                                             if scenario == 'lost_response' else False,
+                                             resurrect_final=final_role if scenario == 'restarted' else False,
+                                             candidate_unhealthy=final_role == 'rollback')
+            run = str(uuid4())
+            deploy, smoke, rollback, smoke_rollback, cleanup = [command(adapter.manifest, action, run_id=run)
+                for action in ('deploy_container','smoke_container','rollback_container',
+                               'smoke_container_rollback','cleanup_'+final_role)]
+            effects = []
+            for req, role, probe_req in ((deploy,'candidate',smoke),(rollback,'rollback',smoke_rollback)):
+                state_kind = 'state_copy' if role == 'candidate' else 'rollback_state'
+                generation = adapter.state_provisioner._generation(run,str(uuid5(UUID(req.command_id),state_kind)),role)
+                image = adapter._verified_image(role)
+                profile = adapter._profile(image,adapter._defaults_from_record(image),generation,adapter._resolve_secrets())
+                create = replace(fixture(),operation_id=str(uuid5(UUID(req.command_id),'create_'+role)),run_id=run,
+                    kind='create_'+role,fence=req.fencing_generation,owner_epoch=journal._owner.epoch,
+                    resource_name=f'{adapter.manifest.runtime.resource_name_prefix}-{run[:12]}-{role}',
+                    container_id=None,image_index_digest=image.runnable_reference,platform_manifest_digest=image.platform_manifest_digest,
+                    image_config_id=image.image_config_id,state_generation_id=generation,
+                    environment_names=tuple(n for n,_ in profile.environment),memory_bytes=profile.memory_bytes,
+                    cpu_millicores=profile.cpu_millicores,pids_limit=profile.pids_limit,tmpfs_bytes=profile.tmpfs[0][1])
+                start = replace(create,operation_id=str(uuid5(UUID(req.command_id),'start_'+role)),kind='start',resource_name=None)
+                probes = adapter.manifest.probes.candidate if role == 'candidate' else adapter.manifest.probes.rollback
+                probe = replace(create,operation_id=str(uuid5(UUID(probe_req.command_id),'probe')),kind='probe',
+                    resource_name=None,probe_set_digest=adapter._probe_digest(probes))
+                stop_req = cleanup if role == final_role else rollback
+                stop = replace(create,operation_id=str(uuid5(UUID(stop_req.command_id),'stop')),kind='stop',resource_name=None)
+                effects.extend((create,DeferredTargetEffect(start,req.command_id),
+                                DeferredTargetEffect(probe,req.command_id),DeferredTargetEffect(stop,req.command_id)))
+            adapter.backend.effect_binding_provider = enrolled_effect_provider(journal,key,tuple(effects),
+                source_ledger=adapter.ledger,verify_generation=lambda actual, _: not (
+                    scenario == 'revoked' and actual.context.request.action == 'cleanup_'+final_role))
+            adapter.effect_context_guard = TrustedEffectContextGuard(lambda _: True,adapter.backend.effect_context_scope)
+            sequence = ((deploy,'succeeded'),(smoke,'succeeded')) if final_role == 'candidate' else (
+                (deploy,'succeeded'),(smoke,'failed'),(rollback,'succeeded'),(smoke_rollback,'succeeded'))
+            for req, expected in sequence:
+                result = adapter.submit(req); assert result.state == expected, result
+                adapter.acknowledge_single_pilot(req,single_pilot_outcome_digest(result))
+            assert adapter.ledger.target_snapshot(cleanup.target_id)['state'] == 'cleanup_pending'
+            result = adapter.submit(cleanup)
+            if scenario != 'success':
+                assert result.state == 'held'
+                before = tuple(posts); assert adapter.submit(cleanup).state == 'held'; assert tuple(posts) == before
+            else:
+                assert result.state == 'succeeded', result
+                assert adapter.ledger.target_snapshot(cleanup.target_id)['state'] == 'held'
+                adapter.acknowledge_single_pilot(cleanup,single_pilot_outcome_digest(result))
+                assert sum(path.endswith('/stop') for path in posts) == (1 if final_role == 'candidate' else 2)
+        finally:
+            key.close()

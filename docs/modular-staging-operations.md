@@ -228,3 +228,9 @@ and verify isolation with separate local browser-test origins only.
 No production deployment, DNS/Cloudflare change, host installation, cleanup,
 daemon activation, filesystem recovery or held-reservation release was performed
 for this document.
+
+Queue request IDs beginning with `staging:` are reserved for internal staging
+controller submissions. Public work-queue REST and MCP submissions must choose
+another prefix. Existing ambiguous jobs using that prefix cannot be cancelled
+through the generic queue operation; review their staging ownership and resources
+before taking further action; no automatic cleanup is provided.

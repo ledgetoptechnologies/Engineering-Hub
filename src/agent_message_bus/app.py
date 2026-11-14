@@ -8,7 +8,7 @@ import re
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager, closing
+from contextlib import AsyncExitStack, asynccontextmanager, closing
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -19,6 +19,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.responses import JSONResponse
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse as StarletteJSONResponse
 
@@ -33,7 +34,8 @@ from .presence import MCPStreamPresenceMiddleware
 from .sqlite_events import MessageCursorReader, SQLiteEventSource, native_event_support
 from .retention import cleanup
 from .agent_sessions_transport import (MCPAuthMiddleware, AgentSessionsBoundaryMiddleware,
-    AgentSessionResponseGuardMiddleware)
+    AgentSessionResponseGuardMiddleware, IsolatedSessionTransportMiddleware)
+from . import agent_sessions_transport
 from .semantic import SemanticIndex
 
 
@@ -170,6 +172,20 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
         mcp.settings.transport_security = transport_security_settings
     app = mcp.streamable_http_app()  # Base app preserves FastMCP's session-manager lifespan.
     original_lifespan = app.router.lifespan_context
+    ehs_manager = None
+    if agent_sessions is not None:
+        legacy_manager = mcp.session_manager
+        # Share only the registered MCP server, not SDK transport state. EHS
+        # churn therefore cannot consume the legacy manager's session slots.
+        ehs_manager = StreamableHTTPSessionManager(
+            app=legacy_manager.app, event_store=legacy_manager.event_store,
+            json_response=legacy_manager.json_response, stateless=False,
+            security_settings=legacy_manager.security_settings,
+            retry_interval=legacy_manager.retry_interval,
+            session_idle_timeout=legacy_manager.session_idle_timeout,
+            max_request_body_size=legacy_manager.max_request_body_size,
+            max_sessions=agent_sessions_transport.MAX_NEW_TRANSPORTS,
+        )
     transport_owners = []
     def capture_transport_owner(owner):
         if transport_owners:
@@ -179,7 +195,10 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
     @asynccontextmanager
     async def application_lifespan(root_app):
         nonlocal event_source
-        async with original_lifespan(root_app):
+        async with AsyncExitStack() as stack:
+            await stack.enter_async_context(original_lifespan(root_app))
+            if ehs_manager is not None:
+                await stack.enter_async_context(ehs_manager.run())
             push_publisher.bind_loop(asyncio.get_running_loop())
             if not disable_native_push:
                 supported, support_reason = native_event_support(repository.path)
@@ -235,6 +254,10 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
                         owner.close()
 
     app.router.lifespan_context = application_lifespan
+    if ehs_manager is not None:
+        # MCPAuthMiddleware is installed outside this route and has already
+        # checked the exact credential and any existing transport owner.
+        app.add_middleware(IsolatedSessionTransportMiddleware, manager=ehs_manager)
     app.add_middleware(MCPAuthMiddleware, auth=auth, push_publisher=push_publisher,
                        agent_sessions=agent_sessions, on_owner=capture_transport_owner)
     app.add_middleware(AgentSessionsBoundaryMiddleware, auth=auth, repository=agent_sessions, config=agent_sessions_config)
@@ -285,6 +308,10 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
         if event_source is not None:
             event_stats = event_source.stats
             push_health["cursor"] = event_stats["cursor"]
+            push_health["degraded"] = bool(event_stats.get("degraded", False))
+            push_health["busy_retry_count"] = event_stats.get("busy_retry_count", 0)
+            if event_stats.get("degraded") and push_health["state"] != "failed":
+                push_health["state"] = "degraded"
             # Safe fixed-stage and canonical SQLite diagnostics, never the
             # source's exception text (which can contain SQL or file paths).
             for key in ("failure_stage", "sqlite_errorcode", "sqlite_errorname"):
@@ -292,7 +319,7 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
                     push_health[key] = event_stats[key]
             if not event_source.healthy:
                 push_health["state"] = "failed"
-        return StarletteJSONResponse({"ok": db_status == "ok" and push_health["state"] != "failed",
+        return StarletteJSONResponse({"ok": db_status == "ok" and push_health["state"] not in {"failed", "degraded"},
                                       "database": db_status,
                                       "schema_version": 4,
                                       "version": version("agent-message-bus"),
@@ -313,6 +340,7 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
     app.state.push_status = push_state
     app.state.push_cursor_reader = cursor_reader
     app.state.mcp = mcp
+    app.state.agent_session_mcp_manager = ehs_manager
     app.state.auth = auth
     return app
 

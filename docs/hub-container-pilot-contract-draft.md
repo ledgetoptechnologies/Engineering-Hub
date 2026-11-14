@@ -192,8 +192,11 @@ Actions are `deploy_container`, `smoke_container`, `rollback_container` and
 container creation/start is not proof of successful rollback. Per-run phase
 dedupe must not be bypassed by a fresh command UUID.
 
-GET by command UUID is read-only. Explicit bodyless reconcile inspects the
-original effect without replay. Unknown outcomes stay held until inspected;
+GET by command UUID returns the ledger's current view without dispatching an
+effect. In legacy mode explicit bodyless reconcile can inspect original durable
+operation IDs for a held command when a backend is available, without replay;
+in single-pilot mode reconcile returns the ledger's current view and does not
+inspect the daemon or clear a gate. Unknown outcomes stay held until inspected;
 no timeout, lease expiry or new process grants permission to repeat a Docker
 effect. Responses echo every request field and report state, fixed safe reason
 and bounded actual-container evidence. No exception, secret, host path, session
@@ -231,6 +234,42 @@ local storage, never SMB SQLite/lock files. Reserve before I/O; inspect exact
 daemon container ID, image/config, mounts and ownership metadata after an
 uncertain result. Labels or a file receipt alone cannot certify a real container.
 Do not silently start an exited workload during reconciliation.
+
+In single-pilot mode, a failure after arming the effect-held gate but before
+command admission can leave that exact gate held even when there is no command
+or operation row. Matching retries deliberately remain held, including after
+restart. Missing rows alone do not prove that no effect occurred: do not delete
+or reset the gate on that basis. Recovery requires a reviewed procedure that
+first stops and independently fences the owner and dispatcher, preserves the
+ledger, and examines the relevant external evidence. The implemented reconcile
+route does not clear this gate, and a safe clear procedure for this condition is
+not yet implemented.
+
+The executor's no-effect denial replay marker is a row in the existing private
+ledger `control` table; it does not change the ledger schema version. A current
+executor can read an older ledger, but it does not infer that an older held
+denial is safe to release when the marker is absent. The previous protocol-aware
+executor at `85411ff` does not understand the new marker: after a downgrade it
+can reopen the ledger, but it masks the original denial as `recovery_required`
+and cannot replay that denial exactly. Executors predating the single-pilot
+protocol can ignore its control rows entirely; the unchanged schema version is
+not a downgrade fence.
+
+The synthetic cross-version ledger checks in
+`tests/test_hub_container_executor_ledger.py` run when the exact `85411ff`
+Git object is available. A shallow checkout or source archive may lack it;
+the checks then explicitly skip and do not establish compatibility. To require
+the check for a review, run the ledger test file with
+`HUB_VERIFY_PRIOR_PILOT_LEDGER=1`; a missing object or Git executable then fails
+the test instead of skipping it. These checks do not validate a host rollback.
+
+An application-image rollback within the pilot is a separate operation from
+replacing or downgrading the executor. Before considering an executor change,
+preserve the ledger and its identity, stop and independently fence the prior
+owner, and establish a reviewed compatibility and recovery procedure for the
+exact executable and retained state. Do not remove denial markers or reset the
+ledger to force a downgrade. These notes do not authorize a deployment or
+establish that rollback or recovery has been validated on a host.
 
 Acceptance must exercise actual app rollout and HTTP/assets/auth-disabled smoke,
 a declared real candidate startup/health failure and actual data-safe rollback,

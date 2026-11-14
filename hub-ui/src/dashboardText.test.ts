@@ -12,12 +12,12 @@ function task(change: Partial<Task>): Task {
 describe("dashboard wording", () => {
   it.each([
     [{ status: "assigned" }, "Waiting for an agent to claim it."],
-    [{ status: "claimed", owner: "codex" }, "Codex is working on it."],
-    [{ status: "claimed", owner: "codex", repair_count: 2 }, "Codex is repairing it (2/3 repairs used)."],
+    [{ status: "claimed", owner: "codex" }, "Codex has claimed it."],
+    [{ status: "claimed", owner: "codex", repair_count: 2 }, "Codex has claimed it for repair (2/3 repairs used)."],
     [{ status: "in_review", owner: "claude", candidate_commit: commit },
       "Waiting for an independent review. No reviewer assigned; any agent except Claude can review."],
     [{ status: "verified", owner: "codex", review: { actor: "claude", commit, verdict: "approve" } },
-      "Review passed by Claude. Running it is separate and needs its own authorization."],
+      "Review passed by Claude. A passed review doesn't start or authorize a run. Running it needs separate authorization, which this page doesn't show."],
   ] as [Partial<Task>, string][])("derives waiting-on from recorded state %#", (change, text) => {
     expect(waitingOn(task(change), name)).toBe(text);
   });

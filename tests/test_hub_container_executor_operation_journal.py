@@ -5,7 +5,8 @@ import sqlite3
 import subprocess
 import sys
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
+from dataclasses import replace
 from uuid import uuid4
 
 import pytest
@@ -13,11 +14,237 @@ import pytest
 pytest.importorskip("fcntl", reason="Host executor package requires actual Linux kernel ownership")
 
 from hub_container_executor.operation_journal import (
-    SQLiteOperationJournal, OperationJournalConflict, OperationJournalError,
+    SQLiteOperationJournal, OperationJournalConflict, OperationJournalError, OperationBinding,
 )
 
 LINUX = pytest.mark.skipif(sys.platform != "linux", reason="Actual private Linux journal ownership")
 CID = "a" * 64
+
+
+def binding(*, name="hub-pilot-demo-0123456789ab-candidate", target=None, mac=None):
+    return OperationBinding(str(uuid4()), 123, 456, name, target,
+                            mac or "hmac-sha256:" + "a" * 64, 1)
+
+
+@LINUX
+def test_opt_in_migration_keeps_legacy_pending_and_bound_ids_unique(path):
+    legacy, bound = str(uuid4()), str(uuid4())
+    value = binding()
+    with journal(path) as store:
+        store.begin(legacy, "create_candidate")
+        with pytest.raises(OperationJournalError):
+            store.begin_bound(bound, "create_candidate", value)
+        store.enable_bindings()
+        assert store.inspect(legacy).state == "pending"
+        assert store.inspect_binding(legacy) is None
+        with pytest.raises(OperationJournalError):
+            store.begin(str(uuid4()), "create_candidate")
+        store.begin_bound(bound, "create_candidate", value)
+        assert store.inspect(bound).state == "pending"
+        recorded = store.inspect_binding(bound)
+        record = store.inspect_record(bound)
+        assert (record.operation_id, record.kind, record.state, record.container_id) == (bound, 'create_candidate', 'pending', None)
+        assert recorded == replace(value, owner_epoch=store._owner.epoch)
+        with pytest.raises(OperationJournalConflict):
+            store.begin_bound(str(uuid4()), "create_candidate", value)
+        with pytest.raises(OperationJournalConflict):
+            store.begin_bound(bound, "create_candidate", value)
+    with journal(path, create=False) as store:
+        assert store.inspect(legacy).state == "pending"
+        assert store.inspect_binding(bound) == recorded
+        assert recorded.owner_epoch != store._owner.epoch
+
+
+@LINUX
+def test_bound_target_validation_and_no_plaintext_binding(path):
+    with journal(path) as store:
+        store.enable_bindings()
+        identity = str(uuid4())
+        value = binding(name=None, target=CID)
+        store.begin_bound(identity, "start", value)
+        assert store.inspect_binding(identity) == replace(value, owner_epoch=store._owner.epoch)
+        with pytest.raises(OperationJournalError):
+            store.begin_bound(str(uuid4()), "start", replace(value, owner_epoch=str(uuid4())))
+        for invalid in (binding(name=None, target=None), binding(name=None, target=CID, mac="secret-token"),
+                        binding(name="../foreign")):
+            with pytest.raises(OperationJournalError):
+                store.begin_bound(str(uuid4()), "start", invalid)
+        assert b"secret-token" not in path.read_bytes()
+
+
+@LINUX
+def test_single_pilot_bound_journal_requires_opt_in_and_no_pending(path):
+    with journal(path) as store:
+        store.enable_bindings()
+        with pytest.raises(OperationJournalError):
+            store.require_no_pending()
+        store.require_no_pending(allow_bound=True)
+        identity = str(uuid4())
+        store.begin_bound(identity, 'stop', binding(name=None, target=CID))
+        with pytest.raises(OperationJournalError):
+            store.require_no_pending(allow_bound=True)
+        store.completed(identity, 'stop', CID)
+        store.require_no_pending(allow_bound=True)
+        with pytest.raises(OperationJournalConflict):
+            store.begin_bound(identity, 'stop', binding(name=None, target=CID))
+
+
+@LINUX
+def test_single_pilot_bound_mode_refuses_migrated_unbound_history(path):
+    with journal(path) as store:
+        identity = str(uuid4())
+        store.begin(identity, 'stop')
+        store.completed(identity, 'stop', CID)
+        store.enable_bindings()
+        with pytest.raises(OperationJournalError):
+            store.require_no_pending(allow_bound=True)
+
+
+@LINUX
+@pytest.mark.parametrize("kind", ("start", "stop", "probe"))
+def test_bound_completion_requires_original_container_and_allows_exact_retry(path, kind):
+    identity = str(uuid4())
+    with journal(path) as store:
+        store.enable_bindings()
+        store.begin_bound(identity, kind, binding(name=None, target=CID))
+        with pytest.raises(OperationJournalConflict):
+            store.completed(identity, kind, "b" * 64)
+        assert store.inspect_record(identity).state == "pending"
+        assert store.inspect_record(identity).container_id is None
+        store.completed(identity, kind, CID)
+        store.completed(identity, kind, CID)
+    with journal(path, create=False) as store:
+        assert store.inspect_record(identity).container_id == CID
+        store.completed(identity, kind, CID)
+        with pytest.raises(OperationJournalConflict):
+            store.completed(identity, kind, "b" * 64)
+
+
+@LINUX
+@pytest.mark.parametrize("kind", ("start", "stop", "probe"))
+def test_conflicting_bound_receipt_rejected_before_owner_reopen(path, kind):
+    identity = str(uuid4())
+    with journal(path) as store:
+        store.enable_bindings()
+        store.begin_bound(identity, kind, binding(name=None, target=CID))
+        store.completed(identity, kind, CID)
+    with sqlite3.connect(path) as db:
+        owner_before = db.execute("SELECT * FROM hub_pilot_owner").fetchall()
+        epochs_before = db.execute("SELECT * FROM hub_pilot_owner_epochs").fetchall()
+        db.execute("UPDATE private_operation_journal SET container_id=? WHERE operation_id=?",
+                   ("b" * 64, identity))
+    with pytest.raises(OperationJournalError):
+        journal(path, create=False)
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT * FROM hub_pilot_owner").fetchall() == owner_before
+        assert db.execute("SELECT * FROM hub_pilot_owner_epochs").fetchall() == epochs_before
+
+
+@LINUX
+def test_bound_completion_preserves_legacy_and_create_receipts(path):
+    legacy, created = str(uuid4()), str(uuid4())
+    with journal(path) as store:
+        store.begin(legacy, "stop")
+        store.completed(legacy, "stop", CID)
+        store.enable_bindings()
+        store.completed(legacy, "stop", CID)
+        store.begin_bound(created, "create_candidate", binding())
+        store.completed(created, "create_candidate", "b" * 64)
+    with journal(path, create=False) as store:
+        assert store.inspect_record(legacy).container_id == CID
+        assert store.inspect_binding(legacy) is None
+        assert store.inspect_record(created).container_id == "b" * 64
+
+
+@LINUX
+def test_interrupted_migration_rolls_back_both_schema_and_version(path, monkeypatch):
+    with journal(path) as store:
+        original = __import__("hub_container_executor.operation_journal", fromlist=["_schema"])
+        real = original._schema
+        def reject_v2(db, **kwargs):
+            if db.execute("PRAGMA user_version").fetchone() == (2,):
+                raise OperationJournalError("injected migration failure")
+            return real(db, **kwargs)
+        monkeypatch.setattr(original, "_schema", reject_v2)
+        with pytest.raises(OperationJournalError):
+            store.enable_bindings()
+        monkeypatch.setattr(original, "_schema", real)
+        with sqlite3.connect(path) as db:
+            assert db.execute("PRAGMA user_version").fetchone() == (1,)
+            assert db.execute("SELECT 1 FROM sqlite_master WHERE name='private_operation_binding'").fetchone() is None
+
+
+@LINUX
+def test_binding_insert_failure_rolls_back_intent(path, monkeypatch):
+    identity = str(uuid4())
+    with journal(path) as store:
+        store.enable_bindings()
+        original = store._connection
+        @contextmanager
+        def rejecting(*args, **kwargs):
+            with original(*args, **kwargs) as db:
+                db.set_authorizer(lambda action, table, *rest: sqlite3.SQLITE_DENY
+                    if action == sqlite3.SQLITE_INSERT and table == "private_operation_binding"
+                    else sqlite3.SQLITE_OK)
+                yield db
+        monkeypatch.setattr(store, "_connection", rejecting)
+        with pytest.raises(OperationJournalError):
+            store.begin_bound(identity, "create_candidate", binding())
+        monkeypatch.setattr(store, "_connection", original)
+        assert store.inspect(identity) is None
+        assert store.inspect_binding(identity) is None
+
+
+@LINUX
+def test_orphan_binding_rejected_before_owner_reopen(path):
+    with journal(path) as store:
+        store.enable_bindings()
+    with sqlite3.connect(path) as db:
+        value = binding()
+        db.execute("INSERT INTO private_operation_binding VALUES (?,?,?,?,?,?,?,?,?)",
+                   (str(uuid4()), value.boot_id, value.daemon_pid, value.daemon_start,
+                    value.resource_name, value.target_id, value.request_mac, value.fence, str(uuid4())))
+    with pytest.raises(OperationJournalError):
+        journal(path, create=False)
+
+
+@LINUX
+def test_unknown_owner_epoch_rejected_before_owner_reopen(path):
+    identity = str(uuid4())
+    with journal(path) as store:
+        store.enable_bindings()
+        store.begin_bound(identity, "create_candidate", binding())
+    with sqlite3.connect(path) as db:
+        owner_before = db.execute("SELECT * FROM hub_pilot_owner").fetchall()
+        db.execute("UPDATE private_operation_binding SET owner_epoch=? WHERE operation_id=?",
+                   (str(uuid4()), identity))
+    with pytest.raises(OperationJournalError):
+        journal(path, create=False)
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT * FROM hub_pilot_owner").fetchall() == owner_before
+
+
+@LINUX
+def test_bound_pending_survives_writer_crash_without_replay(path):
+    identity = str(uuid4())
+    boot_id = str(uuid4())
+    script = """
+import os,sys
+from hub_container_executor.operation_journal import SQLiteOperationJournal, OperationBinding
+s=SQLiteOperationJournal(sys.argv[1],create=True,allow_ephemeral_test_storage=True)
+s.enable_bindings()
+b=OperationBinding(sys.argv[3],123,456,'hub-pilot-demo-0123456789ab-candidate',None,'hmac-sha256:'+'a'*64,1)
+s.begin_bound(sys.argv[2],'create_candidate',b)
+os._exit(23)
+"""
+    result = subprocess.run([sys.executable, "-c", script, str(path), identity, boot_id],
+                            timeout=10, capture_output=True, text=True)
+    assert result.returncode == 23
+    with journal(path, create=False) as store:
+        assert store.inspect(identity).state == "pending"
+        assert store.inspect_binding(identity).boot_id == boot_id
+        with pytest.raises(OperationJournalConflict):
+            store.begin_bound(identity, "create_candidate", replace(store.inspect_binding(identity), owner_epoch=None))
 
 
 @pytest.fixture
@@ -46,6 +273,9 @@ def test_pending_and_completed_durable_reopen_and_no_replay(path, kind):
         assert store.inspect(identity) is None
         store.begin(identity, kind)
         observed = store.inspect(identity)
+        record = store.inspect_record(identity)
+        assert (record.operation_id, record.kind, record.state, record.container_id) == (identity, kind, 'pending', None)
+        assert store.inspect_record(str(uuid4())) is None
         assert observed.state == "pending" and observed.terminal is False and observed.container_id is None
         with pytest.raises(OperationJournalConflict):
             store.begin(identity, kind)
@@ -55,6 +285,8 @@ def test_pending_and_completed_durable_reopen_and_no_replay(path, kind):
             store.begin(identity, kind)
         store.completed(identity, kind, CID)
         completed = store.inspect(identity)
+        record = store.inspect_record(identity)
+        assert (record.operation_id, record.kind, record.state, record.container_id) == (identity, kind, 'completed', CID)
         assert completed.state == "completed" and completed.terminal is True and completed.container_id == CID
         store.completed(identity, kind, CID)  # Exact receipt replay alone is idempotent.
         with pytest.raises(OperationJournalConflict):

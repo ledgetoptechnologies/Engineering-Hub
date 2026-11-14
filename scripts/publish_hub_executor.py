@@ -285,6 +285,8 @@ def publish(values, local, target, record):
             or compatibility.get('compatibility', {}).get('core_commit') != values['CORE_COMMIT']
             or compatibility.get('compatibility', {}).get('installed_core_identity') != 'passed'):
         raise ValueError('Exact compatibility receipt required')
+    if compatibility['compatibility'].get('engine_identity') != ci.engine_identity():
+        raise ValueError('Compatibility engine identity changed')
     expected = compatibility['compatibility']['executor_imports']['image_id']
     if type(expected) is not str or not DIGEST.fullmatch(expected):
         raise ValueError('Exact executor config required')
@@ -342,6 +344,8 @@ def publish(values, local, target, record):
     report = smoke(alias, values['SOURCE_COMMIT'])
     if report.get('image_id') != expected:
         raise ValueError('Published smoke identity mismatch')
+    if compatibility['compatibility']['engine_identity'] != ci.engine_identity():
+        raise ValueError('Publication engine identity changed')
     record.update(stage='complete', state='published_verified',
                   installed_imports='passed', staging_acceptance='not_tested')
 

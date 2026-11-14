@@ -306,3 +306,246 @@ def test_trusted_guard_write_postcheck_rolls_back_before_commit():
         assert registry.db.execute('SELECT count(*) FROM infra_devices').fetchone()[0]==0
         assert registry.db.execute('SELECT count(*) FROM infra_events').fetchone()[0]==0
     finally:registry.close()
+
+
+def test_startup_diagnostics_are_bounded_and_do_not_expose_configuration(tmp_path, caplog):
+    secret = 'private-token-in-path-and-content'
+    path = tmp_path / secret
+    path.write_text(secret)
+    module = compose_infrastructure(path, state_root=tmp_path)
+    assert module.state == 'invalid' and module.service is None
+    assert 'config_unreadable_or_invalid' in caplog.text
+    assert secret not in caplog.text and str(tmp_path) not in caplog.text
+    caplog.clear()
+    module = compose_infrastructure(tmp_path / 'absent', state_root=tmp_path)
+    assert module.state == 'disabled'
+    assert 'config_missing_no_default_owner' in caplog.text
+    caplog.clear()
+    module = compose_infrastructure(write(tmp_path / 'disabled', config(False)), state_root=tmp_path)
+    assert module.state == 'disabled'
+    assert 'explicitly_disabled' in caplog.text
+
+
+@POSIX
+def test_startup_diagnostics_identify_private_directory_failure(tmp_path, caplog):
+    settings = write(tmp_path / 'settings.json', config())
+    root = tmp_path / 'infrastructure'
+    root.mkdir(mode=0o755)
+    root.chmod(0o755)
+    module = compose_infrastructure(settings, state_root=tmp_path)
+    assert module.state == 'invalid' and module.service is None
+    assert 'state_directory_mode_failed' in caplog.text
+    assert str(tmp_path) not in caplog.text
+
+
+@POSIX
+def test_directory_chmod_failure_is_safe(tmp_path, caplog, monkeypatch):
+    settings = write(tmp_path / 'settings.json', config())
+    def fail(*args, **kwargs):
+        raise OSError('private failure detail')
+    monkeypatch.setattr(os, 'chmod', fail)
+    module = compose_infrastructure(settings, state_root=tmp_path)
+    assert module.state == 'invalid' and module.service is None
+    assert 'state_directory_chmod_failed' in caplog.text
+    assert 'private failure detail' not in caplog.text and str(tmp_path) not in caplog.text
+
+
+@POSIX
+def test_directory_owner_failure_is_safe(tmp_path, caplog, monkeypatch):
+    settings = write(tmp_path / 'settings.json', config())
+    root = tmp_path / 'infrastructure'
+    root.mkdir(mode=0o700)
+    original = os.fstat
+    def altered(fd):
+        info = original(fd)
+        if info.st_ino == root.stat().st_ino:
+            values = list(info)
+            values[4] = info.st_uid + 1
+            return os.stat_result(values)
+        return info
+    monkeypatch.setattr(os, 'fstat', altered)
+    module = compose_infrastructure(settings, state_root=tmp_path)
+    assert module.state == 'invalid' and module.service is None
+    assert 'state_directory_owner_failed' in caplog.text
+    assert str(tmp_path) not in caplog.text
+
+
+@POSIX
+def test_directory_identity_failure_is_safe(tmp_path, caplog, monkeypatch):
+    import engineering_hub.infrastructure_module as module_impl
+    settings = write(tmp_path / 'settings.json', config())
+    root = tmp_path / 'infrastructure'
+    root.mkdir(mode=0o700)
+    original = module_impl._identity
+    calls = 0
+    def altered(info):
+        nonlocal calls
+        calls += 1
+        identity = original(info)
+        return (identity[0], identity[1] + 1) if calls == 3 else identity
+    monkeypatch.setattr(module_impl, '_identity', altered)
+    module = compose_infrastructure(settings, state_root=tmp_path)
+    assert module.state == 'invalid' and module.service is None
+    assert 'state_directory_identity_failed' in caplog.text
+    assert str(tmp_path) not in caplog.text
+
+
+@POSIX
+def test_existing_directory_is_allowed_but_chmod_file_exists_fails_closed(tmp_path, caplog, monkeypatch):
+    settings = write(tmp_path / 'settings.json', config())
+    existing_state = tmp_path / 'existing'
+    existing_state.mkdir()
+    (existing_state / 'infrastructure').mkdir(mode=0o700)
+    existing = compose_infrastructure(settings, state_root=existing_state)
+    assert existing.state == 'ready'
+    existing.close()
+
+    new_state = tmp_path / 'new'
+    new_state.mkdir()
+    def fail_chmod(*args, **kwargs):
+        raise FileExistsError('private failure detail')
+    monkeypatch.setattr(os, 'chmod', fail_chmod)
+    failed = compose_infrastructure(settings, state_root=new_state)
+    assert failed.state == 'invalid' and failed.service is None
+    assert 'state_directory_chmod_failed' in caplog.text
+    assert 'private failure detail' not in caplog.text and str(tmp_path) not in caplog.text
+
+
+
+
+def _leftover(tmp_path, mode=0o600, content=b''):
+    """A first start that created the file and stopped before the schema."""
+    directory = tmp_path / 'infrastructure'; directory.mkdir(mode=0o700); directory.chmod(0o700)
+    database = directory / 'inventory.sqlite3'; database.write_bytes(content); database.chmod(mode)
+    return directory, database
+
+
+def _snapshot(directory):
+    return {p.name: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode), p.stat().st_ino) for p in directory.iterdir()}
+
+
+def _populated(tmp_path):
+    settings = write(tmp_path / 'settings.json', config())
+    first = compose_infrastructure(settings, state_root=tmp_path); assert first.state == 'ready'
+    first.service.upsert_device('human:1', dict(id='fixture', name='Fixture', addresses=[], role='Fixture'),
+                                expected_revision=0)
+    first.close()
+    return settings, tmp_path / 'infrastructure', tmp_path / 'infrastructure/inventory.sqlite3'
+
+
+@POSIX
+@pytest.mark.parametrize('mode', [0o600, 0o700])
+def test_empty_leftover_is_named_and_left_untouched(tmp_path, caplog, mode):
+    path = tmp_path / 'infrastructure.json'
+    directory, database = _leftover(tmp_path, mode)
+    before = _snapshot(directory)
+    module = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    assert module.state == 'invalid' and module.service is None
+    assert 'database_empty_leftover_failed' in caplog.text and str(tmp_path) not in caplog.text
+    assert _snapshot(directory) == before
+
+
+@POSIX
+def test_after_owner_moves_leftover_fresh_inventory_accepts_simulated_0700_mode(tmp_path, monkeypatch):
+    import engineering_hub.infrastructure_module as module
+    path = tmp_path / 'infrastructure.json'
+    directory, database = _leftover(tmp_path, 0o700)
+    database.rename(directory / 'inventory.sqlite3.reviewed-empty')
+    real = os.fchmod
+
+    def acl_dataset(fd, mode):
+        # Simulate a reported 0700 mode; this does not test effective ACLs.
+        real(fd, 0o700)
+    monkeypatch.setattr(module.os, 'fchmod', acl_dataset)
+    first = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    try:
+        assert first.state == 'ready'
+        assert stat.S_IMODE(database.stat().st_mode) == 0o700
+        first.service.upsert_device('human:1', dict(id='fixture', name='Fixture', addresses=[], role='Fixture'),
+                                    expected_revision=0)
+    finally:
+        first.close()
+    monkeypatch.undo()
+    reopened = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    try:
+        assert reopened.state == 'ready'
+        assert reopened.service.get_device('human:1', 'fixture')['device']['revision'] == 1
+    finally:
+        reopened.close()
+    assert (directory / 'inventory.sqlite3.reviewed-empty').read_bytes() == b''
+
+
+@POSIX
+def test_populated_owner_only_database_with_execute_bit_reopens(tmp_path):
+    settings, directory, database = _populated(tmp_path)
+    database.chmod(0o700)
+    module = compose_infrastructure(settings, state_root=tmp_path)
+    try:
+        assert module.state == 'ready'
+        assert module.service.get_device('hermes', 'fixture')['device']['revision'] == 1
+        assert stat.S_IMODE(database.stat().st_mode) == 0o700
+    finally:
+        module.close()
+
+
+@POSIX
+@pytest.mark.parametrize('mode', [0o640, 0o604, 0o610, 0o601, 0o400, 0o200, 0o1600, 0o2600, 0o4600, 0o1700])
+def test_unsafe_file_modes_stay_closed(tmp_path, caplog, mode):
+    settings, directory, database = _populated(tmp_path)
+    with database.open('rb') as retained:
+        database.chmod(mode)
+        before = (retained.read(), stat.S_IMODE(database.stat().st_mode), database.stat().st_ino)
+        entries = {p.name for p in directory.iterdir()}
+        module = compose_infrastructure(settings, state_root=tmp_path)
+        assert module.state == 'invalid' and module.service is None
+        expected_stage = ('database_admission_failed' if mode == 0o200 and not os.access(database, os.R_OK)
+                          else 'database_file_failed')
+        assert expected_stage in caplog.text
+        retained.seek(0)
+        after = (retained.read(), stat.S_IMODE(database.stat().st_mode), database.stat().st_ino)
+        assert after == before
+        assert {p.name for p in directory.iterdir()} == entries
+
+
+@POSIX
+@pytest.mark.parametrize('late', ['journal', 'wal', 'shm'])
+def test_sidecar_observed_at_pre_open_check_is_refused(tmp_path, monkeypatch, caplog, late):
+    import engineering_hub.infrastructure_module as module
+    settings, directory, database = _populated(tmp_path)
+    original = database.read_bytes()
+    real = sqlite3.connect
+
+    def racing(target, *args, **kwargs):
+        connection = real(target, *args, **kwargs)
+        if 'immutable=1' in str(target):
+            (directory / ('inventory.sqlite3-' + late)).write_bytes(b'foreign uncommitted pages')
+        return connection
+    monkeypatch.setattr(module.sqlite3, 'connect', racing)
+    result = compose_infrastructure(settings, state_root=tmp_path)
+    monkeypatch.undo()
+    assert result.state == 'invalid' and result.service is None
+    assert 'database_open_failed' in caplog.text
+    assert database.read_bytes() == original
+    assert (directory / ('inventory.sqlite3-' + late)).read_bytes() == b'foreign uncommitted pages'
+
+
+@POSIX
+@pytest.mark.parametrize('result_mode,state', [(0o700, 'ready'), (0o640, 'invalid')])
+def test_refused_chmod_on_a_fresh_file_depends_only_on_the_resulting_mode(tmp_path, monkeypatch, caplog,
+                                                                           result_mode, state):
+    import engineering_hub.infrastructure_module as module
+    path = tmp_path / 'infrastructure.json'
+    real = os.fchmod
+
+    def restricted(fd, mode):
+        # Simulate a resulting mode and refused chmod, not an actual ACL.
+        real(fd, result_mode)
+        raise PermissionError(1, 'Operation not permitted')
+    monkeypatch.setattr(module.os, 'fchmod', restricted)
+    module_ = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    try:
+        assert module_.state == state
+        if state == 'invalid':
+            assert 'database_file_failed' in caplog.text
+    finally:
+        module_.close()

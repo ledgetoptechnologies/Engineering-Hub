@@ -148,7 +148,7 @@ def standby_pid1_acceptance(image, owner, volume, names):
 
 
 def smoke(image, commit):
-    if not re.fullmatch(r"ghcr\.io/ledgetoptechnologies/engineering-hub-control:(?:build-)[a-z0-9-]+|ghcr\.io/ledgetoptechnologies/engineering-hub-control@sha256:[a-f0-9]{64}", image):
+    if not re.fullmatch(r"sha256:[a-f0-9]{64}|ghcr\.io/ledgetoptechnologies/engineering-hub-control:(?:build-)[a-z0-9-]+|ghcr\.io/ledgetoptechnologies/engineering-hub-control@sha256:[a-f0-9]{64}", image):
         raise ValueError("Expected the explicit Hub release artifact")
     if not re.fullmatch(r"[a-f0-9]{40}", commit):
         raise ValueError("Expected exact source commit")

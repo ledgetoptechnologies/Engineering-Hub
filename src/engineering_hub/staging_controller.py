@@ -9,14 +9,26 @@ from contextlib import asynccontextmanager
 import base64
 import hashlib
 import json
+import logging
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from threading import BoundedSemaphore
 
 from .repository import AGENTS, HubError
+from . import reconciliation_context
+from .staging_action_key import staging_action_key
+from .staging_source_binding import UNBOUND_HOLD as _UNBOUND_HOLD, valid_source_binding as _valid_source_binding
 from .staging_resources import KINDS
-from .staging_client import _FILE_TYPES, StagingNotAccepted
+from .staging_client import _FILE_TYPES, StagingNotAccepted, _failed_result_consistent
 from .work_queue import WorkAction, WorkQueue, WorkTarget, WorkWorker, STAGING_SERVICE_EXECUTOR
+
+_PROOF_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix='staging-proof')
+_PROOF_SLOT = BoundedSemaphore(1)
+# Admission receipts are retained, never silently pruned. Exhaustion is a
+# visible fail-closed condition until an explicit archival policy exists.
+_MAX_RECONCILIATION_ADMISSIONS = 100000
 
 
 def _json(value):
@@ -26,6 +38,8 @@ def _json(value):
 def _require(value, code='invalid_staging_request', status=400):
     if not value:
         raise HubError(code, status)
+
+
 
 
 def _id(value):
@@ -43,7 +57,7 @@ def compose_queue(repo, existing_queue, projects, machine_id):
         repo._project(project)
         for recipe in recipes:
             _require(type(recipe) is str and re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', recipe))
-            key = 'staging-service.' + hashlib.sha256(_json([project, recipe]).encode()).hexdigest()[:24]
+            key = staging_action_key(project, recipe)
             mapping[(project, recipe)] = key
             actions[key] = WorkAction(machine_id, project=project)
     _require(bool(actions), 'invalid_staging_configuration')
@@ -94,6 +108,7 @@ class StagingController:
             db.execute('CREATE TABLE IF NOT EXISTS hub_staging_submissions (id TEXT PRIMARY KEY,actor TEXT NOT NULL,request_id TEXT NOT NULL,fingerprint TEXT NOT NULL,data TEXT NOT NULL,UNIQUE(actor,request_id))')
             db.execute("CREATE INDEX IF NOT EXISTS hub_staging_submission_job ON hub_staging_submissions(json_extract(data,'$.job_id'))")
             db.execute('CREATE TABLE IF NOT EXISTS hub_staging_dispatch_cleanup (id TEXT PRIMARY KEY,data TEXT NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS hub_staging_reconcile_admissions (id TEXT PRIMARY KEY,job_id TEXT NOT NULL,actor TEXT NOT NULL,fingerprint TEXT NOT NULL,data TEXT NOT NULL,UNIQUE(job_id,actor,fingerprint))')
         self._install_verifiers()
 
     def _shared_guard(self, *, admission=False):
@@ -147,10 +162,15 @@ class StagingController:
                 return old_target(actor, action, environment, value) if old_target else False
             try:
                 self._shared_guard(admission=True)
-                item = self._read(value.task_id)
+                item = self._read(value.submission_id)
+                if item.get('hold_reason') == _UNBOUND_HOLD or not _valid_source_binding(item):
+                    return False
                 self._grants(item['actor'], item['project'])
                 return (actor == item['actor'] and environment == 'staging' and item['phase'] != 'depositing'
                         and action == self.actions[(item['project'], item['recipe'])]
+                        and value.task_id == item['review_task_id']
+                        and value.review_revision == item['review_task_revision']
+                        and self.repo.reviewed_task_matches(value.task_id, actor, value.review_revision, value.source_commit)
                         and value.source_commit == item['source_commit']
                         and value.artifact_digest == 'sha256:' + item['source_digest'])
             except Exception:
@@ -162,7 +182,7 @@ class StagingController:
             self._shared_guard(admission=True)
             if self._unknown_production(machine, old_target):
                 return False
-            item = self._read(value.task_id)
+            item = self._read(value.submission_id)
             return (worker == self.worker and item['phase'] == 'queued'
                     and set(item['resource_ids']) == KINDS
                     and target(item['actor'], action, environment, value))
@@ -200,9 +220,13 @@ class StagingController:
     async def submit(self, actor, payload):
         self._shared_guard(admission=True)
         _require(actor in AGENTS, 'staging_agent_required', 403)
-        fields = {'request_id', 'project', 'recipe', 'source_commit', 'source_digest', 'source_zip_base64'}
+        fields = {'request_id', 'review_task_id', 'review_task_revision', 'project', 'recipe',
+                  'source_commit', 'source_digest', 'source_zip_base64', 'source_commit_object_base64'}
         _require(type(payload) is dict and set(payload) in (fields, fields | {'topic'}))
         _id(payload['request_id'])
+        _id(payload['review_task_id'])
+        _require(type(payload['review_task_revision']) is int and payload['review_task_revision'] >= 1,
+                 'staging_review_required', 409)
         project, recipe = payload['project'], payload['recipe']
         _require((project, recipe) in self.actions, 'staging_profile_not_registered', 403)
         self._grants(actor, project)
@@ -215,13 +239,41 @@ class StagingController:
         except ValueError:
             raise HubError('invalid_staging_source') from None
         _require(len(raw) <= 8 * 1024**2 and hashlib.sha256(raw).hexdigest() == payload['source_digest'], 'staging_source_digest_mismatch')
+        _require(type(payload['source_commit_object_base64']) is str
+                 and 0 < len(payload['source_commit_object_base64']) <= 87384, 'staging_source_binding_invalid')
+        with self.repo._connection() as db:
+            prior = db.execute('SELECT data FROM hub_staging_submissions WHERE actor=? AND request_id=?',
+                               (actor, payload['request_id'])).fetchone()
+        if prior is not None:
+            previous = json.loads(prior['data'])
+            _require(all(previous.get(key) == payload.get(key) for key in (
+                'review_task_id', 'review_task_revision', 'project', 'recipe', 'source_commit', 'source_digest'))
+                and previous.get('topic') == payload.get('topic'), 'staging_request_conflict', 409)
+        _require(_PROOF_SLOT.acquire(blocking=False), 'staging_source_verification_busy', 503)
+        from hub_staging_service.source_provenance import verify
+        try:
+            future = _PROOF_EXECUTOR.submit(verify, raw, payload['source_commit_object_base64'], payload['source_commit'])
+        except BaseException:
+            _PROOF_SLOT.release()
+            raise
+        future.add_done_callback(lambda _: _PROOF_SLOT.release())
+        try:
+            binding = await asyncio.shield(asyncio.wrap_future(future))
+        except ValueError:
+            raise HubError('staging_source_binding_invalid') from None
         topic = payload.get('topic')
         _require(topic is None or type(topic) is str and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', topic))
-        public = {key: value for key, value in payload.items() if key != 'source_zip_base64'}
+        public = {key: value for key, value in payload.items()
+                  if key not in {'source_zip_base64', 'source_commit_object_base64'}}
+        public['source_binding'] = binding
         public['topic'] = topic  # Omitted and explicit null have one request identity.
         fingerprint = hashlib.sha256(_json(public).encode()).hexdigest()
         async with self._short_lock():
             with self.repo._transaction() as db:
+                _require(self.repo.reviewed_task_matches(payload['review_task_id'], actor,
+                    payload['review_task_revision'], payload['source_commit'], db=db)
+                    and self.repo._get(db, payload['review_task_id'], 'task')['project'] == project,
+                    'staging_review_required', 409)
                 old = db.execute('SELECT * FROM hub_staging_submissions WHERE actor=? AND request_id=?', (actor, payload['request_id'])).fetchone()
                 if old:
                     _require(old['fingerprint'] == fingerprint, 'staging_request_conflict', 409)
@@ -234,14 +286,18 @@ class StagingController:
             if item['phase'] == 'depositing':
                 self._shared_guard(admission=True)
                 receipt = await self.client.put_source({'source_id': item['source_id'], 'project': project,
-                    'source_digest': item['source_digest'], 'source_zip_base64': encoded})
+                    'source_digest': item['source_digest'], 'source_zip_base64': encoded,
+                    'source_commit': item['source_commit'],
+                    'source_commit_object_base64': payload['source_commit_object_base64']})
                 self._shared_guard()
                 _require(all(receipt.get(key) == item[key] for key in ('source_id', 'source_digest', 'project')),
                          'staging_source_receipt_mismatch', 502)
+                _require(receipt.get('source_binding') == binding, 'staging_source_binding_receipt_mismatch', 502)
                 item['phase'] = 'deposited'; self._save(item)
             if item['job_id'] is None:
                 self._shared_guard(admission=True)
-                target = WorkTarget(item['id'], item['source_commit'], 'sha256:' + item['source_digest'])
+                target = WorkTarget(item['review_task_id'], item['source_commit'], 'sha256:' + item['source_digest'],
+                                    item['review_task_revision'], item['id'])
                 job = self.queue.submit(actor=actor, request_id='staging:' + item['request_id'],
                     action_key=self.actions[(project, recipe)], environment='staging', target=target)
                 item['job_id'] = job['id']; self._save(item)
@@ -266,8 +322,14 @@ class StagingController:
         return self._view(item)
 
     def _view(self, item):
-        return {'job': self.queue.get_job(item['job_id']), 'source_id': item['source_id'],
-                'resource_ids': item['resource_ids'], 'phase': item['phase']}
+        result = {'job': self.queue.get_job(item['job_id']), 'source_id': item['source_id'],
+                  'resource_ids': item['resource_ids'], 'phase': item['phase']}
+        if item.get('hold_reason') != _UNBOUND_HOLD and _valid_source_binding(item):
+            result['source_binding'] = item['source_binding']
+            result['source_commit_verification'] = 'git-sha1-tree-v1'
+        if item.get('hold_reason') == _UNBOUND_HOLD:
+            result['hold_reason'] = _UNBOUND_HOLD
+        return result
 
     async def runtime(self, actor):
         self.repo._actor(actor, human=True)
@@ -299,29 +361,159 @@ class StagingController:
                 projects = tuple(result['profiles'])
                 entries = [] if not projects else [json.loads(row[0]) for row in db.execute(
                     "SELECT s.data FROM hub_staging_submissions s JOIN hub_work_jobs j ON j.id=json_extract(s.data,'$.job_id') "
-                    "WHERE j.state IN ('claimed','held') AND j.project IN (" + ','.join('?' for _ in projects) + ') ORDER BY j.sequence LIMIT 50', projects)]
+                    "WHERE (j.state IN ('claimed','held') OR (j.state='queued' AND json_extract(s.data,'$.phase')='held')) "
+                    "AND j.project IN (" + ','.join('?' for _ in projects) + ') ORDER BY j.sequence LIMIT 50', projects)]
             for item in entries:
                 if item['project'] not in result['profiles'] or item.get('job_id') is None:
                     continue
                 job = self.queue.get_job(item['job_id'])
-                if job['state'] not in ('claimed', 'held'):
+                if job['state'] not in ('queued', 'claimed', 'held'):
+                    continue
+                if job['state'] == 'queued' and item.get('phase') != 'held':
                     continue
                 if (job['state'] == 'claimed' and not job.get('requires_reconciliation')
                         and item['phase'] != 'held' and job.get('worker') == self.worker.encoded()):
                     continue  # Normal in-flight work is not a held outcome.
-                result['held_jobs'].append({'id': job['id'], 'project': item['project'],
+                held = {'id': job['id'], 'project': item['project'],
                     'recipe': item['recipe'], 'state': job['state'], 'phase': item['phase'],
-                    'source_commit': item['source_commit']})
+                    'source_commit': item['source_commit']}
+                if item.get('hold_reason') == _UNBOUND_HOLD:
+                    held['hold_reason'] = _UNBOUND_HOLD
+                result['held_jobs'].append(held)
                 if len(result['held_jobs']) == 50:
                     break
         return result
 
-    async def reconcile_for(self, actor, identity):
+    async def reconcile_for(self, actor, identity, *, admission_guard=None):
         self.repo._actor(actor, human=True)
         _require(actor in self.resources.admin_actors, 'staging_admin_required', 403)
-        item = self._read(job_id=_id(identity))
-        self.resources.authorize(actor, item['project'], 'read')
-        return await self.reconcile(identity)
+        _require(callable(admission_guard), 'staging_human_admission_required', 403)
+        try:
+            async with self._short_lock():
+                return await self._guarded_reconcile(identity, actor=actor, admission_guard=admission_guard)
+        except reconciliation_context.Changed:
+            raise HubError('staging_reconciliation_changed', 409) from None
+
+    async def _guarded_reconcile(self, identity, *, actor=None, admission_guard=None):
+        """Bind every local recovery write to the original operation snapshot.
+
+        A guard detects local competing writes; it does not fence a worker or
+        authorize release of a machine without the queue's normal proof.
+        """
+        identity = _id(identity)
+        self._shared_guard()
+        with self.repo._transaction(before_commit=admission_guard) as db:
+            rows = db.execute("SELECT data FROM hub_staging_submissions WHERE json_extract(data,'$.job_id')=? LIMIT 2", (identity,)).fetchall()
+            _require(len(rows) == 1, 'staging_job_not_found', 404)
+            item = json.loads(rows[0]['data'])
+            if actor is not None:
+                self.resources._authorize(db, actor, item['project'], 'read')
+            row = db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (identity,)).fetchone()
+            _require(row is not None and row['project'] == item['project'], 'staging_reconciliation_pending', 409)
+            if not row['action_key'].startswith('modular.') and _valid_source_binding(item):
+                target = json.loads(row['target'])
+                action_key = self.actions.get((item['project'], item['recipe']))
+                action = self.queue.actions.get(action_key)
+                _require(action is not None and row['action_key'] == action_key
+                         and row['machine_id'] == action.machine_id and row['actor'] == item['actor']
+                         and row['environment'] == 'staging'
+                         and target.get('submission_id') == item['id']
+                         and target.get('task_id') == item['review_task_id']
+                         and target.get('review_revision') == item['review_task_revision']
+                         and target.get('source_commit') == item['source_commit']
+                         and target.get('artifact_digest') == 'sha256:' + item['source_digest'],
+                         'staging_reconciliation_changed', 409)
+                claim = item.get('claim')
+                if claim is not None:
+                    _require(type(claim) is dict and claim.get('id') == identity
+                             and claim.get('worker') == row['worker'] and claim.get('fence') == row['fence'],
+                             'staging_reconciliation_changed', 409)
+            current = self.queue._public(row)
+            current['requires_reconciliation'] = (row['state'] == 'held' or
+                row['state'] == 'claimed' and row['lease_until'] <= self.queue._now())
+            ids = item.get('resource_ids')
+            _require(type(ids) is dict and set(ids) <= KINDS and all(type(v) is str for v in ids.values())
+                     and len(set(ids.values())) == len(ids), 'staging_reconciliation_pending', 409)
+            for value in ids.values():
+                _id(value)
+            if _valid_source_binding(item):
+                owned = db.execute('SELECT * FROM hub_staging_resource_ownership WHERE job_id=? ORDER BY id LIMIT ?',
+                                   (identity, len(KINDS) + 1)).fetchall()
+                _require(len(owned) <= len(KINDS), 'staging_reconciliation_changed', 409)
+                owned_by_id = {entry['id']: entry for entry in owned}
+                refs = db.execute("SELECT id FROM hub_entities WHERE kind='staging_resource' AND (CASE WHEN json_valid(data) THEN json_extract(data,'$.job_id') END)=? ORDER BY id LIMIT ?",
+                                  (identity, len(KINDS) + 1)).fetchall()
+                already_terminal = item.get('phase') == 'verified' and row['state'] == item.get('outcome')
+                if (item.get('phase') in ('dispatching', 'accepted', 'held', 'verified')
+                        and item.get('hold_reason') != _UNBOUND_HOLD and not already_terminal):
+                    _require(set(ids) == KINDS and set(ids.values()) == set(owned_by_id)
+                             and set(ids.values()) == {entry['id'] for entry in refs},
+                             'staging_reconciliation_changed', 409)
+                for entry in owned:
+                    _require(entry['project'] == item['project'] and entry['created_by'] == item['actor']
+                             and entry['source_commit'] == item['source_commit'],
+                             'staging_reconciliation_changed', 409)
+                for kind, resource_id in ids.items():
+                    entry = owned_by_id.get(resource_id)
+                    data = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='staging_resource'", (resource_id,)).fetchone()
+                    _require(entry is not None and data is not None, 'staging_reconciliation_changed', 409)
+                    resource = json.loads(data['data'])
+                    _require(resource.get('kind') == kind and resource.get('job_id') == identity
+                             and resource.get('project') == item['project'] and resource.get('created_by') == item['actor']
+                             and resource.get('source_commit') == item['source_commit'],
+                             'staging_reconciliation_changed', 409)
+            guard = reconciliation_context.Guard(self.repo.path, item['id'], identity, item['project'], ids.values(), len(KINDS))
+            if actor is not None:
+                # The credential itself is never persisted. The precommit guard
+                # proves the exact session at admission; this immutable record
+                # binds the admitted actor to the existing operation snapshot.
+                binding = {'submission_id': item['id'], 'job_id': identity,
+                    'command_id': item.get('command_id'), 'project': item['project'],
+                    'recipe': item['recipe'], 'queue_revision': row['revision'],
+                    'machine_id': row['machine_id'], 'worker': row['worker'], 'fence': row['fence'],
+                    'target': json.loads(row['target']), 'resource_ids': ids,
+                    # Private ledger only: distinguish changes to submission,
+                    # resource and policy state that do not bump queue revision.
+                    'snapshot_sha256': hashlib.sha256(_json(guard.snapshot(db)).encode()).hexdigest()}
+                fingerprint = hashlib.sha256(_json(binding).encode()).hexdigest()
+                receipt = db.execute('SELECT id,data FROM hub_staging_reconcile_admissions WHERE job_id=? AND actor=? AND fingerprint=?',
+                                     (identity, actor, fingerprint)).fetchone()
+                if receipt is None:
+                    _require(db.execute('SELECT count(*) FROM hub_staging_reconcile_admissions').fetchone()[0]
+                             < _MAX_RECONCILIATION_ADMISSIONS, 'staging_reconciliation_admission_limit', 503)
+                    receipt_id = str(uuid.uuid4())
+                    db.execute('INSERT INTO hub_staging_reconcile_admissions(id,job_id,actor,fingerprint,data) VALUES(?,?,?,?,?)',
+                               (receipt_id, identity, actor, fingerprint, _json(binding)))
+                else:
+                    _require(json.loads(receipt['data']) == binding, 'staging_reconciliation_changed', 409)
+                    receipt_id = receipt['id']
+                guard.admission_id = receipt_id
+            baseline = guard.snapshot(db)
+        guard.expected = baseline
+        token = reconciliation_context.current.set(guard)
+        try:
+            result = await self._reconcile_locked(identity, item=item, current=current)
+            # Read-only return paths must not return an outdated snapshot.
+            with self.repo._connection() as db:
+                db.execute('BEGIN')
+                try:
+                    guard.before_write(self.repo.path, db)
+                finally:
+                    db.rollback()
+        except reconciliation_context.Changed:
+            raise HubError('staging_reconciliation_changed', 409) from None
+        finally:
+            guard.active = False
+            reconciliation_context.current.reset(token)
+        # This maintenance is outside the admitted job's transaction guard.
+        # Its own writer revalidates both terminal records and their ordering;
+        # a failure retains old protections and never rewrites this outcome.
+        if item.get('phase') == 'verified' and item.get('outcome') == 'failed':
+            try:
+                self._supersede_failures(item)
+            except Exception:
+                logging.getLogger(__name__).warning('staging_failure_retention_maintenance_deferred')
+        return result
 
     def _finish_no_effect(self, item, claim, proof, reason):
         """Local intent or authenticated rejection proves THIS command did not run."""
@@ -362,6 +554,29 @@ class StagingController:
             except HubError:
                 pass  # Expired claim already keeps the physical machine reserved.
 
+    def _hold_unbound(self, item):
+        """Preserve the original uncertain attempt; never infer or fabricate proof."""
+        current = self.queue.get_job(item['job_id'])
+        if current['state'] == 'queued':
+            # No machine was acquired. Report the local hold without fabricating
+            # a queue reservation; target checks will prevent any later claim.
+            if (item.get('phase') != 'held' or item.get('hold_reason') != _UNBOUND_HOLD
+                    or item.get('manual_recovery_only') is not True):
+                item.update(phase='held', hold_reason=_UNBOUND_HOLD, manual_recovery_only=True)
+                self._save(item)
+            return self._view(item)
+        if item.get('hold_reason') != _UNBOUND_HOLD:
+            item['hold_reason'] = _UNBOUND_HOLD
+            self._save(item)
+        claim = item.get('claim')
+        if not (type(claim) is dict and type(claim.get('fence')) is int and claim['fence'] > 0):
+            claim = None  # Preserve the original queue reservation; never invent a fence.
+        self._hold(item, claim)
+        if item.get('manual_recovery_only') is not True:
+            item['manual_recovery_only'] = True
+            self._save(item)
+        return self._view(item)
+
     async def run_once(self):
         _require(not self.stopping, 'staging_controller_closing', 503)
         # Shield a tracked execution from an HTTP caller's cancellation. close()
@@ -387,16 +602,33 @@ class StagingController:
                 self._grants(item['actor'], item['project'])
                 self.queue.live_claim(job_id=claim['id'], worker=self.worker, fence=claim['fence'])
                 self._shared_guard(admission=True)
-                item['phase'], item['claim'] = 'dispatching', claim
-                self._save(item)  # Never retry POST after this durable boundary.
+                with self.repo._transaction() as db:
+                    row = self.queue._owned(db, claim['id'], self.worker, claim['fence'], self.queue._now())
+                    _require(not self.repo._paused(db) and not db.execute(
+                        'SELECT paused FROM hub_work_policy WHERE id=1').fetchone()[0], 'staging_admission_changed', 409)
+                    _require(self.queue._modular_target_in_transaction(db, row['actor'], row['action_key'],
+                        row['environment'], WorkTarget(**json.loads(row['target']))), 'staging_review_required', 409)
+                    current = db.execute('SELECT data FROM hub_staging_submissions WHERE id=?', (item['id'],)).fetchone()
+                    _require(current is not None and json.loads(current['data']) == item and item['phase'] == 'queued',
+                             'staging_admission_changed', 409)
+                    self.resources._authorize(db, item['actor'], item['project'], 'build')
+                    self.resources._authorize(db, item['actor'], item['project'], 'test')
+                    item['phase'], item['claim'] = 'dispatching', claim
+                    db.execute('UPDATE hub_staging_submissions SET data=? WHERE id=?', (_json(item), item['id']))
                 receipt = await self.client.submit({'job_id': item['job_id'], 'command_id': item['command_id'],
                     'idempotency_key': item['command_id'], 'project': item['project'], 'recipe': item['recipe'],
                     'source_commit': item['source_commit'], 'source_digest': item['source_digest'],
-                    'source_id': item['source_id'], 'resource_ids': item['resource_ids']})
+                    'source_id': item['source_id'], 'resource_ids': item['resource_ids'],
+                    'require_source_binding': True, 'expected_source_binding': item['source_binding']})
                 self._shared_guard()
                 item['phase'] = 'accepted'; self._save(item)
                 return await self._follow(item, receipt, claim)
             except Exception as error:
+                # A terminal result may have committed before rendering its
+                # response failed. Do not rewrite durable verified facts as a
+                # hold after the queue has already finalized or been released.
+                if item.get('phase') == 'verified':
+                    raise
                 if item['phase'] in ('queued', 'deposited'):
                     return self._finish_no_effect(item, claim, 'never_sent', 'admission_changed')
                 if isinstance(error, StagingNotAccepted) and error.reason not in ('worker_busy', 'worker_busy_or_held'):
@@ -421,23 +653,36 @@ class StagingController:
             if claim and self.queue.get_job(item['job_id'])['state'] == 'claimed':
                 self.queue.renew(job_id=item['job_id'], worker=self.worker, fence=claim['fence'], lease_seconds=600)
             await asyncio.sleep(self.poll_interval)
-            receipt = await self.client.job(item['job_id'])
+            with reconciliation_context.suspended():
+                receipt = await self.client.job(item['job_id'])
             self._shared_guard()
 
     async def _finish(self, item, receipt, claim):
         self._shared_guard()
+        _require(_valid_source_binding(item) and item.get('hold_reason') != _UNBOUND_HOLD,
+                 'staging_source_binding_required', 409)
         outcome = receipt['state']
+        result = receipt['result']
+        if outcome == 'failed':
+            _require(_failed_result_consistent(result), 'staging_completion_proof_invalid', 502)
+        _require(result.get('source_commit') == item['source_commit']
+                 and result.get('source_digest') == item['source_digest']
+                 and result.get('source_commit_verification') == 'git-sha1-tree-v1'
+                 and result.get('source_binding') == item['source_binding'],
+                 'staging_completion_proof_invalid', 502)
         if outcome == 'succeeded':
-            result = receipt['result']
-            _require(all(result.get(key) == item[key] for key in ('source_commit', 'source_digest', 'resource_ids'))
-                     and result.get('source_commit_verification') == 'declared' and result.get('preview_ready') is True
+            _require('error' not in result
+                     and all(result.get(key) == item[key] for key in ('source_commit', 'source_digest', 'resource_ids'))
+                     and result.get('source_commit_verification') == 'git-sha1-tree-v1'
+                     and result.get('source_binding') == item['source_binding'] and result.get('preview_ready') is True
                      and set(result.get('stages', {})) == {'build', 'test'}
                      and all(stage.get('exit_code') == 0 for stage in result['stages'].values()),
                      'staging_completion_proof_invalid', 502)
         metadata = {}
         for kind, identity in item['resource_ids'].items():
             if outcome == 'succeeded':
-                fact = await self.client.resource(identity)
+                with reconciliation_context.suspended():
+                    fact = await self.client.resource(identity)
                 self._shared_guard()
                 _require(fact.get('id') == identity and fact.get('kind') == kind and
                          fact.get('job_id') == item['job_id'] and fact.get('state') == 'ready',
@@ -452,7 +697,8 @@ class StagingController:
                      and diagnostic['scope'] == 'original_engine_owned_writers_exporters_volumes_absent'
                      and receipt['result'].get('error') == 'stage_' + diagnostic['stage'] + '_failed',
                      'staging_diagnostic_proof_invalid', 502)
-            fact = await self.client.resource(identity)
+            with reconciliation_context.suspended():
+                fact = await self.client.resource(identity)
             self._shared_guard()
             _require(fact.get('id') == identity and fact.get('kind') == 'test_run'
                      and fact.get('job_id') == item['job_id'] and fact.get('state') == 'ready'
@@ -460,15 +706,27 @@ class StagingController:
                      and hashlib.sha256(_json(fact['manifest']).encode()).hexdigest() == diagnostic['manifest_sha256'],
                      'staging_diagnostic_proof_invalid', 502)
             metadata['test_run'] = fact
+        # An interrupted finalization may already have recorded some facts.
+        # Revalidate every recorded fact against this exact terminal receipt
+        # and current worker metadata before changing any remaining resources.
+        pending = []
         for kind, identity in item['resource_ids'].items():
             resource = self.resources.inspect_resource(self.principal, identity)
-            if resource['state'] != 'provisioning':
-                continue  # Previously recorded fact from interrupted read-only reconciliation.
             fact = metadata.get(kind)
             digest = 'sha256:' + hashlib.sha256(_json(fact['manifest']).encode()).hexdigest() if fact else None
-            self.resources.mark_resource_ready(self.principal, identity, resource['revision'],
-                artifact_digest=digest, size_bytes=fact['bytes'] if fact else None,
-                preview_path='/staging/previews/' + identity if kind == 'preview' and fact else None,
+            size = fact['bytes'] if fact else None
+            preview = '/staging/previews/' + identity if kind == 'preview' and fact else None
+            if resource['state'] != 'provisioning':
+                _require(resource['state'] == ('failed' if outcome == 'failed' else 'ready')
+                         and resource.get('artifact_digest') == digest
+                         and resource.get('size_bytes') == size
+                         and resource.get('preview_path') == preview,
+                         'staging_resource_proof_invalid', 502)
+                continue
+            pending.append((identity, resource['revision'], digest, size, preview))
+        for identity, revision, digest, size, preview in pending:
+            self.resources.mark_resource_ready(self.principal, identity, revision,
+                artifact_digest=digest, size_bytes=size, preview_path=preview,
                 failed=outcome == 'failed')
         binding = self.resources.inspect_job(self.principal, item['job_id'])
         protected = [p for p in binding['protected'] if not(p['reason'] == 'held_campaign' and p['ref'] == item['job_id'])]
@@ -485,8 +743,13 @@ class StagingController:
         else:
             self.queue.complete(job_id=item['job_id'], worker=self.worker, fence=claim['fence'],
                                 outcome=outcome, evidence_id=item['evidence_id'])
-        if outcome == 'failed':
-            self._supersede_failures(item)
+        if outcome == 'failed' and reconciliation_context.current.get() is None:
+            try:
+                self._supersede_failures(item)
+            except Exception:
+                # Completion already committed. Leave remaining protections
+                # intact on error; never rewrite a terminal job as held.
+                logging.getLogger(__name__).warning('staging_failure_retention_maintenance_deferred')
         return self._view(item)
 
     def _supersede_failures(self, newest):
@@ -496,31 +759,64 @@ class StagingController:
             if (prior['id'] == newest['id'] or prior['project'] != newest['project'] or
                     prior['recipe'] != newest['recipe'] or prior.get('phase') != 'verified' or prior.get('outcome') != 'failed'):
                 continue
-            self.resources.supersede_latest_failure(self.principal, prior['job_id'])
+            self.resources.supersede_latest_failure(self.principal, prior['job_id'],
+                                                    superseded_by=newest['job_id'])
 
     async def reconcile(self, identity):
-        async with self._short_lock():
+        try:
+            async with self._short_lock():
+                return await self._guarded_reconcile(identity)
+        except reconciliation_context.Changed:
+            raise HubError('staging_reconciliation_changed', 409) from None
+
+    async def _reconcile_locked(self, identity, *, item, current):
             self._shared_guard()
-            item = self._read(job_id=_id(identity))
-            current = self.queue.get_job(identity)
+            # Retired-key work predates the transactional binding. Preserve
+            # its terminal history, but never reinterpret or release an open
+            # reservation through the new action registry.
+            if current['action_key'].startswith('modular.'):
+                if item['phase'] == 'verified' and current['state'] == item.get('outcome'):
+                    return self._view(item)
+                raise HubError('staging_legacy_action_reconciliation_required', 409)
+            if (current['state'] == 'claimed' and not current.get('requires_reconciliation')
+                    and current.get('worker') != self.worker.encoded()):
+                raise HubError('staging_reconciliation_pending', 409)
+            if item.get('hold_reason') == _UNBOUND_HOLD:
+                return self._hold_unbound(item)
+            if item.get('dispatch_proof') in ('never_sent', 'definitively_rejected'):
+                return self._finish_no_effect(item, None, item['dispatch_proof'], item['rejection_reason'])
+            if item['phase'] == 'verified' and current['state'] == item.get('outcome'):
+                return self._view(item)  # Historical terminal facts are not rewritten.
+            if not _valid_source_binding(item):
+                return self._hold_unbound(item)
             if (item['phase'] in ('queued', 'deposited') and
                     (current['state'] == 'held' or current.get('requires_reconciliation'))):
                 return self._finish_no_effect(item, None, 'never_sent', 'restart_before_dispatch')
-            if item.get('dispatch_proof') in ('never_sent', 'definitively_rejected'):
-                return self._finish_no_effect(item, None, item['dispatch_proof'], item['rejection_reason'])
-            if item['phase'] == 'verified' and current['state'] == item['outcome']:
-                return self._view(item)  # Public owner authorization was checked separately.
             _require(item['phase'] in ('held', 'dispatching', 'accepted', 'verified'), 'staging_reconcile_not_needed', 409)
             try:
-                return await self._follow(item, await self.client.job(identity), item.get('claim'))
+                with reconciliation_context.suspended():
+                    receipt = await self.client.job(identity)
+                return await self._follow(item, receipt, item.get('claim'))
+            except reconciliation_context.Changed:
+                raise
             except Exception:
+                # Finalization may already have committed a verified submission
+                # or released the queue reservation before a later read fails.
+                # Preserve those facts and surface the error; the next explicit
+                # reconciliation can finish an incomplete verified transition.
+                # A save error can have an uncertain commit outcome, so do not
+                # overwrite either possible durable state here.
+                if item.get('phase') == 'verified':
+                    raise
                 self._hold(item, item.get('claim'))
                 return {'job': self.queue.get_job(identity), 'resource_ids': item['resource_ids'], 'phase': 'held'}
 
-    async def cleanup_apply(self, actor, plan_id, digest):
+    async def cleanup_apply(self, actor, plan_id, digest, *, admission_guard=None):
+        if actor.startswith('human:') and admission_guard is None:
+            raise HubError('staging_human_admission_required', 403)
         async with self._short_lock():
             self._shared_guard()
-            begun = self.resources.cleanup_begin(actor, plan_id, digest)
+            begun = self.resources.cleanup_begin(actor, plan_id, digest, admission_guard=admission_guard)
             result = {'removed': [], 'failed': [], 'skipped_changed': [entry['id'] for entry in begun['skipped']]}
             for operation in begun['operations']:
                 identity, command = operation['id'], operation['operation_id']
@@ -568,7 +864,7 @@ class StagingController:
                     payload = {'command_id': command, 'idempotency_key': command,
                                'resources': [{'resource_id': identity, 'expected_revision': fact['revision']}]}
                     self._shared_guard(admission=True)
-                    with self.repo._transaction() as db:
+                    with self.repo._transaction(before_commit=admission_guard) as db:
                         local = self.resources._resource(db, identity)
                         self.repo._cas(local, operation['expected_revision'])
                         self.resources._authorize(db, actor, local['project'], 'cleanup')
@@ -693,12 +989,24 @@ class StagingController:
         for item in entries:
             if self.stopping or item.get('job_id') is None or item['phase'] not in ('queued', 'deposited', 'held', 'accepted', 'dispatching', 'verified'):
                 continue
+            if (item.get('hold_reason') == _UNBOUND_HOLD and item.get('manual_recovery_only') is True
+                    and item.get('phase') == 'held'):
+                continue  # Explicit operator reconciliation; never poll the old worker automatically.
             due, delay = self.recheck_backoff.get(item['job_id'], (0, 15))
             if time.monotonic() < due:
                 continue
             try:
                 job = self.queue.get_job(item['job_id'])
             except HubError:
+                continue
+            if job['action_key'].startswith('modular.'):
+                continue  # Preserve legacy work for explicit operator review.
+            if job['state'] == 'queued' and (item.get('hold_reason') == _UNBOUND_HOLD
+                                             or not _valid_source_binding(item)):
+                try:
+                    await self.reconcile(item['job_id'])
+                except Exception:
+                    pass
                 continue
             if job['state'] not in ('claimed', 'held'):
                 continue

@@ -34,6 +34,15 @@ SESSION_HISTORY_WINDOW_SECONDS = 86400
 MAX_MESSAGES = 10000
 MAX_MAILBOX = 1000
 MAX_SUBSCRIPTIONS = 32
+# Separate bounded pools reserve room for short-lived response guards even
+# when all transport-owner registrations are occupied. These are internal
+# purposes, not grants exposed to clients.
+MAX_OWNER_SUBSCRIPTIONS = 1024
+MAX_RESPONSE_SUBSCRIPTIONS = 128
+MAX_ATTENTION_SUBSCRIPTIONS = 32
+MAX_OWNER_SUBSCRIPTIONS_PER_SESSION = 32
+MAX_RESPONSE_SUBSCRIPTIONS_PER_SESSION = 4
+MAX_ATTENTION_SUBSCRIPTIONS_PER_SESSION = 4
 MAX_BODY_BYTES = 16384
 SESSION_SECONDS = 900
 PAIRING_SECONDS = 600
@@ -96,6 +105,7 @@ class AgentSessionRepository:
         self.path, self.owner, self.clock = Path(path), owner, clock
         self._lock = threading.RLock()
         self._listeners = {}
+        self._listener_counts = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._transaction() as db:
             # This feature must never silently share a legacy bus/Hub database.
@@ -122,6 +132,9 @@ class AgentSessionRepository:
                     installation_id TEXT NOT NULL, request_key TEXT NOT NULL,
                     fingerprint TEXT NOT NULL, message_id TEXT NOT NULL REFERENCES session_messages(id),
                     PRIMARY KEY(installation_id,request_key))''',
+                '''CREATE TABLE IF NOT EXISTS session_ack_receipts (
+                    message_id TEXT PRIMARY KEY REFERENCES session_messages(id),
+                    session_id TEXT NOT NULL, generation INTEGER NOT NULL, claim_hash TEXT NOT NULL)''',
                 '''CREATE TABLE IF NOT EXISTS agent_session_audit (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, actor TEXT NOT NULL,
                     installation_id TEXT, session_id TEXT, message_id TEXT, created_at REAL NOT NULL)''',
@@ -310,7 +323,11 @@ class AgentSessionRepository:
 
     def _invalidate(self, session_ids):
         with self._lock:
-            callbacks = [callback for sid in session_ids for callback in self._listeners.pop(sid, {}).values()]
+            callbacks = []
+            for sid in session_ids:
+                for purpose, callback in self._listeners.pop(sid, {}).values():
+                    self._listener_counts[purpose] -= 1
+                    callbacks.append(callback)
         for callback in callbacks:
             try:
                 callback()
@@ -384,21 +401,33 @@ class AgentSessionRepository:
         self._invalidate([id])
         return result
 
-    def subscribe_session(self, secret, callback):
-        if not callable(callback):
+    def subscribe_session(self, secret, callback, *, purpose='default'):
+        limits = {'default': MAX_SUBSCRIPTIONS, 'owner': MAX_OWNER_SUBSCRIPTIONS,
+                  'response': MAX_RESPONSE_SUBSCRIPTIONS, 'attention': MAX_ATTENTION_SUBSCRIPTIONS}
+        per_session = {'owner': MAX_OWNER_SUBSCRIPTIONS_PER_SESSION,
+                       'response': MAX_RESPONSE_SUBSCRIPTIONS_PER_SESSION,
+                       'attention': MAX_ATTENTION_SUBSCRIPTIONS_PER_SESSION}
+        if not callable(callback) or type(purpose) is not str or purpose not in limits:
             raise AgentSessionError('invalid_input', 422)
         with self._lock:
             with self._transaction() as db:
                 principal = self._principal(db, secret, self._now())
-                if sum(map(len, self._listeners.values())) >= MAX_SUBSCRIPTIONS:
+                if self._listener_counts.get(purpose, 0) >= limits[purpose]:
+                    raise AgentSessionError('subscription_limit', 429)
+                if (purpose in per_session and sum(1 for category, _ in
+                        self._listeners.get(principal.session_id, {}).values() if category == purpose)
+                        >= per_session[purpose]):
                     raise AgentSessionError('subscription_limit', 429)
             key = uuid.uuid4().hex
-            self._listeners.setdefault(principal.session_id, {})[key] = callback
+            self._listeners.setdefault(principal.session_id, {})[key] = (purpose, callback)
+            self._listener_counts[purpose] = self._listener_counts.get(purpose, 0) + 1
         def unsubscribe():
             with self._lock:
                 listeners = self._listeners.get(principal.session_id)
                 if listeners is not None:
-                    listeners.pop(key, None)
+                    removed = listeners.pop(key, None)
+                    if removed is not None:
+                        self._listener_counts[removed[0]] -= 1
                     if not listeners:
                         self._listeners.pop(principal.session_id, None)
         return principal, unsubscribe
@@ -508,7 +537,22 @@ class AgentSessionRepository:
     def acknowledge(self, session_secret, id, claim_handle, generation):
         with self._transaction() as db:
             now = self._now(); p = self._principal(db, session_secret, now)
+            _number(generation, 1, (1 << 63) - 1)
+            try:
+                digest = _secret(claim_handle, 'ehc_')
+            except AgentSessionError:
+                raise AgentSessionError('claim_not_owned', 409) from None
+            row = self._received(db, p, id)
+            if row['status'] == 'acknowledged':
+                receipt = db.execute('SELECT session_id,generation,claim_hash FROM session_ack_receipts WHERE message_id=?', (id,)).fetchone()
+                if (receipt is not None and receipt['session_id'] == p.session_id
+                        and receipt['generation'] == generation
+                        and secrets.compare_digest(receipt['claim_hash'], digest)):
+                    return self._public_message(row)
+                raise AgentSessionError('claim_not_owned', 409)
             self._claimed(db, p, id, claim_handle, generation, now)
+            db.execute('INSERT INTO session_ack_receipts(message_id,session_id,generation,claim_hash) VALUES(?,?,?,?)',
+                       (id, p.session_id, generation, digest))
             db.execute("UPDATE session_messages SET status='acknowledged',acknowledged_at=?,claim_hash=NULL,claim_expires_at=NULL WHERE id=?", (now, id))
             self._audit(db, 'message.acknowledged', p.installation_id, now, p.installation_id, p.session_id, id)
             return self._public_message(self._received(db, p, id))

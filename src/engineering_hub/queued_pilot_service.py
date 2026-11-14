@@ -52,7 +52,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                                  agent_host='0.0.0.0', agent_port=8770,
                                  stop_event=None, on_ready=None,
                                  install_signals=True, recover_socket=False,
-                                 session_acceptance_factory=None, access_verifier=None):
+                                 session_acceptance_factory=None, access_verifier=None, single_pilot_protocol=False):
     """Bind first, then own exactly one persistent private queue composition.
 
     ``client_factory`` must synchronously return a new, dedicated, exact
@@ -67,9 +67,9 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
     closing the accepted client and finally its newly constructed PilotOwner.
     """
     try:
-        if (type(settings) is not Settings or settings.ingress_mode != 'combined'
+        if (type(single_pilot_protocol) is not bool or type(settings) is not Settings or settings.ingress_mode != 'combined'
                 or type(settings.auth_config) is not AuthConfig
-                or settings.auth_config.human_auth_mode != 'cloudflare_access'
+                or settings.auth_config.human_auth_mode not in {'cloudflare_access', 'github_cloudflare'}
                 or settings.auth_config.cloudflare_config is None
                 or type(machine_id) is not str or machine_id != settings.staging_machine_id
                 or not _synchronous(client_factory) or not _synchronous(target_verifier)
@@ -126,7 +126,8 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         client = accepted
         repo = HubRepository(settings.database,
             execution_principal='executor:container-pilot', pilot_owner=owner)
-        workflow = ContainerPilotWorkflow(repo, client, [target], pilot_owner=owner)
+        workflow = ContainerPilotWorkflow(repo, client, [target], pilot_owner=owner,
+                                          single_pilot_protocol=single_pilot_protocol)
         try:
             staging_draft = prepare_shared_staging(repo,
                 path=settings.staging_config_path or Path(settings.database).parent / 'staging-service.json',
@@ -157,6 +158,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         return HubFrontends(core, access_verifier=access_verifier)
 
     async def cleanup():
+        from .unproved_drain import retain_unproved_drain
         failed = False
         release_owner = shared is None
         try:
@@ -165,10 +167,18 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                     await finish_owned(asyncio.gather(*rejected_reconciliation_tasks, return_exceptions=True))
                 except BaseException:
                     failed = True
-            release_owner, shared_failed = await _cleanup_shared_staging(shared, staging_draft)
+            try:
+                release_owner, shared_failed = await _cleanup_shared_staging(shared, staging_draft)
+            except BaseException:
+                if shared is not None or staging_draft is not None:
+                    release_owner = False
+                    await retain_unproved_drain(owner, shared, staging_draft, client,
+                                               reconciliation, acceptance_broker)
+                raise
             failed = shared_failed or failed
             if not release_owner:
-                raise QueuedPilotServiceError()
+                await retain_unproved_drain(owner, shared, staging_draft, client,
+                                           reconciliation, acceptance_broker)
             if acceptance_broker is not None:
                 try:
                     acceptance_broker.close()
@@ -229,7 +239,7 @@ async def _cleanup_shared_staging(shared, draft):
                 await draft.module.client.aclose()
         except BaseException:
             failed = True
-    return True, failed
+    return not failed, failed
 
 
 def _reconciliation(factory, owner, target, rejected_local_tasks, lifecycle_task):

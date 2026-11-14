@@ -83,7 +83,8 @@ def test_agents_read_mcp_but_cannot_mutate_projects_even_with_human_cookie(hub, 
     assert call(client, 'hub_project_get', {'project_id': 'landscript'}, token='test-' + agent) == original
     assert original in call(client, 'hub_project_list', token='test-' + agent)['items']
     names = {t['name'] for t in rpc(client, 'tools/list', token='test-' + agent).json()['result']['tools']}
-    assert {n for n in names if n.startswith('hub_project_')} == {'hub_project_list', 'hub_project_get'}
+    assert {n for n in names if n.startswith('hub_project_')} == {
+        'hub_project_list', 'hub_project_get', 'hub_project_tasks'}
     assert rpc(client, 'tools/call', {'name': 'hub_project_get',
         'arguments': {'project_id': 'landscript'}}, token=None).status_code == 401
 

@@ -99,7 +99,7 @@ def test_guard_entry_failure_never_mutates_or_acquires_bus_writer(tmp_path, monk
         repo.get('landscript', 'notes.md')
 
 
-def test_guard_covers_commit_and_post_commit_readback(tmp_path, monkeypatch):
+def test_guard_covers_transaction_row_capture_and_commit(tmp_path, monkeypatch):
     repo = KnowledgeRepository(tmp_path / 'bus.sqlite3')
     events = []
     @contextmanager
@@ -110,17 +110,39 @@ def test_guard_covers_commit_and_post_commit_readback(tmp_path, monkeypatch):
         finally:
             events.append('exited')
     repo.configure_write_admission(guard)
-    original_get = repo.get
-    def checked_get(project, path):
-        assert events == ['entered']
-        # A separate handle sees the committed row before the guard releases.
-        with closing(sqlite3.connect(repo.db_path)) as connection:
-            assert connection.execute('SELECT version FROM knowledge').fetchone()[0] == 1
-        events.append('committed-readback')
-        return original_get(project, path)
-    monkeypatch.setattr(repo, 'get', checked_get)
-    assert put(repo).version == 1
-    assert events == ['entered', 'committed-readback', 'exited']
+    original_connection = repo._connection
+    original_from_row = repo._from_row
+    class ObservedConnection:
+        def __init__(self, inner):
+            self.inner = inner
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+        def execute(self, sql, parameters=()):
+            if sql == 'SELECT * FROM knowledge WHERE project=? AND path=?':
+                assert events == ['entered'] and self.inner.in_transaction
+                events.append('capture-row')
+            return self.inner.execute(sql, parameters)
+        def commit(self):
+            assert events == ['entered', 'capture-row', 'verified-row'] and self.inner.in_transaction
+            self.inner.commit()
+            # A separate handle must see the committed row before admission exits.
+            with closing(sqlite3.connect(repo.db_path)) as connection:
+                assert connection.execute('SELECT version FROM knowledge').fetchone()[0] == 1
+            events.append('committed')
+    @contextmanager
+    def observed_connection():
+        with original_connection() as db:
+            yield ObservedConnection(db)
+    def checked_row(row):
+        assert events == ['entered', 'capture-row']
+        events.append('verified-row')
+        return original_from_row(row)
+    monkeypatch.setattr(repo, '_connection', observed_connection)
+    monkeypatch.setattr(repo, '_from_row', checked_row)
+    monkeypatch.setattr(repo, 'get', lambda *_: pytest.fail('post-commit readback is unsafe'))
+    result = put(repo)
+    assert result.version == 1 and result.content == 'Durable notes'
+    assert events == ['entered', 'capture-row', 'verified-row', 'committed', 'exited']
 
 
 def test_guard_releases_on_cas_conflict_and_does_not_overwrite(tmp_path):

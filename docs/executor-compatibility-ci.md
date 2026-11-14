@@ -6,6 +6,13 @@ wheel, core manifest/config and commit inputs must be explicit immutable values;
 source must be an ancestor of the checked-out main commit. The existing job
 `GITHUB_TOKEN` needs only `contents: read` and `packages: read`.
 
+The executor recipe copies the selected core's virtual environment onto its
+separately pinned Python runtime. Its current Python base digest matches the
+reviewed staging control build's base; an independently selected core may use
+a different runtime. Check the exact base and installed runtime compatibility
+for each core before approval. A matching Python minor version or a successful
+static recipe check alone does not establish compatibility.
+
 The default tuple uses reviewed source `40d3d2f`, core manifest `d78d1576`, and
 config `c3ebafe5`. Source is read from Git archives/blobs (canonical LF), with
 setuptools 84.0.0 downloaded as a binary wheel using its reviewed SHA256 and

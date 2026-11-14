@@ -5,7 +5,7 @@ permitted inside admission. An OS lock refuses a second bridge process; the
 session SQLite writer also serializes revocation from independent connections.
 """
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 import inspect
 import hashlib
@@ -30,20 +30,48 @@ TOOLS = {
     'hub_project_list': 'project.read', 'hub_project_get': 'project.read',
     'hub_component_list': 'component.read', 'hub_component_get': 'component.read',
     'hub_component_create': 'component.write', 'hub_component_update': 'component.write',
-    'hub_component_retire': 'component.write', 'hub_task_get': 'task.read',
+    'hub_component_retire': 'component.write', 'hub_task_get': 'task.read', 'hub_project_tasks': 'task.list',
+    'hub_tracking_task_propose': 'tracking.propose', 'hub_tracking_draft_propose': 'tracking.propose',
+    'hub_tracking_task_update': 'tracking.update',
+    'hub_tracking_claim_withdraw': 'tracking.update',
+    'hub_tracking_task_list': 'tracking.read', 'hub_tracking_task_history': 'tracking.read',
+    'hub_tracking_task_origin': 'tracking.read',
+    'hub_orchestration_request_tasks': 'tracking.read',
+    'hub_orchestration_request_origin_task_summary': 'tracking.read',
+    'hub_tracking_task_compact': 'tracking.update',
+    'hub_tracking_task_review': 'tracking.review',
+    'hub_role_list': 'role.read', 'hub_role_get': 'role.read', 'hub_role_acquire': 'role.lease', 'hub_role_renew': 'role.lease',
+    'hub_role_release': 'role.lease', 'hub_role_claim': 'role.claim',
+    'hub_role_claims': 'role.read', 'hub_role_claim_release': 'role.claim',
+    'hub_task_progress_get': 'progress.read', 'hub_task_progress_update': 'progress.write',
+    'hub_orchestration_request_create': 'dispatch.write', 'hub_orchestration_request_get': 'dispatch.read', 'hub_orchestration_request_list': 'dispatch.read',
+    'hub_dispatch_create': 'dispatch.write', 'hub_dispatch_get': 'dispatch.read',
+    'hub_dispatch_list': 'dispatch.read', 'hub_role_dispatch_inbox': 'dispatch.read', 'hub_dispatch_report': 'dispatch.report',
+    'hub_dispatch_checkpoint': 'dispatch.write', 'hub_dispatch_decisions': 'dispatch.read', 'hub_dispatch_reports': 'dispatch.read',
+    'hub_orchestrator_attention_list': 'dispatch.read', 'hub_orchestrator_attention_reconcile_closed': 'dispatch.write',
+    'hub_addressed_attention_list': 'dispatch.read', 'hub_addressed_attention_ack': 'dispatch.read',
+    'hub_orchestrator_report_inspect': 'dispatch.read',
+    'hub_worker_dispatch_pending': 'dispatch.read', 'hub_worker_dispatch_ack': 'dispatch.read',
+    'hub_worker_decision_inspect': 'dispatch.read',
     'hub_staging_task_propose': 'task.propose', 'hub_task_claim': 'task.claim',
     'hub_task_candidate': 'task.candidate', 'hub_task_review': 'task.review',
     'hub_planning_list': 'planning.read', 'hub_planning_get': 'planning.read',
     'hub_planning_put': 'planning.write', 'hub_decision_request': 'decision.request',
+    'hub_decision_get': 'decision.read',
     'hub_entity_withdraw': 'entity.withdraw',
 }
 CAPABILITIES = tuple(sorted(set(TOOLS.values())))
+_SEAT_TOOLS = {'hub_cross_seat_current': 'cross.seat.read', 'hub_cross_seat_handoff': 'cross.seat.handoff'}
+_CROSS_TOOLS = {'hub_cross_routes': 'cross.request.read', 'hub_cross_request_create': 'cross.request.submit',
+                'hub_cross_request_get': 'cross.request.read', 'hub_cross_request_list': 'cross.request.read',
+                'hub_cross_request_transition': 'cross.request.triage',
+                'hub_cross_message_append': 'cross.request.message', 'hub_cross_message_list': 'cross.request.read'}
 
 
 class GrantWrite(Closed):
     expected_revision: int = Field(ge=0)
     projects: list[str] = Field(min_length=1, max_length=32)
-    capabilities: list[str] = Field(min_length=1, max_length=len(CAPABILITIES))
+    capabilities: list[str] = Field(min_length=1, max_length=len(CAPABILITIES) + len(_SEAT_TOOLS) + len(_CROSS_TOOLS))
     lifetime_seconds: int = Field(default=86400, ge=60, le=604800)
 
 
@@ -67,6 +95,7 @@ class _Operation:
     capability: str
     projects: tuple
     used_projects: set = None
+    commit_checks: list = field(default_factory=list)
 
     def project(self, project):
         if project not in self.projects:
@@ -84,7 +113,14 @@ class _Operation:
                           self.capability, session_id=self.principal.session_id)
         for project in tuple(self.used_projects or ()):
             self.project(project)
+        for check in self.commit_checks:
+            check(db)
         if Path(storage_path).resolve() == self.bridge.knowledge_path:
+            if self.capability == 'planning.write' and metadata['version'] > 1:
+                # An update replaces the only stored version. Permission to
+                # read is required, but does not prove the caller read it.
+                self.bridge._live(self.db, self.secret, self.principal.authorization_revision,
+                                  'planning.read', session_id=self.principal.session_id)
             # Planning is committed in the separate shared knowledge database.
             # Record exact session attribution in that same transaction.
             p = self.principal
@@ -95,9 +131,15 @@ class _Operation:
 
 
 class SessionHubBridge:
-    def __init__(self, sessions, repo, projects, components, knowledge):
+    def __init__(self, sessions, repo, projects, components, knowledge, *, seat_foundation_enabled=False, cross_requests_enabled=False):
         if type(sessions) is not AgentSessionRepository:
             raise ValueError('exact_agent_session_repository_required')
+        if type(seat_foundation_enabled) is not bool or type(cross_requests_enabled) is not bool or (cross_requests_enabled and not seat_foundation_enabled):
+            raise ValueError('explicit_seat_foundation_flag_required')
+        self.tools = {**TOOLS, **(_SEAT_TOOLS if seat_foundation_enabled else {}), **(_CROSS_TOOLS if cross_requests_enabled else {})}
+        self.capabilities = tuple(sorted(set(self.tools.values())))
+        self.seat_authority = None
+        self.cross_requests = None
         self.sessions, self.repo, self.projects, self.components = sessions, repo, projects, components
         self.pid = os.getpid()
         self.knowledge_path = Path(knowledge.db_path).resolve()
@@ -131,7 +173,13 @@ class SessionHubBridge:
                     '(sequence INTEGER PRIMARY KEY AUTOINCREMENT, installation_id TEXT NOT NULL, '
                     'session_id TEXT NOT NULL, family TEXT NOT NULL, grant_revision INTEGER NOT NULL, '
                     'capability TEXT NOT NULL, project TEXT NOT NULL, path TEXT NOT NULL, version INTEGER NOT NULL)')
-            sessions._hub_bridge_tools = tuple(TOOLS)
+            if seat_foundation_enabled:
+                from .seat_authority import SeatAuthority
+                self.seat_authority = SeatAuthority(self)
+            if cross_requests_enabled:
+                from .cross_requests import CrossRequests
+                self.cross_requests = CrossRequests(self)
+            sessions._hub_bridge_tools = tuple(self.tools)
             sessions._hub_bridge_owner = self
         except BaseException:
             self.close()
@@ -187,7 +235,7 @@ class SessionHubBridge:
                 or type(projects) is not list or not 1 <= len(projects) <= 32
                 or any(type(p) is not str for p in projects) or len(set(projects)) != len(projects)
                 or type(capabilities) is not list or not capabilities
-                or any(type(c) is not str or c not in CAPABILITIES for c in capabilities)
+                or any(type(c) is not str or c not in self.capabilities for c in capabilities)
                 or len(set(capabilities)) != len(capabilities)):
             raise HubError('invalid_hub_grant', 422)
         with self.sessions._transaction() as db:
@@ -358,15 +406,15 @@ class SessionHubBridge:
 
     @contextmanager
     def admit(self, secret, tool):
-        if tool not in TOOLS:
+        if tool not in self.tools:
             raise HubError('hub_capability_forbidden', 403)
         # Held through every downstream commit. Revokes use this same writer;
         # a revoke that wins first denies, otherwise it follows the committed op.
         with self.sessions._transaction() as db:
-            principal, grant = self._live(db, secret, capability=TOOLS[tool])
+            principal, grant = self._live(db, secret, capability=self.tools[tool])
             p = context.HubSessionPrincipal(principal.installation_id, principal.session_id,
                 principal.family, min(principal.expires_at, grant['expires_at']), grant['revision'])
-            operation = _Operation(self, p, db, secret, TOOLS[tool], tuple(json.loads(grant['projects'])))
+            operation = _Operation(self, p, db, secret, self.tools[tool], tuple(json.loads(grant['projects'])))
             token = context.current.set(operation)
             try:
                 yield operation
@@ -380,12 +428,64 @@ class SessionHubBridge:
         if tool == 'hub_project_get':
             project = arguments['project_id']
         elif tool in {'hub_task_get', 'hub_task_claim', 'hub_task_candidate', 'hub_task_review'}:
-            project = self.repo.get_task(arguments['task_id'])['project']
+            try:
+                project = self.repo.get_task(arguments['task_id'])['project']
+                operation.project(project)
+            except HubError as error:
+                if error.code not in {'not_found', 'hub_project_forbidden', 'project_archived'}:
+                    raise
+                raise HubError('hub_task_unavailable', 404) from None
+            return
+        elif tool in {'hub_role_get', 'hub_role_acquire', 'hub_role_renew', 'hub_role_release', 'hub_role_claim', 'hub_role_claims', 'hub_role_claim_release'}:
+            try:
+                from .roles import RoleRepository
+                RoleRepository(self.repo).get(operation.principal.actor, arguments['role'])
+            except HubError:
+                raise HubError('role_unavailable', 404) from None
+            return
+        elif tool in {'hub_tracking_task_update', 'hub_tracking_claim_withdraw', 'hub_tracking_task_review', 'hub_tracking_task_history', 'hub_tracking_task_compact', 'hub_tracking_task_origin'}:
+            try:
+                project = self.repo._read(arguments['task_id'], 'tracking_task')['project']
+                operation.project(project)
+            except HubError:
+                # A tracking ID is not a capability to discover a task in an
+                # ungranted, archived, or nonexistent project.
+                raise HubError('hub_tracking_task_unavailable', 404) from None
+            return
+        elif tool in {'hub_task_progress_get', 'hub_task_progress_update'}:
+            # TaskProgress resolves the exact task kind and independently checks
+            # project scope and underlying task-read capability under this guard.
+            return
+        elif tool == 'hub_decision_get':
+            try:
+                project = self.repo.get_decision(arguments['decision_id'])['project']
+                operation.project(project)
+            except HubError:
+                # Do not disclose whether an ID exists in an ungranted or
+                # archived project; neither becomes a read authority.
+                raise HubError('hub_decision_unavailable', 404) from None
+            return
         elif tool in {'hub_component_get', 'hub_component_update', 'hub_component_retire'}:
             identity = arguments.get('component_id', data.get('component_id'))
-            project = self.components.get_component(identity)['project']
+            try:
+                project = self.components.get_component(identity)['project']
+                operation.project(project)
+            except HubError as error:
+                if error.code not in {'not_found', 'hub_project_forbidden', 'project_archived'}:
+                    raise
+                raise HubError('hub_component_unavailable', 404) from None
+            return
         elif tool == 'hub_entity_withdraw':
-            project = self.repo._read(arguments['entity_id'], arguments['kind'])['project']
+            if arguments['kind'] not in {'task', 'decision'}:
+                raise HubError('invalid_kind')
+            try:
+                project = self.repo._read(arguments['entity_id'], arguments['kind'])['project']
+                operation.project(project)
+            except HubError as error:
+                if error.code not in {'not_found', 'hub_project_forbidden', 'project_archived'}:
+                    raise
+                raise HubError('hub_entity_unavailable', 404) from None
+            return
         if project is not None:
             operation.project(project)
 
@@ -394,7 +494,7 @@ class SessionHubBridge:
         class Registration:
             def tool(self, *decorator_args, **decorator_kwargs):
                 def decorate(fn):
-                    if fn.__name__ not in TOOLS:
+                    if fn.__name__ not in bridge.tools:
                         return mcp.tool(*decorator_args, **decorator_kwargs)(fn)
                     if inspect.iscoroutinefunction(fn):
                         raise ValueError('synchronous_hub_bridge_tool_required')
@@ -409,12 +509,136 @@ class SessionHubBridge:
                         try:
                             with bridge.admit(bearer(request), fn.__name__) as operation:
                                 bridge._scope(fn.__name__, arguments, operation)
+                                if fn.__name__ == 'hub_planning_put' and arguments['payload'].expected_version > 0:
+                                    bridge._live(operation.db, operation.secret,
+                                        operation.principal.authorization_revision, 'planning.read',
+                                        session_id=operation.principal.session_id)
                                 if fn.__name__ == 'hub_project_list':
                                     from .projects_api import project_view
                                     items = [bridge.projects.get_project(p) for p in operation.projects]
-                                    return {'items': [project_view(p) for p in items if not p['archived']]}
-                                result = fn(*args, **kwargs)
-                                if operation.capability.endswith('.read'):
+                                    result = {'items': [project_view(p) for p in items if not p['archived']]}
+                                else:
+                                    result = fn(*args, **kwargs)
+                                if fn.__name__ == 'hub_cross_seat_current':
+                                    bridge.seat_authority.recheck_current(operation.principal.actor, result)
+                                    bridge._live(operation.db, operation.secret,
+                                        operation.principal.authorization_revision, 'cross.seat.read',
+                                        session_id=operation.principal.session_id)
+                                    operation.project(result['project'])
+                                if fn.__name__ in {'hub_cross_routes', 'hub_cross_request_get',
+                                                   'hub_cross_request_list', 'hub_cross_message_list'}:
+                                    service = bridge.cross_requests
+                                    actor = operation.principal.actor
+                                    generation = arguments['generation']
+                                    if fn.__name__ == 'hub_cross_routes':
+                                        checked = service.routes(actor, generation, arguments.get('limit', 50), arguments.get('after'))
+                                    elif fn.__name__ == 'hub_cross_request_get':
+                                        checked = service.get(actor, generation, arguments['request_id'])
+                                    elif fn.__name__ == 'hub_cross_request_list':
+                                        checked = service.list(actor, generation, arguments.get('limit', 50), arguments.get('after'))
+                                    else:
+                                        checked = service.messages(actor, generation, arguments['request_id'],
+                                                                   arguments.get('limit', 50), arguments.get('after'))
+                                    if checked != result:
+                                        raise HubError('cross_request_unavailable', 404)
+                                    bridge._live(operation.db, operation.secret,
+                                        operation.principal.authorization_revision, 'cross.request.read',
+                                        session_id=operation.principal.session_id)
+                                read_required = {
+                                    'hub_tracking_task_propose': 'tracking.read', 'hub_tracking_draft_propose': 'tracking.read',
+                                    'hub_tracking_task_update': 'tracking.read',
+                                    'hub_tracking_claim_withdraw': 'tracking.read',
+                                    'hub_tracking_task_review': 'tracking.read', 'hub_tracking_task_compact': 'tracking.read',
+                                    'hub_staging_task_propose': 'task.read', 'hub_task_claim': 'task.read',
+                                    'hub_task_candidate': 'task.read', 'hub_task_review': 'task.read',
+                                    'hub_component_create': 'component.read', 'hub_component_update': 'component.read',
+                                    'hub_component_retire': 'component.read',
+                                    'hub_role_acquire': 'role.read', 'hub_role_renew': 'role.read',
+                                    'hub_role_release': 'role.read', 'hub_role_claim': 'role.read',
+                                    'hub_role_claim_release': 'role.read',
+                                    'hub_task_progress_update': 'progress.read',
+                                    'hub_planning_put': 'planning.read',
+                                    'hub_orchestration_request_create': 'dispatch.read',
+                                    'hub_dispatch_create': 'dispatch.read',
+                                    'hub_dispatch_report': 'dispatch.read',
+                                    'hub_dispatch_checkpoint': 'dispatch.read',
+                                }.get(fn.__name__)
+                                if fn.__name__ == 'hub_entity_withdraw':
+                                    # Scope validation rejects other kinds before
+                                    # this point; never infer a read grant from the
+                                    # source entity or its creation capability.
+                                    read_required = {'task': 'task.read', 'decision': 'decision.read'}[arguments['kind']]
+                                if read_required is not None:
+                                    # Mutations can be granted without the associated read. In
+                                    # particular, an idempotent retry may return a row
+                                    # changed by another actor since the original write.
+                                    # Do not turn a write grant into a history read.
+                                    try:
+                                        bridge._live(operation.db, operation.secret,
+                                            operation.principal.authorization_revision, read_required,
+                                            session_id=operation.principal.session_id)
+                                        for project in result.get('projects', [result.get('project')]):
+                                            operation.project(project)
+                                    except (HubError, AgentSessionError):
+                                        if fn.__name__ in {'hub_role_acquire', 'hub_role_renew', 'hub_role_release'}:
+                                            lease = result.get('lease')
+                                            result = {'role_id': result['role_id'], 'revision': result['revision'],
+                                                'generation': result['generation'],
+                                                'lease_expires_at': lease['expires_at'] if lease else None,
+                                                'handoff_revision': result['handoff']['revision'],
+                                                'takeover': result.get('takeover'),
+                                                'response_scope': 'coordination_receipt',
+                                                'execution_authorization': False}
+                                        elif fn.__name__ in {'hub_role_claim', 'hub_role_claim_release'}:
+                                            result = {'id': result['id'], 'role_id': result['role_id'],
+                                                'task_id': result['task_id'], 'revision': result['revision'],
+                                                'response_scope': 'coordination_receipt',
+                                                'execution_authorization': False}
+                                        elif fn.__name__ == 'hub_dispatch_checkpoint':
+                                            # Checkpoint may be a no-op or change a stale
+                                            # state; its resulting revision would reveal that
+                                            # transition to a caller without dispatch.read.
+                                            result = {'id': result['id'], 'response_scope': 'mutation_receipt',
+                                                'current_state_included': False}
+                                        elif fn.__name__ == 'hub_task_progress_update':
+                                            # Revision is exactly the caller's expected
+                                            # revision plus one, including accepted retries.
+                                            # Do not expose derived rate anchors or ETA.
+                                            result = {'id': result['id'], 'revision': result['revision'],
+                                                'response_scope': 'coordination_receipt',
+                                                'execution_authorization': False}
+                                        elif fn.__name__ == 'hub_planning_put':
+                                            result = {'project': result['project'], 'path': result['path'],
+                                                'version': result['version'], 'response_scope': 'mutation_receipt',
+                                                'advisory': True, 'execution_authorization': False}
+                                        elif fn.__name__ in {'hub_orchestration_request_create', 'hub_dispatch_create',
+                                                            'hub_dispatch_report'}:
+                                            # Exact idempotency receipts are revision-bound in
+                                            # DispatchRepository; no current report or routing
+                                            # fields are disclosed without dispatch.read.
+                                            decision_id = result.get('decision_id') if (
+                                                fn.__name__ == 'hub_dispatch_report'
+                                                and arguments.get('state') == 'ask') else None
+                                            decision_project = result.get('project') if decision_id is not None else None
+                                            result = {'id': result['id'], 'revision': result['revision'],
+                                                'response_scope': 'coordination_receipt',
+                                                'execution_authorization': False}
+                                            if decision_id is not None:
+                                                # Ask creates this decision atomically and requires
+                                                # decision.request and decision.read. Revision-bound
+                                                # replay cannot return a later decision.
+                                                try:
+                                                    bridge._live(operation.db, operation.secret,
+                                                        operation.principal.authorization_revision, 'decision.read',
+                                                        session_id=operation.principal.session_id)
+                                                    operation.project(decision_project)
+                                                    result['decision_id'] = decision_id
+                                                except (HubError, AgentSessionError):
+                                                    pass
+                                        else:
+                                            result = {'id': result['id'], 'response_scope': 'mutation_receipt',
+                                                      'current_state_included': False}
+                                if operation.capability.endswith('.read') or operation.capability == 'task.list':
                                     operation.before_commit(bridge.repo.path, None)
                                 return result
                         except (HubError, AgentSessionError) as error:
@@ -444,7 +668,7 @@ class SessionHubBridge:
         @app.get(OWNER_CONNECTION_PREFIX + '/hub-capabilities')
         def capabilities(request: Request):
             owner(request)
-            return dict(enabled=True, capabilities=list(CAPABILITIES), features=dict(task_recovery=True))
+            return dict(enabled=True, capabilities=list(self.capabilities), features=dict(task_recovery=True))
         path = OWNER_CONNECTION_PREFIX + '/installations/{installation_id}/hub-grant'
         @app.get(path)
         def get(installation_id: str, request: Request):

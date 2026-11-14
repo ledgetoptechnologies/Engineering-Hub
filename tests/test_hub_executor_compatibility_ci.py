@@ -85,6 +85,7 @@ def test_preparation_uses_immutable_git_bytes(tmp_path, source_repository):
 
 
 def test_command_failure_does_not_expose_output(monkeypatch):
+    monkeypatch.setattr(CI, 'docker_command', lambda a: (['docker', *a], {}))
     monkeypatch.setattr(CI.subprocess, 'run', lambda *args, **kwargs:
                         subprocess.CompletedProcess(args, 1, b'credential', b'private-data'))
     with pytest.raises(RuntimeError) as failure:

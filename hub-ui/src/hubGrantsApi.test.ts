@@ -4,10 +4,14 @@ import { actorAvatar, actorFamily, actorName } from "./actors";
 import { waitingOn } from "./dashboardText";
 import wire from "./fixtures/agent-hub-bridge-wire-v1.json";
 import {
-  grantFailureText, httpHubGrants, parseBridgeTask, parseCatalog, parseClaims, parseGrant, parseHistory, parseRecoveryResult,
+  capabilityLabel, grantFailureText, httpHubGrants, parseBridgeTask, parseCatalog, parseClaims, parseGrant, parseHistory, parseRecoveryResult,
 } from "./hubGrantsApi";
 import { resourceMaker } from "./StagingResourcesPanel";
 import type { Task } from "./types";
+
+it("describes decision read as project-wide questions and answers", () => {
+  expect(capabilityLabel("decision.read")).toBe("Read all questions and answers in selected projects");
+});
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 const installation = wire.active_grant.installation_id;
@@ -110,7 +114,7 @@ describe("actor names", () => {
   it("explains waiting tasks with the installation and its family", () => {
     const task = { ...(wire.overview.tasks[0] as unknown as Task) };
     const name = (id: string, family?: string | null) => actorName(id, { family });
-    expect(waitingOn(task, name)).toBe("Codex on install 88736abd is working on it.");
+    expect(waitingOn(task, name)).toBe("Codex on install 88736abd has claimed it.");
     expect(waitingOn({ ...task, status: "in_review", review: null }, name))
       .toBe("Waiting for an independent review. No reviewer assigned; any agent except Codex (on any computer) can review.");
   });
@@ -125,7 +129,7 @@ describe("installation reviews and withdrawals (fixture v2 provenance)", () => {
   it("names the reviewer and withdrawer by installation and family", () => {
     const task = wire.installation_review as unknown as Task;
     const name = (id: string, family?: string | null) => actorName(id, { family });
-    expect(waitingOn(task, name)).toBe("Review passed by Claude on install 7a207d88. Running it is separate and needs its own authorization.");
+    expect(waitingOn(task, name)).toBe("Review passed by Claude on install 7a207d88. A passed review doesn't start or authorize a run. Running it needs separate authorization, which this page doesn't show.");
     const decision = wire.mcp_withdrawn_decision;
     expect(actorName(decision.withdrawn_by, { family: decision.withdrawn_family, viewer: "human:42" })).toBe("Codex on install 88736abd");
   });

@@ -32,7 +32,7 @@ _GET = frozenset({
     '/', '/index.html', '/hub.svg', '/favicon.ico',
     '/api/hub/v1/auth/login', '/api/hub/v1/auth/me',
     *('/api/hub/v1/' + name for name in (
-        'overview', 'projects', 'agents', 'tasks', 'decisions', 'runs', 'image-versions',
+        'overview', 'projects', 'agents', 'agents/activity', 'tasks', 'decisions', 'runs', 'image-versions',
         'autonomy', 'events', 'events/status', 'work/status', 'work/jobs', 'notes', 'notes/document',
         'planning', 'planning/document', 'activity', 'label-sets', 'topics', 'interactive-reviews',
         'staging/session-reconciliation', 'staging/status', 'staging/runtime', 'staging/resources',
@@ -96,8 +96,10 @@ def _diagnostic_path(path, *, files_only=False):
             and all(part not in ('', '.', '..') for part in relative.split('/')))
 
 
-def browser_route_allowed(method, path):
+def browser_route_allowed(method, path, *, allow_bound_oauth_callback=False):
     """Closed browser surface; new backend routes are not exposed implicitly."""
+    if allow_bound_oauth_callback and method == 'GET' and path == '/api/hub/v1/auth/callback':
+        return True
     owner = '/api/hub/v1/agent-connections'
     installation = owner + '/installations/' + _UUID
     if method in {'GET', 'HEAD', 'PUT'} and path == owner + '/installation-scopes':
@@ -109,6 +111,16 @@ def browser_route_allowed(method, path):
         return True
     if method == 'PUT' and re.fullmatch(installation + r'/(?:hub-grant|scope)', path) is not None:
         return True
+    if method in {'PUT', 'POST'} and re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/attention-route' + (r'/revoke' if method == 'POST' else ''), path) is not None:
+        return True
+    if method in {'PUT', 'POST'} and re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/worker-attention-routes/' + _PROJECT_ID + (r'/revoke' if method == 'POST' else ''), path) is not None:
+        return True
+    if method == 'PUT' and re.fullmatch(r'/api/hub/v1/roles/' + _PROJECT_ID, path) is not None:
+        return True
+    if method == 'PUT' and path in {'/api/hub/v1/orchestration/stale-service-grant', '/api/hub/v1/orchestration/stale-evaluator'}:
+        return True
+    if method == 'POST' and path == '/api/hub/v1/orchestration/stale-service-grant/revoke':
+        return True
     if method == 'PATCH' and re.fullmatch(installation, path) is not None:
         return True
     if method == 'POST' and (
@@ -118,15 +130,32 @@ def browser_route_allowed(method, path):
         return True
     if method in {'GET', 'HEAD'}:
         return (path in _GET or client_page_allowed(method, path)
+                or path == '/api/hub/v1/roles'
+                or path == '/api/hub/v1/orchestration/stale-service-grant'
+                or path == '/api/hub/v1/orchestration/stale-evaluator'
+                or re.fullmatch(r'/api/hub/v1/task-progress/' + _UUID, path) is not None
+                or re.fullmatch(r'/api/hub/v1/orchestration/requests/' + _UUID + r'(?:/dispatches)?', path) is not None
+                or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/(?:attention-route|attention-receipts)', path) is not None
+                or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/worker-attention-(?:routes|receipts)/' + _PROJECT_ID, path) is not None
+                or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/orchestration-requests', path) is not None
+                or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/orchestration-requests/' + _UUID + r'/view', path) is not None
+                or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/orchestration-requests/' + _UUID + r'/tracking-tasks', path) is not None
+                or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + r'/orchestration-attention', path) is not None
+                or re.fullmatch(r'/api/hub/v1/orchestration/dispatches/' + _UUID + r'/(?:reports|decisions)', path) is not None
+                or re.fullmatch(r'/api/hub/v1/roles/' + _PROJECT_ID, path) is not None
                 or path == '/api/hub/v1/infrastructure/devices'
                 or path == '/api/hub/v1/infrastructure/metrics'
+                or path == '/api/hub/v1/infrastructure/metrics/history'
                 or re.fullmatch(r'/api/hub/v1/infrastructure/devices/' + _PROJECT_ID, path) is not None
                 or method == 'GET' and _diagnostic_path(path)
                 or re.fullmatch(r'/api/hub/v1/interactive-reviews/' + _UUID + r'(?:/state|/assets/' + _UUID + ')?', path) is not None
                 or re.fullmatch(r'/assets/[A-Za-z0-9][A-Za-z0-9_.-]{0,180}\.(?:js|css|svg|png|ico|woff2)', path) is not None
                 or re.fullmatch(r'/api/hub/v1/(?:tasks|work/jobs)/' + _UUID, path) is not None
+                or re.fullmatch(r'/api/hub/v1/container-pilot/runs/' + _UUID + r'/release-evidence', path) is not None
                 or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + '/components', path) is not None
+                or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + '/tracking-tasks', path) is not None
+                or re.fullmatch(r'/api/hub/v1/tracking-tasks/' + _UUID + '/history', path) is not None
                 or re.fullmatch(r'/api/hub/v1/components/' + _UUID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/staging/(?:resources|jobs)/' + _UUID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/staging/projects/' + _PROJECT_ID + '/policy', path) is not None
@@ -142,6 +171,8 @@ def browser_route_allowed(method, path):
         return (re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/components/' + _UUID, path) is not None)
     return method == 'POST' and (path in _POST
+        or re.fullmatch(r'/api/hub/v1/roles/' + _PROJECT_ID + '/clear-expired', path) is not None
+        or re.fullmatch(r'/api/hub/v1/tracking-tasks/' + _UUID + '/review', path) is not None
         or re.fullmatch(r'/api/hub/v1/infrastructure/devices/' + _PROJECT_ID + '/maintenance', path) is not None
         or re.fullmatch(r'/api/hub/v1/infrastructure/maintenance/' + _UUID + '/resolve', path) is not None
         or re.fullmatch(
@@ -171,7 +202,7 @@ async def _deny(scope, receive, send, code, status):
                        headers={'Cache-Control': 'no-store'})(scope, receive, send)
 
 
-def _scope_headers(scope, *, preview_host=None):
+def _scope_headers(scope, *, preview_host=None, allow_bound_oauth_callback=False):
     path = scope.get('path', '')
     try:
         canonical = path.encode('ascii')
@@ -185,7 +216,7 @@ def _scope_headers(scope, *, preview_host=None):
     if type(query) is not bytes or len(query) > 4096 or any(c < 32 or c == 127 for c in query):
         raise _Denied('gateway_invalid_query', 400)
     preview = _is_preview(scope, preview_host)
-    if not (_preview_path(scope) if preview else browser_route_allowed(scope.get('method'), path)):
+    if not (_preview_path(scope) if preview else browser_route_allowed(scope.get('method'), path, allow_bound_oauth_callback=allow_bound_oauth_callback)):
         raise _Denied('gateway_route_forbidden', 403)
     headers = scope.get('headers', [])
     if len(headers) > 64 or sum(len(k) + len(v) for k, v in headers) > 32768:
@@ -243,7 +274,10 @@ class PrivateBrowserGateway:
     as an unprotected TCP listener; no socket or deployment is created here.
     """
     def __init__(self, core, *, agent_auth, cloudflare_config, access_verifier=None,
-                 preview_origin=None, preview_app=None):
+                 preview_origin=None, preview_app=None, allow_bound_oauth_callback=False):
+        if type(allow_bound_oauth_callback) is not bool:
+            raise ValueError('Explicit callback opt-in must be boolean')
+        self.allow_bound_oauth_callback = allow_bound_oauth_callback
         if cloudflare_config is None:
             raise ValueError('Private browser gateway requires Cloudflare Access')
         self.ingress = HubIngressMiddleware(core, mode='browser', agent_auth=agent_auth,
@@ -261,7 +295,7 @@ class PrivateBrowserGateway:
         if scope['type'] != 'http':
             raise RuntimeError('Private browser gateway has no independent lifespan')
         try:
-            headers, length = _scope_headers(scope, preview_host=self.preview_host)
+            headers, length = _scope_headers(scope, preview_host=self.preview_host, allow_bound_oauth_callback=self.allow_bound_oauth_callback)
             preview = _is_preview(scope, self.preview_host)
             body = await _bounded_body(scope, receive, length, maximum=0 if preview else 65536, timeout=15.0)
         except _Denied as error:
@@ -299,7 +333,10 @@ class PublicBrowserGateway:
     domain's recovery mechanism. SSE is streamed without buffering a full body.
     """
     def __init__(self, client, *, max_body_bytes=65536, max_response_bytes=2097152,
-                 max_concurrency=16, request_timeout=15.0, preview_origin=None):
+                 max_concurrency=16, request_timeout=15.0, preview_origin=None, allow_bound_oauth_callback=False):
+        if type(allow_bound_oauth_callback) is not bool:
+            raise ValueError('Explicit callback opt-in must be boolean')
+        self.allow_bound_oauth_callback = allow_bound_oauth_callback
         if type(client) is not httpx.AsyncClient:
             raise ValueError('Explicit caller-owned AsyncClient required')
         for value, maximum in ((max_body_bytes, 1048576), (max_response_bytes, 16777216),
@@ -337,7 +374,7 @@ class PublicBrowserGateway:
                 started = True
             await send(message)
         try:
-            headers, length = _scope_headers(scope, preview_host=self.preview_host)
+            headers, length = _scope_headers(scope, preview_host=self.preview_host, allow_bound_oauth_callback=self.allow_bound_oauth_callback)
             preview = _is_preview(scope, self.preview_host)
             if length is not None and length > self.max_body_bytes:
                 raise _Denied('gateway_body_too_large', 413)

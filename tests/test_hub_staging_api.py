@@ -49,7 +49,7 @@ class Controller:
         self.resources.authorize(actor, PROJECT, 'read')
         return {'job_id': job_id, 'state': 'queued'}
 
-    async def reconcile_for(self, actor, job_id):
+    async def reconcile_for(self, actor, job_id, *, admission_guard=None):
         if actor not in self.resources.admin_actors:
             raise HubError('staging_admin_required', 403)
         self.resources.authorize(actor, PROJECT, 'read')
@@ -115,7 +115,8 @@ def application(controller, *, broker=None, session=None, observer=None):
         HubRepository._actor(principal, human=True)
         return principal
 
-    attach_staging_routes(app, controller, actor, human, broker, session, observer=observer)
+    attach_staging_routes(app, controller, actor, human, broker, session, observer=observer,
+                          human_admission=lambda request, principal: lambda db: None)
     return TestClient(app), calls
 
 
@@ -137,8 +138,9 @@ def resource(env, *, kind='build', expired=False):
 
 def submission():
     return {'request_id': '33762456-e740-4f80-bda9-776f8dbcf753', 'project': PROJECT, 'recipe': 'static',
+            'review_task_id': '33762456-e740-4f80-bda9-776f8dbcf754', 'review_task_revision': 4,
             'source_commit': COMMIT, 'source_digest': 'c' * 64,
-            'source_zip_base64': 'eA==', 'topic': 'topic'}
+            'source_zip_base64': 'eA==', 'source_commit_object_base64': 'eA==', 'topic': 'topic'}
 
 
 def test_disabled_status_is_authenticated_and_actions_closed():

@@ -1,4 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
+import sqlite3
+import threading
 import uuid
 
 import pytest
@@ -31,8 +33,135 @@ def submit(queue, key='one', env='staging', action='validate', **kwargs):
                         environment=env, target=kwargs.pop('target', target()), **kwargs)
 
 
+def test_reserved_modular_prefix_without_enrollment_fails_closed(tmp_path):
+    repo = HubRepository(tmp_path / 'hub.sqlite3')
+    action = 'staging-service.' + 'a' * 24
+    queue = WorkQueue(repo, {action: WorkAction('machine', project='engineering-hub')},
+                      target_verifier=lambda *args: True)
+    target_value = WorkTarget(str(uuid.uuid4()), 'a' * 40, 'sha256:' + 'b' * 64,
+                              1, str(uuid.uuid4()))
+    with pytest.raises(HubError, match='work_target_not_verified'):
+        queue.submit(actor='codex', request_id='one', action_key=action,
+                     environment='staging', target=target_value)
+
+
 def finish(queue, claimed, outcome='succeeded'):
     return queue.complete(job_id=claimed['id'], worker=WorkWorker(*claimed['worker'].split(':', 1)), fence=claimed['fence'], outcome=outcome)
+
+
+def test_status_identifies_only_visible_same_machine_reservation(setup_queue):
+    q, _, _, _ = setup_queue
+    original = submit(q, key='holder')
+    claimed = q.claim(worker=w('codex'), lease_seconds=10)
+    waiting = submit(q, key='waiting')
+    other = submit(q, key='other-machine', action='other')
+    jobs = {item['id']: item for item in q.status()['jobs']}
+    assert jobs[waiting['id']]['blocked_reason'] == 'machine_reserved'
+    assert jobs[waiting['id']]['reservation_holder_job_id'] == original['id']
+    assert jobs[original['id']]['state'] == 'claimed'
+    assert jobs[other['id']]['reservation_holder_job_id'] is None
+    finish(q, claimed, outcome='held')
+    jobs = {item['id']: item for item in q.status()['jobs']}
+    assert jobs[waiting['id']]['reservation_holder_job_id'] == original['id']
+    assert jobs[original['id']]['state'] == 'held'
+
+
+def test_status_does_not_disclose_holder_outside_fifty_jobs(setup_queue):
+    q, _, _, _ = setup_queue
+    original = submit(q, key='holder')
+    q.claim(worker=w('codex'), lease_seconds=10)
+    for i in range(50): submit(q, key=f'waiting-{i}')
+    jobs = q.status(limit=50)['jobs']
+    assert original['id'] not in {item['id'] for item in jobs}
+    assert all(item['blocked_reason'] == 'machine_reserved' and item['reservation_holder_job_id'] is None
+               for item in jobs)
+
+
+def test_status_limit_one_does_not_disclose_hidden_holder(setup_queue):
+    q, _, _, _ = setup_queue
+    original = submit(q, key='holder')
+    q.claim(worker=w('codex'), lease_seconds=10)
+    waiting = submit(q, key='waiting')
+    jobs = q.status(limit=1)['jobs']
+    assert len(jobs) == 1 and jobs[0]['id'] == waiting['id']
+    assert jobs[0]['blocked_reason'] == 'machine_reserved'
+    assert jobs[0]['reservation_holder_job_id'] is None and original['id'] != waiting['id']
+
+
+def test_status_reservation_and_visible_state_share_one_snapshot(setup_queue, monkeypatch):
+    q, _, _, _ = setup_queue
+    original = submit(q, key='holder')
+    claimed = q.claim(worker=w('codex'), lease_seconds=10)
+    waiting = submit(q, key='waiting')
+    reading, resume = threading.Event(), threading.Event()
+    def block_after_read(*_args):
+        reading.set()
+        assert resume.wait(5)
+        return True
+    monkeypatch.setattr(q, '_target_verified', block_after_read)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(q.status)
+        try:
+            assert reading.wait(5)
+            finish(q, claimed)
+        finally:
+            resume.set()
+        jobs = {item['id']: item for item in future.result(timeout=5)['jobs']}
+    assert jobs[waiting['id']]['blocked_reason'] == 'machine_reserved'
+    assert jobs[waiting['id']]['reservation_holder_job_id'] == original['id']
+    assert jobs[original['id']]['state'] == 'claimed'
+    assert q.get_job(original['id'])['state'] == 'succeeded'
+
+
+def test_status_counts_and_jobs_share_snapshot_during_transition(setup_queue, monkeypatch):
+    q, _, repo, _ = setup_queue
+    job = submit(q)
+    claimed = q.claim(worker=w('codex'), lease_seconds=10)
+    original_paused = repo._paused
+    def transition_after_rows(db):
+        finish(q, claimed, outcome='held')
+        return original_paused(db)
+    monkeypatch.setattr(repo, '_paused', transition_after_rows)
+    snapshot = q.status()
+    assert snapshot['jobs'][0]['id'] == job['id']
+    assert snapshot['jobs'][0]['state'] == 'claimed'
+    assert snapshot['counts'].get('claimed') == 1
+    assert snapshot['counts'].get('held', 0) == 0
+    assert q.get_job(job['id'])['state'] == 'held'
+
+
+@pytest.mark.parametrize('owned', [False, True], ids=['legacy', 'pilot-owner'])
+def test_status_snapshot_exception_closes_connection_and_allows_writer(tmp_path, monkeypatch, owned):
+    from contextlib import nullcontext
+    if owned:
+        pytest.importorskip('fcntl')
+        from engineering_hub.pilot_ownership import PilotOwner
+        private = tmp_path / 'private'
+        private.mkdir(mode=0o700)
+        path = private / 'hub.sqlite3'
+        owner_context = PilotOwner(path, allow_ephemeral_test_storage=True)
+    else:
+        path = tmp_path / 'hub.sqlite3'
+        owner_context = nullcontext(None)
+    with owner_context as owner:
+        repo = HubRepository(path, pilot_owner=owner)
+        queue = WorkQueue(repo, {'validate': WorkAction('machine-one', project='engineering-hub',
+                          requires_execution_proof=False)}, target_verifier=lambda *_: True)
+        job = submit(queue)
+        seen = []
+        original = repo._paused
+        def fail_inside_snapshot(db):
+            assert db.in_transaction
+            seen.append(db)
+            raise RuntimeError('synthetic status failure')
+        monkeypatch.setattr(repo, '_paused', fail_inside_snapshot)
+        with pytest.raises(RuntimeError, match='synthetic status failure'):
+            queue.status()
+        assert len(seen) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+            seen[0].execute('SELECT 1')
+        monkeypatch.setattr(repo, '_paused', original)
+        assert queue.claim(worker=w('codex'))['id'] == job['id']
 
 
 def test_get_exact_job_is_read_only_and_exposes_expired_claim(setup_queue):
@@ -127,6 +256,74 @@ def test_reconcile_requires_exact_authoritative_evidence(setup_queue):
     assert q.reconcile(job_id=job['id'], evidence_id='verified-stopped', outcome='failed')['state'] == 'failed'
     submit(q, 'next')
     assert q.claim(worker=w('claude'))['fence'] == 2
+
+
+@pytest.mark.parametrize('drift', ['missing', 'different-holder', 'empty-holder', 'stale-generation'])
+def test_reconcile_rejects_changed_machine_reservation_atomically(setup_queue, drift):
+    q, clock, repo, actions = setup_queue
+    job = submit(q)
+    claimed = q.claim(worker=w('codex'))
+    finish(q, claimed, 'held')
+    with repo._transaction() as db:
+        if drift == 'missing':
+            db.execute('DELETE FROM hub_work_machines WHERE machine_id=?', ('machine-one',))
+        elif drift == 'different-holder':
+            db.execute('UPDATE hub_work_machines SET job_id=? WHERE machine_id=?', (str(uuid.uuid4()), 'machine-one'))
+        elif drift == 'empty-holder':
+            db.execute('UPDATE hub_work_machines SET job_id=NULL WHERE machine_id=?', ('machine-one',))
+        else:
+            db.execute('UPDATE hub_work_machines SET generation=generation+1 WHERE machine_id=?', ('machine-one',))
+
+    def snapshot():
+        with repo._connection() as db:
+            job_row = tuple(db.execute('SELECT state,revision,worker,fence FROM hub_work_jobs WHERE id=?', (job['id'],)).fetchone())
+            reservation = db.execute('SELECT generation,job_id FROM hub_work_machines WHERE machine_id=?', ('machine-one',)).fetchone()
+            audit = db.execute("SELECT COUNT(*) FROM hub_audit WHERE entity_id=? AND action='work.reconciled'", (job['id'],)).fetchone()[0]
+            return job_row, tuple(reservation) if reservation is not None else None, audit
+
+    original = snapshot()
+    q = WorkQueue(repo, actions, target_verifier=lambda *args: True, clock=lambda: clock[0],
+                  reconciliation_verifier=lambda *_args: True)
+    with pytest.raises(HubError, match='work_reservation_changed'):
+        q.reconcile(job_id=job['id'], evidence_id='synthetic-proof', outcome='failed')
+    assert snapshot() == original
+
+
+def test_reconcile_verifier_scope_ends_before_queue_commit(setup_queue, monkeypatch):
+    """A synthetic verifier-local guard is not a commit-spanning fence."""
+    from agent_message_bus import session_hub_context as session_context
+
+    q, clock, repo, actions = setup_queue
+    job = submit(q)
+    claim = q.claim(worker=w('codex'))
+    finish(q, claim, 'held')
+    state = {'guard': False, 'verified': False, 'commit_checked': False}
+
+    def verifier(row, evidence, outcome):
+        state['guard'] = True
+        try:
+            state['verified'] = True
+            return row['id'] == job['id'] and evidence == 'synthetic-proof' and outcome == 'failed'
+        finally:
+            state['guard'] = False
+
+    q = WorkQueue(repo, actions, target_verifier=lambda *args: True, clock=lambda: clock[0],
+                  reconciliation_verifier=verifier)
+    original = session_context.before_commit
+
+    def inspect_before_commit(path, db):
+        assert state['verified'] and not state['guard']
+        assert db.execute('SELECT state FROM hub_work_jobs WHERE id=?', (job['id'],)).fetchone()[0] == 'failed'
+        assert db.execute('SELECT job_id FROM hub_work_machines WHERE machine_id=?', ('machine-one',)).fetchone()[0] is None
+        with sqlite3.connect(repo.path) as reader:
+            assert reader.execute('SELECT state FROM hub_work_jobs WHERE id=?', (job['id'],)).fetchone()[0] == 'held'
+            assert reader.execute('SELECT job_id FROM hub_work_machines WHERE machine_id=?', ('machine-one',)).fetchone()[0] == job['id']
+        state['commit_checked'] = True
+        return original(path, db)
+
+    monkeypatch.setattr(session_context, 'before_commit', inspect_before_commit)
+    assert q.reconcile(job_id=job['id'], evidence_id='synthetic-proof', outcome='failed')['state'] == 'failed'
+    assert state['commit_checked'] and q.get_job(job['id'])['state'] == 'failed'
 
 
 def test_idempotence_full_target_and_capacity(setup_queue):
@@ -386,3 +583,31 @@ def test_production_status_explains_unapproved_job(setup_queue):
     status = q.status()['jobs'][0]
     assert status['blocked_reason'] == 'production_approval_required'
     assert not status['eligible']
+
+
+def test_target_receipt_bindings_survive_queue_and_change_idempotency(setup_queue):
+    from dataclasses import replace
+    q, _, repo, actions = setup_queue
+    t = WorkTarget(str(uuid.uuid4()), 'a' * 40, 'sha256:' + 'b' * 64,
+                   review_revision=3, submission_id=str(uuid.uuid4()),
+                   ci_attempt_job_id=str(uuid.uuid4()),
+                   build_receipt_digest='sha256:' + 'c' * 64,
+                   execution_release_digest='sha256:' + 'd' * 64)
+    job = submit(q, 'bound', target=t)
+    reopened = WorkQueue(repo, actions, target_verifier=lambda *args: True, clock=lambda: 1000.0)
+    assert WorkTarget(**reopened.get_job(job['id'])['target']) == t
+    assert submit(reopened, 'bound', target=t)['id'] == job['id']
+    for field, value in [('review_revision', 4), ('submission_id', str(uuid.uuid4())),
+                         ('ci_attempt_job_id', str(uuid.uuid4())),
+                         ('build_receipt_digest', 'sha256:' + 'e' * 64),
+                         ('execution_release_digest', 'sha256:' + 'f' * 64)]:
+        with pytest.raises(HubError, match='work_request_conflict'):
+            submit(reopened, 'bound', target=replace(t, **{field: value}))
+
+
+def test_legacy_target_retains_idempotency_fingerprint(setup_queue):
+    q, _, _, _ = setup_queue
+    t = target()
+    job = submit(q, 'legacy', target=t)
+    assert submit(q, 'legacy', target=t)['id'] == job['id']
+    assert set(job['target']) == {'task_id', 'source_commit', 'artifact_digest'}

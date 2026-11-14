@@ -236,3 +236,130 @@ for (const [name, size] of [["desktop", { width: 1280, height: 800 }], ["phone",
     await page.screenshot({ path: test.info().outputPath(`new-project-${name}.png`) });
   });
 }
+
+
+test("project tracking starts at the first page after changing project", async ({ page }) => {
+  const { overview } = await fixture(page);
+  const first = overview.projects[0].id as string, second = overview.projects[1].id as string;
+  const requests: string[] = [];
+  await page.route("**/api/hub/v1/projects/*/tracking-tasks*", async route => {
+    const url = new URL(route.request().url());
+    const project = url.pathname.split("/")[5];
+    requests.push(`${project}:${url.searchParams.get("after_task_id") ?? "first"}`);
+    const cursor = url.searchParams.get("after_task_id");
+    const next = "11111111-1111-4111-8111-111111111111";
+    return route.fulfill({ contentType: "application/json", body: JSON.stringify({project,
+      tasks: [{id: cursor ?? next, revision: 1, project, title: cursor ? "Later page" : `${project} first record`,
+        status: "open", created_by: "codex", execution_authorization: false, updates: []}],
+      truncated: project === first && !cursor, next_after: project === first && !cursor ? next : null}) });
+  });
+  await page.goto(`/#/projects/${first}/work`);
+  await page.getByRole("button", {name: "Next page"}).click();
+  await expect(page.getByText("Later page")).toBeVisible();
+  await page.goto(`/#/projects/${second}/work`);
+  await expect(page.getByText(`${second} first record`)).toBeVisible();
+  expect(requests).toContain(`${second}:first`);
+  expect(requests.filter(value => value.startsWith(`${second}:`))).toEqual([`${second}:first`]);
+});
+
+test("earlier tracking history is paged and keeps claim and review meanings", async ({ page }) => {
+  const { overview } = await fixture(page);
+  const project = overview.projects[0].id as string;
+  const id = "11111111-1111-4111-8111-111111111111";
+  await page.route("**/api/hub/v1/projects/*/tracking-tasks*", route => route.fulfill({contentType:"application/json", body:JSON.stringify({project,
+    tasks:[{id,project,title:"Long work",status:"open",revision:110,created_by:"codex",execution_authorization:false,
+      updates:[{actor:"codex",progress:"Current",evidence_links:[],completion_claim:false}],history_segments:{updates:2,reviews:1}}],
+    truncated:false,next_after:null})}));
+  await page.route("**/api/hub/v1/tracking-tasks/*/history*", route => {
+    const url = new URL(route.request().url()), kind = url.searchParams.get("kind"), before = url.searchParams.get("before");
+    const records = kind === "updates" ? [{actor:"codex",progress:before ? "Oldest" : "Claimed", completion_claim:!before,
+      evidence_links:[{label:"Evidence",url:"https://example.test/proof"}]}] : [{actor:"claude",verdict:"verify",note:"Checked",evidence_links:[]}];
+    return route.fulfill({contentType:"application/json",body:JSON.stringify({task_id:id,kind,records,next_before:kind === "updates" && !before ? 1 : null})});
+  });
+  await page.goto(`/#/projects/${project}/work`);
+  const panel = page.getByRole("region", {name:"Project tracking"});
+  await panel.getByText("Earlier updates", {exact:true}).click();
+  await panel.getByRole("button", {name:"Load earlier updates"}).click();
+  await expect(panel.getByText("Completion claimed — unverified", {exact:false})).toBeVisible();
+  await expect(panel.getByRole("link", {name:"Evidence"})).toHaveAttribute("href", "https://example.test/proof");
+  await panel.getByRole("button", {name:"Older updates"}).click();
+  await expect(panel.getByText("Oldest", {exact:false})).toBeVisible();
+  await expect(panel.getByText("Claimed", {exact:false})).toHaveCount(0);
+  await panel.getByText("Earlier reviews", {exact:true}).click();
+  await panel.getByRole("button", {name:"Load earlier reviews"}).click();
+  await expect(panel.getByText("Verified claim", {exact:false})).toBeVisible();
+});
+
+for (const status of [401, 403]) {
+  test(`earlier history ${status} clears loaded private task data`, async ({ page }) => {
+    const { overview } = await fixture(page);
+    const project = overview.projects[0].id as string, id = "11111111-1111-4111-8111-111111111111";
+    await page.route("**/api/hub/v1/projects/*/tracking-tasks*", route => route.fulfill({contentType:"application/json",body:JSON.stringify({project,
+      tasks:[{id,project,title:"Private tracked task",status:"open",revision:55,created_by:"codex",execution_authorization:false,
+        updates:[{actor:"codex",progress:"Private current progress",evidence_links:[],completion_claim:false}],history_segments:{updates:1}}],
+      truncated:false,next_after:null})}));
+    await page.route("**/api/hub/v1/tracking-tasks/*/history*", route => route.fulfill({status,contentType:"application/json",body:JSON.stringify({detail:{code:status === 401 ? "human_session_required" : "forbidden"}})}));
+    await page.goto(`/#/projects/${project}/work`);
+    await expect(page.getByText("Private current progress", {exact:false})).toBeVisible();
+    await page.getByText("Earlier updates", {exact:true}).click();
+    await page.getByRole("button", {name:"Load earlier updates"}).click();
+    await expect(page.getByRole("link", {name:"Sign in securely"})).toBeVisible();
+    await expect(page.getByText("Private current progress", {exact:false})).toHaveCount(0);
+    await expect(page.getByText("Private tracked task", {exact:true})).toHaveCount(0);
+  });
+}
+
+test("tracking defaults to unfinished and resets paging when filter changes", async ({ page }) => {
+  const { overview } = await fixture(page);
+  const project = overview.projects[0].id as string;
+  const requests: string[] = [];
+  const next = "11111111-1111-4111-8111-111111111111";
+  await page.route("**/api/hub/v1/projects/*/tracking-tasks*", route => {
+    const url = new URL(route.request().url());
+    const filter = url.searchParams.get("unfinished") === "true" ? "unfinished" : "all";
+    const cursor = url.searchParams.get("after_task_id");
+    requests.push(`${filter}:${cursor ?? "first"}`);
+    const title = filter === "all" ? "Verified task" : cursor ? "Needs review" : "Open task";
+    return route.fulfill({contentType: "application/json", body: JSON.stringify({project,
+      tasks: [{id: cursor ?? next, revision: 1, project, title,
+        status: filter === "all" ? "completion_verified" : cursor ? "completion_claimed" : "open",
+        created_by: "codex", execution_authorization: false, updates: []}],
+      truncated: filter === "unfinished" && !cursor, next_after: filter === "unfinished" && !cursor ? next : null})});
+  });
+  await page.goto(`/#/projects/${project}/work`);
+  await expect(page.getByText("Open task")).toBeVisible();
+  await page.getByRole("button", {name: "Next page"}).click();
+  await expect(page.getByText("Needs review")).toBeVisible();
+  await expect(page.getByText("Completion claimed — unverified")).toBeVisible();
+  await page.getByRole("button", {name: "First page"}).click();
+  await expect(page.getByText("Open task")).toBeVisible();
+  await page.getByRole("button", {name: "Next page"}).click();
+  await page.getByLabel("Tracking records").selectOption("all");
+  await expect(page.getByText("Verified task")).toBeVisible();
+  expect(requests).toContain("all:first");
+  expect(requests).not.toContain(`all:${next}`);
+});
+
+test("tracking completion review requires evidence acknowledgement and sends exact revision", async ({ page }) => {
+  const { overview } = await fixture(page);
+  const project = overview.projects[0].id as string;
+  let sent: Record<string, unknown> | undefined;
+  let csrf: string | undefined;
+  const task = { id: "11111111-1111-4111-8111-111111111111", project, title: "Verify task", status: "completion_claimed", revision: 2,
+    created_by: "codex", execution_authorization: false, updates: [{actor:"codex", progress:"Done", completion_claim:true,
+      evidence_links:[{label:"Evidence",url:"https://example.com/evidence"}]}] };
+  await page.route("**/api/hub/v1/projects/*/tracking-tasks*", route => route.fulfill({contentType:"application/json", body:JSON.stringify({project,tasks:[task],truncated:false,next_after:null})}));
+  await page.route("**/api/hub/v1/tracking-tasks/*/review", route => {
+    sent = route.request().postDataJSON(); csrf = route.request().headers()["x-hub-csrf"];
+    return route.fulfill({contentType:"application/json", body:JSON.stringify({...task,status:"completion_verified",revision:3})});
+  });
+  await page.goto(`/#/projects/${project}/work`);
+  await page.getByText("Review completion claim").click();
+  const verify = page.getByRole("button", {name:"Verify completion"});
+  await page.getByLabel("Review note").fill("I checked the evidence");
+  await expect(verify).toBeDisabled();
+  await page.getByLabel("I reviewed the linked evidence").check();
+  await verify.click();
+  await expect.poll(() => sent).toMatchObject({expected_revision:2,verdict:"verify",note:"I checked the evidence",evidence_links:[{label:"Evidence",url:"https://example.com/evidence"}]});
+  expect(csrf).toBe("fixture-csrf");
+});

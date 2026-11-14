@@ -113,6 +113,44 @@ def test_explicit_grants_cas_scope_and_no_implicit_capabilities(env):
     assert env.bridge.grant_get(OWNER, installation)['state'] == 'inactive'
 
 
+def test_tracking_and_project_enumeration_require_distinct_grants(env):
+    installation, token, _ = pair(env, caps=())
+    env.bridge.grant_put(OWNER, installation, 0, [PROJECT], ['task.read'])
+    for tool in ('hub_project_tasks', 'hub_tracking_task_list', 'hub_tracking_task_propose', 'hub_tracking_task_update', 'hub_tracking_task_review'):
+        with pytest.raises(HubError, match='hub_capability_forbidden'):
+            call(env, token, tool, lambda _: None)
+    env.bridge.grant_put(OWNER, installation, 1, [PROJECT], ['tracking.propose', 'tracking.read', 'tracking.update', 'task.list'])
+    item = call(env, token, 'hub_tracking_task_propose', lambda actor:
+        env.repo.propose_tracking_task(actor, PROJECT, 'Inert test', 'tracking-key'))
+    with pytest.raises(HubError, match='hub_project_forbidden'):
+        call(env, token, 'hub_tracking_task_list', lambda _: env.repo.tracking_tasks('project-alpha', 100, None))
+    with pytest.raises(HubError, match='hub_project_forbidden'):
+        call(env, token, 'hub_tracking_task_list', lambda _: env.repo.tracking_tasks('project-alpha', 100, None, True))
+    assert call(env, token, 'hub_tracking_task_list', lambda _: env.repo.tracking_tasks(PROJECT, 100, None))[0]['id'] == item['id']
+    assert call(env, token, 'hub_tracking_task_list', lambda _: env.repo.tracking_tasks(PROJECT, 100, None, True))[0]['id'] == item['id']
+    env.bridge.grant_revoke(OWNER, installation, 2)
+    with pytest.raises(HubError, match='hub_grant_required'):
+        call(env, token, 'hub_tracking_task_list', lambda _: None)
+
+
+def test_tracking_review_requires_independent_agent_family(env):
+    _, author, _ = pair(env, 'tracking-author', family='codex')
+    _, sibling, _ = pair(env, 'tracking-sibling', family='codex')
+    _, reviewer, _ = pair(env, 'tracking-reviewer', family='claude')
+    item = call(env, author, 'hub_tracking_task_propose', lambda actor:
+        env.repo.propose_tracking_task(actor, PROJECT, 'Test claim', 'new-tracking'))
+    links = [{'label': 'Evidence', 'url': 'https://example.com/evidence'}]
+    item = call(env, author, 'hub_tracking_task_update', lambda actor:
+        env.repo.update_tracking_task(actor, item['id'], 1, 'claim-tracking', progress='Done',
+                                      evidence_links=links, completion_claim=True))
+    with pytest.raises(HubError, match='independent_review_required'):
+        call(env, sibling, 'hub_tracking_task_review', lambda actor:
+            env.repo.review_tracking_task(actor, item['id'], 2, 'same-family', verdict='verify', note='Read', evidence_links=links))
+    verified = call(env, reviewer, 'hub_tracking_task_review', lambda actor:
+        env.repo.review_tracking_task(actor, item['id'], 2, 'other-family', verdict='verify', note='Read', evidence_links=links))
+    assert verified['status'] == 'completion_verified'
+
+
 @pytest.mark.parametrize('projects,caps', [([], ['task.propose']), ([PROJECT], []), (['*'], ['task.propose']),
     ([PROJECT], ['*']), ([PROJECT, PROJECT], ['task.propose']), ([PROJECT], ['task.propose', 'task.propose'])])
 def test_reject_wildcard_empty_duplicate_grants(env, projects, caps):
@@ -371,6 +409,773 @@ def data(result):
     return result.get('structuredContent') or json.loads(result['content'][0]['text'])
 
 
+def test_planning_write_requires_read_for_replacement_and_redacts_receipts(unified, monkeypatch):
+    client, app, bus, _ = unified
+    session_env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    writer_id, token, _ = pair(session_env, name='planning-write-only', caps=('planning.write',))
+    _, reader_token, _ = pair(session_env, name='planning-reader', family='claude',
+                              caps=('planning.read', 'planning.write'))
+    writer, _ = sdk(client, token)
+    reader, _ = sdk(client, reader_token)
+    payload = {'scope': 'topic', 'project': PROJECT, 'topic': 'synthetic', 'kind': 'plan',
+               'item_id': 'shared', 'title': 'Plan', 'content': 'Original private content',
+               'status': 'proposed', 'expected_version': 0}
+    original = data(reader('hub_planning_put', {'payload': payload}))
+    assert original['version'] == 1
+    denied = writer('hub_planning_put', {'payload': {**payload, 'content': 'Blind replacement', 'expected_version': 1}})
+    assert denied['isError'] and 'hub_capability_forbidden' in denied['content'][0]['text']
+    lookup = {key: payload[key] for key in ('scope', 'project', 'topic', 'kind', 'item_id')}
+    assert data(reader('hub_planning_get', lookup))['content'] == 'Original private content'
+    created = data(writer('hub_planning_put', {'payload': {**payload, 'item_id': 'new', 'content': 'Writer content'}}))
+    assert created == {'project': PROJECT, 'path': 'planning/topics/synthetic/plan/new.json', 'version': 1,
+                       'response_scope': 'mutation_receipt', 'advisory': True, 'execution_authorization': False}
+    session_env.bridge.grant_put(OWNER, writer_id, 1, [PROJECT], ['planning.write', 'planning.read'])
+    update = {**payload, 'content': 'Reviewed replacement', 'expected_version': 1}
+    live = session_env.bridge._live
+    read_checks = 0
+    def expire_before_commit(db, secret, revision=None, capability=None, *, session_id=None):
+        nonlocal read_checks
+        if capability == 'planning.read':
+            read_checks += 1
+            if read_checks == 2:
+                raise HubError('hub_capability_forbidden', 403)
+        return live(db, secret, revision, capability, session_id=session_id)
+    monkeypatch.setattr(session_env.bridge, '_live', expire_before_commit)
+    assert writer('hub_planning_put', {'payload': update})['isError']
+    monkeypatch.setattr(session_env.bridge, '_live', live)
+    current = data(reader('hub_planning_get', lookup))
+    assert current['version'] == 1 and current['content'] == 'Original private content'
+    assert data(writer('hub_planning_put', {'payload': update}))['version'] == 2
+    checks = 0
+    def expire_at_response(db, secret, revision=None, capability=None, *, session_id=None):
+        nonlocal checks
+        if capability == 'planning.read':
+            checks += 1
+            if checks >= 3:  # pre-admission, commit guard, then response projection
+                raise HubError('hub_capability_forbidden', 403)
+        return live(db, secret, revision, capability, session_id=session_id)
+    monkeypatch.setattr(session_env.bridge, '_live', expire_at_response)
+    updated = data(writer('hub_planning_put', {'payload': {**update, 'content': 'Third', 'expected_version': 2}}))
+    assert updated == {'project': PROJECT, 'path': 'planning/topics/synthetic/plan/shared.json', 'version': 3,
+                       'response_scope': 'mutation_receipt', 'advisory': True, 'execution_authorization': False}
+    monkeypatch.setattr(session_env.bridge, '_live', live)
+    assert data(reader('hub_planning_get', lookup))['content'] == 'Third'
+    session_env.bridge.grant_revoke(OWNER, writer_id, 2)
+    assert writer('hub_planning_put', {'payload': {**update, 'content': 'Forbidden', 'expected_version': 3}})['isError']
+
+
+def test_tracking_mutation_does_not_disclose_cross_project_or_archived_ids(unified):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, caps=('tracking.propose', 'tracking.update', 'tracking.review'),
+                                  projects=(PROJECT, '3d-viewer'))
+    invoke, _ = sdk(client, token)
+    repo = app.state.repository
+    private = repo.propose_tracking_task('codex', 'project-alpha', 'Private', 'private-tracking')
+    archived = repo.propose_tracking_task('codex', '3d-viewer', 'Archived', 'archived-tracking')
+    env.bridge.projects.archive_project(OWNER, '3d-viewer', 1)
+    valid = data(invoke('hub_tracking_task_propose', {'project': PROJECT, 'title': 'Valid',
+                                                      'client_request_id': 'valid-tracking'}))
+    assert valid == {'id': valid['id'], 'response_scope': 'mutation_receipt', 'current_state_included': False}
+    missing = '00000000-0000-4000-8000-000000000000'
+    for tool, args in (
+        ('hub_tracking_task_update', {'expected_revision': 1, 'client_request_id': 'update-test',
+                                      'progress': 'Progress', 'evidence_links': [], 'completion_claim': False}),
+        ('hub_tracking_task_review', {'expected_revision': 1, 'client_request_id': 'review-test',
+                                      'verdict': 'reopen', 'note': 'Review', 'evidence_links': []}),
+    ):
+        results = [invoke(tool, {**args, 'task_id': task_id}) for task_id in
+                   (private['id'], archived['id'], missing)]
+        assert all(result['isError'] for result in results)
+        assert len({result['content'][0]['text'] for result in results}) == 1
+        assert 'hub_tracking_task_unavailable' in results[0]['content'][0]['text']
+    updated = data(invoke('hub_tracking_task_update', {'task_id': valid['id'], 'expected_revision': 1,
+        'client_request_id': 'valid-update', 'progress': 'Progress', 'evidence_links': [], 'completion_claim': False}))
+    assert updated == valid
+    links = [{'label': 'Evidence', 'url': 'https://example.com/evidence'}]
+    claim = data(invoke('hub_tracking_task_update', {'task_id': valid['id'], 'expected_revision': 2,
+        'client_request_id': 'valid-claim', 'progress': 'Done', 'evidence_links': links, 'completion_claim': True}))
+    _, reviewer, _ = pair(env, name='reviewer', family='claude', caps=('tracking.review',))
+    review, _ = sdk(client, reviewer)
+    verified = data(review('hub_tracking_task_review', {'task_id': valid['id'], 'expected_revision': 3,
+        'client_request_id': 'valid-review', 'verdict': 'verify', 'note': 'Checked', 'evidence_links': links}))
+    assert claim == valid and verified == valid
+    assert repo._read(valid['id'], 'tracking_task')['status'] == 'completion_verified'
+    env.bridge.grant_revoke(OWNER, installation, 1)
+    assert invoke('hub_tracking_task_update', {'task_id': valid['id'], 'expected_revision': 4,
+        'client_request_id': 'revoked', 'progress': 'No', 'evidence_links': [], 'completion_claim': False})['isError']
+    assert repo._read(valid['id'], 'tracking_task')['revision'] == 4
+
+
+def test_tracking_write_only_receipts_do_not_disclose_later_history(unified):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, creator, _ = pair(env, name='tracking-propose-only', caps=('tracking.propose',))
+    _, updater, _ = pair(env, name='tracking-update-only', caps=('tracking.update',))
+    _, reviewer, _ = pair(env, name='tracking-review-only', family='claude', caps=('tracking.review',))
+    create, _ = sdk(client, creator)
+    update, _ = sdk(client, updater)
+    review, _ = sdk(client, reviewer)
+    proposal = {'project': PROJECT, 'title': 'Public task title', 'client_request_id': 'stable-proposal'}
+    receipt = data(create('hub_tracking_task_propose', proposal))
+    assert receipt == {'id': receipt['id'], 'response_scope': 'mutation_receipt', 'current_state_included': False}
+    identity = receipt['id']
+
+    # Another authorized actor adds private evidence after the original write.
+    # A retry must not become a read of their current task or review history.
+    private = 'private-progress-not-for-write-only'
+    repo = app.state.repository
+    item = repo.update_tracking_task('claude', identity, 1, 'private-progress',
+        progress=private, evidence_links=[])
+    assert private in json.dumps(item)
+    assert data(create('hub_tracking_task_propose', proposal)) == receipt
+
+    progress = {'task_id': identity, 'expected_revision': item['revision'], 'client_request_id': 'update',
+                'progress': 'Another update', 'evidence_links': [], 'completion_claim': False}
+    assert data(update('hub_tracking_task_update', progress)) == receipt
+    item = repo._read(identity, 'tracking_task')
+    compact = {'task_id': identity, 'expected_revision': item['revision'], 'client_request_id': 'compact'}
+    assert data(update('hub_tracking_task_compact', compact)) == receipt
+    item = repo._read(identity, 'tracking_task')
+    links = [{'label': 'Evidence', 'url': 'https://example.com/evidence'}]
+    claim = {'task_id': identity, 'expected_revision': item['revision'], 'client_request_id': 'claim',
+             'progress': 'Claimed', 'evidence_links': links, 'completion_claim': True}
+    assert data(update('hub_tracking_task_update', claim)) == receipt
+    item = repo._read(identity, 'tracking_task')
+    verified = {'task_id': identity, 'expected_revision': item['revision'], 'client_request_id': 'review',
+                'verdict': 'verify', 'note': 'private-review-note', 'evidence_links': links}
+    assert data(review('hub_tracking_task_review', verified)) == receipt
+    assert data(review('hub_tracking_task_review', verified)) == receipt
+    assert data(create('hub_tracking_task_propose', proposal)) == receipt
+
+    # Granting read enables the existing full response; revoking just that
+    # capability restores the receipt even for an idempotent retry.
+    env.bridge.grant_put(OWNER, installation, 1, [PROJECT], ['tracking.propose', 'tracking.read'])
+    full = data(create('hub_tracking_task_propose', proposal))
+    assert full['status'] == 'completion_verified' and 'private-review-note' in json.dumps(full)
+    env.bridge.grant_put(OWNER, installation, 2, [PROJECT], ['tracking.propose'])
+    assert data(create('hub_tracking_task_propose', proposal)) == receipt
+
+
+def test_tracking_read_capability_loss_at_response_returns_only_receipt(unified, monkeypatch):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    _, token, _ = pair(env, name='response-read-expiry', caps=('tracking.propose', 'tracking.read'))
+    invoke, _ = sdk(client, token)
+    original_live = env.bridge._live
+    def expire_read(db, secret, revision=None, capability=None, *, session_id=None):
+        if capability == 'tracking.read':
+            raise HubError('hub_grant_required', 403)
+        return original_live(db, secret, revision, capability, session_id=session_id)
+    monkeypatch.setattr(env.bridge, '_live', expire_read)
+    result = data(invoke('hub_tracking_task_propose', {'project': PROJECT, 'title': 'Committed safely',
+                                                       'client_request_id': 'expiry-after-commit'}))
+    assert result == {'id': result['id'], 'response_scope': 'mutation_receipt', 'current_state_included': False}
+    assert app.state.repository._read(result['id'], 'tracking_task')['title'] == 'Committed safely'
+
+
+def test_task_and_component_mutations_without_read_return_only_id(unified):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, name='write-only-tasks',
+        caps=('task.propose', 'task.claim', 'task.candidate', 'component.write'))
+    _, reviewer, _ = pair(env, name='write-only-task-reviewer', family='claude', caps=('task.review',))
+    invoke, _ = sdk(client, token); review, _ = sdk(client, reviewer)
+    repo, components = app.state.repository, env.bridge.components
+    def receipt(identity):
+        return {'id': identity, 'response_scope': 'mutation_receipt', 'current_state_included': False}
+
+    proposal = {'project': PROJECT, 'title': 'Work', 'client_request_id': 'staging-proposal'}
+    task = data(invoke('hub_staging_task_propose', proposal)); tid = task['id']
+    assert task == receipt(tid)
+    assert data(invoke('hub_task_claim', {'task_id': tid, 'expected_revision': 1})) == receipt(tid)
+    assert data(invoke('hub_task_candidate', {'task_id': tid, 'expected_revision': 2, 'commit': 'a' * 40})) == receipt(tid)
+    assert data(review('hub_task_review', {'task_id': tid, 'expected_revision': 3,
+        'commit': 'a' * 40, 'verdict': 'approve'})) == receipt(tid)
+    assert data(invoke('hub_staging_task_propose', proposal)) == receipt(tid)
+    assert repo.get_task(tid)['status'] == 'verified'
+
+    cp = {'payload': {'project': PROJECT, 'slug': 'bounded-component', 'name': 'Original',
+                      'client_request_id': 'component-proposal'}}
+    component = data(invoke('hub_component_create', cp)); cid = component['id']
+    assert component == receipt(cid)
+    components.update_component(OWNER, cid, 1, description='private-metadata')
+    assert data(invoke('hub_component_create', cp)) == receipt(cid)
+    assert data(invoke('hub_component_update', {'payload': {'component_id': cid,
+        'expected_revision': 2, 'name': 'Original'}})) == receipt(cid)
+    assert components.get_component(cid)['revision'] == 2  # No-op stays a no-op.
+    assert data(invoke('hub_component_update', {'payload': {'component_id': cid,
+        'expected_revision': 2, 'name': 'New'}})) == receipt(cid)
+    assert data(invoke('hub_component_retire', {'payload': {'component_id': cid,
+        'expected_revision': 3}})) == receipt(cid)
+    env.bridge.grant_put(OWNER, installation, 1, [PROJECT],
+        ['task.propose', 'task.claim', 'task.candidate', 'task.read', 'component.write', 'component.read'])
+    assert data(invoke('hub_staging_task_propose', proposal))['status'] == 'verified'
+    assert data(invoke('hub_component_create', cp))['description'] == 'private-metadata'
+    env.bridge.grant_put(OWNER, installation, 2, [PROJECT],
+        ['task.propose', 'task.claim', 'task.candidate', 'component.write'])
+    assert data(invoke('hub_staging_task_propose', proposal)) == receipt(tid)
+    assert data(invoke('hub_component_create', cp)) == receipt(cid)
+
+
+def test_withdraw_uses_the_matching_entity_read_grant(unified):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, name='withdraw-write-only',
+        caps=('entity.withdraw', 'task.propose', 'decision.request'))
+    invoke, _ = sdk(client, token)
+    task = data(invoke('hub_staging_task_propose', {'project': PROJECT, 'title': 'Task',
+                                                   'client_request_id': 'withdraw-proposal'}))
+    decision = data(invoke('hub_decision_request', {'project': PROJECT, 'title': 'Decision',
+                                                    'options': ['Yes', 'No']}))
+    def receipt(identity):
+        return {'id': identity, 'response_scope': 'mutation_receipt', 'current_state_included': False}
+    task_request = {'kind': 'task', 'entity_id': task['id'], 'expected_revision': 1, 'reason': 'No longer needed'}
+    decision_request = {'kind': 'decision', 'entity_id': decision['id'], 'expected_revision': 1, 'reason': 'No longer needed'}
+    assert data(invoke('hub_entity_withdraw', task_request)) == receipt(task['id'])
+    assert data(invoke('hub_entity_withdraw', decision_request)) == receipt(decision['id'])
+    assert data(invoke('hub_entity_withdraw', task_request)) == receipt(task['id'])
+    assert data(invoke('hub_entity_withdraw', decision_request)) == receipt(decision['id'])
+    env.bridge.grant_put(OWNER, installation, 1, [PROJECT],
+                         ['entity.withdraw', 'task.propose', 'decision.request', 'task.read'])
+    assert data(invoke('hub_entity_withdraw', task_request))['status'] == 'withdrawn'
+    assert data(invoke('hub_entity_withdraw', decision_request)) == receipt(decision['id'])
+    env.bridge.grant_put(OWNER, installation, 2, [PROJECT],
+                         ['entity.withdraw', 'task.propose', 'decision.request', 'decision.read'])
+    assert data(invoke('hub_entity_withdraw', task_request)) == receipt(task['id'])
+    assert data(invoke('hub_entity_withdraw', decision_request))['status'] == 'withdrawn'
+
+
+def test_role_lease_only_receipts_do_not_disclose_handoff_or_release_reason(unified):
+    from engineering_hub.roles import RoleRepository
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    first_id, first, _ = pair(env, name='role-first', caps=('role.lease', 'role.claim', 'tracking.read'))
+    second_id, second, _ = pair(env, name='role-second', family='claude',
+                                caps=('role.lease', 'role.claim', 'tracking.read'))
+    roles = RoleRepository(app.state.repository)
+    roles.configure(OWNER, 'bounded-privacy', 0, [PROJECT], [first_id, second_id], ['private/path'],
+                    'private-standing-rules', [])
+    task = app.state.repository.propose_tracking_task('codex', PROJECT, 'Work', 'role-task')
+    a, _ = sdk(client, first); b, _ = sdk(client, second)
+    lease = data(a('hub_role_acquire', {'role': 'bounded-privacy', 'expected_revision': 1, 'lease_seconds': 60}))
+    assert lease['response_scope'] == 'coordination_receipt' and lease['generation'] == 1
+    assert 'private-standing-rules' not in json.dumps(lease) and 'handoff' not in lease
+    claim = data(a('hub_role_claim', {'role': 'bounded-privacy', 'generation': 1, 'task_id': task['id'],
+                                     'client_request_id': 'first-claim'}))
+    assert claim['response_scope'] == 'coordination_receipt'
+    released_claim = data(a('hub_role_claim_release', {'role': 'bounded-privacy', 'generation': 1,
+        'task_id': task['id'], 'expected_revision': claim['revision'], 'reason': 'private-release-reason'}))
+    assert 'private-release-reason' not in json.dumps(released_claim)
+    released = data(a('hub_role_release', {'role': 'bounded-privacy', 'expected_revision': lease['revision'],
+        'generation': 1, 'expected_handoff_revision': lease['handoff_revision'], 'handoff': 'private-handoff'}))
+    acquired = data(b('hub_role_acquire', {'role': 'bounded-privacy', 'expected_revision': released['revision'],
+                                          'lease_seconds': 60}))
+    assert acquired['takeover'] == 'handoff_recorded' and acquired['handoff_revision'] == 1
+    assert 'private-handoff' not in json.dumps(acquired)
+    reclaimed = data(b('hub_role_claim', {'role': 'bounded-privacy', 'generation': acquired['generation'],
+        'task_id': task['id'], 'client_request_id': 'second-claim'}))
+    assert reclaimed['revision'] > claim['revision'] and 'private-release-reason' not in json.dumps(reclaimed)
+    renewed = data(b('hub_role_renew', {'role': 'bounded-privacy', 'expected_revision': acquired['revision'],
+        'generation': acquired['generation'], 'lease_seconds': 60}))
+    assert renewed['lease_expires_at'] and 'private-handoff' not in json.dumps(renewed)
+    env.bridge.grant_put(OWNER, second_id, 1, [PROJECT], ['role.lease', 'role.claim', 'role.read', 'tracking.read'])
+    full = data(b('hub_role_renew', {'role': 'bounded-privacy', 'expected_revision': renewed['revision'],
+        'generation': renewed['generation'], 'lease_seconds': 60}))
+    assert full['handoff']['text'] == 'private-handoff'
+    env.bridge.grant_put(OWNER, second_id, 2, [PROJECT], ['role.lease', 'role.claim', 'tracking.read'])
+    limited = data(b('hub_role_renew', {'role': 'bounded-privacy', 'expected_revision': full['revision'],
+        'generation': full['generation'], 'lease_seconds': 60}))
+    assert limited['response_scope'] == 'coordination_receipt' and 'private-handoff' not in json.dumps(limited)
+    roles.configure(OWNER, 'mixed-scope', 0, [PROJECT, '3d-viewer'], [first_id], [], 'private-mixed', [])
+    denied = a('hub_role_acquire', {'role': 'mixed-scope', 'expected_revision': 1, 'lease_seconds': 60})
+    assert denied['isError'] and 'private-mixed' not in json.dumps(denied)
+    assert roles.owner_get(OWNER, 'mixed-scope')['lease'] is None
+
+
+def test_component_secondary_scope_filters_before_pagination_and_denies_stale_mutations(unified):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, name='component-primary-only', caps=('component.read', 'component.write'))
+    invoke, _ = sdk(client, token)
+    repo = env.bridge.components
+    proposal = {'payload': {'project': PROJECT, 'slug': 'stale-secondary', 'name': 'Created by session',
+                            'client_request_id': 'component-stable'}}
+    original = data(invoke('hub_component_create', proposal)); target = original['id']
+    repo.update_component(OWNER, target, 1, legacy_project_id='project-alpha')
+    hidden = repo.get_component(target)
+    assert hidden['legacy_project_id'] == 'project-alpha'
+
+    # Current link, not original input, governs retries and mutations. Clearing
+    # or replacing a foreign link is also forbidden before revision handling.
+    missing = '00000000-0000-4000-8000-000000000000'
+    denied = invoke('hub_component_get', {'component_id': target})
+    absent = invoke('hub_component_get', {'component_id': missing})
+    assert denied['isError'] and absent['isError']
+    assert denied['content'][0]['text'] == absent['content'][0]['text']
+    assert 'hub_component_unavailable' in denied['content'][0]['text']
+    for args in (
+        {'component_id': target, 'expected_revision': 2, 'legacy_project_id': None},
+        {'component_id': target, 'expected_revision': 1, 'legacy_project_id': None},
+        {'component_id': target, 'expected_revision': 2, 'legacy_project_id': PROJECT},
+    ):
+        result = invoke('hub_component_update', {'payload': args})
+        assert result['isError'] and 'hub_component_unavailable' in result['content'][0]['text']
+    assert invoke('hub_component_retire', {'payload': {'component_id': target, 'expected_revision': 2}})['isError']
+    assert invoke('hub_component_create', proposal)['isError']
+    assert repo.get_component(target) == hidden
+
+    # Interleave foreign-linked records before/between visible records in UUID
+    # order; a one-item page must still advance through every visible row.
+    rows = [repo.create_component(OWNER, PROJECT, f'page-{i}', f'Page {i}', f'page-{i}') for i in range(6)]
+    ordered = sorted(rows, key=lambda x: x['id'])
+    for row in (ordered[0], ordered[2], ordered[4]):
+        repo.update_component(OWNER, row['id'], 1, legacy_project_id='project-alpha')
+    expected = {row['id'] for row in (ordered[1], ordered[3], ordered[5])}
+    cursor = None; seen = []
+    while True:
+        args = {'project': PROJECT, 'limit': 1}
+        if cursor is not None:
+            args['after'] = cursor
+        page = data(invoke('hub_component_list', args))
+        assert len(page['items']) <= 1
+        seen.extend(row['id'] for row in page['items'])
+        cursor = page['next_after']
+        if cursor is None:
+            break
+        assert cursor == page['items'][-1]['id']
+    assert set(seen) == expected and len(seen) == len(expected)
+
+    # Legacy broad bearers retain compatibility; an explicitly expanded EHS
+    # grant can read and edit the secondary link, and removal denies it again.
+    legacy, _ = sdk(client, 'synthetic-codex')
+    assert data(legacy('hub_component_get', {'component_id': target}))['legacy_project_id'] == 'project-alpha'
+    env.bridge.grant_put(OWNER, installation, 1, [PROJECT, 'project-alpha'], ['component.read', 'component.write'])
+    assert data(invoke('hub_component_get', {'component_id': target}))['legacy_project_id'] == 'project-alpha'
+    assert data(invoke('hub_component_create', proposal))['id'] == target
+    env.bridge.grant_put(OWNER, installation, 2, [PROJECT], ['component.read', 'component.write'])
+    assert invoke('hub_component_get', {'component_id': target})['isError']
+
+
+@pytest.mark.parametrize('operation', ['get', 'list'])
+def test_component_secondary_archive_before_response_fails_closed(unified, monkeypatch, operation):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    _, token, _ = pair(env, name='secondary-response', caps=('component.read',),
+                       projects=(PROJECT, 'project-alpha'))
+    invoke, _ = sdk(client, token)
+    components = env.bridge.components
+    row = components.create_component(OWNER, PROJECT, 'response-race', 'Private component text',
+                                      'response-race', legacy_project_id='project-alpha')
+    entered, release = threading.Event(), threading.Event()
+    method = 'get_component' if operation == 'get' else 'list_components'
+    original = getattr(components, method)
+    calls = 0
+    def pause_after_snapshot(*args, **kwargs):
+        nonlocal calls
+        result = original(*args, **kwargs)
+        calls += 1
+        # get is first used by bridge scope resolution, then by the tool.
+        if operation == 'list' or calls == 2:
+            entered.set()
+            assert release.wait(5)
+        return result
+    monkeypatch.setattr(components, method, pause_after_snapshot)
+    tool = 'hub_component_get' if operation == 'get' else 'hub_component_list'
+    args = {'component_id': row['id']} if operation == 'get' else {'project': PROJECT}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(invoke, tool, args)
+        try:
+            assert entered.wait(5)
+            project = env.bridge.projects.get_project('project-alpha')
+            env.bridge.projects.archive_project(OWNER, 'project-alpha', project['revision'])
+        finally:
+            release.set()
+        response = future.result(timeout=5)
+    assert response['isError'] and 'Private component text' not in json.dumps(response)
+
+
+def test_component_secondary_grant_revoke_serializes_with_inflight_list(unified, monkeypatch):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, name='secondary-grant-race', caps=('component.read',),
+                                  projects=(PROJECT, 'project-alpha'))
+    invoke, _ = sdk(client, token)
+    components = env.bridge.components
+    row = components.create_component(OWNER, PROJECT, 'grant-race', 'Visible before revoke',
+                                      'grant-race', legacy_project_id='project-alpha')
+    entered, release, contended = threading.Event(), threading.Event(), threading.Event()
+    original = components.list_components
+    def pause_after_snapshot(*args, **kwargs):
+        result = original(*args, **kwargs)
+        entered.set()
+        assert release.wait(5)
+        return result
+    monkeypatch.setattr(components, 'list_components', pause_after_snapshot)
+    def revoke_secondary():
+        if env.sessions._lock.acquire(blocking=False):
+            env.sessions._lock.release()
+            raise AssertionError('grant write did not contend with live read')
+        contended.set()
+        return env.bridge.grant_put(OWNER, installation, 1, [PROJECT], ['component.read'])
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        read = pool.submit(invoke, 'hub_component_list', {'project': PROJECT})
+        try:
+            assert entered.wait(5)
+            revoke = pool.submit(revoke_secondary)
+            assert contended.wait(5) and not revoke.done()
+        finally:
+            release.set()
+        assert data(read.result(timeout=5))['items'][0]['id'] == row['id']
+        revoke.result(timeout=5)
+    monkeypatch.setattr(components, 'list_components', original)
+    assert data(invoke('hub_component_list', {'project': PROJECT}))['items'] == []
+
+
+def test_tracking_history_and_compaction_obey_live_project_grants(unified):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, caps=('tracking.read', 'tracking.update'), projects=(PROJECT, '3d-viewer'))
+    invoke, _ = sdk(client, token)
+    repo = app.state.repository
+    valid = repo.propose_tracking_task('codex', PROJECT, 'Long work', 'history-valid')
+    for i in range(51):
+        valid = repo.update_tracking_task('codex', valid['id'], valid['revision'], f'history-{i}',
+                                          progress=f'Update {i}', evidence_links=[])
+    private = repo.propose_tracking_task('codex', 'project-alpha', 'Private', 'history-private')
+    archived = repo.propose_tracking_task('codex', '3d-viewer', 'Archived', 'history-archived')
+    env.bridge.projects.archive_project(OWNER, '3d-viewer', 1)
+    missing = '00000000-0000-4000-8000-000000000000'
+    for tool, args in (
+        ('hub_tracking_task_history', {'kind': 'updates'}),
+        ('hub_tracking_task_compact', {'expected_revision': 1, 'client_request_id': 'compact-private'}),
+    ):
+        results = [invoke(tool, {**args, 'task_id': task_id}) for task_id in (private['id'], archived['id'], missing)]
+        assert all(result['isError'] for result in results)
+        assert len({result['content'][0]['text'] for result in results}) == 1
+        assert 'hub_tracking_task_unavailable' in results[0]['content'][0]['text']
+    page = data(invoke('hub_tracking_task_history', {'task_id': valid['id'], 'kind': 'updates'}))
+    assert page['records'][0]['progress'] == 'Update 0'
+    env.bridge.grant_revoke(OWNER, installation, 1)
+    assert invoke('hub_tracking_task_history', {'task_id': valid['id'], 'kind': 'updates'})['isError']
+    assert invoke('hub_tracking_task_compact', {'task_id': valid['id'], 'expected_revision': valid['revision'],
+                  'client_request_id': 'after-revoke'})['isError']
+
+
+def test_tracking_history_guidance_is_visible_in_session_tool_discovery(unified):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    _, token, _ = pair(env, caps=('tracking.read', 'tracking.update', 'tracking.review'), projects=(PROJECT,))
+    _, headers = sdk(client, token)
+    result = client.post('/mcp', headers=headers, json={'jsonrpc': '2.0', 'id': 3,
+                         'method': 'tools/list', 'params': {}})
+    assert result.status_code == 200
+    tools = result.json()['result']['tools']
+    descriptions = {tool['name']: tool.get('description', '') for tool in tools}
+    for name in ('hub_tracking_task_list', 'hub_tracking_task_update', 'hub_tracking_task_review', 'hub_tracking_task_compact'):
+        assert all(word in descriptions[name] for word in ('recent windows', 'history_segments', 'hub_tracking_task_history', 'next_before'))
+    assert all(word in descriptions['hub_tracking_task_history'] for word in ('task_id', 'kind', 'updates', 'reviews', 'before', 'next_before'))
+
+
+def test_session_id_tools_do_not_disclose_unavailable_entities(unified):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    _, token, _ = pair(env, projects=(PROJECT, '3d-viewer'))
+    invoke, _ = sdk(client, token)
+    repo, components = app.state.repository, env.bridge.components
+    private_task = repo.create_task(OWNER, 'project-alpha', 'Private task', 'oracle-private-task')
+    archived_task = repo.create_task(OWNER, '3d-viewer', 'Archived task', 'oracle-archived-task')
+    own_task = repo.create_task(OWNER, PROJECT, 'Own task', 'oracle-own-task')
+    private_component = components.create_component(OWNER, 'project-alpha', 'private', 'Private', 'oracle-private-comp')
+    archived_component = components.create_component(OWNER, '3d-viewer', 'archived', 'Archived', 'oracle-archived-comp')
+    own_component = components.create_component(OWNER, PROJECT, 'own', 'Own', 'oracle-own-comp')
+    private_decision = repo.create_decision(OWNER, 'project-alpha', 'Private', ['A', 'B'])
+    archived_decision = repo.create_decision(OWNER, '3d-viewer', 'Archived', ['A', 'B'])
+    own_decision = data(invoke('hub_decision_request', {'project': PROJECT, 'title': 'Own',
+        'options': ['A', 'B'], 'client_request_id': 'oracle-own-decision'}))
+    env.bridge.projects.archive_project(OWNER, '3d-viewer', 1)
+    missing = '00000000-0000-4000-8000-000000000000'
+    cases = [
+        ('hub_task_get', lambda i: {'task_id': i}, private_task['id'], archived_task['id'], 'hub_task_unavailable'),
+        ('hub_task_claim', lambda i: {'task_id': i, 'expected_revision': 1}, private_task['id'], archived_task['id'], 'hub_task_unavailable'),
+        ('hub_task_candidate', lambda i: {'task_id': i, 'expected_revision': 1, 'commit': 'a' * 40}, private_task['id'], archived_task['id'], 'hub_task_unavailable'),
+        ('hub_task_review', lambda i: {'task_id': i, 'expected_revision': 1, 'commit': 'a' * 40, 'verdict': 'approve'}, private_task['id'], archived_task['id'], 'hub_task_unavailable'),
+        ('hub_component_get', lambda i: {'component_id': i}, private_component['id'], archived_component['id'], 'hub_component_unavailable'),
+        ('hub_component_update', lambda i: {'payload': {'component_id': i, 'expected_revision': 1, 'name': 'New'}}, private_component['id'], archived_component['id'], 'hub_component_unavailable'),
+        ('hub_component_retire', lambda i: {'payload': {'component_id': i, 'expected_revision': 1}}, private_component['id'], archived_component['id'], 'hub_component_unavailable'),
+        ('hub_entity_withdraw', lambda i: {'kind': 'task', 'entity_id': i, 'expected_revision': 1, 'reason': 'Done'}, private_task['id'], archived_task['id'], 'hub_entity_unavailable'),
+        ('hub_entity_withdraw', lambda i: {'kind': 'decision', 'entity_id': i, 'expected_revision': 1, 'reason': 'Done'}, private_decision['id'], archived_decision['id'], 'hub_entity_unavailable'),
+    ]
+    for tool, args, private, archived, error in cases:
+        results = [invoke(tool, args(i)) for i in (private, archived, missing)]
+        assert all(result['isError'] for result in results), tool
+        assert len({result['content'][0]['text'] for result in results}) == 1, tool
+        assert error in results[0]['content'][0]['text']
+    assert data(invoke('hub_task_get', {'task_id': own_task['id']}))['id'] == own_task['id']
+    claimed = data(invoke('hub_task_claim', {'task_id': own_task['id'], 'expected_revision': 1}))
+    candidate = data(invoke('hub_task_candidate', {'task_id': own_task['id'], 'expected_revision': claimed['revision'], 'commit': 'a' * 40}))
+    assert candidate['candidate_commit'] == 'a' * 40
+    _, reviewer, _ = pair(env, name='task-reviewer', family='claude', caps=('task.review',))
+    review, _ = sdk(client, reviewer)
+    assert data(review('hub_task_review', {'task_id': own_task['id'], 'expected_revision': candidate['revision'],
+        'commit': 'a' * 40, 'verdict': 'approve'})) == {
+            'id': own_task['id'], 'response_scope': 'mutation_receipt', 'current_state_included': False}
+    assert repo.get_task(own_task['id'])['review']['verdict'] == 'approve'
+    assert data(invoke('hub_component_get', {'component_id': own_component['id']}))['id'] == own_component['id']
+    edited = data(invoke('hub_component_update', {'payload': {'component_id': own_component['id'], 'expected_revision': 1, 'name': 'New'}}))
+    assert data(invoke('hub_component_retire', {'payload': {'component_id': own_component['id'], 'expected_revision': edited['revision']}}))['status'] == 'retired'
+    assert data(invoke('hub_entity_withdraw', {'kind': 'decision', 'entity_id': own_decision['id'], 'expected_revision': 1, 'reason': 'Done'}))['status'] == 'withdrawn'
+    own_withdraw = data(invoke('hub_staging_task_propose', {'project': PROJECT, 'title': 'Withdraw',
+        'client_request_id': 'oracle-own-withdraw'}))
+    assert data(invoke('hub_entity_withdraw', {'kind': 'task', 'entity_id': own_withdraw['id'],
+        'expected_revision': 1, 'reason': 'Done'}))['status'] == 'withdrawn'
+    bad = invoke('hub_component_get', {'component_id': 'not-a-uuid'})
+    assert bad['isError'] and 'invalid_component_id' in bad['content'][0]['text']
+    bad = invoke('hub_entity_withdraw', {'kind': 'invalid', 'entity_id': missing, 'expected_revision': 1, 'reason': 'Done'})
+    assert bad['isError'] and 'invalid_kind' in bad['content'][0]['text']
+
+
+@pytest.mark.parametrize('kind', ['task', 'decision'])
+def test_withdraw_replacement_does_not_disclose_foreign_status(unified, kind):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, projects=(PROJECT, '3d-viewer'))
+    invoke, _ = sdk(client, token)
+    repo = app.state.repository
+    def create(project, label):
+        if kind == 'task':
+            return repo.create_task(OWNER, project, label, 'replace-' + label)
+        return repo.create_decision(OWNER, project, label, ['A', 'B'])
+    private = create('project-alpha', 'private')
+    private_withdrawn = create('project-alpha', 'private-withdrawn')
+    repo.withdraw(OWNER, kind, private_withdrawn['id'], 1, 'old')
+    archived = create('3d-viewer', 'archived')
+    own_replacement = create(PROJECT, 'own-replacement')
+    own_withdrawn = create(PROJECT, 'own-withdrawn')
+    repo.withdraw(OWNER, kind, own_withdrawn['id'], 1, 'old')
+    if kind == 'task':
+        own = data(invoke('hub_staging_task_propose', {'project': PROJECT, 'title': 'Own',
+            'client_request_id': 'withdraw-source'}))
+    else:
+        own = data(invoke('hub_decision_request', {'project': PROJECT, 'title': 'Own', 'options': ['A', 'B'],
+            'client_request_id': 'withdraw-source'}))
+    env.bridge.projects.archive_project(OWNER, '3d-viewer', 1)
+    missing = '00000000-0000-4000-8000-000000000000'
+    args = {'kind': kind, 'entity_id': own['id'], 'expected_revision': 1, 'reason': 'Replaced'}
+    errors = [invoke('hub_entity_withdraw', {**args, 'superseded_by': identity}) for identity in
+              (private['id'], private_withdrawn['id'], archived['id'], missing)]
+    assert all(result['isError'] for result in errors)
+    assert len({result['content'][0]['text'] for result in errors}) == 1
+    assert 'hub_replacement_unavailable' in errors[0]['content'][0]['text']
+    assert repo._read(own['id'], kind)['status'] != 'withdrawn'
+    invalid = invoke('hub_entity_withdraw', {**args, 'superseded_by': own_withdrawn['id']})
+    assert invalid['isError'] and 'invalid_replacement' in invalid['content'][0]['text']
+    invalid = invoke('hub_entity_withdraw', {**args, 'superseded_by': 'invalid'})
+    assert invalid['isError'] and 'invalid_replacement' in invalid['content'][0]['text']
+    valid = {**args, 'superseded_by': own_replacement['id']}
+    result = data(invoke('hub_entity_withdraw', valid))
+    assert result['status'] == 'withdrawn' and result['superseded_by'] == own_replacement['id']
+    assert data(invoke('hub_entity_withdraw', valid)) == result
+
+
+def test_withdraw_retry_rechecks_replacement_grant(unified):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, projects=(PROJECT, '3d-viewer'))
+    invoke, _ = sdk(client, token)
+    original = data(invoke('hub_staging_task_propose', {'project': PROJECT, 'title': 'Original',
+        'client_request_id': 'retry-source'}))
+    replacement = app.state.repository.create_task(OWNER, '3d-viewer', 'Replacement', 'retry-replacement')
+    args = {'kind': 'task', 'entity_id': original['id'], 'expected_revision': 1,
+            'reason': 'Replaced', 'superseded_by': replacement['id']}
+    result = data(invoke('hub_entity_withdraw', args))
+    assert data(invoke('hub_entity_withdraw', args)) == result
+    env.bridge.grant_put(OWNER, installation, 1, [PROJECT], list(CAPABILITIES))
+    denied = invoke('hub_entity_withdraw', args)
+    assert denied['isError'] and 'hub_replacement_unavailable' in denied['content'][0]['text']
+    assert app.state.repository._read(original['id'], 'task')['revision'] == result['revision']
+
+
+@pytest.mark.parametrize('expiry', ['grant', 'session'])
+def test_project_list_rechecks_expiry_after_enumeration(unified, monkeypatch, expiry):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, caps=('project.read',))
+    if expiry == 'grant':
+        env.bridge.grant_put(OWNER, installation, 1, [PROJECT], ['project.read'], lifetime_seconds=60)
+    invoke, _ = sdk(client, token)
+    assert [item['id'] for item in data(invoke('hub_project_list', {}))['items']] == [PROJECT]
+    original = env.bridge.projects.get_project
+    def expire_during_enumeration(project):
+        result = original(project)
+        bus.state.agent_sessions.clock.value += 61 if expiry == 'grant' else 901
+        return result
+    monkeypatch.setattr(env.bridge.projects, 'get_project', expire_during_enumeration)
+    denied = invoke('hub_project_list', {})
+    assert denied['isError']
+    assert not denied.get('structuredContent')
+
+
+def test_project_list_serializes_with_grant_revocation(unified, monkeypatch):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, caps=('project.read',))
+    invoke, _ = sdk(client, token)
+    entered, release, revoked = threading.Event(), threading.Event(), threading.Event()
+    original = env.bridge.projects.get_project
+    def block_during_enumeration(project):
+        result = original(project)
+        entered.set()
+        assert release.wait(5)
+        return result
+    monkeypatch.setattr(env.bridge.projects, 'get_project', block_during_enumeration)
+    def revoke():
+        try:
+            return env.bridge.grant_revoke(OWNER, installation, 1)
+        finally:
+            revoked.set()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        read_future = pool.submit(invoke, 'hub_project_list', {})
+        try:
+            assert entered.wait(5)
+            revoke_future = pool.submit(revoke)
+            assert not revoked.wait(.05)
+        finally:
+            release.set()
+        assert [item['id'] for item in data(read_future.result(timeout=5))['items']] == [PROJECT]
+        revoke_future.result(timeout=5)
+    assert invoke('hub_project_list', {})['isError']
+
+
+def test_session_decision_read_cross_surface_and_project_grants(unified):
+    client, app, bus, csrf = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, caps=('decision.request', 'decision.read'))
+    _, no_read, _ = pair(env, name='no-read', caps=('decision.request',))
+    invoke, _ = sdk(client, token); denied, _ = sdk(client, no_read)
+    request = {'project': PROJECT, 'title': 'Shared question', 'options': ['A', 'B'],
+               'client_request_id': 'shared-question-1'}
+    created = data(invoke('hub_decision_request', request))
+    assert data(invoke('hub_decision_request', request))['id'] == created['id']
+    assert invoke('hub_decision_request', {**request, 'title': 'Changed'})['isError']
+    overview = client.get('/api/hub/v1/overview').json()
+    assert next(row for row in overview['decisions'] if row['id']==created['id'])['status']=='open'
+    response = client.post('/api/hub/v1/decisions/'+created['id']+'/answer', headers=csrf,
+                           json={'expected_revision':1,'answer':'B'})
+    assert response.status_code==200
+    answer = data(invoke('hub_decision_get', {'decision_id':created['id']}))
+    assert answer['status']=='answered' and answer['answer']=='B' and answer['execution_authorization'] is False
+    request_only = {**request, 'client_request_id': 'request-only'}
+    created_without_read = data(denied('hub_decision_request', request_only))
+    response = client.post('/api/hub/v1/decisions/'+created_without_read['id']+'/answer', headers=csrf,
+                           json={'expected_revision':1,'answer':'B'})
+    assert response.status_code == 200
+    assert data(denied('hub_decision_request', request_only)) == created_without_read
+    assert denied('hub_decision_get', {'decision_id':created['id']})['isError']
+    other = app.state.repository.create_decision(OWNER, 'project-alpha', 'Private scope', ['A','B'])
+    cross=invoke('hub_decision_get', {'decision_id':other['id']})
+    missing=invoke('hub_decision_get', {'decision_id':'00000000-0000-4000-8000-000000000000'})
+    assert cross['isError'] and missing['isError'] and cross['content'][0]['text']==missing['content'][0]['text']
+    app.state.session_hub_bridge.grant_revoke(OWNER, installation, 1)
+    assert invoke('hub_decision_get', {'decision_id':created['id']})['isError']
+
+
+def test_decision_read_denies_expired_grant_and_archived_project(env):
+    installation, token, _ = pair(env, caps=('decision.read',), projects=('project-alpha',))
+    item=env.repo.create_decision(OWNER, 'project-alpha', 'Question', ['A','B'])
+    def scoped():
+        with env.bridge.admit(token, 'hub_decision_get') as op:
+            env.bridge._scope('hub_decision_get', {'decision_id':item['id']}, op)
+            result=env.repo.get_decision(item['id'])
+            op.before_commit(env.repo.path, None)
+            return result
+    assert scoped()['id']==item['id']
+    env.projects.archive_project(OWNER, 'project-alpha', 1)
+    with pytest.raises(HubError, match='hub_decision_unavailable'):
+        scoped()
+    env.clock.value += 86401
+    with pytest.raises((HubError, AgentSessionError)):
+        scoped()
+
+
+def test_decision_read_holds_session_writer_until_result_is_authorized(env):
+    installation, token, _ = pair(env, caps=('decision.read',))
+    item=env.repo.create_decision(OWNER, PROJECT, 'Question', ['A','B'])
+    entered=threading.Event(); release=threading.Event(); revoked=threading.Event()
+    def read():
+        with env.bridge.admit(token, 'hub_decision_get') as op:
+            env.bridge._scope('hub_decision_get', {'decision_id':item['id']}, op)
+            value=env.repo.get_decision(item['id'])
+            entered.set(); assert release.wait(5)
+            op.before_commit(env.repo.path, None)
+            return value
+    def revoke():
+        env.bridge.grant_revoke(OWNER, installation, 1)
+        revoked.set()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        read_future=pool.submit(read)
+        try:
+            assert entered.wait(5)
+            revoke_future=pool.submit(revoke)
+            assert not revoked.wait(.05)
+        finally:
+            release.set()
+        assert read_future.result(timeout=5)['id']==item['id']
+        revoke_future.result(timeout=5)
+    with pytest.raises(HubError, match='hub_grant_required'):
+        with env.bridge.admit(token, 'hub_decision_get'):
+            pass
+
+
+@pytest.mark.parametrize('kind', ['session', 'grant'])
+def test_decision_read_expiry_after_fetch_denies_result(env, kind):
+    installation, token, _ = pair(env, caps=('decision.read',))
+    if kind == 'grant':
+        env.bridge.grant_put(OWNER, installation, 1, [PROJECT], ['decision.read'], 60)
+    item = env.repo.create_decision(OWNER, PROJECT, 'Question', ['A', 'B'])
+    returned = []
+    with pytest.raises(AgentSessionError if kind == 'session' else HubError):
+        with env.bridge.admit(token, 'hub_decision_get') as op:
+            env.bridge._scope('hub_decision_get', {'decision_id': item['id']}, op)
+            value = env.repo.get_decision(item['id'])
+            env.clock.value += 901 if kind == 'session' else 61
+            op.before_commit(env.repo.path, None)
+            returned.append(value)
+    assert returned == []
+
+
+def test_decision_read_serializes_session_revocation(env):
+    _, token, _ = pair(env, caps=('decision.read',))
+    session_id = env.sessions.authenticate_session(token).session_id
+    item = env.repo.create_decision(OWNER, PROJECT, 'Question', ['A', 'B'])
+    entered, release, attempting, revoked = (threading.Event() for _ in range(4))
+    def read():
+        with env.bridge.admit(token, 'hub_decision_get') as op:
+            env.bridge._scope('hub_decision_get', {'decision_id': item['id']}, op)
+            value = env.repo.get_decision(item['id'])
+            entered.set(); assert release.wait(5)
+            op.before_commit(env.repo.path, None)
+            return value
+    def revoke():
+        attempting.set()
+        env.sessions.revoke_session(OWNER, session_id, 1)
+        revoked.set()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        read_future = pool.submit(read)
+        try:
+            assert entered.wait(5)
+            revoke_future = pool.submit(revoke)
+            assert attempting.wait(5)
+            assert not revoked.wait(.05)
+        finally:
+            release.set()
+        assert read_future.result(timeout=5)['id'] == item['id']
+        revoke_future.result(timeout=5)
+    with pytest.raises(AgentSessionError):
+        with env.bridge.admit(token, 'hub_decision_get'):
+            pass
+
+
 def test_real_owner_api_and_existing_mcp_tools_unified(unified):
     client, app, bus, csrf = unified
     env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
@@ -393,6 +1198,8 @@ def test_real_owner_api_and_existing_mcp_tools_unified(unified):
     proposed = data(invoke('hub_staging_task_propose', {'project': PROJECT, 'title': 'Transport task', 'client_request_id': 'transport'}))
     claimed = data(invoke('hub_task_claim', {'task_id': proposed['id'], 'expected_revision': 1}))
     assert claimed['owner'].startswith('installation:') and claimed['owner_session_id']
+    assert data(invoke('hub_project_tasks', {'project': PROJECT}))['tasks'][0]['id'] == claimed['id']
+    assert invoke('hub_project_tasks', {'project': 'project-alpha'})['isError']
     created = data(invoke('hub_component_create', {'payload': {'project': PROJECT, 'slug': 'transport', 'name': 'Transport', 'client_request_id': 'component'}}))
     assert created['created_by'] == claimed['owner']
     planned = data(invoke('hub_planning_put', {'payload': {'scope': 'topic', 'project': PROJECT,
@@ -424,8 +1231,11 @@ def test_real_owner_api_and_existing_mcp_tools_unified(unified):
     review_invoke, _ = sdk(client, review_token)
     installation_review = data(review_invoke('hub_task_review', {'task_id': claimed['id'],
         'expected_revision': 3, 'commit': 'a' * 40, 'verdict': 'approve'}))
-    assert installation_review['review']['family'] == 'claude'
-    assert installation_review['review']['actor'].startswith('installation:')
+    assert installation_review == {'id': claimed['id'], 'response_scope': 'mutation_receipt',
+                                   'current_state_included': False}
+    actual_review = app.state.repository.get_task(claimed['id'])['review']
+    assert actual_review['family'] == 'claude'
+    assert actual_review['actor'].startswith('installation:')
     sibling = env.sessions.exchange(secret)
     target = sibling['session']['id']
     recovery_path = prefix + '/tasks/' + claimed['id'] + '/recover-claim'
@@ -705,7 +1515,7 @@ def test_withdrawal_replay_reauthorizes_secondary_project_after_grant_narrowing(
     with env.repo._connection() as db:
         assert db.execute('SELECT count(*) FROM hub_audit').fetchone()[0] == count
     env.bridge.grant_put(OWNER, installation, 1, [PROJECT], list(CAPABILITIES))
-    with pytest.raises(HubError, match='hub_project_forbidden'):
+    with pytest.raises(HubError, match='hub_replacement_unavailable'):
         call(env, token, 'hub_entity_withdraw', withdraw)
     assert env.repo._read(first['id'], 'decision') == withdrawn
     with env.repo._connection() as db:
@@ -723,3 +1533,50 @@ def test_legacy_withdrawal_replay_retains_later_replacement_lifecycle_semantics(
     assert env.repo.withdraw(OWNER, 'decision', first['id'], 1, 'Superseded', replacement['id']) == withdrawn
     with env.repo._connection() as db:
         assert db.execute('SELECT count(*) FROM hub_audit').fetchone()[0] == count
+
+def test_tracking_review_serializes_with_session_revocation(env):
+    _, reviewer, _ = pair(env, 'race-reviewer', family='claude')
+    session_id = env.sessions.authenticate_session(reviewer).session_id
+    item = env.repo.propose_tracking_task('codex', PROJECT, 'Race claim', 'race-propose')
+    links = [{'label':'Evidence', 'url':'https://example.com/evidence'}]
+    env.repo.update_tracking_task('codex', item['id'], 1, 'race-claim', progress='Done', evidence_links=links, completion_claim=True)
+    entered, release, attempting, revoked = (threading.Event() for _ in range(4))
+    def review():
+        with env.bridge.admit(reviewer, 'hub_tracking_task_review') as op:
+            env.bridge._scope('hub_tracking_task_review', {'task_id': item['id']}, op)
+            entered.set()
+            assert release.wait(5)
+            return env.repo.review_tracking_task(op.principal.actor, item['id'], 2, 'race-review',
+                verdict='verify', note='Checked', evidence_links=links)
+    def revoke():
+        attempting.set()
+        env.sessions.revoke_session(OWNER, session_id, 1)
+        revoked.set()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(review)
+        try:
+            assert entered.wait(5)
+            second = pool.submit(revoke)
+            assert attempting.wait(5)
+            assert not revoked.wait(.1)
+        finally:
+            release.set()
+        assert first.result(timeout=5)['status'] == 'completion_verified'
+        second.result(timeout=5)
+    with pytest.raises(AgentSessionError):
+        call(env, reviewer, 'hub_tracking_task_review', lambda actor: None)
+    stored = env.repo._read(item['id'], 'tracking_task')
+    assert len(stored['reviews']) == 1 and stored['reviews'][0]['claim_revision'] == 2
+
+def test_tracking_review_revoked_session_cannot_mutate_claim(env):
+    _, reviewer, _ = pair(env, 'revoked-reviewer', family='claude')
+    session_id = env.sessions.authenticate_session(reviewer).session_id
+    item = env.repo.propose_tracking_task('codex', PROJECT, 'Revoked claim', 'revoked-propose')
+    links = [{'label':'Evidence', 'url':'https://example.com/evidence'}]
+    env.repo.update_tracking_task('codex', item['id'], 1, 'revoked-claim', progress='Done', evidence_links=links, completion_claim=True)
+    env.sessions.revoke_session(OWNER, session_id, 1)
+    with pytest.raises(AgentSessionError):
+        call(env, reviewer, 'hub_tracking_task_review', lambda actor:
+            env.repo.review_tracking_task(actor, item['id'], 2, 'revoked-review', verdict='verify', note='Checked', evidence_links=links))
+    stored = env.repo._read(item['id'], 'tracking_task')
+    assert stored['status'] == 'completion_claimed' and stored['revision'] == 2 and not stored.get('reviews')

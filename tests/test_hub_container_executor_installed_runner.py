@@ -1,10 +1,11 @@
 """Synthetic parser/lifecycle fixtures, not installed PID1, mount or Engine proof."""
 import asyncio
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 import json
 import os
+import signal
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -16,6 +17,29 @@ pytest.importorskip('fcntl', reason='Optional executor uses Linux ownership prov
 from engineering_hub.container_pilot_manifest import PilotManifest
 from hub_container_executor import installed_runner as module
 from tests.test_hub_container_pilot_manifest import make_manifest_data
+
+
+@pytest.mark.asyncio
+async def test_postlaunch_startup_signal_cancels_wait_and_restores_handlers(monkeypatch):
+    from hub_container_executor import postlaunch_delivery
+    import asyncio
+    loop = asyncio.get_running_loop()
+    started, drained = asyncio.Event(), asyncio.Event()
+    previous = {n: signal.getsignal(n) for n in (signal.SIGINT, signal.SIGTERM)}
+    async def waiting(**kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            drained.set()
+    monkeypatch.setattr(postlaunch_delivery, 'wait_for_postlaunch_approval', waiting)
+    task = asyncio.create_task(module._wait_for_approval_with_startup_signals())
+    await started.wait()
+    os.kill(os.getpid(), signal.SIGTERM)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert drained.is_set()
+    assert all(signal.getsignal(n) == previous[n] for n in previous)
 
 
 def canonical(value):
@@ -334,3 +358,131 @@ def test_cli_invalid_arguments_sanitized_before_io(monkeypatch, capsys, argument
     assert module.main(arguments) == 2
     output = capsys.readouterr()
     assert output.out == '' and output.err == 'Installed executor unavailable\n'
+
+
+def test_single_pilot_requires_explicit_v2_schema_and_true():
+    legacy = configuration()
+    assert 'single_pilot_protocol' not in module.parse_configuration(canonical(legacy)).resources
+    legacy['resources']['single_pilot_protocol'] = True
+    with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(legacy))
+    legacy['schema'] = module.SCHEMA_SINGLE_PILOT
+    assert module.parse_configuration(canonical(legacy)).resources['single_pilot_protocol'] is True
+    for wrong in (False, 1, 'true'):
+        legacy['resources']['single_pilot_protocol'] = wrong
+        with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(legacy))
+
+
+def test_bound_pilot_requires_closed_v3_profile_and_preexisting_journal():
+    from tests.test_hub_container_effect_binding_canonical import fixture
+    source = configuration()
+    source['schema'] = module.SCHEMA_BOUND_PILOT
+    source['resources']['single_pilot_protocol'] = True
+    source['resources']['journal_create'] = False
+    binding = asdict(fixture())
+    binding.pop('owner_epoch')
+    binding['environment_names'] = list(binding['environment_names'])
+    source['bound_profile'] = dict(key_id=digest('b'), approval_path='/fixture/approval.json',
+        approver_public_key_hex='e'*64, approval_wait_ms=30000,
+        effects=[dict(binding=binding, create_command_id=None)])
+    result = module.parse_configuration(canonical(source))
+    assert result.bound_profile.key_id == digest('b')
+    assert result.resources['single_pilot_protocol'] is True
+    for transform in (
+        lambda v: v['resources'].__setitem__('journal_create', True),
+        lambda v: v['bound_profile'].__setitem__('key_id', 'secret-value'),
+        lambda v: v['bound_profile'].__setitem__('approval_path', '../not-absolute'),
+        lambda v: v['bound_profile']['effects'].append(v['bound_profile']['effects'][0]),
+        lambda v: v['bound_profile']['effects'][0]['binding'].__setitem__('owner_epoch', str(uuid4())),
+    ):
+        import copy
+        invalid = copy.deepcopy(source)
+        transform(invalid)
+        with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(invalid))
+
+
+@pytest.mark.asyncio
+async def test_bound_signal_at_approval_service_boundary_requests_drain(lifecycle, monkeypatch):
+    from hub_container_executor import postlaunch_delivery
+    config, events = lifecycle
+    config = replace(config, bound_profile=SimpleNamespace(approval_path='/test/approval',
+        approver_public_key=b'x' * 32, approval_wait_ms=1000))
+    previous = {n: signal.getsignal(n) for n in (signal.SIGINT, signal.SIGTERM)}
+    async def wait(**kwargs):
+        # Signal callback becomes runnable exactly as this coroutine returns.
+        os.kill(os.getpid(), signal.SIGTERM)
+        return SimpleNamespace(approval=SimpleNamespace(launch=None))
+    class Observer:
+        def __init__(self, **kwargs): events.append('bound-observer')
+        def close(self): events.append('bound-observer-close')
+    async def service(factory, **kwargs):
+        assert kwargs['install_signals'] is False
+        await asyncio.sleep(.05)
+        assert kwargs['stop_event'].is_set()
+        events.append('service-stopped-before-admission')
+    monkeypatch.setattr(postlaunch_delivery, 'wait_for_postlaunch_approval', wait)
+    monkeypatch.setattr(module, 'CurrentExecutorObserver', Observer)
+    monkeypatch.setattr(module, 'serve_owned_host_executor_unix', service)
+    await module.run_installed_executor(config)
+    assert 'service-stopped-before-admission' in events
+    assert events[-4:] == ['bound-observer-close', 'observation-close', 'identity-close', 'transport-close']
+    assert all(signal.getsignal(n) == previous[n] for n in previous)
+
+
+@pytest.mark.asyncio
+async def test_bound_signal_during_approval_cancels_and_closes_owned_resources(lifecycle, monkeypatch):
+    from hub_container_executor import postlaunch_delivery
+    config, events = lifecycle
+    config = replace(config, bound_profile=SimpleNamespace(approval_path='/test/approval',
+        approver_public_key=b'x' * 32, approval_wait_ms=1000))
+    started, drained = asyncio.Event(), asyncio.Event()
+    previous = {n: signal.getsignal(n) for n in (signal.SIGINT, signal.SIGTERM)}
+    async def wait(**kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            drained.set()
+    monkeypatch.setattr(postlaunch_delivery, 'wait_for_postlaunch_approval', wait)
+    task = asyncio.create_task(module.run_installed_executor(config))
+    await started.wait()
+    os.kill(os.getpid(), signal.SIGTERM)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert drained.is_set()
+    assert events[-3:] == ['observation-close', 'identity-close', 'transport-close']
+    assert all(signal.getsignal(n) == previous[n] for n in previous)
+
+
+def test_bound_profile_app_cgroup_pins_are_closed_and_independent():
+    from tests.test_hub_container_effect_binding_canonical import fixture
+    source = configuration()
+    source['schema'] = module.SCHEMA_BOUND_PILOT
+    source['resources']['single_pilot_protocol'] = True
+    source['resources']['journal_create'] = False
+    binding = asdict(fixture())
+    binding.pop('owner_epoch')
+    binding['environment_names'] = list(binding['environment_names'])
+    source['bound_profile'] = dict(key_id=digest('b'), approval_path='/fixture/approval.json',
+        approver_public_key_hex='e'*64, approval_wait_ms=30000,
+        effects=[dict(binding=binding, create_command_id=None)],
+        app_cgroup=dict(parent='parent.slice', device=1, inode=2, namespace_device=3, namespace_inode=4))
+    parsed = module.parse_configuration(canonical(source))
+    assert parsed.bound_profile.app_cgroup.parent == 'parent.slice'
+    source['bound_profile']['app_cgroup']['extra'] = True
+    with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(source))
+
+
+def test_response_recording_requires_explicit_boolean_in_bound_profile():
+    from tests.test_hub_container_effect_binding_canonical import fixture
+    source = configuration()
+    source['schema'] = module.SCHEMA_BOUND_PILOT
+    source['resources']['single_pilot_protocol'] = True
+    source['resources']['journal_create'] = False
+    binding = asdict(fixture()); binding.pop('owner_epoch')
+    binding['environment_names'] = list(binding['environment_names'])
+    source['bound_profile'] = dict(key_id=digest('b'), approval_path='/fixture/approval.json',
+        approver_public_key_hex='e'*64, approval_wait_ms=30000,
+        effects=[dict(binding=binding, create_command_id=None)], record_effect_responses=True)
+    assert module.parse_configuration(canonical(source)).bound_profile.record_effect_responses is True
+    source['bound_profile']['record_effect_responses'] = 1
+    with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(source))

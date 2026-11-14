@@ -10,6 +10,7 @@ from contextlib import contextmanager
 import hashlib
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -18,8 +19,9 @@ import stat
 import sys
 import tempfile
 import time
+import uuid
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from urllib.request import ProxyHandler, HTTPRedirectHandler, Request, build_opener
 
 
@@ -175,6 +177,76 @@ def _request(origin, path, payload, token=None):
         raise ClientError('server_unavailable_profile_retained') from None
 
 
+
+def _listen_attention(directory, name, project, generation, private_vpn):
+    """Explicit foreground SSE consumer; prints only fixed content-free events."""
+    if (not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,47}', name)
+            or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', project)
+            or type(generation) is not int or not 1 <= generation < (1 << 63)):
+        raise ClientError('invalid_attention_subscription')
+    profile = _read(directory / 'installation.private')
+    session = _read(directory / (name + '.session.private'))
+    selected_private = profile.get('private_vpn', False)
+    if type(selected_private) is not bool or selected_private != private_vpn:
+        raise ClientError('private_vpn_profile_mismatch')
+    if selected_private:
+        owner_origin = _origin(profile.get('origin'))
+        if urlsplit(owner_origin).scheme != 'https':
+            raise ClientError('invalid_private_profile')
+        origin = _private_origin(profile.get('private_origin'))
+    else:
+        if profile.get('private_origin') is not None:
+            raise ClientError('invalid_private_profile')
+        origin = _origin(profile.get('origin'))
+    token, expires = session.get('token'), session.get('expires_at')
+    try:
+        installation_id = profile.get('installation_id')
+        if type(installation_id) is not str or str(uuid.UUID(installation_id)) != installation_id:
+            raise ValueError()
+    except (ValueError, TypeError, AttributeError):
+        raise ClientError('invalid_private_profile') from None
+    if (type(token) is not str or not re.fullmatch(r'ehs_[A-Za-z0-9_-]{43}', token)
+            or type(expires) not in (int, float) or not math.isfinite(expires) or expires <= time.time()
+            or session.get('installation_id') != installation_id):
+        raise ClientError('invalid_or_expired_session')
+    query = urlencode({'project': project, 'generation': generation})
+    request = Request(origin + '/api/agent-sessions/v1/hub-attention-stream?' + query,
+                      headers={'Authorization': 'Bearer ' + token, 'Accept': 'text/event-stream',
+                               'User-Agent': 'Engineering-Hub-Agent-Client/0.7'}, method='GET')
+    opener = build_opener(ProxyHandler({}), NoRedirect())
+    try:
+        with opener.open(request, timeout=max(1, min(3600, expires - time.time()))) as response:
+            if response.status != 200 or response.headers.get_content_type() != 'text/event-stream':
+                raise ClientError('invalid_server_response')
+            event = data = None
+            while True:
+                raw = response.readline(1025)
+                if not raw:
+                    if event is not None or data is not None:
+                        raise ClientError('invalid_server_response')
+                    return 0
+                if len(raw) > 1024:
+                    raise ClientError('invalid_server_response')
+                line = raw.rstrip(b'\r\n')
+                if not line:
+                    if event is not None or data is not None:
+                        if event not in ('attention-ready', 'attention-check') or data != '{}':
+                            raise ClientError('invalid_server_response')
+                        print(json.dumps({'event': event}), flush=True)
+                    event = data = None
+                elif line.startswith(b':'):
+                    continue
+                elif line.startswith(b'event: ') and event is None:
+                    event = line[7:].decode('ascii')
+                elif line.startswith(b'data: ') and data is None:
+                    data = line[6:].decode('ascii')
+                else:
+                    raise ClientError('invalid_server_response')
+    except HTTPError as error:
+        raise ClientError('server_request_denied_' + str(error.code)) from None
+    except (URLError, TimeoutError, UnicodeError):
+        raise ClientError('server_unavailable_profile_retained') from None
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Pair an isolated agent installation.')
     parser.add_argument('--profile-dir', type=Path, required=True)
@@ -192,11 +264,18 @@ def main(argv=None):
     connect.add_argument('--private-vpn', action='store_true')
     headers = commands.add_parser('headers', help='Private connector pipe only; do not run in chat/terminal logs.')
     headers.add_argument('--session', required=True)
+    listen = commands.add_parser('listen-attention', help='Explicit foreground, event-driven attention hints.')
+    listen.add_argument('--session', required=True)
+    listen.add_argument('--project', required=True)
+    listen.add_argument('--generation', type=int, required=True)
+    listen.add_argument('--private-vpn', action='store_true')
     args = parser.parse_args(argv)
-    if args.command in {'headers', 'connect'} and not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,47}', args.session):
+    if args.command in {'headers', 'connect', 'listen-attention'} and not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,47}', args.session):
         raise ClientError('bounded_local_session_name_required')
     directory = args.profile_dir.expanduser().absolute()
     installation_path = directory / 'installation.private'
+    if args.command == 'listen-attention':
+        return _listen_attention(directory, args.session, args.project, args.generation, args.private_vpn)
     if args.command == 'headers':
         session = _read(directory / (args.session + '.session.private'))
         if type(session.get('expires_at')) not in (float, int) or session['expires_at'] <= time.time():

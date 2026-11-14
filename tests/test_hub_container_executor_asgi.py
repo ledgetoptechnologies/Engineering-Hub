@@ -175,3 +175,101 @@ def test_auth_unknown_duplicate_oversized_and_nonempty_reconcile_are_rejected(tm
 
     run_owned_loop(flow())
     adapter.close()
+
+
+def test_ack_route_requires_bearer_and_exact_command_identity(tmp_path):
+    from hub_container_executor.ledger import _make_response
+    manifest = PilotManifest.from_bytes(json.dumps(make_manifest_data()).encode())
+    cmd = command(manifest); calls=[]
+    class Adapter:
+        _single_pilot_protocol = False
+        def acknowledge_single_pilot(self, request, digest):
+            calls.append((request,digest))
+            return _make_response(request, state='succeeded')
+    app=create_app(Adapter(), bearer_token='test-token-only')
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test.invalid') as client:
+            path='/v1/container-pilot/commands/' + cmd.command_id + '/acknowledge'
+            body={'request':cmd.model_dump(mode='json'),'outcome_digest':'sha256:'+'a'*64}
+            assert (await client.post(path,json=body)).status_code == 401
+            headers={'Authorization':'Bearer test-token-only'}
+            bad=dict(body); bad['request']=dict(body['request'],command_id=str(uuid4()))
+            assert (await client.post(path,json=bad,headers=headers)).status_code == 400
+            assert calls == []
+            good=await client.post(path,json=body,headers=headers)
+            assert good.status_code == 200 and calls == [(cmd,body['outcome_digest'])]
+    run_owned_loop(exercise())
+
+
+@pytest.mark.parametrize('client_mode,server_mode,allowed', [
+    (False,False,True),(True,True,True),(False,True,False),(True,False,False)])
+def test_versioned_capability_and_command_routes_fail_closed_before_effect(client_mode,server_mode,allowed):
+    from engineering_hub.container_pilot_client import ContainerPilotClient, ContainerPilotClientError
+    from hub_container_executor.ledger import _make_response
+    manifest=PilotManifest.from_bytes(json.dumps(make_manifest_data()).encode()); cmd=command(manifest)
+    class Adapter:
+        _single_pilot_protocol=server_mode
+        def __init__(self): self.calls=[]
+        def submit(self, request): self.calls.append(request); return _make_response(request)
+    adapter=Adapter(); app=create_app(adapter,bearer_token='test-token-only')
+    async def exercise():
+        client=ContainerPilotClient('http://127.0.0.1','test-token-only',
+            transport=httpx.ASGITransport(app=app),single_pilot_protocol=client_mode)
+        try:
+            if allowed:
+                assert (await client.submit_command(cmd)).command_id == cmd.command_id
+                assert adapter.calls==[cmd]
+            else:
+                with pytest.raises(ContainerPilotClientError): await client.submit_command(cmd)
+                assert adapter.calls==[]
+        finally:
+            await client.aclose()
+    run_owned_loop(exercise())
+
+
+@pytest.mark.parametrize('mode', [None, 1, 'true'])
+def test_invalid_protocol_mode_fails_closed_before_body_and_effect(mode):
+    class Adapter:
+        _single_pilot_protocol = mode
+        def submit(self, request):
+            raise AssertionError('must not submit')
+    app = create_app(Adapter(), bearer_token='test-token-only')
+    async def exercise():
+        for path in ('/v1/container-pilot/commands', '/v2/container-pilot/commands',
+                     '/v2/container-pilot/capability'):
+            result = await request(app, 'GET', path)
+            assert result.status_code == 500
+    run_owned_loop(exercise())
+
+
+def test_missing_protocol_mode_fails_closed():
+    app = create_app(object(), bearer_token='test-token-only')
+    async def exercise():
+        for path in ('/v1/container-pilot/commands', '/v2/container-pilot/commands',
+                     '/v2/container-pilot/capability'):
+            assert (await request(app, 'GET', path)).status_code == 500
+    run_owned_loop(exercise())
+
+
+@pytest.mark.parametrize('path', ['/v1/container-pilot/commands', '/v2/container-pilot/commands'])
+def test_missing_protocol_mode_rejects_authenticated_post_before_body_or_adapter(path):
+    class Adapter:
+        def submit(self, request):
+            raise AssertionError('adapter must not be called')
+
+    app = create_app(Adapter(), bearer_token='test-token-only')
+    messages = []
+
+    async def receive():
+        raise AssertionError('request body must not be consumed')
+
+    async def send(message):
+        messages.append(message)
+
+    async def exercise():
+        await app({'type': 'http', 'method': 'POST', 'path': path,
+                   'headers': [(b'authorization', b'Bearer test-token-only')]}, receive, send)
+
+    run_owned_loop(exercise())
+    assert messages[0]['type'] == 'http.response.start'
+    assert messages[0]['status'] == 500

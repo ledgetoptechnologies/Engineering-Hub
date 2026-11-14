@@ -78,6 +78,14 @@ def _validate_client_request_id(client_request_id: str) -> None:
         raise MessageError("invalid client request id")
 
 
+def _body_json(body: Any) -> str:
+    """Stored bodies must parse as strict JSON for every reader; NaN and Infinity are refused."""
+    try:
+        return json.dumps(body, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        raise MessageError("message body is not valid JSON data") from None
+
+
 def _send_fingerprint(*, recipient: str, message_type: str, body: Any, priority: str,
                       correlation_id: str | None, in_reply_to: str | None,
                       requires_user_approval: bool) -> str:
@@ -339,7 +347,7 @@ class MessageRepository:
                     (id,sender,recipient,message_type,priority,body_json,correlation_id,in_reply_to,hop_count,
                      requires_user_approval,created_at)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (message_id, sender, recipient, message_type, priority,
-                    json.dumps(body, separators=(",", ":"), ensure_ascii=False), correlation_id, in_reply_to,
+                    _body_json(body), correlation_id, in_reply_to,
                     hop_count, int(requires_user_approval), created))
                 conn.execute(
                     "INSERT INTO message_delivery_sequence (message_id) VALUES (?)", (message_id,)
@@ -405,6 +413,34 @@ class MessageRepository:
                 sql += " AND lower(message_type) IN ('task', 'request')"
             rows = conn.execute(sql + " ORDER BY created_at LIMIT ?", (*params, limit)).fetchall()
             return [self._from_row(row) for row in rows]
+
+    def routing_activity(self, *, since: str, open_limit: int = 100, scan_limit: int = 5000) -> dict[str, Any]:
+        """Message routing metadata for a human overview. Only body.topic is read from a body."""
+        topic = ("CASE WHEN json_valid(body_json) AND json_type(body_json, '$.topic') = 'text' "
+                 "THEN json_extract(body_json, '$.topic') END")
+        with self._connection() as conn:
+            # The totals, samples and truncation flags must describe one snapshot.
+            conn.execute('BEGIN')
+            open_counts = conn.execute(
+                f"SELECT recipient, {topic} AS topic, status, COUNT(*) AS total, MIN(created_at) AS oldest "
+                "FROM (SELECT recipient, status, created_at, body_json FROM messages "
+                "WHERE status IN ('pending', 'claimed') ORDER BY created_at LIMIT ?) "
+                "GROUP BY recipient, topic, status", (scan_limit,)).fetchall()
+            open_total = conn.execute("SELECT COUNT(*) FROM messages WHERE status IN ('pending', 'claimed')").fetchone()[0]
+            links = conn.execute(
+                f"SELECT sender, recipient, {topic} AS topic, COUNT(*) AS total, MAX(created_at) AS latest "
+                "FROM (SELECT sender, recipient, created_at, body_json FROM messages WHERE created_at >= ? "
+                "ORDER BY created_at DESC LIMIT ?) GROUP BY sender, recipient, topic", (since, scan_limit)).fetchall()
+            links_truncated = conn.execute(
+                'SELECT 1 FROM messages WHERE created_at >= ? ORDER BY created_at DESC LIMIT 1 OFFSET ?',
+                (since, scan_limit)).fetchone() is not None
+            waiting = conn.execute(
+                f"SELECT id, sender, recipient, message_type, priority, status, created_at, {topic} AS topic "
+                "FROM messages WHERE status IN ('pending', 'claimed') ORDER BY created_at LIMIT ?",
+                (min(max(1, int(open_limit)), 100),)).fetchall()
+        return {"open_counts": [dict(row) for row in open_counts], "links": [dict(row) for row in links],
+                "open": [dict(row) for row in waiting], "open_total": open_total,
+                "open_counts_truncated": open_total > scan_limit, "recent_links_truncated": links_truncated}
 
     @staticmethod
     def _delivery_head(conn: sqlite3.Connection) -> int:
@@ -475,25 +511,36 @@ class MessageRepository:
             conn.commit(); return self.get(message_id, conn=conn)
 
     def acknowledge(self, message_id: str, agent: str) -> Message:
+        return self.acknowledge_with_outcome(message_id, agent)[0]
+
+    def acknowledge_with_outcome(self, message_id: str, agent: str) -> tuple[Message, bool]:
+        """Return (message, replayed); replayed means an earlier identical ack had already committed."""
         return self._finish(message_id, agent, "acknowledged", None)
 
     def reject(self, message_id: str, agent: str, reason: str) -> Message:
+        return self.reject_with_outcome(message_id, agent, reason)[0]
+
+    def reject_with_outcome(self, message_id: str, agent: str, reason: str) -> tuple[Message, bool]:
         if not reason: raise MessageError("rejection reason is required")
         return self._finish(message_id, agent, "rejected", reason)
 
-    def _finish(self, message_id: str, agent: str, status: str, reason: str | None) -> Message:
+    def _finish(self, message_id: str, agent: str, status: str, reason: str | None) -> tuple[Message, bool]:
         self._validate_agent(agent); timestamp = iso(now_utc())
         with self._lock, self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
             if row is None: conn.rollback(); raise NotFound("message not found")
+            if (row["recipient"] == agent and row["claimed_by"] == agent and row["status"] == status
+                    and (status == "acknowledged" or row["rejection_reason"] == reason)):
+                # A retry of a finish that already committed (e.g. lost response or restart) returns the result.
+                conn.rollback(); return self._from_row(row), True
             if row["recipient"] != agent or row["status"] != "claimed" or row["claimed_by"] != agent:
                 conn.rollback(); raise InvalidTransition("message is not claimed by this agent")
             if status == "acknowledged":
                 conn.execute("UPDATE messages SET status=?,acknowledged_at=?,claim_expires_at=NULL WHERE id=?", (status, timestamp, message_id))
             else:
                 conn.execute("UPDATE messages SET status=?,rejected_at=?,rejection_reason=?,claim_expires_at=NULL WHERE id=?", (status, timestamp, reason, message_id))
-            conn.commit(); return self.get(message_id, conn=conn)
+            conn.commit(); return self.get(message_id, conn=conn), False
 
     def cleanup(self, *, acknowledged_days: int = 30, rejected_days: int = 90) -> dict[str, int]:
         acknowledged_days = max(1, int(acknowledged_days)); rejected_days = max(1, int(rejected_days)); current = now_utc()

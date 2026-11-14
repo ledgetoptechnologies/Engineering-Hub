@@ -10,6 +10,70 @@ import json
 import re
 import subprocess
 import uuid
+import os
+import stat
+import shutil
+from pathlib import Path
+
+
+_engine_pin = None
+
+def docker_command(args):
+    """Bind all Docker CLI operations to the explicitly selected private socket.
+
+    Preserve the existing Docker config for registry auth and Buildx; never
+    inherit a Docker context or endpoint. This is not host attestation.
+    """
+    global _engine_pin
+    host = os.environ.get("EH_EXECUTOR_DOCKER_HOST", "")
+    if (not re.fullmatch(r"unix:///run/[A-Za-z0-9_./-]+\.sock", host)
+            or any(part in ("", ".", "..") for part in host[8:].split("/"))
+            or host in ("unix:///run/docker.sock", "unix:///run/containerd/containerd.sock")):
+        raise ValueError("Explicit dedicated Docker socket required")
+    path = Path(host[7:])
+    if str(path.resolve(strict=True)) != str(path):
+        raise ValueError("Docker socket aliases are forbidden")
+    info = path.stat()
+    if not stat.S_ISSOCK(info.st_mode):
+        raise ValueError("Docker endpoint must be a socket")
+    for name in ("/run/docker.sock", "/var/run/docker.sock"):
+        try:
+            other = os.stat(name)
+        except FileNotFoundError:
+            continue
+        if (info.st_dev, info.st_ino) == (other.st_dev, other.st_ino):
+            raise ValueError("Shared Docker socket forbidden")
+    env = dict(os.environ)
+    for name in ("DOCKER_CONTEXT", "DOCKER_HOST", "DOCKER_TLS_VERIFY",
+                 "DOCKER_CERT_PATH", "DOCKER_API_VERSION", "BUILDX_BUILDER"):
+        env.pop(name, None)
+    executable = shutil.which("docker", path="/usr/bin:/bin")
+    if executable is None or not executable.startswith("/"):
+        raise ValueError("System Docker CLI required")
+    prefix = [executable, "--host", host]
+    try:
+        probe = subprocess.run([*prefix, "info", "--format", "{{.ID}}"],
+                               env=env, check=True, capture_output=True, text=True, timeout=15)
+        daemon_id = probe.stdout.strip()
+        after = path.stat()
+        if ((after.st_dev, after.st_ino) != (info.st_dev, info.st_ino)
+                or not re.fullmatch(r"[A-Za-z0-9:-]{1,128}", daemon_id)):
+            raise ValueError
+    except (OSError, subprocess.SubprocessError, ValueError):
+        raise ValueError("Docker engine identity unavailable") from None
+    current = (host, info.st_dev, info.st_ino, daemon_id)
+    if _engine_pin is None:
+        _engine_pin = current
+    elif current != _engine_pin:
+        raise ValueError("Docker engine changed during transaction")
+    return [*prefix, *args], env
+
+
+def engine_identity():
+    """Check and return process-pinned identity, not privileged host attestation."""
+    docker_command([])
+    return {"socket": _engine_pin[0], "device": _engine_pin[1],
+            "inode": _engine_pin[2], "daemon_id": _engine_pin[3]}
 
 
 OWNER = 'hub.executor-smoke-owner'
@@ -35,7 +99,8 @@ package = root / 'hub_container_executor'
 record = json.loads((package / '_executor_source.json').read_bytes())
 assert record['schema_version'] == 1 and record['source_commit'] == sys.argv[1]
 names = ('service', 'local_resources', 'runtime_identity', 'installed_runner',
-         'installed_coordinator', 'launch_supervisor', 'launcher_cli', 'launch_transport', 'configuration_commitment')
+         'installed_coordinator', 'colocated_session', 'colocated_pair_preflight', 'coordinator_observation_transport',
+         'launch_supervisor', 'launcher_cli', 'launch_transport', 'configuration_commitment')
 for name in names:
     module = importlib.import_module('hub_container_executor.' + name)
     path = pathlib.Path(module.__file__)
@@ -47,6 +112,8 @@ assert pathlib.Path(helper.__file__) == root / 'scripts/inspect_hub_image_identi
 assert hashlib.sha256(pathlib.Path(helper.__file__).read_bytes()).hexdigest() == record['source_files']['src/scripts/inspect_hub_image_identity.py']
 from engineering_hub.container_pilot_client import ContainerPilotClient
 assert callable(getattr(ContainerPilotClient, 'for_private_unix', None)), 'incompatible core'
+from hub_container_executor.colocated_session import require_core_compatibility
+require_core_compatibility()
 print(json.dumps({'source_commit': sys.argv[1], 'installed_modules': list(names),
                   'private_unix_client': True, 'installed_artifact': 'passed'}))
 '''
@@ -54,7 +121,8 @@ print(json.dumps({'source_commit': sys.argv[1], 'installed_modules': list(names)
 
 def run(*args, timeout=60):
     try:
-        return subprocess.run(args, check=True, capture_output=True, text=True,
+        command, env = docker_command(args[1:]) if args and args[0] == 'docker' else (args, None)
+        return subprocess.run(command, env=env, check=True, capture_output=True, text=True,
                               timeout=timeout).stdout.strip()
     except (subprocess.SubprocessError, OSError):
         # Never reflect arbitrary Docker/image output or local configuration.
@@ -72,8 +140,8 @@ def verify_defaults(info):
 
 
 def remove_owned(name, owner):
-    result = subprocess.run(['docker', 'container', 'inspect', name],
-                            capture_output=True, text=True, timeout=15)
+    command, env = docker_command(['container', 'inspect', name])
+    result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=15)
     if result.returncode:
         if 'no such container' in result.stderr.lower():
             return

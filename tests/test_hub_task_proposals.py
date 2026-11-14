@@ -69,18 +69,32 @@ def test_reviewed_proposal_can_enter_staging_but_never_production_even_direct_qu
     target = WorkTarget(item['id'], COMMIT, DIGEST)
     payload = WorkSubmission(request_id='staging', action_key='hub.validate', environment='staging',
                              target=dict(task_id=item['id'], source_commit=COMMIT, artifact_digest=DIGEST))
-    job = submit_reviewed_work(repo, queue, 'codex', payload)
-    assert job['state'] == 'queued' and job['environment'] == 'staging'
-    for direct in [True, False]:
-        with pytest.raises(HubError, match='work_target_not_verified'):
-            if direct:
-                queue.submit(actor='codex', request_id='production-direct', action_key='hub.validate',
-                             environment='production', target=target, approval_id='approved')
-            else:
-                submit_reviewed_work(repo, queue, 'codex', payload.model_copy(update={
-                    'request_id': 'production-http-mcp', 'environment': 'production', 'approval_id': 'approved'}))
+    def reject_production_work():
+        for direct in [True, False]:
+            with pytest.raises(HubError, match='work_target_not_verified'):
+                if direct:
+                    queue.submit(actor='codex', request_id='production-direct', action_key='hub.validate',
+                                 environment='production', target=target, approval_id='approved')
+                else:
+                    submit_reviewed_work(repo, queue, 'codex', payload.model_copy(update={
+                        'request_id': 'production-http-mcp', 'environment': 'production', 'approval_id': 'approved'}))
+    # Prove both APIs reject production before any active-job guard can mask
+    # the staging-only scope, even with an affirmative approval verifier.
+    reject_production_work()
     with pytest.raises(HubError, match='invalid_target'):
         repo.create_run('codex', item['id'], item['revision'], DIGEST, 'engineering-hub:production')
+    with repo._connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM hub_work_jobs').fetchone()[0] == 0
+    assert repo.list_runs() == []
+    job = submit_reviewed_work(repo, queue, 'codex', payload)
+    assert job['state'] == 'queued' and job['environment'] == 'staging'
+    reject_production_work()
+    with pytest.raises(HubError, match='active_work_job'):
+        repo.create_run('codex', item['id'], item['revision'], DIGEST, 'engineering-hub:production')
+    with repo._connection() as db:
+        assert [(row['id'], row['environment']) for row in db.execute(
+            'SELECT id,environment FROM hub_work_jobs')] == [(job['id'], 'staging')]
+    assert repo.list_runs() == []
     # The scope persists across reopen and the actual claim/lease path consumes it.
     reopened = HubRepository(repo.path)
     reopened_queue = queue_for(reopened)

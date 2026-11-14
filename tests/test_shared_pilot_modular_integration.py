@@ -62,7 +62,7 @@ def joint_case(tmp_path, *, reopening=False, clients=None, activate=True):
 @pytest.mark.asyncio
 async def test_real_controllers_share_one_owner_and_release_same_machine_sequentially(tmp_path):
     with joint_case(tmp_path) as case:
-        modular = await case.modular.submit('codex', payload())
+        modular = await case.modular.submit('codex', payload(case.repo))
         _, pilot = submit(case)
         assert case.modular.queue is case.bridge.queue is case.queue
         assert case.modular.repo is case.workflow.repo is case.repo
@@ -79,7 +79,7 @@ async def test_real_controllers_share_one_owner_and_release_same_machine_sequent
 async def test_lost_modular_ack_blocks_pilot_until_original_get_recovery(tmp_path):
     with joint_case(tmp_path) as case:
         case.modular_client.lost_ack = True
-        modular = await case.modular.submit('codex', payload())
+        modular = await case.modular.submit('codex', payload(case.repo))
         _, pilot = submit(case)
         assert (await case.modular.run_once())['job']['state'] == 'held'
         assert await case.bridge.run_once() is None
@@ -94,7 +94,7 @@ async def test_held_pilot_blocks_modular_without_creating_another_run(tmp_path):
     with joint_case(tmp_path) as case:
         case.client.outcomes['deploy_container'] = TimeoutError()
         _, pilot = submit(case)
-        modular = await case.modular.submit('codex', payload())
+        modular = await case.modular.submit('codex', payload(case.repo))
         assert (await case.bridge.run_once())['state'] == 'held'
         assert await case.modular.run_once() is None
         assert machine_job(case) == pilot['id'] and case.modular_client.posts == 0
@@ -107,7 +107,7 @@ async def test_real_pilot_health_failure_rolls_back_before_modular_can_run(tmp_p
     with joint_case(tmp_path) as case:
         case.client.outcomes['smoke_container'] = 'failed'
         _, pilot = submit(case)
-        await case.modular.submit('codex', payload())
+        await case.modular.submit('codex', payload(case.repo))
         assert (await case.bridge.run_once())['state'] == 'failed'
         assert [command.action for command in case.client.submissions] == ACTIONS
         assert case.repo.list_runs()[0]['status'] == 'rolled_back'
@@ -130,7 +130,7 @@ def original_hold_rows(case, job_id):
 async def test_reopened_owner_preserves_exact_modular_hold_then_original_get_recovers(tmp_path):
     with joint_case(tmp_path) as initial:
         initial.modular_client.lost_ack = True
-        submitted = await initial.modular.submit('codex', payload())
+        submitted = await initial.modular.submit('codex', payload(initial.repo))
         held = await initial.modular.run_once()
         assert held['job']['state'] == 'held'
         before = original_hold_rows(initial, submitted['job']['id'])
@@ -156,7 +156,7 @@ async def test_reopened_owner_preserves_exact_modular_hold_then_original_get_rec
 async def test_inconsistent_original_modular_submission_still_denies_reenrollment(tmp_path):
     with joint_case(tmp_path) as initial:
         initial.modular_client.lost_ack = True
-        submitted = await initial.modular.submit('codex', payload())
+        submitted = await initial.modular.submit('codex', payload(initial.repo))
         await initial.modular.run_once()
         with initial.repo._transaction() as db:
             row = db.execute("SELECT id,data FROM hub_staging_submissions WHERE json_extract(data,'$.job_id')=?",
@@ -181,7 +181,7 @@ async def test_inconsistent_original_modular_submission_still_denies_reenrollmen
 @pytest.mark.asyncio
 async def test_live_original_modular_lease_is_preserved_without_recovery_or_adoption(tmp_path):
     with joint_case(tmp_path) as initial:
-        submitted = await initial.modular.submit('codex', payload())
+        submitted = await initial.modular.submit('codex', payload(initial.repo))
         initial.queue.claim(worker=initial.modular.worker,
             action_keys=tuple(initial.modular.actions.values()), lease_seconds=600)
         before = original_hold_rows(initial, submitted['job']['id'])
@@ -202,7 +202,7 @@ async def test_live_original_modular_lease_is_preserved_without_recovery_or_adop
 async def test_journal_coherence_does_not_authorize_a_mismatched_original_receipt(tmp_path):
     with joint_case(tmp_path) as initial:
         initial.modular_client.lost_ack = True
-        submitted = await initial.modular.submit('codex', payload())
+        submitted = await initial.modular.submit('codex', payload(initial.repo))
         await initial.modular.run_once()
         with initial.repo._transaction() as db:
             row = db.execute("SELECT id,data FROM hub_staging_submissions WHERE json_extract(data,'$.job_id')=?",

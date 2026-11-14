@@ -6,7 +6,9 @@
 ARG CORE_IMAGE
 FROM ${CORE_IMAGE} AS core
 
-FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS python-runtime
+# Matches the Python base pinned for the reviewed staging control build.
+# A different core image still requires independent runtime compatibility review.
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS python-runtime
 
 FROM python-runtime AS executor-installer
 ARG CORE_IMAGE
@@ -32,8 +34,9 @@ ENV PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin
 WORKDIR /
 # Inert imports against the actual overlaid, installed venv. The wheel validator
 # only proves archive consistency; an old 0.6.0 core can still lack required APIs.
+# Matching the recorded Python patch is not a binary or native-library ABI proof.
 # Never construct a runner/resource/issuer or read operator configuration here.
-RUN --network=none /opt/venv/bin/python -I -B -c "import importlib,json,pathlib; root=pathlib.Path('/opt/venv/lib/python3.12/site-packages'); record=json.loads((root/'hub_container_executor/_executor_source.json').read_bytes()); names=['engineering_hub.current_executor_observation','engineering_hub.current_executor_transport','engineering_hub.startup_reconciliation']+[name[4:-3].replace('/','.') for name in record['source_files'] if name.startswith('src/') and name.endswith('.py')]; modules=[importlib.import_module(name) for name in names]; assert all(pathlib.Path(module.__file__).is_relative_to(root) for module in modules), 'Installed executor/core compatibility unavailable'"
+RUN --network=none /opt/venv/bin/python -I -B -c "import importlib,json,pathlib,sys; cfg=dict(tuple(part.strip() for part in line.split('=',1)) for line in pathlib.Path('/opt/venv/pyvenv.cfg').read_text().splitlines() if '=' in line); tuple(map(int,cfg['version_info'].split('.'))) == sys.version_info[:3] or sys.exit('Core venv Python version mismatch'); root=pathlib.Path('/opt/venv/lib/python3.12/site-packages'); record=json.loads((root/'hub_container_executor/_executor_source.json').read_bytes()); names=['engineering_hub.current_executor_observation','engineering_hub.current_executor_transport','engineering_hub.startup_reconciliation']+[name[4:-3].replace('/','.') for name in record['source_files'] if name.startswith('src/') and name.endswith('.py')]; modules=[importlib.import_module(name) for name in names]; assert all(pathlib.Path(module.__file__).is_relative_to(root) for module in modules), 'Installed executor/core compatibility unavailable'; from hub_container_executor.colocated_session import require_core_compatibility; require_core_compatibility()"
 USER 10001:10001
 ENTRYPOINT ["/opt/venv/bin/python", "-I", "-m", "hub_container_executor.installed_runner"]
 CMD ["--config", "/operator/runner.json"]

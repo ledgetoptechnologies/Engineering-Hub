@@ -17,6 +17,7 @@ async function fixture(page: Page, options: { catalog?: boolean } = {}) {
     failNext: null as null | { status: number; code: string } | "abort",
     recovered: false,
     extraTasks: [] as Record<string, unknown>[],
+    tracking: "missing" as "missing" | "ok" | "unauthenticated" | "forbidden",
     extraProjects: 0, holdGrant: false, grantReleases: [] as (() => void)[],
   };
   await page.route("**/api/hub/v1/**", async route => {
@@ -34,6 +35,13 @@ async function fixture(page: Page, options: { catalog?: boolean } = {}) {
     if (path.endsWith("/events/status")) return respond({ available: false, reason: "native_source_unsupported", observer_epoch: "f", cursor: 0 });
     if (path.endsWith("/peers")) return respond(createDemoTopic("auto-wake-v1-test"));
     if (path.endsWith("/work/status")) return respond({}, 423);
+    if (path.endsWith("/projects/engineering-hub/tracking-tasks") && state.tracking !== "missing") {
+      if (state.tracking === "unauthenticated") return respond({ detail: { code: "human_session_required" } }, 401);
+      if (state.tracking === "forbidden") return respond({ detail: { code: "forbidden" } }, 403);
+      return respond({ project: "engineering-hub", tasks: [{ id: "33333333-4444-4555-8666-777777777777",
+        project: "engineering-hub", title: "Private tracked progress", status: "open", revision: 1,
+        created_by: "codex", execution_authorization: false, updates: [] }], truncated: false, next_after: null });
+    }
     const prefix = "/api/hub/v1/agent-connections";
     if (!path.startsWith(prefix)) return respond({ detail: { code: "gateway_route_forbidden" } }, 403);
     const rest = path.slice(prefix.length);
@@ -83,7 +91,7 @@ async function fixture(page: Page, options: { catalog?: boolean } = {}) {
 const panel = (page: Page) => page.getByRole("region", { name: "Installations", exact: true });
 const access = (page: Page) => page.getByRole("group", { name: "Hub access for Codex on the desk PC" });
 async function openAccess(page: Page) {
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const row = panel(page).locator(".installation-row", { hasText: "desk-pc" });
   // Session labels help name the claim's sessions.
   await row.getByRole("button", { name: "Show sessions" }).click();
@@ -95,7 +103,7 @@ async function openAccess(page: Page) {
 
 test("the Hub access section is only offered when the backend has it", async ({ page }) => {
   await fixture(page, { catalog: false });
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   await expect(panel(page).locator(".installation-row")).toHaveCount(1);
   await expect(panel(page).getByRole("button", { name: "Hub access" })).toHaveCount(0);
 });
@@ -216,6 +224,8 @@ test("installation-owned tasks are named by installation everywhere, never as th
   await expect(row).toContainText("Staging proposal · Codex on install 88736abd");
   await page.goto("/#/projects/engineering-hub/work");
   await expect(page.locator(".board-card").filter({ has: page.getByText("Transport task", { exact: true }) })).toContainText("Codex on install 88736abd");
+  await expect(page.getByRole("region", { name: "Project tracking" }).getByRole("alert")).toContainText("Project tracking could not be loaded");
+  await expect(page.getByRole("link", { name: "Sign in securely" })).toHaveCount(0);
   const withdrawn = page.locator(".withdrawn-list");
   await withdrawn.locator("summary").click();
   await expect(withdrawn).toContainText("Withdrawn by an install");
@@ -226,6 +236,22 @@ test("installation-owned tasks are named by installation everywhere, never as th
   await reviewed.locator("summary").click();
   await expect(reviewed).toContainText("Independent reviewer: Claude on install 7a207d88");
 });
+
+for (const denial of ["unauthenticated", "forbidden"] as const) {
+  test(`tracking ${denial} clears an already loaded private workspace`, async ({ page }) => {
+    const state = await fixture(page);
+    state.extraTasks = [{ ...wire.overview.tasks[0] }];
+    state.tracking = "ok";
+    await page.goto("/#/projects/engineering-hub/work");
+    await expect(page.locator(".board-card").filter({ has: page.getByText("Transport task", { exact: true }) })).toBeVisible();
+    await expect(page.getByRole("region", { name: "Project tracking" })).toContainText("Private tracked progress");
+    state.tracking = denial;
+    await page.getByLabel("Tracking records").selectOption("all");
+    await expect(page.getByRole("link", { name: "Sign in securely" })).toBeVisible();
+    await expect(page.getByText("Transport task", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("Private tracked progress", { exact: true })).toHaveCount(0);
+  });
+}
 
 test("access that has run out by this browser's clock never shows as in effect", async ({ page }) => {
   const state = await fixture(page);
@@ -273,7 +299,7 @@ test("an older access read that answers after a Refresh never brings back the ol
   const state = await fixture(page);
   state.grant = future();
   state.holdGrant = true;
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const row = panel(page).locator(".installation-row", { hasText: "desk-pc" });
   await row.getByRole("button", { name: "Hub access" }).click();
   await expect.poll(() => state.grantReleases.length).toBe(1);
@@ -317,17 +343,4 @@ test("the hand-over confirmation shows exact ids, and changing the target asks f
   await dialog.getByLabel("Hand over to").selectOption(second);
   await expect(dialog.getByLabel("To session id")).toHaveText(second);
   await expect(dialog.getByLabel("I understand the review is cleared")).not.toBeChecked();
-});
-
-test("with Hub access available, the staging note says tasks and reviews need a grant", async ({ page }) => {
-  await fixture(page);
-  await page.goto("/#/agents");
-  await expect(panel(page)).toContainText("only where you grant them under Hub access");
-  await expect(panel(page)).not.toContainText("can't use Hub tasks or reviews");
-});
-
-test("without Hub access, the staging note keeps the foundation-only wording", async ({ page }) => {
-  await fixture(page, { catalog: false });
-  await page.goto("/#/agents");
-  await expect(panel(page)).toContainText("can't use Hub tasks or reviews");
 });

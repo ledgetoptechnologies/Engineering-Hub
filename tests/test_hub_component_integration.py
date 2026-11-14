@@ -87,7 +87,8 @@ def test_composed_human_mutations_preserve_session_csrf_and_mcp_discovery(compos
     assert response.status_code == 200, response.text
     tools = {tool['name']: tool for tool in response.json()['result']['tools']}
     assert {name for name in tools if name.startswith('hub_component_')} == COMPONENT_TOOLS
-    assert {name for name in tools if name.startswith('hub_project_')} == {'hub_project_list', 'hub_project_get'}
+    assert {name for name in tools if name.startswith('hub_project_')} == {
+        'hub_project_list', 'hub_project_get', 'hub_project_tasks'}
     for name in COMPONENT_TOOLS:
         schema = tools[name]['inputSchema']
         assert not {'actor', 'identity', 'ctx'} & set(schema['properties'])

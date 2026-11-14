@@ -26,6 +26,89 @@ TOKEN = 'synthetic-private-worker-token-never-real'
 KINDS = ('workspace', 'build', 'test_run', 'preview')
 
 
+@pytest.mark.parametrize('details', [
+    {},
+    {'error': 'execution_uncertain'},
+    {'error': 'scratch_cleanup_unproven'},
+    {'error': 'scratch_cleanup_uncertain'},
+    {'error': 'cleanup_uncertain'},
+    {'error': 'unknown_future_reason'},
+    {'error': 'stage_test_failed', 'preview_ready': True},
+    {'error': 'stage_test_failed', 'preview_ready': False},
+    {'error': 'stage_test_failed', 'stages': {
+        'build': {'exit_code': 0, 'log_bytes': 0}, 'test': {'exit_code': 0, 'log_bytes': 0}}},
+    {'error': 'stage_build_failed', 'stages': {
+        'build': {'exit_code': 0, 'log_bytes': 0}, 'test': {'exit_code': 1, 'log_bytes': 0}}},
+    {'error': 'stage_test_failed', 'stages': {
+        'build': {'exit_code': 1, 'log_bytes': 0}, 'test': {'exit_code': 1, 'log_bytes': 0}}},
+    {'error': 'stage_test_failed', 'extra': 'not_worker_contract'},
+])
+def test_operation_rejects_contradictory_failed_receipt(details):
+    with pytest.raises(StagingClientError):
+        StagingClient._operation({'command_id': str(uuid4()), 'job_id': str(uuid4()),
+                                  'state': 'failed', 'result': details})
+
+
+@pytest.mark.asyncio
+async def test_job_read_rejects_contradictory_failure_over_http(config):
+    job = str(uuid4())
+    receipt = {'command_id': str(uuid4()), 'job_id': job, 'state': 'failed',
+               'result': {'error': 'stage_test_failed', 'preview_ready': True}}
+    client = StagingClient(config, test_transport=httpx.MockTransport(lambda _: httpx.Response(200, json=receipt)))
+    try:
+        with pytest.raises(StagingClientError):
+            await client.job(job)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.parametrize('reason', ['stage_build_failed', 'stage_test_failed', 'invalid_archive', 'output_size_limit'])
+def test_operation_accepts_legitimate_failed_receipt(reason):
+    receipt = {'command_id': str(uuid4()), 'job_id': str(uuid4()),
+               'state': 'failed', 'result': {'error': reason}}
+    assert StagingClient._operation(receipt) == receipt
+
+
+def test_operation_rejects_success_with_failure_reason():
+    with pytest.raises(StagingClientError):
+        StagingClient._operation({'command_id': str(uuid4()), 'job_id': str(uuid4()),
+                                  'state': 'succeeded', 'result': {'error': 'stage_test_failed'}})
+
+
+@pytest.mark.asyncio
+async def test_job_read_rejects_contradictory_success_over_http(config):
+    job = str(uuid4())
+    receipt = {'command_id': str(uuid4()), 'job_id': job, 'state': 'succeeded',
+               'result': {'error': 'stage_test_failed'}}
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, json=receipt))
+    client = StagingClient(config, test_transport=transport)
+    try:
+        with pytest.raises(StagingClientError):
+            await client.job(job)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.parametrize('mutation', ['missing', 'declared', 'commit', 'digest'])
+def test_operation_rejects_contradictory_source_proof(mutation):
+    binding = {'scheme': 'git-sha1-tree-v1', 'commit_oid': 'a' * 40, 'tree_oid': 'b' * 40,
+               'archive_sha256': 'c' * 64, 'commit_object_sha256': 'd' * 64,
+               'expanded_bytes': 1, 'entries': 1}
+    details = {'source_commit': 'a' * 40, 'source_digest': 'c' * 64,
+               'source_commit_verification': 'git-sha1-tree-v1', 'source_binding': binding}
+    if mutation == 'missing':
+        del details['source_binding']
+    elif mutation == 'declared':
+        details['source_commit_verification'] = 'declared'
+    elif mutation == 'commit':
+        details['source_commit'] = 'e' * 40
+    else:
+        details['source_digest'] = 'e' * 64
+    with pytest.raises(StagingClientError):
+        StagingClient._operation({'command_id': str(uuid4()), 'job_id': str(uuid4()),
+                                  'state': 'succeeded', 'result': details})
+
+
 @pytest.fixture
 def config(tmp_path):
     secret = tmp_path / 'worker-token'

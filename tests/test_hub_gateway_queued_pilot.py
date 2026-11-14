@@ -6,10 +6,11 @@ HTTP socket. FakeClient effects are not Docker/application acceptance, and the
 public/agent frontends remain in-process; no deployed isolation is claimed.
 """
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 import json
 import sys
 import time
+from types import SimpleNamespace
 import uuid
 
 import httpx
@@ -59,6 +60,38 @@ def signed_access(monkeypatch):
 def checked(response, expected=200):
     assert response.status_code == expected, response.text
     return response.json()
+
+
+def pilot_failure_diagnostics(rig):
+    """Report only fixed synthetic action/state labels, never payloads or IDs."""
+    actions = frozenset(ACTIONS)
+    states = frozenset({'unknown', 'held', 'failed', 'succeeded', 'ack_pending'})
+    safe_action = lambda value: value if value in actions else '<other>'
+    safe_state = lambda value: value if value in states else '<other>'
+    try:
+        with rig.repo._connection() as db:
+            rows = db.execute('SELECT action,state FROM hub_container_pilot_commands').fetchall()
+        commands = [(safe_action(row['action']), safe_state(row['state'])) for row in rows]
+    except Exception:
+        commands = '<unavailable>'
+    submitted = [safe_action(command.action) for command in rig.client.submissions]
+    return {'commands': commands, 'submitted': submitted}
+
+
+def test_pilot_failure_diagnostics_reports_only_allowlisted_labels():
+    @contextmanager
+    def connection():
+        yield SimpleNamespace(execute=lambda _: SimpleNamespace(fetchall=lambda: [
+            {'action': 'smoke_container_rollback', 'state': 'unknown'},
+            {'action': 'private-action', 'state': 'private-state'},
+        ]))
+
+    rig = SimpleNamespace(repo=SimpleNamespace(_connection=connection),
+                          client=SimpleNamespace(submissions=[SimpleNamespace(action='private-action')]))
+    assert pilot_failure_diagnostics(rig) == {
+        'commands': [('smoke_container_rollback', 'unknown'), ('<other>', '<other>')],
+        'submitted': ['<other>'],
+    }
 
 
 @asynccontextmanager
@@ -185,7 +218,7 @@ async def test_public_human_agent_review_native_runtime_and_result(
                 assert not checked(await browser.post(BASE + '/work/pause', json={'paused': False}))['paused']
                 await asyncio.wait_for(completed.wait(), 5)
                 result = checked(await browser.get(BASE + '/work/jobs/' + job['id']))
-                assert result['state'] == ('failed' if failed_smoke else 'succeeded')
+                assert result['state'] == ('failed' if failed_smoke else 'succeeded'), pilot_failure_diagnostics(rig)
                 runs = checked(await browser.get(BASE + '/runs'))['items']
                 assert len(runs) == 1 and runs[0]['task_id'] == task_id
                 assert runs[0]['status'] == ('rolled_back' if failed_smoke else 'succeeded')

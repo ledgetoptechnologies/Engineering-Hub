@@ -25,7 +25,26 @@ features:{task_recovery:true}}`. The capability catalog is finite:
 
 `project.read`, `component.read`, `component.write`, `task.read`, `task.propose`,
 `task.claim`, `task.candidate`, `task.review`, `planning.read`, `planning.write`,
-`decision.request`, `entity.withdraw`.
+`decision.request`, `decision.read`, `entity.withdraw`. `decision.read` is an
+explicit independent grant: it permits reading any decision and answer within
+the granted active projects, including sensitive answer text. Grant it only
+where that visibility is intended. It grants no answer or execution authority.
+Existing grants do not acquire this new capability automatically.
+
+`hub_decision_request` accepts an optional `client_request_id`. Reusing the
+same ID for the same normalized request by the same installation and project
+returns the original creation receipt, including after an answer; use
+`decision.read` for current state. Changing the request under that ID conflicts.
+Without an ID, each call creates a new decision.
+
+The first keyed request creates a persistent receipt table atomically with the
+decision. Back up the complete database and retain its receipts. Earlier cold
+enrollment tools reject this additional table; do not drop it to force a
+rollback. Earlier binaries do not honor keyed retries even before the table
+exists. Stop old writers and hold/reconcile outstanding requests before any
+version change. Use a reviewed compatible binary or a verified coherent backup
+and an operator-approved recovery plan; restoring an older backup can lose later
+decisions and receipts. This does not establish a live rollback procedure.
 
 There are no implicit capability dependencies. A permitted mutation returns
 its own result; a later read needs its separate read capability. A grant is the
@@ -33,6 +52,57 @@ explicit cross product of its projects and capabilities. Wildcards, unknown
 capabilities, duplicate entries and empty arrays are rejected. Both target and
 secondary project references require authorization. Human `GET /api/hub/v1/projects`
 provides the active project IDs/names for the picker.
+
+For EHS staging task proposal, claim, candidate and review; tracking proposal,
+update, review and compaction; and component create, update and retirement,
+a caller without the
+corresponding `task.read`, `tracking.read` or `component.read` receives only
+an ID-only mutation receipt. This includes idempotent retries, which otherwise
+could return current details added by another actor. A caller with the current
+read grant receives the existing full current entity, which is not an
+immutable receipt of its original mutation. `hub_entity_withdraw` uses
+`task.read` for tasks and `decision.read` for decisions; it does not infer
+read access from creation or withdrawal authority. Role lease mutations without
+`role.read` return only coordination data needed to continue safely: role ID,
+revision, generation, expiry, handoff revision and takeover state. Role claim
+mutations without `role.read` return only claim ID, role ID, task ID and
+revision. Progress updates without `progress.read` return only the progress ID
+and resulting revision; derived ETA and rate history require a current read grant.
+Orchestration request creation, dispatch creation and report without
+`dispatch.read` return only ID and revision as a coordination receipt.
+An `ask` report also returns the decision ID it creates when `decision.read`
+and project access remain valid at response time; that operation independently requires both
+`decision.request` and `decision.read`. If access expires after the write, the
+decision ID is omitted from the receipt.
+Checkpoint instead returns an ID-only receipt: its resulting revision can reveal
+whether a state transition occurred. Accepted idempotent retries are revision-bound
+and never return a later report; a changed dispatch gives a `dispatch_changed`
+error, which reveals that its revision changed. A current read grant is needed
+for full state. These
+receipts convey no execution authority. The capability and
+project scope are rechecked while holding the session writer; a response
+already in flight cannot be recalled by a later revoke. Existing legacy family
+bearer behavior is unchanged. This describes only the named mutation tools,
+not a completed audit of every Hub write endpoint.
+
+An EHS session with `planning.write` may create a new advisory item without
+`planning.read`; its response is a project/path/version receipt only. Replacing
+an existing item requires both `planning.write` and a current `planning.read`
+grant, checked at admission and again before commit. This verifies permission,
+not that the caller actually read or reconciled the previous text. CAS rejects a
+stale version but a conflict can reveal the current version. The knowledge store
+keeps the current document, not prior content versions; a successful replacement
+cannot be recovered from its provenance record. Existing legacy bearer access
+and author attribution remain unchanged.
+
+An EHS component with a stored `legacy_project_id` is visible or mutable only
+when the session is also authorized for that secondary project. Direct reads,
+updates, retirement and proposal retries use the current stored link, including
+when an update would clear it. Inaccessible records are filtered before list
+pagination, and direct lookup returns the same unavailable error as a missing
+component. This does not eliminate other existence or timing inference, such
+as a slug collision. Both scopes are rechecked for each call; a grant or cursor
+is not a durable entitlement. Human and legacy family-bearer behavior is unchanged.
 
 `GET /installations/{UUID}/hub-grant` returns:
 

@@ -10,19 +10,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import partial
 import json
 import os
 from pathlib import Path
 import re
+import signal
 import stat
 import sys
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 from engineering_hub.container_pilot_manifest import PilotManifest, Platform
 from engineering_hub.pilot_service import REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS
+from engineering_hub.current_executor_observation import CurrentExecutorObserver, CurrentExecutorReleasePins
+from .bound_installed_config import InstalledBoundProfile, parse_bound_profile
 from .build_enrollment import BuildEnrollment
 from .daemon_backend import DockerEngineBinding
 from .launch_transport import UnixLaunchReceiptTransport, UnixCurrentObservationTransport
@@ -33,6 +36,8 @@ from .service import serve_owned_host_executor_unix
 
 
 SCHEMA = 'engineering-hub.installed-executor.v1'
+SCHEMA_SINGLE_PILOT = 'engineering-hub.installed-executor.v2'
+SCHEMA_BOUND_PILOT = 'engineering-hub.installed-executor.v3'
 MAX_CONFIG_BYTES = 256 * 1024
 _ERROR = 'Installed executor unavailable'
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
@@ -109,6 +114,7 @@ class RunnerConfiguration:
     socket_path: str
     bearer_slot: tuple
     process_id: int
+    bound_profile: InstalledBoundProfile | None = None
 
 
 def parse_configuration(raw):
@@ -128,8 +134,9 @@ def parse_configuration(raw):
 
         value = json.loads(raw, object_pairs_hook=unique, parse_float=reject,
                            parse_constant=reject)
-        _object(value, _ROOT_FIELDS)
-        _require(value['schema'] == SCHEMA and _canonical(value) == raw)
+        _require(type(value) is dict and value.get('schema') in {SCHEMA, SCHEMA_SINGLE_PILOT, SCHEMA_BOUND_PILOT})
+        _object(value, _ROOT_FIELDS | ({'bound_profile'} if value['schema'] == SCHEMA_BOUND_PILOT else set()))
+        _require(_canonical(value) == raw)
         manifest = PilotManifest.from_bytes(_canonical(value['manifest']))
         binding_data = dict(_object(value['docker_binding'], DockerEngineBinding.__dataclass_fields__))
         binding_data['platform'] = Platform.model_validate(binding_data['platform'])
@@ -140,7 +147,12 @@ def parse_configuration(raw):
         _require(binding.runner_id == runner.runner_id
                  and binding.daemon_identity == runner.daemon_identity
                  and binding.platform == runner.platform)
-        resources = dict(_object(value['resources'], _RESOURCE_FIELDS))
+        resources = dict(_object(value['resources'], _RESOURCE_FIELDS | ({'single_pilot_protocol'} if value['schema'] in {SCHEMA_SINGLE_PILOT, SCHEMA_BOUND_PILOT} else set())))
+        if value['schema'] in {SCHEMA_SINGLE_PILOT, SCHEMA_BOUND_PILOT}:
+            _require(resources['single_pilot_protocol'] is True)
+        bound = parse_bound_profile(value['bound_profile']) if value['schema'] == SCHEMA_BOUND_PILOT else None
+        if bound is not None:
+            _require(resources['journal_create'] is False)
         for name in _RESOURCE_PATHS:
             _path(resources[name])
         for name in ('journal_create', 'state_reservations_create'):
@@ -202,7 +214,7 @@ def parse_configuration(raw):
             _integer(value['exchange_timeout_ms'], 100, 10000),
             _integer(value['supervisor_stop_grace_seconds'],
                      REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS, 2**31 - 1),
-            socket_path, bearer_slot, os.getpid())
+            socket_path, bearer_slot, os.getpid(), bound)
     except Exception:
         raise InstalledRunnerError() from None
 
@@ -250,6 +262,49 @@ def load_configuration(path):
             os.close(fd)
 
 
+async def _wait_for_approval_with_startup_signals(**kwargs):
+    """Cancellation closes the native wait before serving has installed signals."""
+    from .postlaunch_delivery import wait_for_postlaunch_approval
+    loop, task = asyncio.get_running_loop(), asyncio.current_task()
+    if task is None:
+        raise InstalledRunnerError()
+    previous = []
+    try:
+        for number in (signal.SIGINT, signal.SIGTERM):
+            old = signal.getsignal(number)
+            loop.add_signal_handler(number, task.cancel)
+            previous.append((number, old))
+        return await wait_for_postlaunch_approval(**kwargs)
+    finally:
+        for number, old in reversed(previous):
+            loop.remove_signal_handler(number)
+            signal.signal(number, old)
+
+
+@contextmanager
+def _continuous_bound_signals():
+    """Own termination signals continuously from approval through service drain."""
+    loop, task = asyncio.get_running_loop(), asyncio.current_task()
+    if task is None:
+        raise InstalledRunnerError()
+    state = SimpleNamespace(stop=asyncio.Event(), serving=False)
+    previous = []
+    def request_stop():
+        state.stop.set()
+        if not state.serving:
+            task.cancel()
+    try:
+        for number in (signal.SIGINT, signal.SIGTERM):
+            old = signal.getsignal(number)
+            loop.add_signal_handler(number, request_stop)
+            previous.append((number, old))
+        yield state
+    finally:
+        for number, old in reversed(previous):
+            loop.remove_signal_handler(number)
+            signal.signal(number, old)
+
+
 async def run_installed_executor(config):
     """Obtain direct identity before provider state; drain before closing identity."""
     try:
@@ -266,15 +321,40 @@ async def run_installed_executor(config):
                      == config.manifest.driver.implementation_commit)
             observations = UnixCurrentObservationTransport(**config.transport)
             owned.callback(observations.close)
+            bound_options = {}
+            service_signal_options = {}
+            if config.bound_profile is not None:
+                signal_state = owned.enter_context(_continuous_bound_signals())
+                pins = CurrentExecutorReleasePins(**{name: getattr(config.release, name)
+                    for name in CurrentExecutorReleasePins.__dataclass_fields__})
+                from .postlaunch_delivery import wait_for_postlaunch_approval
+                lease = await wait_for_postlaunch_approval(path=config.bound_profile.approval_path,
+                    verifier=verifier, release=pins, approver_public_key=config.bound_profile.approver_public_key,
+                    expected_engine_id=config.binding.daemon_identity, timeout_ms=config.bound_profile.approval_wait_ms)
+                observer = CurrentExecutorObserver(release=pins, launch=lease.approval.launch,
+                    transport=observations, exchange_timeout_ms=config.timeout_ms)
+                owned.callback(observer.close)
+                bound_options = dict(bound_profile=config.bound_profile, bound_observer=observer,
+                                     bound_release=pins, bound_approval_lease=lease)
+                if getattr(config.bound_profile, 'app_cgroup', None) is not None:
+                    from .app_cgroup_observation import AppCgroupObserver
+                    app_observer = AppCgroupObserver(transport=observations, release=pins,
+                        launch=lease.approval.launch, pins=config.bound_profile.app_cgroup, timeout_ms=config.timeout_ms)
+                    owned.callback(app_observer.close)
+                    bound_options['bound_app_cgroup_observer'] = app_observer
+                # The same handlers now request a graceful service drain. No
+                # remove/reinstall window exists between these two phases.
+                signal_state.serving = True
+                service_signal_options = dict(stop_event=signal_state.stop, install_signals=False)
             with ImmutableTestSecretResolver(config.resources['secret_root'],
                     bindings=config.resources['secret_bindings']) as secrets:
                 bearer = secrets.resolve_test_secret(*config.bearer_slot)
             factory = partial(local_host_adapter_resources, manifest=config.manifest,
-                binding=config.binding, **config.resources, driver_identity_verifier=verifier)
+                binding=config.binding, **config.resources, driver_identity_verifier=verifier, **bound_options)
             await serve_owned_host_executor_unix(factory, bearer_token=bearer,
                 supervisor_stop_grace_seconds=config.stop_grace_seconds,
                 socket_path=config.socket_path, current_observation_transport=observations,
-                current_observation_timeout_ms=config.timeout_ms)
+                current_observation_timeout_ms=config.timeout_ms, **service_signal_options)
     except Exception:
         raise InstalledRunnerError() from None
 
@@ -294,6 +374,8 @@ def main(argv=None):
         asyncio.run(run_installed_executor(config))
         return 0
     except KeyboardInterrupt:
+        return 130
+    except asyncio.CancelledError:
         return 130
     except Exception:
         print(_ERROR, file=sys.stderr)

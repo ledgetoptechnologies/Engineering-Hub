@@ -14,6 +14,8 @@ import time
 import uuid
 
 from .repository import AGENTS, HubError, HubRepository
+from .staging_action_key import staging_action_key
+from .staging_source_binding import valid_source_binding
 
 
 KINDS = frozenset({'workspace', 'build', 'test_run', 'preview'})
@@ -96,10 +98,24 @@ class StagingResourceStore:
                 'CREATE TABLE IF NOT EXISTS hub_staging_policy (project TEXT PRIMARY KEY, data TEXT NOT NULL)',
                 'CREATE TABLE IF NOT EXISTS hub_staging_resource_jobs (id TEXT PRIMARY KEY, data TEXT NOT NULL)',
                 'CREATE TABLE IF NOT EXISTS hub_staging_resource_ownership (id TEXT PRIMARY KEY, job_id TEXT NOT NULL, project TEXT NOT NULL, created_by TEXT NOT NULL, source_commit TEXT NOT NULL)',
+                'CREATE INDEX IF NOT EXISTS hub_staging_resource_ownership_job ON hub_staging_resource_ownership(job_id,id)',
+                "CREATE INDEX IF NOT EXISTS hub_staging_resource_job_ref ON hub_entities((CASE WHEN json_valid(data) THEN json_extract(data,'$.job_id') END),id) WHERE kind='staging_resource'",
+                "CREATE INDEX IF NOT EXISTS hub_staging_resource_bad_job_ref ON hub_entities((CASE WHEN json_valid(data) THEN CASE WHEN json_type(data,'$.job_id')='text' THEN 0 ELSE 1 END ELSE 1 END),id) WHERE kind='staging_resource'",
                 'CREATE TABLE IF NOT EXISTS hub_staging_cleanup_plans (id TEXT PRIMARY KEY, actor TEXT NOT NULL, data TEXT NOT NULL)',
                 'CREATE TABLE IF NOT EXISTS hub_staging_cleanup_receipts (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, data TEXT NOT NULL)',
+                'CREATE INDEX IF NOT EXISTS hub_audit_terminal_lookup ON hub_audit(entity_id,revision,action)',
             ):
                 db.execute(sql)
+            # IF NOT EXISTS does not check an existing index definition. A name
+            # collision could silently turn the guarded bounded lookups into scans.
+            for name, table, expected in (
+                ('hub_staging_resource_ownership_job', 'hub_staging_resource_ownership', 'CREATE INDEX hub_staging_resource_ownership_job ON hub_staging_resource_ownership(job_id,id)'),
+                ('hub_staging_resource_job_ref', 'hub_entities', "CREATE INDEX hub_staging_resource_job_ref ON hub_entities((CASE WHEN json_valid(data) THEN json_extract(data,'$.job_id') END),id) WHERE kind='staging_resource'"),
+                ('hub_staging_resource_bad_job_ref', 'hub_entities', "CREATE INDEX hub_staging_resource_bad_job_ref ON hub_entities((CASE WHEN json_valid(data) THEN CASE WHEN json_type(data,'$.job_id')='text' THEN 0 ELSE 1 END ELSE 1 END),id) WHERE kind='staging_resource'"),
+            ):
+                actual = db.execute('SELECT type,tbl_name,sql FROM sqlite_master WHERE name=?', (name,)).fetchone()
+                if actual is None or tuple(actual) != ('index', table, expected):
+                    raise HubError('staging_resource_index_invalid', 503)
 
     def _trusted(self, principal):
         if self._control is None or principal is not self._control:
@@ -143,7 +159,7 @@ class StagingResourceStore:
             self._authorize(db, actor, project, action)
         return True
 
-    def set_policy(self, actor, project, expected_revision, grants):
+    def set_policy(self, actor, project, expected_revision, grants, *, admission_guard=None):
         _actor(actor)
         if actor not in self.admin_actors:
             raise HubError('staging_admin_required', 403)
@@ -155,7 +171,7 @@ class StagingResourceStore:
             if type(actions) not in (list, tuple, frozenset, set) or any(type(a) is not str or a not in ACTIONS for a in actions):
                 raise HubError('invalid_staging_grants')
             normalized[grantee] = sorted(set(actions))
-        with self.repo._transaction() as db:
+        with self.repo._transaction(before_commit=admission_guard) as db:
             self.repo._project(project, db)
             prior = self._policy(db, project)
             self.repo._cas(prior, expected_revision)
@@ -416,7 +432,19 @@ class StagingResourceStore:
             if job['terminal'] and not terminal:
                 raise HubError('staging_job_terminal', 409)
             protections = job['protected'] if normalized is None else normalized
-            for row in db.execute("SELECT data FROM hub_entities WHERE kind='staging_resource'"):
+            from . import reconciliation_context
+            active_guard = reconciliation_context.current.get()
+            if active_guard is not None:
+                if active_guard.job_id != job_id:
+                    raise reconciliation_context.Changed()
+                # The same writer's guard has already checked malformed data,
+                # ownership and the complete, bounded job-reference set.
+                rows = db.execute("SELECT data FROM hub_entities WHERE kind='staging_resource' AND (CASE WHEN json_valid(data) THEN json_extract(data,'$.job_id') END)=? ORDER BY id LIMIT ?", (job_id, active_guard.max_resources + 1)).fetchall()
+                if len(rows) > active_guard.max_resources:
+                    raise reconciliation_context.Changed()
+            else:
+                rows = db.execute("SELECT data FROM hub_entities WHERE kind='staging_resource'")
+            for row in rows:
                 item = json.loads(row['data'])
                 if item['job_id'] != job_id or item['state'] == 'deleted':
                     continue
@@ -452,16 +480,63 @@ class StagingResourceStore:
                 item['protected'].append({'reason': 'active_job', 'ref': job['id']})
             return self._save(db, item['created_by'], 'staging.resource_protection', item)
 
-    def supersede_latest_failure(self, principal, job_id):
-        """Remove only this terminal job's own latest-failure reference atomically.
+    def supersede_latest_failure(self, principal, job_id, *, superseded_by):
+        """Remove an older terminal failure's protection only with ordered evidence.
 
-        Already superseded jobs cause no writes. Deleting/deleted resources are
-        never revised by this maintenance operation or a stale caller snapshot.
+        A delayed controller may resume after a newer failure has completed.
+        Ordering, bindings and removal are checked in this same writer. Missing
+        or ambiguous terminal evidence preserves all protections.
         """
         self._trusted(principal)
+        _uuid(job_id); _uuid(superseded_by)
+        if job_id == superseded_by:
+            return
         with self.repo._transaction() as db:
-            job = self._job(db, _uuid(job_id))
-            if job['terminal'] is not True:
+            def terminal_failure(identity):
+                row = db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (identity,)).fetchone()
+                if row is None or row['state'] != 'failed':
+                    return None
+                try:
+                    target = json.loads(row['target'])
+                    submission_id = target['submission_id']
+                    entry = db.execute('SELECT id,data FROM hub_staging_submissions WHERE id=?', (submission_id,)).fetchone()
+                    if entry is None:
+                        return None
+                    submission = json.loads(entry['data'])
+                    job = self._job(db, identity)
+                    if (submission.get('id') != entry['id'] or submission.get('job_id') != identity
+                            or submission.get('phase') != 'verified' or submission.get('outcome') != 'failed'
+                            or not valid_source_binding(submission) or job.get('terminal') is not True
+                            or row['environment'] != 'staging' or row['requires_execution_proof'] != 1
+                            or job.get('project') != row['project'] or submission.get('project') != row['project']
+                            or job.get('created_by') != submission.get('actor') or row['actor'] != submission.get('actor')
+                            or job.get('source_commit') != submission.get('source_commit')
+                            or target.get('source_commit') != submission.get('source_commit')
+                            or target.get('task_id') != submission.get('review_task_id')
+                            or target.get('review_revision') != submission.get('review_task_revision')
+                            or target.get('artifact_digest') != 'sha256:' + submission.get('source_digest', '')
+                            or row['action_key'] != staging_action_key(submission['project'], submission['recipe'])):
+                        return None
+                    events = db.execute("SELECT sequence FROM hub_audit WHERE entity_id=? AND revision=? AND action IN ('work.failed','work.reconciled') ORDER BY sequence LIMIT 2",
+                                        (identity, row['revision'])).fetchall()
+                    if len(events) != 1:
+                        return None
+                    return submission, job, events[0]['sequence']
+                except (KeyError, TypeError, ValueError, HubError):
+                    return None
+
+            older = terminal_failure(job_id)
+            newer = terminal_failure(superseded_by)
+            if older is None or newer is None:
+                return
+            prior_submission, job, prior_sequence = older
+            next_submission, next_job, next_sequence = newer
+            if (prior_submission['project'] != next_submission['project']
+                    or prior_submission['recipe'] != next_submission['recipe']
+                    or prior_sequence >= next_sequence
+                    or type(next_job.get('protected')) is not list
+                    or type(job.get('protected')) is not list
+                    or {'reason': 'latest_failure', 'ref': superseded_by} not in next_job['protected']):
                 return
             reference = {'reason': 'latest_failure', 'ref': job_id}
             rows = [json.loads(row['data']) for row in db.execute(
@@ -479,7 +554,7 @@ class StagingResourceStore:
                 item['protected'] = [protection for protection in item['protected'] if protection != reference]
                 self._save(db, item['created_by'], 'staging.resource_protection', item)
 
-    def set_keep(self, actor, identity, mode, *, until=None, reason='', expected_revision):
+    def set_keep(self, actor, identity, mode, *, until=None, reason='', expected_revision, admission_guard=None):
         _actor(actor)
         if mode not in ('until', 'pinned', 'none'):
             raise HubError('invalid_staging_keep')
@@ -489,7 +564,7 @@ class StagingResourceStore:
             until = _iso(_seconds(until))
         elif until is not None:
             raise HubError('invalid_staging_keep')
-        with self.repo._transaction() as db:
+        with self.repo._transaction(before_commit=admission_guard) as db:
             item = self._resource(db, identity)
             self._authorize(db, actor, item['project'], 'retain')
             self._owned(actor, item)
@@ -537,11 +612,11 @@ class StagingResourceStore:
             return 'not_expired'
         return None
 
-    def cleanup_plan(self, actor, project=None, *, kinds=None):
+    def cleanup_plan(self, actor, project=None, *, kinds=None, admission_guard=None):
         _actor(actor)
         if kinds is not None and (type(kinds) not in (list, tuple, set, frozenset) or not kinds or any(type(k) is not str or k not in KINDS for k in kinds)):
             raise HubError('invalid_staging_kinds')
-        with self.repo._transaction() as db:
+        with self.repo._transaction(before_commit=admission_guard) as db:
             if project is not None:
                 self._authorize(db, actor, project, 'cleanup')
             now = self._now()
@@ -574,9 +649,9 @@ class StagingResourceStore:
                        (plan['plan_id'], actor, _json(stored)))
             return plan
 
-    def cleanup_begin(self, actor, plan_id, digest):
+    def cleanup_begin(self, actor, plan_id, digest, *, admission_guard=None):
         _actor(actor)
-        with self.repo._transaction() as db:
+        with self.repo._transaction(before_commit=admission_guard) as db:
             row = db.execute('SELECT * FROM hub_staging_cleanup_plans WHERE id=?', (_uuid(plan_id),)).fetchone()
             if row is None:
                 raise HubError('not_found', 404)

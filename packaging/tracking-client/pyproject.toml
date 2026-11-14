@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools==84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "engineering-hub-tracking-client"
+version = "0.1.0"
+description = "Explicit foreground Engineering Hub project tracking client"
+requires-python = ">=3.12,<3.13"
+dependencies = ["mcp==1.30.0", "httpx==0.28.1"]
+
+[tool.uv]
+constraint-dependencies = [
+  "pycparser==3.0",
+  "pydantic-settings==2.15.0",
+  "python-dotenv==1.2.3",
+  "starlette==1.7.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["engineering_hub", "agent_message_bus"]
+
+[tool.setuptools.package-data]
+engineering_hub = ["_tracking_client_source.json"]

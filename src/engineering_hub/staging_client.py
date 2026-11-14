@@ -47,6 +47,27 @@ class StagingClientError(HubError):
         super().__init__(code, status)
 
 
+# Known terminal reasons in the installed worker's _execute_operation path:
+# extraction/source validation and post-run tree validation (core.py), or a
+# stage failure (docker.py). Unknown and uncertain reasons never release a job.
+_DEFINITIVE_STAGING_FAILURES = frozenset({
+    'unsafe_path', 'archive_file_count', 'duplicate_archive_path',
+    'unsupported_archive_entry', 'archive_size', 'archive_expansion_limit',
+    'archive_size_drift', 'invalid_archive', 'invalid_source_executable_paths',
+    'output_file_count', 'output_symlink', 'output_special_file', 'output_size_limit',
+    'stage_build_failed', 'stage_test_failed',
+})
+_FAILED_RESULT_FIELDS = frozenset({'error', 'source_commit', 'source_digest',
+    'source_commit_verification', 'source_binding', 'diagnostic'})
+
+
+def _failed_result_consistent(details):
+    """Accept only documented worker failure shapes, not a claim of host fencing."""
+    return (type(details) is dict and not set(details) - _FAILED_RESULT_FIELDS
+            and type(details.get('error')) is str
+            and details['error'] in _DEFINITIVE_STAGING_FAILURES)
+
+
 _NOT_ACCEPTED = {
     '/v1/jobs': {
         409: frozenset({'worker_busy_or_held', 'worker_storage_capacity', 'resource_conflict'}),
@@ -380,13 +401,36 @@ class StagingClient:
 
     @_opaque
     async def put_source(self, payload):
-        _shape(payload, {'source_id', 'project', 'source_digest', 'source_zip_base64'})
+        fields = {'source_id', 'project', 'source_digest', 'source_zip_base64'}
+        _check(type(payload) is dict and set(payload) in
+               (fields, fields | {'source_commit', 'source_commit_object_base64'}))
         _uuid(payload['source_id']); self._project(payload['project'])
         size = self._source(payload)
+        proof_supplied = 'source_commit' in payload
+        if proof_supplied:
+            _check(type(payload['source_commit']) is str and _COMMIT.fullmatch(payload['source_commit']))
+            _check(type(payload['source_commit_object_base64']) is str
+                   and 0 < len(payload['source_commit_object_base64']) <= 87384)
+            proof = base64.b64decode(payload['source_commit_object_base64'], validate=True)
+            _check(0 < len(proof) <= 65536)
         result = await self._request('POST', '/v1/sources', payload)
-        _shape(result, {'source_id', 'source_digest', 'size_bytes', 'project'})
+        base_result = {'source_id', 'source_digest', 'size_bytes', 'project'}
+        expected_result = base_result | {'source_binding'} if proof_supplied else base_result
+        _check(type(result) is dict and set(result) == expected_result)
         _check(all(result[key] == payload[key] for key in ('source_id', 'source_digest', 'project'))
                and type(result['size_bytes']) is int and result['size_bytes'] == size)
+        if proof_supplied:
+            binding = result['source_binding']
+            _check(type(binding) is dict and set(binding) == {'scheme', 'commit_oid', 'tree_oid',
+                'archive_sha256', 'commit_object_sha256', 'expanded_bytes', 'entries'}
+                and binding['scheme'] == 'git-sha1-tree-v1'
+                and binding['commit_oid'] == payload['source_commit']
+                and binding['archive_sha256'] == payload['source_digest']
+                and type(binding['tree_oid']) is str and _COMMIT.fullmatch(binding['tree_oid'])
+                and type(binding['commit_object_sha256']) is str and _SHA.fullmatch(binding['commit_object_sha256'])
+                and binding['commit_object_sha256'] == hashlib.sha256(proof).hexdigest()
+                and type(binding['expanded_bytes']) is int and 0 <= binding['expanded_bytes'] <= 64 * 1024**2
+                and type(binding['entries']) is int and 1 <= binding['entries'] <= 5000)
         return result
 
     @staticmethod
@@ -403,8 +447,13 @@ class StagingClient:
                and result['state'] in {'accepted', 'running', 'held', 'failed', 'succeeded'}
                and type(result['result']) is dict)
         details = result['result']
+        # A successful receipt cannot simultaneously carry a failure reason.
+        # Preserve uncertainty rather than accepting contradictory terminal facts.
+        _check(result['state'] != 'succeeded' or 'error' not in details)
+        _check(result['state'] != 'failed' or _failed_result_consistent(details))
         _check(not set(details) - {'error', 'stages', 'preview_ready', 'source_commit',
-               'source_commit_verification', 'source_digest', 'resource_ids', 'deleted_resource_ids', 'diagnostic'})
+               'source_commit_verification', 'source_digest', 'source_binding', 'resource_ids',
+               'deleted_resource_ids', 'diagnostic', 'profile_digest'})
         if 'error' in details:
             _check(type(details['error']) is str and re.fullmatch(r'[a-z][a-z0-9_]{0,127}', details['error']))
         if 'preview_ready' in details:
@@ -418,9 +467,27 @@ class StagingClient:
         if 'source_commit' in details:
             _check(type(details['source_commit']) is str and _COMMIT.fullmatch(details['source_commit']))
         if 'source_commit_verification' in details:
-            _check(details['source_commit_verification'] == 'declared')
+            _check(details['source_commit_verification'] in {'declared', 'git-sha1-tree-v1'})
+        if 'source_binding' in details:
+            binding = details['source_binding']
+            _check(type(binding) is dict and set(binding) == {'scheme', 'commit_oid', 'tree_oid',
+                'archive_sha256', 'commit_object_sha256', 'expanded_bytes', 'entries'}
+                and binding['scheme'] == 'git-sha1-tree-v1'
+                and type(binding['commit_oid']) is str and _COMMIT.fullmatch(binding['commit_oid'])
+                and type(binding['tree_oid']) is str and _COMMIT.fullmatch(binding['tree_oid'])
+                and type(binding['archive_sha256']) is str and _SHA.fullmatch(binding['archive_sha256'])
+                and type(binding['commit_object_sha256']) is str and _SHA.fullmatch(binding['commit_object_sha256'])
+                and type(binding['expanded_bytes']) is int and 0 <= binding['expanded_bytes'] <= 64 * 1024**2
+                and type(binding['entries']) is int and 1 <= binding['entries'] <= 5000)
         if 'source_digest' in details:
             _check(type(details['source_digest']) is str and _SHA.fullmatch(details['source_digest']))
+        if details.get('source_commit_verification') == 'git-sha1-tree-v1' or 'source_binding' in details:
+            _check(details.get('source_commit_verification') == 'git-sha1-tree-v1'
+                   and 'source_binding' in details
+                   and details.get('source_commit') == details['source_binding']['commit_oid']
+                   and details.get('source_digest') == details['source_binding']['archive_sha256'])
+        if 'profile_digest' in details:
+            _check(type(details['profile_digest']) is str and _SHA.fullmatch(details['profile_digest']))
         if 'resource_ids' in details:
             _shape(details['resource_ids'], _KINDS)
             identifiers = [_uuid(item) for item in details['resource_ids'].values()]
@@ -444,7 +511,11 @@ class StagingClient:
     async def submit(self, payload):
         required = {'job_id', 'command_id', 'idempotency_key', 'project', 'recipe',
                     'source_commit', 'source_digest', 'resource_ids'}
-        _check(type(payload) is dict and set(payload) in (required | {'source_id'}, required | {'source_zip_base64'}))
+        legacy = (required | {'source_id'}, required | {'source_zip_base64'})
+        bound = required | {'source_id', 'require_source_binding', 'expected_source_binding'}
+        _check(type(payload) is dict and set(payload) in (*legacy, bound))
+        if 'require_source_binding' in payload:
+            _check(payload['require_source_binding'] is True and type(payload['expected_source_binding']) is dict)
         _uuid(payload['job_id']); _uuid(payload['command_id']); _key(payload['idempotency_key'])
         self._project(payload['project'], payload['recipe']); self._source(payload)
         _check(type(payload['source_commit']) is str and _COMMIT.fullmatch(payload['source_commit']))

@@ -10,6 +10,7 @@ from agent_message_bus.auth import AuthSettings
 from engineering_hub.app import Settings, create_app
 from engineering_hub.auth import AuthConfig
 from engineering_hub.repository import HubRepository
+from tests.test_hub_unified_mcp import HUB_TOOLS
 
 
 def settings(tmp_path, **kwargs):
@@ -36,6 +37,8 @@ def test_default_queue_is_explicitly_unconfigured_and_still_authenticated(tmp_pa
 def test_opt_in_first_version_cannot_reserve_without_worker_enrollment(tmp_path):
     app = create_app(settings(tmp_path, work_queue_enabled=True))
     task = reviewed(app.state.repository)
+    stage_task = reviewed(app.state.repository)
+    assert stage_task['id'] != task['id']
     headers = {'Authorization': 'Bearer test-codex'}
     target = {'task_id': task['id'], 'source_commit': 'a' * 40, 'artifact_digest': 'sha256:' + 'b' * 64}
     with TestClient(app) as client:
@@ -47,7 +50,7 @@ def test_opt_in_first_version_cannot_reserve_without_worker_enrollment(tmp_path)
         assert production.status_code == 201
         staging = client.post('/api/hub/v1/work/jobs', headers=headers, json={
             'request_id': 'stage-test', 'action_key': 'engineering-hub.validate',
-            'environment': 'staging', 'target': target})
+            'environment': 'staging', 'target': {**target, 'task_id': stage_task['id']}})
         assert staging.status_code == 201
         instance = str(uuid4())
         result = client.post('/api/hub/v1/work/claim', headers=headers,
@@ -57,10 +60,14 @@ def test_opt_in_first_version_cannot_reserve_without_worker_enrollment(tmp_path)
         state = client.get('/api/hub/v1/work/status', headers=headers).json()
         assert state['claim_admission_state'] == 'unconfigured'
         assert state['counts'] == {'queued': 2}
+        prod = next(job for job in state['jobs'] if job['id'] == production.json()['id'])
+        assert prod['blocked_reason'] == 'production_approval_required'
+        assert prod['fence'] is None and not prod['requires_reconciliation']
         stage = next(job for job in state['jobs'] if job['id'] == staging.json()['id'])
         assert stage['blocked_reason'] == 'admission_not_configured'
         assert stage['fence'] is None and not stage['requires_reconciliation']
         assert app.state.repository.get_task(task['id'])['status'] == 'verified'
+        assert app.state.repository.get_task(stage_task['id'])['status'] == 'verified'
 
 
 def test_new_queue_cannot_bypass_legacy_dispatch_machine_exclusion(tmp_path):
@@ -77,13 +84,16 @@ def test_real_app_passes_configured_queue_to_authenticated_mcp(tmp_path):
         response = client.post('/mcp/', headers=headers, json={
             'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {}})
         assert response.status_code == 200
-        tools = {tool['name'] for tool in response.json()['result']['tools']}
-        # 30 composed Hub tools plus the 7 explicitly configured queue tools.
-        assert len(tools) == 37 and {
-            'hub_component_create', 'hub_component_update', 'hub_component_retire',
+        listed = response.json()['result']['tools']
+        tools = {tool['name'] for tool in listed}
+        queue_tools = {
             'hub_work_status', 'hub_work_jobs', 'hub_work_get', 'hub_work_submit',
-            'hub_work_claim', 'hub_work_renew', 'hub_work_complete',
-        } <= tools
+            'hub_work_cancel_unclaimed', 'hub_work_claim', 'hub_work_renew', 'hub_work_complete',
+        }
+        # This fixture has no configured infrastructure module, so its six
+        # conditional tools are intentionally absent.
+        expected = HUB_TOOLS | queue_tools
+        assert len(expected) == len(listed) == 80 and tools == expected
         response = client.post('/mcp/', headers=headers, json={
             'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
             'params': {'name': 'hub_work_status', 'arguments': {'payload': {}}}})

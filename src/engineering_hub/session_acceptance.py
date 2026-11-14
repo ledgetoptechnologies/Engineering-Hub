@@ -21,12 +21,14 @@ from typing import Literal
 from fastapi import HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from .openapi_body import request_body
 from .auth import AuthConfig, SessionStore, require_human
 from .pilot_ownership import PilotOwner
 from .startup_reconciliation import (ExecutorSessionIdentity, OperatorReconciliation,
                                      StartupReconciliation)
 
 _BODY_READ_TIMEOUT_SECONDS = 2.0
+MAX_ACCEPTANCE_EVIDENCE_BYTES = 8192
 
 
 class SessionAcceptanceError(RuntimeError):
@@ -94,7 +96,7 @@ class SessionAcceptanceBroker:
                 r'human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})', operator_actor))
             _require(_sync_callable(audit))
             _require(type(lifetime_seconds) is int and 1 <= lifetime_seconds <= 3600)
-            _require(type(evidence) is str and 0 < len(evidence.encode('utf-8')) <= 8192
+            _require(type(evidence) is str and 0 < len(evidence.encode('utf-8')) <= MAX_ACCEPTANCE_EVIDENCE_BYTES
                      and '\x00' not in evidence)
             _require(type(report) is OperatorReconciliation
                      and type(executor) is ExecutorSessionIdentity
@@ -388,7 +390,7 @@ def attach_session_acceptance_routes(app, *, broker, config, sessions):
         except SessionAcceptanceError as error:
             unavailable(error)
 
-    @app.post(path)
+    @app.post(path, openapi_extra=request_body(_Answer))
     async def answer(request: Request):
         identity = actor(request, mutation=True)
         try:

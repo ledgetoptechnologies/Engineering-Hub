@@ -29,6 +29,7 @@ from .repository import AGENTS
 
 
 SCHEMA = 'engineering-hub.unified-pilot.v1'
+SCHEMA_SINGLE_PILOT = 'engineering-hub.unified-pilot.v2'
 ACTION = 'engineering-hub:container-pilot'
 ERROR = 'Unified pilot configuration or startup unavailable'
 
@@ -73,6 +74,7 @@ class PilotProfile:
     credential_file: Path = field(repr=False)
     credential_sha256: str = field(repr=False)
     grace_seconds: int
+    single_pilot_protocol: bool = False
 
 
 def parse_profile(raw):
@@ -88,9 +90,13 @@ def parse_profile(raw):
         def reject(_):
             raise UnifiedPilotStartupError()
         value = json.loads(raw, object_pairs_hook=unique, parse_constant=reject, parse_float=reject)
+        _require(type(value) is dict and value.get('schema') in {SCHEMA, SCHEMA_SINGLE_PILOT})
         _object(value, {'schema', 'manifest', 'machine_id', 'action_key', 'allowed_actors',
-                        'allowed_task_ids', 'executor', 'supervisor_stop_grace_seconds'})
-        _require(value['schema'] == SCHEMA and value['action_key'] == ACTION
+                        'allowed_task_ids', 'executor', 'supervisor_stop_grace_seconds'}
+                | ({'single_pilot_protocol'} if value['schema'] == SCHEMA_SINGLE_PILOT else set()))
+        if value['schema'] == SCHEMA_SINGLE_PILOT:
+            _require(value['single_pilot_protocol'] is True)
+        _require(value['action_key'] == ACTION
                  and value['machine_id'] == 'staging-pc')
         manifest = PilotManifest.from_bytes(json.dumps(value['manifest'], separators=(',', ':')).encode())
         _require(manifest.target_id == 'engineering-hub:staging')
@@ -115,7 +121,8 @@ def parse_profile(raw):
         _require(type(grace) is int and REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS <= grace <= 86400)
         return PilotProfile(manifest, frozenset(actors), frozenset(tasks), value['machine_id'],
             origin, _path(executor['ca_file']), _digest(executor['ca_sha256']),
-            _path(executor['credential_file']), _digest(executor['credential_sha256']), grace)
+            _path(executor['credential_file']), _digest(executor['credential_sha256']), grace,
+            value['schema'] == SCHEMA_SINGLE_PILOT)
     except Exception:
         raise UnifiedPilotStartupError() from None
 
@@ -127,7 +134,7 @@ def _file_identity(info, *, private):
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-def read_protected_file(path, *, maximum_bytes, private=True):
+def read_protected_file(path, *, maximum_bytes, private=True, require_readonly=False):
     """Read stable retained bytes through no-follow FDs, never reopen as TLS input.
 
     Secret/profile leaves require current-UID0600 and parent0700. Public CA
@@ -136,7 +143,7 @@ def read_protected_file(path, *, maximum_bytes, private=True):
     """
     directory = fd = None
     try:
-        _require(sys.platform == 'linux' and type(private) is bool)
+        _require(sys.platform == 'linux' and type(private) is bool and type(require_readonly) is bool)
         path = _path(os.fspath(path))
         if private:
             directory, parent_identity = _private_parent(path)
@@ -159,6 +166,8 @@ def read_protected_file(path, *, maximum_bytes, private=True):
             parent = os.fstat(directory)
             parent_identity = parent.st_dev, parent.st_ino
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=directory)
+        if require_readonly:
+            _require(os.fstatvfs(fd).f_flag & os.ST_RDONLY)
         before = _file_identity(os.fstat(fd), private=private)
         _require(0 < before[2] <= maximum_bytes)
         _require(_file_identity(os.stat(path.name, dir_fd=directory, follow_symlinks=False), private=private) == before)
@@ -171,6 +180,8 @@ def read_protected_file(path, *, maximum_bytes, private=True):
         _require(len(pieces) == before[2]
                  and _file_identity(os.fstat(fd), private=private) == before
                  and _file_identity(os.stat(path.name, dir_fd=directory, follow_symlinks=False), private=private) == before)
+        if require_readonly:
+            _require(os.fstatvfs(fd).f_flag & os.ST_RDONLY)
         if private:
             _check_parent(path, directory, parent_identity)
         else:
@@ -242,6 +253,13 @@ async def serve_configuration(config_path, profile_path, *, reconciliation_facto
         deployment, profile = validate_configuration(config_path, profile_path)
         from .app import Settings
         settings = Settings.from_env(deployment)
+        if session_enrollment_path is not None:
+            from .trusted_queued_session import (parse_enrollment, MAX_ENROLLMENT_BYTES,
+                                                 TrustedQueuedSessionComposition,
+                                                 validate_unified_session)
+            enrollment = parse_enrollment(read_protected_file(Path(session_enrollment_path),
+                                                               maximum_bytes=MAX_ENROLLMENT_BYTES))
+            validate_unified_session(profile, enrollment)
         # Must precede credentials, TLS transport allocation and listener binds.
         owner = PilotOwner(settings.database, require_existing=True)
         credential = read_protected_file(profile.credential_file, maximum_bytes=4096)
@@ -251,10 +269,6 @@ async def serve_configuration(config_path, profile_path, *, reconciliation_facto
         ca = read_protected_file(profile.ca_file, maximum_bytes=1024 * 1024, private=False)
         _require('sha256:' + hashlib.sha256(ca).hexdigest() == profile.ca_sha256)
         if session_enrollment_path is not None:
-            from .trusted_queued_session import (parse_enrollment, MAX_ENROLLMENT_BYTES,
-                                                 TrustedQueuedSessionComposition)
-            enrollment = parse_enrollment(read_protected_file(Path(session_enrollment_path),
-                                                               maximum_bytes=MAX_ENROLLMENT_BYTES))
             composition = TrustedQueuedSessionComposition(profile=profile, database=settings.database,
                 enrollment=enrollment, ca_pem=ca, credential=credential)
             reconciliation_factory = composition.reconciliation_factory
@@ -263,19 +277,22 @@ async def serve_configuration(config_path, profile_path, *, reconciliation_facto
         from .unified_queued_pilot_service import serve_owned_unified_queued_pilot
         from .work_queue import WorkTarget
         def client_factory():
-            return ContainerPilotClient.for_verified_https(profile.origin, credential.decode('ascii'), ca)
+            return ContainerPilotClient.for_verified_https(profile.origin, credential.decode('ascii'), ca,
+                **({'single_pilot_protocol': True} if profile.single_pilot_protocol else {}))
         def target_verifier(actor, action, environment, target):
             return (actor in profile.actors and action == ACTION and environment == 'staging'
                 and type(target) is WorkTarget and target.task_id in profile.task_ids
                 and target.source_commit == profile.manifest.candidate.source_commit
-                and target.artifact_digest == profile.manifest.candidate.image_config_id)
+                and target.artifact_digest == profile.manifest.candidate.image_config_id
+                and (composition is None or composition.scope_allows(actor, target.task_id)))
         await serve_owned_unified_queued_pilot(settings, profile.manifest, client_factory,
             owner=owner, bus_paths=deployment.bus_paths, action_key=ACTION,
             machine_id=profile.machine_id, target_verifier=target_verifier,
             reconciliation_factory=reconciliation_factory,
             session_acceptance_factory=session_acceptance_factory,
             supervisor_stop_grace_seconds=profile.grace_seconds,
-            agent_host='0.0.0.0', agent_port=8770, browser_host='0.0.0.0', browser_port=8771)
+            agent_host='0.0.0.0', agent_port=8770, browser_host='0.0.0.0', browser_port=8771,
+            **({'single_pilot_protocol': True} if profile.single_pilot_protocol else {}))
     except Exception:
         raise UnifiedPilotStartupError() from None
     finally:

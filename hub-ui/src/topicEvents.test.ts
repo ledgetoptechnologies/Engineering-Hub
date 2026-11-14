@@ -112,6 +112,23 @@ describe("canonical topic event channel", () => {
     expect(state.accept).toHaveBeenCalledWith(newer);
     expect(state.failed).not.toHaveBeenCalled();
   });
+  it("opens only registry topics, which the events route requires, and fails others without a request", () => {
+    // The events route exists only in registry mode, which accepts lowercase letters, digits, "_" and "-".
+    for (const name of ["test-topic", "eh_release-2"]) {
+      const sources: Source[] = [];
+      const failed = vi.fn();
+      watchTopicRegistry({ topic: name, epoch, fetchSnapshot: vi.fn(async () => snapshot), accept: vi.fn(), invalidate: vi.fn(), failed,
+        source: (url) => { const source = new Source(url); sources.push(source); return source as unknown as EventSource; } });
+      expect(failed).not.toHaveBeenCalled();
+      expect(sources[0].url).toBe(`/api/hub/v1/topics/${name}/events`);
+    }
+    for (const name of ["", "-lead", "Hermes:review", "eh.release-2", "a/b", "a b", "x".repeat(129)]) {
+      const failed = vi.fn(), source = vi.fn();
+      watchTopicRegistry({ topic: name, epoch, fetchSnapshot: vi.fn(async () => snapshot), accept: vi.fn(), invalidate: vi.fn(), failed, source });
+      expect(failed).toHaveBeenCalledOnce();
+      expect(source).not.toHaveBeenCalled();
+    }
+  });
   it("bounds event-driven snapshot attempts with explicit manual recovery, not timers", async () => {
     const state = setup();
     for (let cursor = 1; cursor <= TOPIC_SNAPSHOT_BUDGET + 1; cursor++) {

@@ -2,7 +2,7 @@ import { AgentConnectionsPanel } from "../AgentConnectionsPanel";
 import { useEffect, useState } from "react";
 import { HubApiError } from "../api";
 import { relativeAge } from "../dashboardText";
-import { listTopics, rememberedTopics, rememberTopic, type TopicEntry } from "../topicsApi";
+import { listTopics, rememberedTopics, rememberTopic, visibleTopics, type TopicEntry } from "../topicsApi";
 import { link } from "../router";
 import { connectionView, observationTime } from "../agentStatus";
 import type { Hub } from "../hub";
@@ -10,6 +10,7 @@ import type { AgentSummary } from "../types";
 import { Badge, Icon, PageHeader, PanelTitle, names, pretty } from "../ui";
 import { WorkQueuePanel } from "../WorkQueuePanel";
 import { StagingRuntimePanel } from "../StagingRuntimePanel";
+import { RunReleaseEvidence } from "../ReleaseEvidencePanel";
 import { StagingResourcesPanel } from "../StagingResourcesPanel";
 import { SessionReconciliationPanel } from "../SessionReconciliationPanel";
 import { SharedStagingPanel } from "../SharedStagingPanel";
@@ -43,7 +44,56 @@ function HubConnectionRow({ agent, stale }: { agent: AgentSummary; stale: boolea
   );
 }
 
-export function AgentsPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
+/** Agent installations on their own page: pairing, sessions and Hub access, apart from the status overview. */
+function AgentInstallationsPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
+  return (
+    <>
+      <PageHeader eyebrow="AGENTS / INSTALLATIONS" title="Installations">
+        {actions}
+      </PageHeader>
+      <div id="agents" className="agents-page">
+        {/* Keyed on the signed-in actor: a different person gets a fresh panel, with nothing of the previous owner's kept or late-filled. */}
+        <AgentConnectionsPanel key={hub.session?.actor ?? "signed-out"} hub={hub} />
+        <p className="panel-footnote">
+          Installations are listed only when this Hub runs agent sessions. Stream observations and topic readiness
+          are on the <a className="text-link" href={link("/agents")}>Agents overview</a>.
+        </p>
+      </div>
+    </>
+  );
+}
+
+export function AgentsPage({ hub, actions, view = "overview" }: { hub: Hub; actions: React.ReactNode; view?: "overview" | "installations" }) {
+  return view === "installations" ? <AgentInstallationsPage hub={hub} actions={actions} /> : <AgentsOverview hub={hub} actions={actions} />;
+}
+
+export function TopicList({ topics, current, onSelect, hasServer }: {
+  topics: TopicEntry[]; current: string; onSelect: (topic: string) => void; hasServer: boolean;
+}) {
+  return <>
+    <ul className="topic-list" aria-label="Topics">
+      {topics.map((entry) => (
+        <li key={entry.topic}>
+          <button type="button" className={entry.topic === current ? "topic-item current" : "topic-item"}
+            aria-current={entry.topic === current ? "true" : undefined} onClick={() => onSelect(entry.topic)}>
+            <span className="topic-name">{entry.topic}</span>
+            <span className="topic-meta">
+              {entry.source === "device" ? "This device" : "Hub directory"}
+              {entry.peer_count !== null ? ` · ${entry.peer_count} agents` : ""}
+              {entry.last_activity_at ? ` · ${relativeAge(entry.last_activity_at)}` : ""}
+            </span>
+          </button>
+        </li>
+      ))}
+    </ul>
+    <p className="panel-footnote">
+      {hasServer ? "Hub directory entries are available to your account. This device entries are local selections."
+        : "Topics saved or selected on this device. The Hub can't list the topics available to your account yet."}
+    </p>
+  </>;
+}
+
+function AgentsOverview({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const { peers, demo, stale, topicStale } = hub;
   const [serverTopics, setServerTopics] = useState<TopicEntry[] | null>(null);
   const [remembered, setRemembered] = useState<string[]>(rememberedTopics);
@@ -59,14 +109,10 @@ export function AgentsPage({ hub, actions }: { hub: Hub; actions: React.ReactNod
     return () => controller.abort();
   }, [demo, hub.data]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { setRemembered(rememberTopic(hub.topic)); }, [hub.topic]);
-  const topics: TopicEntry[] = serverTopics ?? remembered.map((topic) => ({ topic, last_activity_at: null, peer_count: null, source: "device" }));
-  if (!topics.some((entry) => entry.topic === hub.topic))
-    topics.unshift({ topic: hub.topic, last_activity_at: null, peer_count: null, source: "device" });
-  const connected = hub.agents.filter((agent) => connectionView(agent, !demo && stale).connected).length;
+  const topics = visibleTopics(serverTopics, remembered, hub.topic);
   return (
     <>
-      <PageHeader eyebrow="AGENTS" title="Agents"
-        subtitle="Recent Hub stream observations and reachability on a specific conversation topic. These are checked separately.">
+      <PageHeader eyebrow="AGENTS" title="Agents">
         {actions}
       </PageHeader>
       <div id="agents" className="agents-page">
@@ -74,14 +120,6 @@ export function AgentsPage({ hub, actions }: { hub: Hub; actions: React.ReactNod
       <section className="agent-cards" aria-label="Hub stream observations">
         {hub.agents.map((agent) => <HubConnectionRow key={agent.id} agent={agent} stale={!demo && stale} />)}
       </section>
-      <p className="panel-footnote">
-        {connected} of {hub.agents.length} with a Hub stream observed. Stream observed means the Hub recently wrote to a
-        retained stream. An upstream connection may still accept writes after the agent stops listening. This does not prove
-        client receipt, listening, or work. Stale means recent stream activity is missing; it doesn't prove the agent is
-        offline. Topic readiness is checked separately.
-      </p>
-      {/* Keyed on the signed-in actor: a different person gets a fresh panel, with nothing of the previous owner's kept or late-filled. */}
-      <AgentConnectionsPanel key={hub.session?.actor ?? "signed-out"} hub={hub} />
       <section className="panel agents-panel" id="topics">
         <PanelTitle title="Topics" count={topics.length} />
         <div className="topics-layout">
@@ -94,24 +132,7 @@ export function AgentsPage({ hub, actions }: { hub: Hub; actions: React.ReactNod
                 <button className="secondary small" disabled={hub.loading}>Check</button>
               </div>
             </form>
-            <ul className="topic-list" aria-label="Topics">
-              {topics.map((entry) => (
-                <li key={entry.topic}>
-                  <button type="button" className={entry.topic === hub.topic ? "topic-item current" : "topic-item"}
-                    aria-current={entry.topic === hub.topic ? "true" : undefined} onClick={() => hub.selectTopic(entry.topic)}>
-                    <span className="topic-name">{entry.topic}</span>
-                    <span className="topic-meta">
-                      {entry.peer_count !== null ? `${entry.peer_count} agents` : ""}
-                      {entry.last_activity_at ? ` · ${relativeAge(entry.last_activity_at)}` : ""}
-                    </span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-            <p className="panel-footnote">
-              {serverTopics ? "Topics available to your account."
-                : "Topics checked on this device only. The Hub can't list the topics available to your account yet."}
-            </p>
+            <TopicList topics={topics} current={hub.topic} onSelect={hub.selectTopic} hasServer={serverTopics !== null} />
           </div>
           <div className="topic-detail" aria-label={`Readiness for ${hub.topic}`}>
             <h3 className="agent-section-title">Readiness on <code>{hub.topic}</code></h3>
@@ -146,17 +167,7 @@ export function AgentsPage({ hub, actions }: { hub: Hub; actions: React.ReactNod
                 );
               })}
             </div>
-            <div className="advisory">
-              <span>↳</span>
-              <p>
-                This is a best guess. Messages are kept even when an agent is offline, and being
-                reachable doesn't mean a message was read or acted on.
-              </p>
-            </div>
-            <p className="panel-footnote">
-              {demo ? "All agent states above are illustrative fixtures."
-                : "An agent shows as unknown until the Hub can confirm its live session for this topic."}
-            </p>
+            {demo && <p className="panel-footnote">All agent states above are illustrative fixtures.</p>}
           </div>
         </div>
       </section>
@@ -172,18 +183,51 @@ export function stagingSummary(projects: { executor_enabled: boolean }[]): strin
   return `${ready} of ${projects.length} project${projects.length === 1 ? " has" : "s have"} a staging target enabled.`;
 }
 
-export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
+export function StagingPage({ hub, actions, view = "overview" }: {
+  hub: Hub; actions: React.ReactNode; view?: "overview" | "queues" | "resources";
+}) {
   const { data } = hub;
+  if (view === "queues") return (
+    <>
+      <PageHeader eyebrow="STAGING / QUEUES & SESSIONS" title="Queues & sessions">
+        {actions}
+      </PageHeader>
+      <div className="staging-layout single">
+        {(hub.demo || hub.session?.authenticated) && (
+          <SharedStagingPanel mode={hub.demo ? "demo" : "live"} csrf={hub.session?.csrf_token ?? null}
+            writable={hub.writable} stale={hub.stale} onUnauthorized={hub.clearPrivateWorkspace} />
+        )}
+        {!hub.demo && data.autonomy.configured && hub.session?.authenticated && (
+          <SessionReconciliationPanel csrf={hub.session.csrf_token}
+            enabled={true} writable={hub.writable} stale={hub.stale}
+            onAuthError={hub.clearPrivateWorkspace} />
+        )}
+        <WorkQueuePanel mode={hub.demo ? "demo" : "live"} refreshToken={data}
+          stale={hub.stale} onUnauthorized={hub.clearPrivateWorkspace} />
+      </div>
+    </>
+  );
+  if (view === "resources") return (
+    <>
+      <PageHeader eyebrow="STAGING / KEPT RESOURCES" title="Kept resources">
+        {actions}
+      </PageHeader>
+      <div className="staging-layout single">
+        <StagingResourcesPanel mode={hub.demo ? "demo" : "live"} refreshToken={data}
+          csrf={hub.session?.csrf_token ?? null} writable={hub.writable} stale={hub.stale}
+          projects={data.projects.filter((item) => !item.archived).map((item) => ({ id: item.id, name: item.name }))}
+          viewerActor={hub.session?.actor ?? null} onUnauthorized={hub.clearPrivateWorkspace} />
+      </div>
+    </>
+  );
   return (
     <>
-      <PageHeader eyebrow="STAGING" title="Staging"
-        subtitle="Staging targets, the emergency pause, execution evidence and the validation queue. Software only.">
+      <PageHeader eyebrow="STAGING" title="Staging">
         {actions}
       </PageHeader>
       <div className="staging-layout">
         <section className="panel" id="staging">
           <PanelTitle title="Staging overview"><Badge tone="neutral">SOFTWARE ONLY</Badge></PanelTitle>
-          <p className="panel-description">Independent projects. Explicit activation. No production shortcuts.</p>
           <div className="staging-control">
             <div>
               <span className={`status-orb ${data.paused ? "paused" : ""}`} />
@@ -230,6 +274,9 @@ export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNo
                   )}
                   <code>{run.artifact_digest}</code>
                   <p className="small-text">Fence {run.fencing_generation} · {run.events.length} recorded events</p>
+                  {!hub.demo && hub.session?.authenticated && (
+                    <RunReleaseEvidence key={`${run.id}-${hub.session?.actor ?? "signed-out"}`} runId={run.id} onUnauthorized={hub.clearPrivateWorkspace} />
+                  )}
                 </details>
               ))}
             </div>
@@ -239,22 +286,11 @@ export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNo
         {(hub.demo || hub.session?.authenticated) && (
           <StagingRuntimePanel mode={hub.demo ? "demo" : "live"} onUnauthorized={hub.clearPrivateWorkspace} />
         )}
-        {(hub.demo || hub.session?.authenticated) && (
-          <SharedStagingPanel mode={hub.demo ? "demo" : "live"} csrf={hub.session?.csrf_token ?? null}
-            writable={hub.writable} stale={hub.stale} onUnauthorized={hub.clearPrivateWorkspace} />
-        )}
-        {!hub.demo && data.autonomy.configured && hub.session?.authenticated && (
-          <SessionReconciliationPanel csrf={hub.session.csrf_token}
-            enabled={true} writable={hub.writable} stale={hub.stale}
-            onAuthError={hub.clearPrivateWorkspace} />
-        )}
-        <WorkQueuePanel mode={hub.demo ? "demo" : "live"} refreshToken={data}
-          stale={hub.stale} onUnauthorized={hub.clearPrivateWorkspace} />
-        <StagingResourcesPanel mode={hub.demo ? "demo" : "live"} refreshToken={data}
-          csrf={hub.session?.csrf_token ?? null} writable={hub.writable} stale={hub.stale}
-          projects={data.projects.filter((item) => !item.archived).map((item) => ({ id: item.id, name: item.name }))}
-          viewerActor={hub.session?.actor ?? null} onUnauthorized={hub.clearPrivateWorkspace} />
       </div>
+      <p className="panel-footnote">
+        Queues and session review are under <a className="text-link" href={link("/staging/queues")}>Queues &amp; sessions</a>;
+        kept items and clean-up are under <a className="text-link" href={link("/staging/resources")}>Kept resources</a>.
+      </p>
     </>
   );
 }

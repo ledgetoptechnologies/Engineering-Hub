@@ -6,6 +6,7 @@ from fastapi import Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .openapi_body import request_body
 from .repository import HubError
 from .work_queue_api import _authorization
 
@@ -55,6 +56,64 @@ class ReviewAnswers(Closed):
     complete: bool = False
 
 
+class StoredAnswer(Closed):
+    value: str
+    by: str
+    at: str
+
+
+class ReviewSummary(Closed):
+    id: str
+    project: str
+    component_id: str
+    component_revision: int
+    topic: str
+    dataset_digest: str
+    schema_name: Literal['choice-text.v1'] = Field(alias='schema')
+    title: str
+    state: Literal['open', 'completed']
+    created_by: str
+    created_at: str
+    updated_at: str
+    revision: int
+    item_count: int
+    answered_count: int
+
+
+class ReviewDetail(Closed):
+    id: str
+    project: str
+    component_id: str
+    component_revision: int
+    topic: str
+    dataset_digest: str
+    schema_name: Literal['choice-text.v1'] = Field(alias='schema')
+    title: str
+    items: list[ReviewItem]
+    state: Literal['open', 'completed']
+    answers: dict[str, StoredAnswer]
+    created_by: str
+    created_at: str
+    updated_at: str
+    revision: int
+
+
+class ReviewState(ReviewSummary):
+    answers: dict[str, StoredAnswer]
+
+
+class ReviewPage(Closed):
+    items: list[ReviewSummary]
+    next_after: str | None
+
+
+def _documented_response(model, status=200):
+    # Schema metadata only: do not add response_model validation or alter wire data.
+    schema = request_body(model)['requestBody']['content']['application/json']['schema']
+    return {'responses': {str(status): {'description': 'Successful response',
+        'content': {'application/json': {'schema': schema}}}}}
+
+
 def _object(pairs):
     value = {}
     for key, entry in pairs:
@@ -84,38 +143,49 @@ async def _payload(request, model, maximum):
         raise HubError('invalid_review_json') from None
 
 
-def attach_interactive_review_routes(app, repository, actor, human):
+def attach_interactive_review_routes(app, repository, actor, human, *, human_admission=None):
     def identity(request, *, mutation=False):
         _authorization(request)
         return human(request, mutation=True) if mutation else actor(request)
 
-    @app.get('/api/hub/v1/interactive-reviews')
+    @app.get('/api/hub/v1/interactive-reviews', openapi_extra=_documented_response(ReviewPage))
     def list_reviews(request: Request, project: str, component_id: str | None = None,
                      state: Literal['open', 'completed'] | None = None, after: str | None = None,
                      limit: int = Query(default=100, ge=1, le=100)):
         return repository.list_reviews(identity(request), project, component_id=component_id,
                                        state=state, after=after, limit=limit)
 
-    @app.get('/api/hub/v1/interactive-reviews/{review_id}')
+    @app.get('/api/hub/v1/interactive-reviews/{review_id}', openapi_extra=_documented_response(ReviewDetail))
     def get_review(review_id: Identity, request: Request):
         return repository.get_review(identity(request), review_id)
 
-    @app.get('/api/hub/v1/interactive-reviews/{review_id}/state')
+    @app.get('/api/hub/v1/interactive-reviews/{review_id}/state', openapi_extra=_documented_response(ReviewState))
     def get_state(review_id: Identity, request: Request):
         return repository.get_state(identity(request), review_id)
 
-    @app.post('/api/hub/v1/interactive-reviews', status_code=201)
+    @app.post('/api/hub/v1/interactive-reviews', status_code=201,
+              openapi_extra={**request_body(ReviewCreate), **_documented_response(ReviewDetail, 201)})
     async def create(request: Request):
         _authorization(request)
         principal = actor(request, mutation=True)
         payload = await _payload(request, ReviewCreate, 1024 * 1024 + 16384)
+        if actor(request, mutation=True) != principal:
+            raise HubError('review_identity_changed', 403)
         return repository.create_review(principal, **payload.model_dump(by_alias=True, exclude_none=True))
 
-    @app.post('/api/hub/v1/interactive-reviews/{review_id}/answers')
+    @app.post('/api/hub/v1/interactive-reviews/{review_id}/answers',
+              openapi_extra={**request_body(ReviewAnswers), **_documented_response(ReviewDetail)})
     async def answer(review_id: Identity, request: Request):
         principal = identity(request, mutation=True)
         payload = await _payload(request, ReviewAnswers, 256 * 1024)
-        return repository.answer_review(principal, review_id, **payload.model_dump())
+        if identity(request, mutation=True) != principal:
+            raise HubError('review_identity_changed', 403)
+        if human_admission is None:
+            raise HubError('interactive_review_admission_unavailable', 503)
+        guard = human_admission(request, principal)
+        if not callable(guard):
+            raise HubError('interactive_review_admission_unavailable', 503)
+        return repository.answer_review(principal, review_id, admission_guard=guard, **payload.model_dump())
 
 
 def register_interactive_review_tools(mcp, *, repository, identity, invoke):

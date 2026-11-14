@@ -1,5 +1,6 @@
 """Local, transactional Hub state. This module never dispatches work."""
 from contextlib import contextmanager
+import base64
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -12,10 +13,15 @@ from agent_message_bus import session_hub_context as session_context
 from .pilot_ownership import PilotOwner
 from .image_state_boundary import ImageStateBoundaryError, require_image_state_mount
 from .entity_context import bounded_text, validated_context
+from .decision_projection import public_decision
+from . import reconciliation_context
 
 
 PROJECTS = frozenset({'engineering-hub', '3d-viewer', 'project-alpha', 'ledge-top-ops', 'treedar'})
 AGENTS = frozenset({'hermes', 'codex', 'claude'})
+_TRACKING_DRAFT_TOTAL_LIMIT = 100000
+_TRACKING_DRAFT_PROJECT_LIMIT = 10000
+_TRACKING_DRAFT_REGISTRATION_LIMIT = 64
 # Audit actions that set a task's status. Run bookkeeping saves the task without
 # changing it, so those actions must not reset how long a task has been waiting.
 TASK_STATUS_ACTIONS = ('task.created', 'task.proposed', 'task.claimed', 'task.claim_recovered', 'task.candidate', 'task.reviewed',
@@ -26,7 +32,8 @@ CREATION_ACTIONS = {'task': ('task.created', 'task.proposed'), 'decision': ('dec
 WITHDRAWABLE_TASK_STATUSES = frozenset({'assigned', 'claimed'})
 _UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 HELD_REASONS = frozenset({'candidate_outcome_uncertain', 'staging_paused', 'rollback_failed',
-                         'rollback_outcome_uncertain', 'rollback_smoke_failed', 'rollback_smoke_outcome_uncertain'})
+                         'rollback_outcome_uncertain', 'rollback_smoke_failed', 'rollback_smoke_outcome_uncertain',
+                         'disposable_cleanup_requires_quiescence', 'disposable_cleanup_outcome_uncertain'})
 
 
 class HubError(Exception):
@@ -152,16 +159,24 @@ class HubRepository:
             db.close()
 
     @contextmanager
-    def _transaction(self):
+    def _transaction(self, *, before_commit=None):
         self._assert_pilot_owner(None)
         with self._write_connection() as db:
             db.execute('BEGIN IMMEDIATE')
+            guard = reconciliation_context.current.get()
             try:
                 self._assert_pilot_owner(db)
+                if guard is not None:
+                    guard.before_write(self.path, db)
                 yield db
                 self._assert_pilot_owner(db)
                 session_context.before_commit(self.path, db)
+                if before_commit is not None:
+                    before_commit(db)
+                snapshot = guard.prepare_commit(self.path, db) if guard is not None else None
                 db.commit()
+                if guard is not None:
+                    guard.committed(snapshot)
             except Exception:
                 db.rollback()
                 raise
@@ -179,15 +194,25 @@ class HubRepository:
 
     def _assert_queued_pilot(self, operation, *, db=None, **context):
         if not self.queued_pilot_enrolled(db):
-            return
+            return None
         # The exact trusted local bridge is not a bearer identity, request flag
         # or callback supplied by a public caller. Its private scoped permit
         # rechecks the original job, live owner and physical reservation.
         from .queued_pilot import QueuedContainerPilot
         bridge = getattr(self, '_queued_pilot', None)
-        if (type(bridge) is not QueuedContainerPilot or bridge.repo is not self
-                or bridge.authorize(operation, db=db, **context) is not True):
+        if type(bridge) is not QueuedContainerPilot or bridge.repo is not self:
             raise HubError('queued_pilot_admission_required', 409)
+        authorization = bridge.authorize(operation, db=db, **context)
+        if operation == 'create_run':
+            # The private bridge returns the exact queued job it validated.
+            # That job owns this task already, so it must be exempt from the
+            # generic "another job is in progress" guard below.
+            if not isinstance(authorization, str):
+                raise HubError('queued_pilot_admission_required', 409)
+            return authorization
+        if authorization is not True:
+            raise HubError('queued_pilot_admission_required', 409)
+        return None
 
     @staticmethod
     def _actor(actor, human=False, agent=False):
@@ -236,7 +261,7 @@ class HubRepository:
         if type(expected) is not int or item['revision'] != expected:
             raise HubError('revision_conflict', 409)
 
-    def _save(self, db, actor, action, kind, item, new=False):
+    def _save(self, db, actor, action, kind, item, new=False, *, publish=True):
         item['revision'] = 1 if new else item['revision'] + 1
         item['updated_at'] = datetime.now(timezone.utc).isoformat()
         db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data',
@@ -244,7 +269,15 @@ class HubRepository:
         db.execute('INSERT INTO hub_audit(actor,action,entity_id,revision,created_at) VALUES(?,?,?,?,?)',
                    (actor, action, item['id'], item['revision'], item['updated_at']))
         session_context.provenance(db, db.execute("SELECT last_insert_rowid()").fetchone()[0])
-        self._emit(db, action, item)
+        # Dispatch-origin decisions are scoped coordination data. The generic
+        # outbox broadcasts IDs without project or decision-grant filtering.
+        # Treat even incomplete origin metadata as private, on every mutation.
+        private_dispatch_decision = (kind == 'decision' and
+            ('origin_dispatch_id' in item or 'origin_dispatch_revision' in item))
+        # Tracking records are project-scoped. The legacy bus publisher has no
+        # project or tracking-grant filter, so even an ID/revision is private.
+        if publish and not private_dispatch_decision and kind != 'tracking_task':
+            self._emit(db, action, item)
         return item
 
     def _emit(self, db, action, item):
@@ -287,6 +320,471 @@ class HubRepository:
 
     def list_tasks(self):
         return self._list('task')
+
+    def tracking_tasks(self, project, limit, after, unfinished=False):
+        """Read inert agent tracking records; none is an execution task."""
+        if type(unfinished) is not bool:
+            raise HubError('invalid_input', 422)
+        with self._connection() as db:
+            self._project(project, db)
+            state = " AND json_extract(data, '$.status') IN ('open','completion_claimed')" if unfinished else ''
+            rows = db.execute("SELECT data FROM hub_entities WHERE kind='tracking_task' AND json_extract(data, '$.project')=? AND id>?" + state + " ORDER BY id LIMIT ?",
+                              (project, after or '', limit + 1)).fetchall()
+            return [json.loads(row['data']) for row in rows]
+
+    @staticmethod
+    def _tracking_segment_id(identity, kind, index):
+        return str(uuid.uuid5(uuid.UUID(identity), f'tracking-history:{kind}:{index}'))
+
+    def _tracking_rollover(self, db, item, kind, *, force=False):
+        """Move a full bounded window into an immutable, task-scoped segment."""
+        records = item.setdefault(kind, [])
+        if not force and len(records) < 50 and len(_json(item).encode('utf-8')) < 256 * 1024:
+            return
+        if type(records) is not list or len(records) > 50:
+            raise HubError('tracking_history_corrupt', 409)
+        # An oversized window of the other kind can precede this kind's first
+        # record, e.g. a large completion claim followed by its first review.
+        if not records:
+            if not force:
+                other = 'reviews' if kind == 'updates' else 'updates'
+                self._tracking_rollover(db, item, other, force=True)
+            return
+        # Preserve the latest visible update/review for old clients and, for
+        # claims, the exact record used by independent review.
+        keep = 1
+        if len(records) <= keep:
+            if not force and len(_json(item).encode('utf-8')) >= 256 * 1024:
+                other = 'reviews' if kind == 'updates' else 'updates'
+                self._tracking_rollover(db, item, other, force=True)
+            return
+        counts = item.setdefault('history_segments', {})
+        index = counts.get(kind, 0)
+        if type(index) is not int or index < 0:
+            raise HubError('tracking_history_corrupt', 409)
+        # Legacy 50-entry windows may exceed the enrollment cell limit. Split
+        # them without loss, keeping each immutable segment bounded by bytes as
+        # well as record count; cursors remain stable as new segments appear.
+        pending = list(records[:-keep] if keep else records)
+        while pending:
+            chunk = []
+            while pending and len(chunk) < 50:
+                candidate = chunk + [pending[0]]
+                value = dict(task_id=item['id'], project=item['project'], kind=kind, index=index, records=candidate)
+                if len(_json(value).encode('utf-8')) > 256 * 1024:
+                    break
+                chunk.append(pending.pop(0))
+            if not chunk:
+                raise HubError('tracking_history_corrupt', 409)
+            segment = dict(task_id=item['id'], project=item['project'], kind=kind, index=index, records=chunk)
+            try:
+                db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
+                           (self._tracking_segment_id(item['id'], kind, index), 'tracking_history', _json(segment)))
+            except (sqlite3.IntegrityError, ValueError):
+                raise HubError('tracking_history_corrupt', 409) from None
+            index += 1
+        counts[kind] = index
+        item[kind] = records[-keep:] if keep else []
+        if not force and len(_json(item).encode('utf-8')) >= 256 * 1024:
+            other = 'reviews' if kind == 'updates' else 'updates'
+            self._tracking_rollover(db, item, other, force=True)
+
+    def tracking_history(self, identity, kind, before=None):
+        """Read one older immutable segment, never an unbounded history."""
+        if kind not in ('updates', 'reviews') or (before is not None and (type(before) is not int or before < 1)):
+            raise HubError('invalid_input', 422)
+        with self._connection() as db:
+            item = self._get(db, identity, 'tracking_task')
+            self._project(item['project'], db)
+            count = item.get('history_segments', {}).get(kind, 0)
+            if type(count) is not int or count < 0 or (before is not None and before > count):
+                raise HubError('invalid_cursor', 422)
+            index = (count if before is None else before) - 1
+            if index < 0:
+                return dict(task_id=identity, kind=kind, records=[], next_before=None)
+            try:
+                segment = self._get(db, self._tracking_segment_id(identity, kind, index), 'tracking_history')
+            except (HubError, ValueError):
+                raise HubError('tracking_history_corrupt', 409) from None
+            if (segment.get('task_id') != identity or segment.get('project') != item['project']
+                    or segment.get('kind') != kind or segment.get('index') != index
+                    or type(segment.get('records')) is not list or not 1 <= len(segment['records']) <= 50):
+                raise HubError('tracking_history_corrupt', 409)
+            return dict(task_id=identity, kind=kind, records=segment['records'],
+                        next_before=index if index else None)
+
+    def compact_tracking_history(self, actor, identity, expected_revision, client_request_id):
+        """Explicit, audited legacy conversion; no execution or status change."""
+        self._actor(actor, agent=True)
+        key = self._text(client_request_id, 128)
+        fingerprint = hashlib.sha256(_json(['tracking_compact', identity, expected_revision]).encode()).hexdigest()
+        with self._transaction() as db:
+            item = self._get(db, identity, 'tracking_task')
+            self._project(item['project'], db)
+            prior = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
+            if prior:
+                if prior['fingerprint'] != fingerprint:
+                    raise HubError('idempotency_conflict', 409)
+                return self._get(db, prior['entity_id'], 'tracking_task')
+            self._cas(item, expected_revision)
+            before = _json(item)
+            # Legacy claims lacked their own revision. Preserve the original
+            # inferred claim revision before an audit-only compaction bumps the
+            # task revision, so later review still names the exact claim.
+            if item.get('status') == 'completion_claimed':
+                updates = item.get('updates', [])
+                if not updates or updates[-1].get('completion_claim') is not True:
+                    raise HubError('tracking_history_corrupt', 409)
+                if 'revision' not in updates[-1]:
+                    updates[-1]['revision'] = item['revision']
+            self._tracking_rollover(db, item, 'updates', force=True)
+            self._tracking_rollover(db, item, 'reviews', force=True)
+            if _json(item) != before:
+                item = self._save(db, actor, 'tracking_task.history_compacted', 'tracking_task', item)
+            db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
+            return item
+
+    def project_task_page(self, project, limit, after):
+        """Bounded project-only rows, with status audit selected by revision."""
+        with self._connection() as db:
+            self._project(project, db)
+            db.execute('BEGIN')
+            try:
+                rows = db.execute("SELECT data FROM hub_entities WHERE kind='task' AND json_extract(data, '$.project')=? AND json_extract(data, '$.status')!='withdrawn' AND id>? ORDER BY id LIMIT ?",
+                                  (project, after or '', limit + 1)).fetchall()
+                tasks = [json.loads(row['data']) for row in rows]
+                marks = ','.join('?' * len(TASK_STATUS_ACTIONS))
+                for task in tasks:
+                    audit = db.execute(f'SELECT created_at FROM hub_audit WHERE entity_id=? AND revision<=? AND action IN ({marks}) ORDER BY revision DESC LIMIT 1',
+                                       (task['id'], task['revision'], *TASK_STATUS_ACTIONS)).fetchone()
+                    task['state_since'] = audit['created_at'] if audit else None
+                paused = self._paused(db)
+                return tasks, paused
+            finally:
+                db.rollback()
+
+    def propose_tracking_task(self, actor, project, title, client_request_id, *, details=None, links=None, origin_request_id=None):
+        """Idempotent agent-authored tracking only; creates no dispatch authority."""
+        self._actor(actor, agent=True)
+        title, key = self._text(title), self._text(client_request_id, 128)
+        context = self._context(details, links)
+        parts = ['tracking_task', project, title, context]
+        if origin_request_id is not None:
+            from .dispatch import DispatchRepository, _canonical_id
+            dispatch = DispatchRepository(self)
+            operation = dispatch._operation(actor)
+            dispatch._grant(operation, 'tracking.propose', 'dispatch.read')
+            _canonical_id(origin_request_id)
+            parts.append(origin_request_id)
+        fingerprint = hashlib.sha256(_json(parts).encode()).hexdigest()
+        with self._transaction() as db:
+            self._project(project, db)
+            if origin_request_id is not None:
+                request = dispatch._request(db, origin_request_id)
+                if request['project'] != project:
+                    raise HubError('dispatch_unavailable', 404)
+            prior = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
+            if prior:
+                if prior['fingerprint'] != fingerprint:
+                    raise HubError('idempotency_conflict', 409)
+                return self._get(db, prior['entity_id'], 'tracking_task')
+            item = self._save(db, actor, 'tracking_task.proposed', 'tracking_task', dict(
+                id=str(uuid.uuid4()), project=project, title=title, status='open',
+                created_by=actor, execution_authorization=False, updates=[], **context), new=True)
+            if origin_request_id is not None:
+                identity = str(uuid.uuid5(uuid.UUID('61a577b0-3296-4b36-9303-83c24ec3ab37'), item['id']))
+                db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
+                           (identity, 'tracking_origin', _json(dict(task_id=item['id'], project=project,
+                                                                   request_id=origin_request_id))))
+            db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
+            return item
+
+    def propose_tracking_draft(self, actor, project, title, client_request_id, intake_id, *,
+                               details=None, links=None, origin_request_id=None):
+        """Deduplicate an explicitly versioned draft across EHS installations in one Hub ledger."""
+        self._actor(actor, agent=True)
+        if not session_context.actor_allowed(actor):
+            raise HubError('tracking_draft_unavailable', 404)
+        try:
+            if type(intake_id) is not str or not re.fullmatch(r'[A-Za-z0-9_-]{43}', intake_id):
+                raise ValueError()
+            raw = base64.urlsafe_b64decode(intake_id + '=')
+            if len(raw) != 32 or base64.urlsafe_b64encode(raw).decode().rstrip('=') != intake_id:
+                raise ValueError()
+        except (ValueError, TypeError):
+            raise HubError('invalid_tracking_intake', 422) from None
+        title, key = self._text(title), self._text(client_request_id, 128)
+        context = self._context(details, links)
+        dispatch = None
+        if origin_request_id is not None:
+            from .dispatch import DispatchRepository, _canonical_id
+            dispatch = DispatchRepository(self)
+            operation = dispatch._operation(actor)
+            dispatch._grant(operation, 'tracking.propose', 'dispatch.read')
+            _canonical_id(origin_request_id)
+        fingerprint = hashlib.sha256(_json(['tracking_draft_v2', project, title, key, context,
+                                             origin_request_id, intake_id]).encode()).hexdigest()
+        identity = 'tracking-intake:' + hashlib.sha256(_json(['tracking_draft_v2', project, intake_id]).encode()).hexdigest()
+        with self._transaction() as db:
+            self._project(project, db)
+            if dispatch is not None:
+                request = dispatch._request(db, origin_request_id)
+                if request['project'] != project:
+                    raise HubError('dispatch_unavailable', 404)
+            actor_receipt = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
+            if actor_receipt and actor_receipt['fingerprint'] != fingerprint:
+                raise HubError('idempotency_conflict', 409)
+            row = db.execute('SELECT kind,data FROM hub_entities WHERE id=?', (identity,)).fetchone()
+            if row is not None:
+                try:
+                    saved = json.loads(row['data'])
+                    if (row['kind'] != 'tracking_intake_receipt' or type(saved) is not dict
+                            or set(saved) != {'project', 'fingerprint', 'task_id', 'registrations'}
+                            or type(saved['registrations']) is not int or not 1 <= saved['registrations'] <= _TRACKING_DRAFT_REGISTRATION_LIMIT
+                            or saved['project'] != project or saved['fingerprint'] != fingerprint):
+                        raise ValueError()
+                    item = self._get(db, saved['task_id'], 'tracking_task')
+                    if item['project'] != project or (actor_receipt and actor_receipt['entity_id'] != item['id']):
+                        raise ValueError()
+                except (ValueError, TypeError, KeyError, HubError):
+                    raise HubError('tracking_draft_conflict', 409) from None
+                if actor_receipt is None:
+                    if saved['registrations'] >= _TRACKING_DRAFT_REGISTRATION_LIMIT:
+                        raise HubError('tracking_draft_capacity', 409)
+                    db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
+                    saved['registrations'] += 1
+                    db.execute('UPDATE hub_entities SET data=? WHERE id=?', (_json(saved), identity))
+                return item
+            if actor_receipt is not None:
+                raise HubError('tracking_draft_conflict', 409)
+            if (db.execute("SELECT count(*) FROM hub_entities WHERE kind='tracking_intake_receipt'").fetchone()[0] >= _TRACKING_DRAFT_TOTAL_LIMIT
+                    or db.execute("SELECT count(*) FROM hub_entities WHERE kind='tracking_intake_receipt' "
+                                  "AND json_extract(data,'$.project')=?", (project,)).fetchone()[0] >= _TRACKING_DRAFT_PROJECT_LIMIT):
+                raise HubError('tracking_draft_capacity', 409)
+            item = self._save(db, actor, 'tracking_task.proposed', 'tracking_task', dict(
+                id=str(uuid.uuid4()), project=project, title=title, status='open',
+                created_by=actor, execution_authorization=False, updates=[], **context), new=True)
+            if origin_request_id is not None:
+                origin_id = str(uuid.uuid5(uuid.UUID('61a577b0-3296-4b36-9303-83c24ec3ab37'), item['id']))
+                db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
+                           (origin_id, 'tracking_origin', _json(dict(task_id=item['id'], project=project,
+                                                                   request_id=origin_request_id))))
+            db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
+                       (identity, 'tracking_intake_receipt', _json(dict(project=project, fingerprint=fingerprint,
+                                                                       task_id=item['id'], registrations=1))))
+            db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
+            return item
+
+    def tracking_task_origin(self, actor, task_id):
+        """Reveal provenance only to a project-scoped EHS reader with both grants."""
+        from .dispatch import DispatchRepository, _canonical_id
+        dispatch = DispatchRepository(self)
+        operation = dispatch._operation(actor)
+        dispatch._grant(operation, 'tracking.read', 'dispatch.read')
+        try:
+            _canonical_id(task_id)
+            with self._connection() as db:
+                db.execute('BEGIN')
+                task = self._get(db, task_id, 'tracking_task')
+                self._project(task['project'], db)
+                identity = str(uuid.uuid5(uuid.UUID('61a577b0-3296-4b36-9303-83c24ec3ab37'), task_id))
+                row = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='tracking_origin'", (identity,)).fetchone()
+                if row is None:
+                    return dict(task_id=task_id, origin_request_id=None)
+                origin = json.loads(row['data'])
+                request = dispatch._request(db, origin['request_id'])
+                if origin['task_id'] != task_id or origin['project'] != task['project'] or request['project'] != task['project']:
+                    raise ValueError()
+                return dict(task_id=task_id, origin_request_id=request['id'])
+        except (HubError, ValueError, TypeError, KeyError):
+            raise HubError('hub_tracking_task_unavailable', 404) from None
+
+    def tracking_request_tasks(self, actor, project, request_id, limit, after):
+        """Bounded private reverse lookup, scoped before pagination."""
+        from .dispatch import DispatchRepository, _canonical_id
+        dispatch = DispatchRepository(self)
+        operation = dispatch._operation(actor)
+        dispatch._grant(operation, 'tracking.read', 'dispatch.read')
+        return self._tracking_request_tasks(project, request_id, limit, after)
+
+    def tracking_request_summary(self, actor, project, request_id, limit, after):
+        """Read origin-linked tracking tasks; dispatch-only work is excluded."""
+        from .dispatch import DispatchRepository, _canonical_id
+        dispatch = DispatchRepository(self)
+        operation = dispatch._operation(actor)
+        dispatch._grant(operation, 'tracking.read', 'dispatch.read')
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise HubError('invalid_limit', 422)
+        if after is not None:
+            _canonical_id(after)
+        with self._connection() as db:
+            db.execute('BEGIN')
+            self._project(project, db)
+            request = dispatch._request(db, request_id)
+            if request['project'] != project:
+                raise HubError('dispatch_unavailable', 404)
+            rows = db.execute("SELECT t.id,t.data FROM hub_entities o JOIN hub_entities t "
+                              "ON t.id=json_extract(o.data,'$.task_id') AND t.kind='tracking_task' "
+                              "WHERE o.kind='tracking_origin' AND json_extract(o.data,'$.project')=? "
+                              "AND json_extract(o.data,'$.request_id')=? AND json_extract(t.data,'$.project')=? "
+                              "AND t.id>? ORDER BY t.id LIMIT ?", (project, request['id'], project, after or '', limit + 1)).fetchall()
+            items = []
+            for row in rows[:limit]:
+                task = json.loads(row['data'])
+                if task.get('id') != row['id'] or task.get('project') != project:
+                    raise HubError('dispatch_unavailable', 404)
+                items.append(dict(id=row['id'], title=task['title'], status=task['status'],
+                                  revision=task['revision'], updated_at=task['updated_at'],
+                                  completion_verified=task['status'] == 'completion_verified'))
+            return dict(request_id=request['id'], tasks=items,
+                        next_after=items[-1]['id'] if len(rows) > limit else None,
+                        snapshot='single_read_transaction_page', scope='origin_linked_tracking_tasks_only',
+                        pagination_note='Pages are separate snapshots; refresh from the beginning for newly linked tasks.',
+                        dispatch_only_tasks_included=False, execution_authorization=False)
+
+    def owner_tracking_request_tasks(self, actor, project, request_id, limit, after):
+        self._actor(actor, human=True)
+        return self._tracking_request_tasks(project, request_id, limit, after)
+
+    def _tracking_request_tasks(self, project, request_id, limit, after):
+        from .dispatch import DispatchRepository, _canonical_id
+        dispatch = DispatchRepository(self)
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise HubError('invalid_limit', 422)
+        if after is not None:
+            _canonical_id(after)
+        with self._connection() as db:
+            db.execute('BEGIN')
+            self._project(project, db)
+            request = dispatch._request(db, request_id)
+            if request['project'] != project:
+                raise HubError('dispatch_unavailable', 404)
+            rows = db.execute("SELECT t.id FROM hub_entities o JOIN hub_entities t "
+                              "ON t.id=json_extract(o.data,'$.task_id') AND t.kind='tracking_task' "
+                              "WHERE o.kind='tracking_origin' AND json_extract(o.data,'$.project')=? "
+                              "AND json_extract(o.data,'$.request_id')=? AND json_extract(t.data,'$.project')=? "
+                              "AND t.id>? ORDER BY t.id LIMIT ?", (project, request['id'], project, after or '', limit + 1)).fetchall()
+            ids = [row['id'] for row in rows[:limit]]
+            return dict(request_id=request['id'], task_ids=ids, next_after=ids[-1] if len(rows) > limit else None)
+
+    def update_tracking_task(self, actor, identity, expected_revision, client_request_id, *,
+                             progress, evidence_links, completion_claim=False):
+        """Append attributed progress or an unverified completion claim using CAS."""
+        self._actor(actor, agent=True)
+        key = self._text(client_request_id, 128)
+        progress = self._text(progress, 4096)
+        if type(completion_claim) is not bool:
+            raise HubError('invalid_input')
+        context = self._context(None, evidence_links)
+        links = context.get('links', [])
+        if completion_claim and not links:
+            raise HubError('evidence_required')
+        fingerprint = hashlib.sha256(_json(['tracking_update', identity, expected_revision,
+                                             progress, links, completion_claim]).encode()).hexdigest()
+        with self._transaction() as db:
+            item = self._get(db, identity, 'tracking_task')
+            self._project(item['project'], db)
+            prior = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
+            if prior:
+                if prior['fingerprint'] != fingerprint:
+                    raise HubError('idempotency_conflict', 409)
+                return self._get(db, prior['entity_id'], 'tracking_task')
+            self._cas(item, expected_revision)
+            if item['status'] == 'completion_verified':
+                raise HubError('tracking_reopen_required', 409)
+            self._tracking_rollover(db, item, 'updates')
+            item['updates'].append(dict(actor=actor, progress=progress, evidence_links=links,
+                                        completion_claim=completion_claim, actor_family=session_context.family(actor),
+                                        revision=expected_revision + 1))
+            item['status'] = 'completion_claimed' if completion_claim else 'open'
+            item = self._save(db, actor, 'tracking_task.updated', 'tracking_task', item)
+            db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
+            return item
+
+    def withdraw_tracking_claim(self, actor, identity, expected_revision, expected_claim_revision,
+                                client_request_id, *, reason):
+        """The exact EHS claimant may retract its own claim; this is not a review."""
+        self._actor(actor, agent=True)
+        if not session_context.actor_allowed(actor):
+            raise HubError('tracking_claim_unavailable', 404)
+        if type(expected_claim_revision) is not int or expected_claim_revision < 1:
+            raise HubError('invalid_input', 422)
+        key, reason = self._text(client_request_id, 128), self._text(reason, 4096)
+        fingerprint = hashlib.sha256(_json(['tracking_claim_withdraw', identity, expected_revision,
+                                             expected_claim_revision, reason]).encode()).hexdigest()
+        with self._transaction() as db:
+            item = self._get(db, identity, 'tracking_task')
+            self._project(item['project'], db)
+            prior = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
+            if prior:
+                if prior['fingerprint'] != fingerprint:
+                    raise HubError('idempotency_conflict', 409)
+                return self._get(db, prior['entity_id'], 'tracking_task')
+            updates = item.get('updates')
+            claim = updates[-1] if type(updates) is list and updates else None
+            if (item.get('status') not in ('completion_claimed', 'completion_verified')
+                    or type(claim) is not dict or claim.get('completion_claim') is not True
+                    or claim.get('actor') != actor or type(claim.get('revision')) is not int
+                    or claim['revision'] != expected_claim_revision):
+                raise HubError('tracking_claim_unavailable', 404)
+            self._cas(item, expected_revision)
+            self._tracking_rollover(db, item, 'updates')
+            item['updates'].append(dict(actor=actor, actor_family=session_context.family(actor),
+                progress=reason, evidence_links=[], completion_claim=False, claim_withdrawal=True,
+                withdrawn_claim_revision=expected_claim_revision, revision=expected_revision + 1))
+            item['status'] = 'open'
+            item = self._save(db, actor, 'tracking_task.claim_withdrawn', 'tracking_task', item)
+            db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
+            return item
+
+    def review_tracking_task(self, actor, identity, expected_revision, client_request_id, *,
+                             verdict, note, evidence_links):
+        """Record an independent review of the exact latest claim, or reopen it."""
+        self._actor(actor)
+        key, note = self._text(client_request_id, 128), self._text(note, 4096)
+        if verdict not in ('verify', 'reopen'):
+            raise HubError('invalid_input')
+        links = self._context(None, evidence_links).get('links', [])
+        if verdict == 'verify' and not links:
+            raise HubError('evidence_required')
+        fingerprint = hashlib.sha256(_json(['tracking_review', identity, expected_revision,
+                                             verdict, note, links]).encode()).hexdigest()
+        with self._transaction() as db:
+            item = self._get(db, identity, 'tracking_task')
+            self._project(item['project'], db)
+            prior = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
+            if prior:
+                if prior['fingerprint'] != fingerprint:
+                    raise HubError('idempotency_conflict', 409)
+                return self._get(db, prior['entity_id'], 'tracking_task')
+            self._cas(item, expected_revision)
+            if item['status'] not in (('completion_claimed',) if verdict == 'verify' else ('completion_claimed', 'completion_verified')):
+                raise HubError('tracking_review_unavailable', 409)
+            claim = item['updates'][-1] if item['updates'] else None
+            if not claim or claim.get('completion_claim') is not True:
+                raise HubError('tracking_review_unavailable', 409)
+            # Old installation claims without retained family cannot be safely
+            # shown independent of another installation; a human may review.
+            if not actor.startswith('human:'):
+                family = claim.get('actor_family')
+                if family is None and claim.get('actor') in AGENTS:
+                    family = claim['actor']
+                if (not family or actor == claim.get('actor') or session_context.family(actor) == family):
+                    raise HubError('independent_review_required', 403)
+            if verdict == 'verify' and any(link not in claim.get('evidence_links', []) for link in links):
+                raise HubError('tracking_evidence_mismatch', 409)
+            reviews = item.setdefault('reviews', [])
+            claim_revision = claim.get('revision', expected_revision if item['status'] == 'completion_claimed'
+                                       else reviews[-1]['claim_revision'])
+            self._tracking_rollover(db, item, 'reviews')
+            reviews = item['reviews']
+            reviews.append(dict(actor=actor, actor_family=session_context.family(actor), verdict=verdict,
+                                note=note, evidence_links=links,
+                                claim_revision=claim_revision))
+            item['status'] = 'completion_verified' if verdict == 'verify' else 'open'
+            item = self._save(db, actor, 'tracking_task.reviewed', 'tracking_task', item)
+            db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
+            return item
 
     def list_task_views(self):
         """Response copies of tasks plus the audited time each entered its current status.
@@ -350,6 +848,8 @@ class HubRepository:
                 return self.task_allows_environment(task_id, environment, db=connection)
         row = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='task'", (task_id,)).fetchone()
         if row is None:
+            if db.execute("SELECT 1 FROM hub_entities WHERE id=? AND kind='tracking_task'", (task_id,)).fetchone():
+                return False
             return True
         task = json.loads(row['data'])
         if task.get('status') == 'withdrawn':
@@ -398,6 +898,8 @@ class HubRepository:
             if item['status'] == 'withdrawn':
                 raise HubError('withdrawn', 409)
             self._no_active_run(db, identity)
+            if self._open_work_job(db, identity):
+                raise HubError('active_work_job', 409)
             item.update(candidate_commit=commit, review=None, status='in_review',
                         **({'candidate_family': item['owner_family']} if 'owner_family' in item else {}))
             return self._save(db, actor, 'task.candidate', 'task', item)
@@ -410,6 +912,8 @@ class HubRepository:
             item = self._get(db, identity, 'task')
             self._project(item['project'], db)
             self._cas(item, expected_revision)
+            if self._open_work_job(db, identity):
+                raise HubError('active_work_job', 409)
             if (item['owner'] == actor
                     or session_context.family(actor) == item.get('candidate_family', item.get('owner_family', item['owner']))):
                 raise HubError('independent_review_required', 403)
@@ -420,7 +924,103 @@ class HubRepository:
                             **({'family': session_context.family(actor)} if session_context.actor_allowed(actor) else {})) if verdict == 'approve' else None)
             return self._save(db, actor, 'task.reviewed', 'task', item)
 
-    def create_decision(self, actor, project, title, options, protected=False, *, details=None, links=None, allow_text=False):
+    def reviewed_task_matches(self, identity, actor, revision, commit, *, db=None):
+        """Check the exact independently reviewed candidate while holding the queue transaction."""
+        if db is None:
+            with self._connection() as connection:
+                return self.reviewed_task_matches(identity, actor, revision, commit, db=connection)
+        try:
+            task = self._get(db, identity, 'task')
+        except HubError:
+            return False
+        return self._reviewed_task_data_matches(task, actor, revision, commit, db=db)
+
+    def _reviewed_task_data_matches(self, task, actor, revision, commit, *, db=None):
+        """Validate an exact review and its persisted per-installation lineage.
+
+        Legacy agent identities are self-describing. Installation actors are
+        accepted only when the task's candidate and review audit events have
+        matching Hub-owned session provenance in the same database snapshot.
+        Actor/family strings in the task JSON alone are never sufficient.
+        """
+        review = task.get('review')
+        if not (type(revision) is int and task.get('revision') == revision
+                and task.get('status') == 'verified' and task.get('owner') == actor
+                and task.get('candidate_commit') == commit and type(review) is dict
+                and review.get('verdict') == 'approve' and review.get('commit') == commit
+                and type(review.get('actor')) is str and review.get('actor') != actor):
+            return False
+        candidate_family = task.get('candidate_family', task.get('owner_family', task.get('owner')))
+        if type(candidate_family) is not str:
+            return False
+
+        review_actor = review['actor']
+        if review_actor in AGENTS:
+            reviewer_family = review.get('family', review_actor)
+            reviewer_valid = reviewer_family == review_actor
+        else:
+            reviewer_family = review.get('family')
+            reviewer_valid = self._session_event_matches(
+                db, task['id'], 'task.reviewed', revision, review_actor,
+                reviewer_family, capability='task.review')
+
+        if actor in AGENTS:
+            candidate_valid = candidate_family == actor
+        else:
+            # The candidate event is the latest candidate transition no later
+            # than the exact reviewed revision. Its provenance is inserted in
+            # the same SQLite commit as task.candidate.
+            candidate_valid = self._latest_session_candidate_matches(
+                db, task['id'], revision, actor, candidate_family,
+                task.get('owner_session_id'))
+
+        return (reviewer_valid and candidate_valid
+                and type(reviewer_family) is str
+                and reviewer_family != candidate_family)
+
+    def _session_event_matches(self, db, task_id, action, revision, actor,
+                               family, session_id=None, *, capability):
+        if db is None:
+            with self._connection() as connection:
+                return self._session_event_matches(connection, task_id, action,
+                    revision, actor, family, session_id, capability=capability)
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_session_provenance'").fetchone():
+            return False
+        row = db.execute(
+            'SELECT a.actor,p.installation_id,p.session_id,p.family,p.capability '
+            'FROM hub_audit a JOIN hub_session_provenance p ON p.audit_sequence=a.sequence '
+            'WHERE a.entity_id=? AND a.action=? AND a.revision=?',
+            (task_id, action, revision)).fetchone()
+        if row is None or row['actor'] != actor:
+            return False
+        return (type(row['installation_id']) is str and actor == 'installation:' + row['installation_id']
+                and (session_id is None or row['session_id'] == session_id)
+                and type(row['session_id']) is str and bool(row['session_id'])
+                and row['family'] == family
+                and row['capability'] == capability)
+
+    def _latest_session_candidate_matches(self, db, task_id, reviewed_revision,
+                                          actor, family, session_id):
+        if db is None:
+            with self._connection() as connection:
+                return self._latest_session_candidate_matches(connection, task_id,
+                    reviewed_revision, actor, family, session_id)
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_session_provenance'").fetchone():
+            return False
+        row = db.execute(
+            'SELECT a.revision,a.actor,p.installation_id,p.session_id,p.family,p.capability '
+            'FROM hub_audit a LEFT JOIN hub_session_provenance p ON p.audit_sequence=a.sequence '
+            "WHERE a.entity_id=? AND a.action='task.candidate' AND a.revision<? "
+            'ORDER BY a.revision DESC LIMIT 1', (task_id, reviewed_revision)).fetchone()
+        if row is None or row['actor'] != actor:
+            return False
+        return (type(row['installation_id']) is str and actor == 'installation:' + row['installation_id']
+                and row['session_id'] == session_id
+                and row['family'] == family
+                and row['capability'] == 'task.candidate')
+
+    def create_decision(self, actor, project, title, options, protected=False, *, details=None, links=None, allow_text=False,
+                        client_request_id=None):
         self._actor(actor)
         title = self._text(title)
         if type(protected) is not bool or not isinstance(options, list) or not 2 <= len(options) <= 5:
@@ -433,11 +1033,29 @@ class HubRepository:
         context = self._context(details, links)
         if allow_text:
             context['allow_text'] = True
+        key = self._text(client_request_id) if client_request_id is not None else None
+        fingerprint = hashlib.sha256(_json([title, options, protected, context]).encode()).hexdigest()
         with self._transaction() as db:
             self._project(project, db)
-            return self._save(db, actor, 'decision.created', 'decision', dict(id=str(uuid.uuid4()), project=project,
+            if key is not None:
+                # Keep unkeyed databases readable by earlier enrollment tools.
+                # DDL, creation, and receipt commit in the same transaction.
+                db.execute('CREATE TABLE IF NOT EXISTS hub_decision_requests ('
+                           'actor TEXT NOT NULL, project TEXT NOT NULL, key TEXT NOT NULL, '
+                           'fingerprint TEXT NOT NULL, receipt TEXT NOT NULL, PRIMARY KEY(actor,project,key))')
+                prior = db.execute('SELECT fingerprint,receipt FROM hub_decision_requests '
+                                   'WHERE actor=? AND project=? AND key=?', (actor, project, key)).fetchone()
+                if prior:
+                    if prior['fingerprint'] != fingerprint:
+                        raise HubError('idempotency_conflict', 409)
+                    return json.loads(prior['receipt'])
+            item = self._save(db, actor, 'decision.created', 'decision', dict(id=str(uuid.uuid4()), project=project,
                 title=title, options=options, protected=protected, status='open', answer=None,
                 execution_authorization=False, **context), new=True)
+            if key is not None:
+                db.execute('INSERT INTO hub_decision_requests VALUES(?,?,?,?,?)',
+                           (actor, project, key, fingerprint, _json(item)))
+            return item
 
     def update_context(self, actor, kind, identity, expected_revision, details, links):
         """Human-only CAS edit; task review never survives changed instructions."""
@@ -461,6 +1079,8 @@ class HubRepository:
                 if self.queued_pilot_enrolled(db):
                     raise HubError('queued_pilot_admission_required', 409)
                 self._no_active_run(db, identity)
+                if self._open_work_job(db, identity):
+                    raise HubError('active_work_job', 409)
                 if item.get('candidate_commit') is not None or item.get('review') is not None:
                     item.update(candidate_commit=None, review=None,
                                 status='claimed' if item.get('owner') else 'assigned')
@@ -471,15 +1091,24 @@ class HubRepository:
             return self._save(db, actor, action, kind, item)
 
     def list_decisions(self):
-        return self._list('decision')
+        return [public_decision(item) for item in self._list('decision')]
+
+    def get_decision(self, identity):
+        return public_decision(self._read(identity, 'decision'))
 
     @staticmethod
-    def _open_work_job(db, task_id):
+    def _open_work_job(db, task_id, *, excluding_job_id=None):
         """A queued, claimed or held work-queue job still owns this task; terminal ones don't."""
         if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_work_jobs'").fetchone():
             return False
-        return db.execute('''SELECT 1 FROM hub_work_jobs WHERE json_extract(target,'$.task_id')=?
-            AND state NOT IN ('succeeded','failed','cancelled') LIMIT 1''', (task_id,)).fetchone() is not None
+        query = '''SELECT 1 FROM hub_work_jobs WHERE json_extract(target,'$.task_id')=?
+            AND state NOT IN ('succeeded','failed','cancelled')'''
+        parameters = [task_id]
+        if excluding_job_id is not None:
+            query += ' AND id<>?'
+            parameters.append(excluding_job_id)
+        query += ' LIMIT 1'
+        return db.execute(query, parameters).fetchone() is not None
 
     @staticmethod
     def _creator(db, kind, identity):
@@ -508,6 +1137,20 @@ class HubRepository:
             raise HubError('invalid_replacement')
         with self._transaction() as db:
             item = self._get(db, identity, kind)
+            def authorized_replacement():
+                # Check scope before inspecting replacement state.  Both the
+                # original request and an idempotent retry must keep foreign
+                # entity existence and status private from session agents.
+                try:
+                    replacement = self._get(db, superseded_by, kind)
+                    if session_context.actor_allowed(actor):
+                        self._project(replacement['project'], db)
+                except HubError as error:
+                    if (session_context.actor_allowed(actor) and error.code in
+                            {'not_found', 'hub_project_forbidden', 'project_archived'}):
+                        raise HubError('hub_replacement_unavailable', 404) from None
+                    raise
+                return replacement
             # Archived projects keep their records; retiring a stale one there is allowed.
             self._project(item['project'], db, require_active=False)
             if (actor in AGENTS or session_context.actor_allowed(actor)) and self._creator(db, kind, identity) != actor:
@@ -519,8 +1162,7 @@ class HubRepository:
                 if (item.get('withdrawn_by') == actor and item.get('withdrawn_reason') == reason
                         and item.get('superseded_by') == superseded_by):
                     if session_context.actor_allowed(actor) and superseded_by is not None:
-                        replacement = self._get(db, superseded_by, kind)
-                        self._project(replacement['project'], db)
+                        authorized_replacement()
                     return item
                 raise HubError('withdrawn', 409)
             self._cas(item, expected_revision)
@@ -538,10 +1180,11 @@ class HubRepository:
                 if self._open_work_job(db, identity):
                     raise HubError('task_in_progress', 409)
             if superseded_by is not None:
-                replacement = self._get(db, superseded_by, kind)
+                replacement = authorized_replacement()
                 if replacement['status'] == 'withdrawn':
                     raise HubError('invalid_replacement')
-                self._project(replacement['project'], db)
+                if not session_context.actor_allowed(actor):
+                    self._project(replacement['project'], db)
             if session_context.actor_allowed(actor):
                 principal = session_context.current.get().principal
                 item.update(withdrawn_family=principal.family, withdrawn_session_id=principal.session_id)
@@ -566,7 +1209,23 @@ class HubRepository:
             if item['status'] != 'open' or (not free_text and answer not in item['options']):
                 raise HubError('invalid_answer', 409)
             item.update(answer=answer, answered_by=actor, status='answered')
-            return self._save(db, actor, 'decision.answered', 'decision', item)
+            item = self._save(db, actor, 'decision.answered', 'decision', item)
+            audience = None
+            origin = item.get('origin_dispatch_id')
+            if type(origin) is str:
+                row = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='role_dispatch'", (origin,)).fetchone()
+                try:
+                    dispatch = json.loads(row['data']) if row else None
+                    if (type(dispatch) is dict and dispatch.get('id') == origin
+                            and dispatch.get('project') == item['project'] and dispatch.get('state') == 'asked'
+                            and dispatch.get('decision_id') == item['id'] and type(dispatch.get('role_id')) is str):
+                        audience = ('worker', item['project'], dispatch['role_id'])
+                except (ValueError, TypeError):
+                    pass  # Corrupt historical data never prevents the answer or sends an unscoped pointer.
+        broker = getattr(self, '_attention_hint_broker', None)
+        if audience is not None and broker is not None:
+            broker.signal(audience)
+        return item
 
     def create_run(self, actor, task_id, expected_revision, artifact_digest, target, *, execution_manifest_digest=None, client_request_id=None):
         if actor not in AGENTS:
@@ -582,7 +1241,7 @@ class HubRepository:
         key = self._text(client_request_id, 128) if client_request_id is not None else None
         fingerprint = hashlib.sha256(_json([task_id, expected_revision, artifact_digest, target, execution_manifest_digest]).encode()).hexdigest()
         with self._transaction() as db:
-            self._assert_queued_pilot('create_run', db=db, actor=actor,
+            authorized_job_id = self._assert_queued_pilot('create_run', db=db, actor=actor,
                 task_id=task_id, expected_revision=expected_revision,
                 artifact_digest=artifact_digest, target=target,
                 execution_manifest_digest=execution_manifest_digest,
@@ -596,6 +1255,8 @@ class HubRepository:
             task = self._get(db, task_id, 'task')
             self._project(task['project'], db)
             self._cas(task, expected_revision)
+            if self._open_work_job(db, task_id, excluding_job_id=authorized_job_id):
+                raise HubError('active_work_job', 409)
             if self._paused(db):
                 raise HubError('paused', 409)
             if task['owner'] != actor:

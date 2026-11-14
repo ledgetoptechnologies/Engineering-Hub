@@ -64,8 +64,10 @@ for token in (None, 'synthetic-invalid-token'):
     headers = {} if token is None else {'Authorization': 'Bearer ' + token}
     assert request(8770, '/api/hub/v1/overview', headers=headers)[0] == 401
 
-expected_tools = {'hub_overview', 'hub_task_get', 'hub_task_claim', 'hub_task_candidate',
-                  'hub_task_review', 'hub_decision_request', 'hub_run_list',
+expected_tools = {'hub_overview', 'hub_project_tasks', 'hub_tracking_task_propose', 'hub_tracking_task_origin', 'hub_orchestration_request_tasks', 'hub_orchestration_request_origin_task_summary',
+                  'hub_tracking_task_update', 'hub_tracking_task_list', 'hub_tracking_task_review', 'hub_role_list', 'hub_role_get', 'hub_role_acquire', 'hub_role_renew', 'hub_role_release', 'hub_role_claim', 'hub_role_claims', 'hub_role_claim_release', 'hub_task_progress_get', 'hub_task_progress_update', 'hub_orchestration_request_create', 'hub_orchestration_request_get', 'hub_orchestration_request_list', 'hub_dispatch_create', 'hub_dispatch_get', 'hub_dispatch_list', 'hub_role_dispatch_inbox', 'hub_dispatch_report', 'hub_dispatch_checkpoint', 'hub_dispatch_decisions', 'hub_dispatch_reports', 'hub_orchestrator_attention_list', 'hub_orchestrator_attention_reconcile_closed', 'hub_addressed_attention_list', 'hub_addressed_attention_ack', 'hub_worker_dispatch_pending', 'hub_worker_dispatch_ack', 'hub_worker_decision_inspect', 'hub_orchestrator_report_inspect', 'hub_tracking_task_history', 'hub_tracking_task_compact', 'hub_tracking_claim_withdraw', 'hub_tracking_draft_propose',
+                  'hub_task_get', 'hub_task_claim', 'hub_task_candidate',
+                  'hub_task_review', 'hub_decision_request', 'hub_decision_get', 'hub_run_list',
                   'hub_topic_peers', 'hub_topic_preflight', 'hub_staging_task_propose',
                   'hub_planning_list', 'hub_planning_get', 'hub_planning_put',
                   'hub_label_set_create', 'hub_label_set_put_image', 'hub_label_set_results',
@@ -204,7 +206,7 @@ print(json.dumps({'durable_records_verified': True, 'authenticated_readers': 3,
 
 def _validate(image, commit):
     if (not isinstance(image, str) or not re.fullmatch(
-            r"ghcr\.io/ledgetoptechnologies/engineering-hub-control:(?:build-)[a-z0-9-]+|"
+            r"sha256:[a-f0-9]{64}|ghcr\.io/ledgetoptechnologies/engineering-hub-control:(?:build-)[a-z0-9-]+|"
             r"ghcr\.io/ledgetoptechnologies/engineering-hub-control@sha256:[a-f0-9]{64}", image)):
         raise ValueError("Expected the explicit Hub release artifact")
     if not isinstance(commit, str) or not re.fullmatch(r"[a-f0-9]{40}", commit):
@@ -262,7 +264,7 @@ def smoke(image, commit):
             _verify_profile(name, volume)
             report = json.loads(run("docker", "exec", name, "python", "-c", PROBE, commit, timeout=110))
             assert report["split_image_smoke"] == "passed" and report["build_commit"] == commit
-            assert report["authenticated_agents"] == 3 and report["mcp_tools"] == 30
+            assert report["authenticated_agents"] == 3 and report["mcp_tools"] == 72
             assert report["agent_bind"] == "0.0.0.0:8770" and report["browser_bind"] == "127.0.0.1:8771"
             if iteration == 0:
                 run("docker", "exec", name, "python", "-c", SEED_RECORDS)

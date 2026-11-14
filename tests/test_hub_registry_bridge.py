@@ -17,6 +17,7 @@ from engineering_hub.registry_bridge import (
 )
 from engineering_hub.registry_client import RegistryClient, RegistrySnapshot
 from engineering_hub.registry_stream import RegistryStream
+from tests.test_hub_unified_mcp import HUB_TOOLS
 
 BASE = "/api/hub/v1/topics/engineering-hub"
 ORIGIN = "https://registry.test"
@@ -263,12 +264,13 @@ def test_mcp_discovery_and_topic_tools_preserve_original_identity(make_hub):
                                  "clientInfo": {"name": "fixture", "version": "1"}})
     assert response.status_code == 200, response.text
     tools = rpc("tools/list", {}).json()["result"]["tools"]
-    assert len(tools) == 36
-    assert {
+    infrastructure_tools = {
         "hub_infrastructure_list", "hub_infrastructure_get",
         "hub_infrastructure_maintenance_open", "hub_infrastructure_maintenance_resolve",
         "hub_infrastructure_probe_record", "hub_infrastructure_metrics",
-    } <= {tool["name"] for tool in tools}
+    }
+    assert len(tools) == len(HUB_TOOLS | infrastructure_tools) == 78
+    assert {tool["name"] for tool in tools} == HUB_TOOLS | infrastructure_tools
     assert {"hub_component_create", "hub_component_update", "hub_component_retire"} <= {
         tool["name"] for tool in tools
     }

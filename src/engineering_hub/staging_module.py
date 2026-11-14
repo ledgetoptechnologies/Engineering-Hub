@@ -5,7 +5,6 @@ credential or Cloudflare policy is created here. Configuration only references
 operator-provisioned private files and explicitly reviewed recipe names.
 """
 from dataclasses import dataclass
-import hashlib
 import inspect
 import re
 from pathlib import Path
@@ -16,6 +15,7 @@ from .staging_client import load_optional_config, StagingClient, StagingConnecti
 from .staging_resources import StagingResourceStore
 from .work_queue import WorkAction, WorkQueue, WorkWorker, ClosedClaimPolicy, STAGING_SERVICE_EXECUTOR, _key
 from .repository import HubError, HubRepository
+from .staging_action_key import staging_action_key
 
 
 @dataclass
@@ -59,7 +59,7 @@ def configured_staging_actions(config, *, machine_id):
                 or len(set(policy['recipes'])) != len(policy['recipes'])):
             raise ValueError('staging_profiles_invalid')
         for recipe in policy['recipes']:
-            key = 'modular.' + hashlib.sha256((project + '\0' + recipe).encode()).hexdigest()
+            key = staging_action_key(project, recipe)
             if key in registry:
                 raise ValueError('staging_action_conflict')
             actions[project, recipe] = key

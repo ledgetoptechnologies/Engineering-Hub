@@ -561,3 +561,32 @@ def test_preview_binding_requires_immutable_output_provenance(env):
     store.update_job(control, job['id'], job['revision'], terminal=True)
     with pytest.raises(HubError, match='staging_preview_unavailable'):
         store.preview_binding(OWNER, item['id'])
+
+
+def test_terminal_lookup_index_preserves_existing_audit_and_is_idempotent(tmp_path):
+    repo = HubRepository(tmp_path / 'populated.sqlite3')
+    entries = [(f'human:{i + 1}', 'work.failed', str(uuid.uuid4()), 2, '2026-01-01T00:00:00+00:00')
+               for i in range(1000)]
+    with repo._transaction() as db:
+        db.executemany('INSERT INTO hub_audit(actor,action,entity_id,revision,created_at) VALUES(?,?,?,?,?)', entries)
+        before = [tuple(row) for row in db.execute('SELECT * FROM hub_audit ORDER BY sequence')]
+    StagingResourceStore(repo)
+    StagingResourceStore(repo)
+    with repo._connection() as db:
+        after = [tuple(row) for row in db.execute('SELECT * FROM hub_audit ORDER BY sequence')]
+        indexes = db.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='hub_audit_terminal_lookup'").fetchall()
+    assert before == after and len(indexes) == 1
+
+
+def test_terminal_lookup_index_creation_failure_rolls_back_staging_schema(tmp_path):
+    repo = HubRepository(tmp_path / 'collision.sqlite3')
+    with repo._transaction() as db:
+        db.execute('CREATE TABLE hub_audit_terminal_lookup (value TEXT)')
+        db.execute("INSERT INTO hub_audit(actor,action,entity_id,revision,created_at) VALUES('human:1','test','retained',1,'2026-01-01')")
+        before = [tuple(row) for row in db.execute('SELECT * FROM hub_audit ORDER BY sequence')]
+    with pytest.raises(sqlite3.OperationalError):
+        StagingResourceStore(repo)
+    with repo._connection() as db:
+        assert [tuple(row) for row in db.execute('SELECT * FROM hub_audit ORDER BY sequence')] == before
+        assert db.execute("SELECT type FROM sqlite_master WHERE name='hub_audit_terminal_lookup'").fetchone()['type'] == 'table'
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_staging_policy'").fetchone() is None

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import asyncio
 import json
 import re
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -20,7 +22,7 @@ from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
 
 from agent_message_bus.auth import AuthSettings
-from .auth import AuthConfig, SessionStore, build_auth_router, require_human
+from .auth import AuthConfig, SessionStore, build_auth_router, human_transaction_guard, require_human
 from .build_info import read_build_commit
 from .image_version_reports import image_versions_for
 from .image_version_reports import ImageVersionsSummary
@@ -41,7 +43,7 @@ from .registry_client import (
 from .dto import (
     AgentListDTO, AutonomyDTO, DecisionDTO, DecisionListDTO, EventStatusDTO,
     HealthDTO, OverviewDTO, PauseDTO, ProjectListDTO, RunDTO, RunListDTO, RecoveryDTO,
-    TaskDTO, TaskListDTO,
+    PilotReleaseEvidenceDTO, TaskDTO, TaskListDTO, OrchestrationRequestView, OrchestrationTrackingTaskIds,
 )
 
 @dataclass(frozen=True)
@@ -61,8 +63,13 @@ class Settings:
     staging_config_path: Path | None = None
     infrastructure_config_path: Path | None = None
     infrastructure_default_path: Path | None = None
+    seat_foundation_enabled: bool = False
+    cross_requests_enabled: bool = False
 
     def __post_init__(self):
+        if (type(self.seat_foundation_enabled) is not bool or type(self.cross_requests_enabled) is not bool
+                or (self.cross_requests_enabled and not self.seat_foundation_enabled)):
+            raise ValueError('Explicit seat foundation flag required')
         if type(self.require_owned_ledger) is not bool:
             raise ValueError('Explicit owned-ledger flag required')
         if self.infrastructure_default_path is not None and not isinstance(self.infrastructure_default_path, Path):
@@ -86,7 +93,7 @@ class Settings:
         if self.ingress_mode not in {"combined", "agents", "browser"}:
             raise ValueError("Unknown Hub ingress mode")
         if self.ingress_mode == "browser" and (
-                self.auth_config.human_auth_mode != "cloudflare_access"
+                self.auth_config.human_auth_mode not in {"cloudflare_access", "github_cloudflare"}
                 or self.auth_config.cloudflare_config is None):
             raise ValueError("Browser ingress requires configured Cloudflare Access")
         # Operator templates must never become usable public bearer credentials.
@@ -114,6 +121,8 @@ class Settings:
         agent_auth = AuthSettings.from_env()
         if deployment is not None:
             agent_auth = replace(agent_auth, allowed_ips=frozenset(deployment.allowed_ips))
+        if deployment is None and os.environ.get("HUB_HUMAN_AUTH_MODE", "github") == "github_cloudflare":
+            raise ValueError("github_cloudflare requires an explicit version 3 deployment configuration")
         auth_config = deployment.auth_config if deployment is not None else AuthConfig(
             base_url=os.environ.get("HUB_BASE_URL", "https://hub.invalid"),
             github_client_id=os.environ.get("HUB_GITHUB_CLIENT_ID", ""),
@@ -161,6 +170,76 @@ class NewTask(Input):
 
 class Revision(Input):
     expected_revision: int = Field(ge=1)
+
+
+class TrackingReview(Revision):
+    client_request_id: str = Field(min_length=1, max_length=128)
+    verdict: Literal['verify', 'reopen']
+    note: str = Field(min_length=1, max_length=4096)
+    evidence_links: list[dict[str, str]] = Field(max_length=8)
+
+
+class RoleWrite(Input):
+    expected_revision: int = Field(ge=0)
+    projects: list[str] = Field(min_length=1, max_length=32)
+    installations: list[str] = Field(min_length=1, max_length=32)
+    paths: list[str] = Field(max_length=64)
+    standing_rules: str = Field(min_length=1, max_length=4096)
+    tool_scope: list[str] = Field(max_length=64)
+
+
+class RoleRecovery(Revision):
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class CrossSeatTopicWrite(Input):
+    topic: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=200)
+
+
+class CrossSeatWrite(Input):
+    topic: str = Field(min_length=1, max_length=64)
+    role: str = Field(min_length=1, max_length=64)
+
+
+class CrossSeatBinding(Revision):
+    session_id: str = Field(min_length=36, max_length=36)
+
+
+class CrossRouteWrite(Input):
+    source_project: str = Field(min_length=1, max_length=64)
+    target_project: str = Field(min_length=1, max_length=64)
+    target_topic: str = Field(min_length=1, max_length=64)
+    participants: list[str] = Field(min_length=1, max_length=16)
+    triager: str = Field(min_length=36, max_length=36)
+    active: bool
+    share_with_source_project: bool
+    expected_revision: int = Field(ge=0)
+
+
+class CrossOwnerTransition(Revision):
+    status: Literal['accepted', 'declined', 'done', 'expired']
+    client_request_id: str = Field(min_length=1, max_length=128)
+
+
+class StaleServiceWrite(Input):
+    expected_revision: int = Field(ge=0)
+    projects: list[str] = Field(min_length=1, max_length=32)
+    lifetime_seconds: int = Field(ge=60, le=86400)
+
+
+class StaleEvaluatorWrite(Input):
+    expected_revision: int = Field(ge=0)
+    grant_revision: int = Field(ge=1)
+    enabled: bool
+
+
+class AttentionRouteWrite(Input):
+    expected_revision: int = Field(ge=0)
+    installation_id: str = Field(min_length=36, max_length=36)
+    session_id: str = Field(min_length=36, max_length=36)
+    generation: int = Field(ge=1)
+    lifetime_seconds: int = Field(ge=10, le=3600)
 
 
 class Candidate(Revision):
@@ -235,7 +314,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         from .cloudflare_access import CloudflareAccessVerifier
         if (type(access_verifier) is not CloudflareAccessVerifier
                 or settings.auth_config is None
-                or settings.auth_config.human_auth_mode != 'cloudflare_access'
+                or settings.auth_config.human_auth_mode not in {'cloudflare_access', 'github_cloudflare'}
                 or access_verifier.config != settings.auth_config.cloudflare_config
                 or settings.ingress_mode != 'combined'):
             raise ValueError('explicit_access_verifier_binding_required')
@@ -297,7 +376,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                     or connection_config.origin != settings.auth_config.origin
                     or (connection_config.environment == 'production'
                         and (not settings.auth_config.secure
-                             or settings.auth_config.human_auth_mode != 'cloudflare_access'
+                             or settings.auth_config.human_auth_mode not in {'cloudflare_access', 'github_cloudflare'}
                              or not connection_config.owner.startswith('human:cf:')
                              or not settings.agent_auth.allowed_ips
                              or hub_state_root not in session_database.parents))
@@ -521,7 +600,26 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     session_bridge = None
     if connection_config is not None and connection_config.hub_bridge:
         from .session_hub_bridge import SessionHubBridge
-        session_bridge = SessionHubBridge(connection_service, repo, project_registry, component_registry, notes_repository)
+        session_bridge = SessionHubBridge(connection_service, repo, project_registry, component_registry, notes_repository,
+                                          seat_foundation_enabled=settings.seat_foundation_enabled,
+                                          cross_requests_enabled=settings.cross_requests_enabled)
+    if settings.seat_foundation_enabled and session_bridge is None:
+        raise ValueError('seat_foundation_requires_session_bridge')
+    stale_evaluator = None
+    if session_bridge is not None:
+        from .pilot_ownership import PilotOwner
+        if type(repo.pilot_owner) is PilotOwner:
+            from .stale_service_authority import StaleServiceGrant
+            from .stale_evaluator import StaleEvaluator
+            stale_evaluator = StaleEvaluator(StaleServiceGrant(repo), session_bridge)
+    attention_delivery = attention_broker = None
+    if session_bridge is not None:
+        from .pilot_ownership import PilotOwner
+        if type(repo.pilot_owner) is PilotOwner:
+            from .attention_delivery import AttentionDelivery
+            from .attention_hints import AttentionHintBroker
+            attention_delivery = AttentionDelivery(repo, session_bridge)
+            attention_broker = AttentionHintBroker()
     try:
         hub_mcp = build_hub_mcp(repo, settings.agent_auth, topic_peers=peers_for,
                           topic_preflight=preflight_for, autonomy_status=autonomy_for,
@@ -532,7 +630,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                           entity_images=entity_images,
                           project_registry=project_registry,
                           component_registry=component_registry,
-                          session_bridge=session_bridge,
+                          session_bridge=session_bridge, attention_delivery=attention_delivery,
                           interactive_reviews=interactive_reviews,
                           infrastructure_service=infrastructure.service,
                           infrastructure_collector=infrastructure.collector,
@@ -576,12 +674,36 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             cleanup_started = True
             from .lifecycle import finish_owned
             async def stop_all():
-                try:
-                    if shared_staging is not None:
+                if attention_broker is not None:
+                    attention_broker.close()
+                    await asyncio.to_thread(attention_broker.wait_closed)
+                    if getattr(repo, '_attention_hint_broker', None) is attention_broker:
+                        del repo._attention_hint_broker
+                if stale_evaluator is not None:
+                    await asyncio.to_thread(stale_evaluator.stop)
+                shared_error = None
+                if shared_staging is not None:
+                    drained = False
+                    try:
                         await shared_staging.close()
-                    elif staging_module.controller is not None:
+                    except BaseException as error:
+                        shared_error = error
+                    try:
+                        drained = shared_staging.is_drained is True
+                    except BaseException:
+                        pass
+                    if not drained:
+                        from .unproved_drain import retain_unproved_drain
+                        # Stay inside the bus lifespan with admission closed.
+                        # Neither a failed drain nor caller cancellation permits
+                        # the feed, transports or owner to disappear underneath it.
+                        await retain_unproved_drain(app, shared_staging, bus_app, feed,
+                            queued_pilot_runtime, staging_module, staging_observer,
+                            interactive_service, runtime, session_bridge, infrastructure)
+                try:
+                    if shared_staging is None and staging_module.controller is not None:
                         await staging_module.controller.close()
-                    elif staging_module.client is not None:
+                    elif shared_staging is None and staging_module.client is not None:
                         await staging_module.client.aclose()
                 finally:
                     try:
@@ -598,6 +720,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                                     session_bridge.close()
                                 clear_metrics_transport()
                                 infrastructure.close()
+                if shared_error is not None:
+                    raise shared_error
             await finish_owned(stop_all())
 
         async def stop_existing_components():
@@ -619,6 +743,12 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                     await drain()
 
         try:
+            if attention_broker is not None:
+                if getattr(repo, '_attention_hint_broker', None) is not None:
+                    raise ValueError('attention_broker_already_owned')
+                repo._attention_hint_broker = attention_broker
+            if stale_evaluator is not None:
+                stale_evaluator.start()
             await feed.start()
             if owned_pilot_service is not None:
                 await owned_pilot_service.start(feed)
@@ -658,6 +788,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     app.state.repository, app.state.sessions, app.state.settings = repo, sessions, settings
     app.state.mcp = hub_mcp
     app.state.session_hub_bridge = session_bridge
+    app.state.attention_delivery = attention_delivery
+    app.state.stale_evaluator = stale_evaluator
     app.state.modular_staging = staging_module
     app.state.interactive_service = interactive_service
     app.state.interactive_reviews = interactive_reviews
@@ -684,6 +816,96 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         from .cloudflare_access import install_cloudflare_access
         install_cloudflare_access(app, settings.auth_config.cloudflare_config, verifier=access_verifier)
     app.include_router(build_auth_router(settings.auth_config, sessions, github_client))
+    @app.get('/api/agent-sessions/v1/hub-attention-stream', include_in_schema=False)
+    async def addressed_attention_stream(request: Request, project: str, generation: int, role: str = 'orchestrator'):
+        if attention_delivery is None or attention_broker is None or connection_config is None:
+            raise HubError('attention_delivery_unavailable', 503)
+        from agent_message_bus.agent_sessions_transport import bearer, session_origin_allowed, source_allowed
+        if not session_origin_allowed(request, connection_config) or not source_allowed(request, settings.agent_auth):
+            raise HTTPException(403)
+        secret = bearer(request)
+        if not secret.startswith('ehs_'):
+            raise HTTPException(401)
+        from .lifecycle import finish_owned
+
+        audience = project if role == 'orchestrator' else ('worker', project, role)
+        def validate(expected_session=None):
+            tool = 'hub_addressed_attention_list' if role == 'orchestrator' else 'hub_worker_dispatch_pending'
+            with session_bridge.admit(secret, tool) as operation:
+                if expected_session is not None and operation.principal.session_id != expected_session:
+                    raise HubError('attention_route_unavailable', 404)
+                service = attention_delivery
+                visible = (service.pending(operation.principal.actor, project, generation, limit=1, actionable_only=True)
+                           if role == 'orchestrator' else service.worker_pending(operation.principal.actor, project, role, generation, limit=1))
+                from .dispatch import DispatchRepository
+                with DispatchRepository(repo)._attention_snapshot() as db:
+                    route = service._route_for(db, operation, project, generation, role)
+                    service._validate_target(operation.db, db, route)
+                    return (operation.principal.session_id, route['expires_at'], route['expires_boottime'],
+                            route['revision'], bool(visible['items']))
+
+        admission_key, _ = attention_broker.register(audience, 'admission:' + uuid.uuid4().hex)
+        try:
+            session_id, deadline, boot_deadline, route_revision, _ = await finish_owned(asyncio.to_thread(validate))
+        finally:
+            attention_broker.unregister(admission_key)
+
+        async def stream():
+            loop = asyncio.get_running_loop()
+            invalid = False
+            acquired = []
+            queue_ref = []
+            key = None
+            def revoked():
+                nonlocal invalid
+                invalid = True
+                if queue_ref:
+                    try:
+                        loop.call_soon_threadsafe(attention_broker._offer, queue_ref[0])
+                    except RuntimeError:
+                        pass
+            def subscribe():
+                result = session_bridge.sessions.subscribe_session(secret, revoked, purpose='attention')
+                acquired.append(result)
+                return result
+            try:
+                key, queue = attention_broker.register(audience, session_id)
+                queue_ref.append(queue)
+                principal, unsubscribe = await finish_owned(asyncio.to_thread(subscribe))
+                if principal.session_id != session_id:
+                    return
+                # Registration precedes the catch-up read; no listener exists
+                # until the response generator actually starts.
+                ready = False
+                while not invalid and not attention_broker.closed:
+                    _, deadline, boot_deadline, current_revision, has_visible = await finish_owned(
+                        asyncio.to_thread(validate, session_id))
+                    if current_revision != route_revision:
+                        break
+                    if not ready:
+                        yield b'event: attention-ready\ndata: {}\n\n'
+                        ready = True
+                    if has_visible:
+                        yield b'event: attention-check\ndata: {}\n\n'
+                    remaining = min(deadline - session_bridge.sessions._now(), boot_deadline - attention_delivery.boottime())
+                    if remaining <= 0:
+                        break
+                    try:
+                        await asyncio.wait_for(queue.get(), timeout=remaining)
+                        attention_broker.consumed(key)
+                    except asyncio.TimeoutError:
+                        break
+            except (HubError, AgentSessionError):
+                return
+            finally:
+                try:
+                    if acquired:
+                        await finish_owned(asyncio.to_thread(acquired[0][1]))
+                finally:
+                    if key is not None:
+                        attention_broker.unregister(key)
+        return StreamingResponse(stream(), media_type='text/event-stream', headers={'Cache-Control': 'no-store'})
+
     if bus_app is None:
         app.mount("/mcp", HubMCPAuthMiddleware(mcp_app, settings.agent_auth))
     else:
@@ -797,11 +1019,16 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     attach_component_routes(app, repository=component_registry, actor=actor, human=human)
     from .interactive_reviews_api import attach_interactive_review_routes
     from .interactive_service import attach_interactive_assets
-    attach_interactive_review_routes(app, interactive_reviews, actor, human)
+    attach_interactive_review_routes(app, interactive_reviews, actor, human,
+        human_admission=lambda request, principal: human_transaction_guard(
+            request, settings.auth_config, sessions, principal))
     attach_interactive_assets(app, interactive_service, interactive_reviews, human)
     app.state.project_registry = project_registry
     from .topic_catalog_api import attach_topic_catalog_route
     attach_topic_catalog_route(app, bridge=registry_bridge, human=human)
+    from .agent_activity_api import attach_agent_activity_route
+    attach_agent_activity_route(app, bus_service=getattr(getattr(bus_app, 'state', None), 'service', None),
+                                sessions=connection_service, human=human)
 
     if archive_reader is not None:
         from .archive_api import attach_archive_routes
@@ -836,7 +1063,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     from .staging_api import attach_staging_routes
     attach_staging_routes(app, staging_module.controller, actor, human,
         preview_broker=staging_module.preview_broker, preview_session=preview_session,
-        module_status=staging_module.status, diagnostic_session=diagnostic_session, observer=staging_observer)
+        module_status=staging_module.status, diagnostic_session=diagnostic_session, observer=staging_observer,
+        human_admission=lambda request, principal: human_transaction_guard(
+            request, settings.auth_config, sessions, principal))
     from .shared_staging_api import attach_shared_staging_routes
     attach_shared_staging_routes(app, shared_staging, human)
 
@@ -1021,6 +1250,262 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         actor(request)
         return image_versions_for(notes_repository)
 
+    def role_owner(request, *, mutation=False):
+        actor_id = human(request, mutation=mutation)
+        if session_bridge is None:
+            raise HubError('role_service_unavailable', 503)
+        if actor_id != session_bridge.sessions.owner:
+            raise HubError('role_owner_required', 403)
+        return actor_id
+
+    if settings.seat_foundation_enabled:
+        seats = session_bridge.seat_authority
+
+        @app.get('/api/hub/v1/projects/{project}/cross-seat-topics')
+        def owner_cross_seat_topics(project: str, request: Request, limit: int = 50, after: str | None = None):
+            return seats.owner_list(role_owner(request), project, 'cross_seat_topic', limit, after)
+
+        @app.post('/api/hub/v1/projects/{project}/cross-seat-topics')
+        def owner_create_cross_seat_topic(project: str, payload: CrossSeatTopicWrite, request: Request):
+            return seats.create_topic(role_owner(request, mutation=True), project, payload.topic, payload.name)
+
+        @app.get('/api/hub/v1/projects/{project}/cross-seats')
+        def owner_cross_seats(project: str, request: Request, limit: int = 50, after: str | None = None):
+            return seats.owner_list(role_owner(request), project, 'cross_seat', limit, after)
+
+        @app.post('/api/hub/v1/projects/{project}/cross-seats')
+        def owner_create_cross_seat(project: str, payload: CrossSeatWrite, request: Request):
+            return seats.create_seat(role_owner(request, mutation=True), project, payload.topic, payload.role)
+
+        @app.put('/api/hub/v1/cross-seats/{seat_id}/binding')
+        def owner_bind_cross_seat(seat_id: str, payload: CrossSeatBinding, request: Request):
+            return seats.bind(role_owner(request, mutation=True), seat_id, payload.expected_revision, payload.session_id)
+
+        @app.post('/api/hub/v1/cross-seats/{seat_id}/unbind')
+        def owner_unbind_cross_seat(seat_id: str, payload: Revision, request: Request):
+            return seats.unbind(role_owner(request, mutation=True), seat_id, payload.expected_revision)
+
+    if settings.cross_requests_enabled:
+        cross = session_bridge.cross_requests
+
+        @app.put('/api/hub/v1/cross-request-route')
+        def owner_cross_request_route(payload: CrossRouteWrite, request: Request):
+            return cross.set_route(role_owner(request, mutation=True), **payload.model_dump())
+
+        @app.get('/api/hub/v1/projects/{project}/cross-request-routes')
+        def owner_cross_request_routes(project: str, request: Request, limit: int = 50, after: str | None = None):
+            return cross.owner_routes(role_owner(request), project, limit, after)
+
+        @app.post('/api/hub/v1/cross-requests/{request_id}/transition')
+        def owner_transition_cross_request(request_id: str, payload: CrossOwnerTransition, request: Request):
+            return cross.owner_transition(role_owner(request, mutation=True), request_id, **payload.model_dump())
+
+        @app.get('/api/hub/v1/projects/{project}/cross-requests')
+        def owner_cross_requests(project: str, request: Request, direction: str, limit: int = 50, after: str | None = None):
+            return cross.owner_records(role_owner(request), project, direction, limit, after)
+
+        @app.get('/api/hub/v1/cross-requests/{request_id}')
+        def owner_cross_request(request_id: str, request: Request):
+            return cross.owner_get(role_owner(request), request_id)
+
+        @app.get('/api/hub/v1/cross-requests/{request_id}/messages')
+        def owner_cross_messages(request_id: str, request: Request, limit: int = 50, after: int | None = None):
+            return cross.owner_messages(role_owner(request), request_id, limit, after)
+
+    @app.get('/api/hub/v1/orchestration/stale-service-grant')
+    def get_stale_service_grant(request: Request):
+        from .stale_service_authority import StaleServiceGrant
+        return StaleServiceGrant(repo).owner_get(role_owner(request))
+
+    @app.put('/api/hub/v1/orchestration/stale-service-grant')
+    def configure_stale_service_grant(payload: StaleServiceWrite, request: Request):
+        from .stale_service_authority import StaleServiceGrant
+        return StaleServiceGrant(repo).owner_configure(role_owner(request, mutation=True), **payload.model_dump())
+
+    @app.post('/api/hub/v1/orchestration/stale-service-grant/revoke')
+    def revoke_stale_service_grant(payload: Revision, request: Request):
+        from .stale_service_authority import StaleServiceGrant
+        return StaleServiceGrant(repo).owner_revoke(role_owner(request, mutation=True), payload.expected_revision)
+
+    @app.get('/api/hub/v1/orchestration/stale-evaluator')
+    def get_stale_evaluator(request: Request):
+        actor_id = role_owner(request)
+        if stale_evaluator is None:
+            raise HubError('stale_evaluator_unavailable', 503)
+        return stale_evaluator.status(actor_id)
+
+    @app.put('/api/hub/v1/orchestration/stale-evaluator')
+    def configure_stale_evaluator(payload: StaleEvaluatorWrite, request: Request):
+        actor_id = role_owner(request, mutation=True)
+        if stale_evaluator is None:
+            raise HubError('stale_evaluator_unavailable', 503)
+        result = stale_evaluator.configure(actor_id, **payload.model_dump())
+        stale_evaluator.stop()
+        if payload.enabled:
+            stale_evaluator.start()
+        return result
+
+    @app.get('/api/hub/v1/projects/{project}/attention-route')
+    def get_attention_route(project: str, request: Request):
+        owner = role_owner(request)
+        if attention_delivery is None:
+            raise HubError('attention_delivery_unavailable', 503)
+        return attention_delivery.owner_get(owner, project)
+
+    @app.get('/api/hub/v1/projects/{project}/attention-receipts')
+    def list_attention_receipts(project: str, request: Request, limit: int = 50, after: str | None = None):
+        owner = role_owner(request)
+        if attention_delivery is None:
+            raise HubError('attention_delivery_unavailable', 503)
+        return attention_delivery.owner_receipts(owner, project, limit, after)
+
+    @app.put('/api/hub/v1/projects/{project}/attention-route')
+    def configure_attention_route(project: str, payload: AttentionRouteWrite, request: Request):
+        owner = role_owner(request, mutation=True)
+        if attention_delivery is None:
+            raise HubError('attention_delivery_unavailable', 503)
+        result = attention_delivery.owner_configure(owner, project, **payload.model_dump())
+        attention_broker.signal(project)
+        return result
+
+    @app.post('/api/hub/v1/projects/{project}/attention-route/revoke')
+    def revoke_attention_route(project: str, payload: Revision, request: Request):
+        owner = role_owner(request, mutation=True)
+        if attention_delivery is None:
+            raise HubError('attention_delivery_unavailable', 503)
+        result = attention_delivery.owner_revoke(owner, project, payload.expected_revision)
+        attention_broker.signal(project)
+        return result
+
+    @app.get('/api/hub/v1/projects/{project}/worker-attention-routes/{role}')
+    def get_worker_attention_route(project: str, role: str, request: Request):
+        owner = role_owner(request)
+        if attention_delivery is None or role == 'orchestrator':
+            raise HubError('attention_delivery_unavailable', 503)
+        return attention_delivery.owner_get(owner, project, role)
+
+    @app.get('/api/hub/v1/projects/{project}/worker-attention-receipts/{role}')
+    def get_worker_attention_receipts(project: str, role: str, request: Request, limit: int = 50, after: str | None = None):
+        owner = role_owner(request)
+        if attention_delivery is None:
+            raise HubError('attention_delivery_unavailable', 503)
+        return attention_delivery.owner_worker_receipts(owner, project, role, limit, after)
+
+    @app.put('/api/hub/v1/projects/{project}/worker-attention-routes/{role}')
+    def configure_worker_attention_route(project: str, role: str, payload: AttentionRouteWrite, request: Request):
+        owner = role_owner(request, mutation=True)
+        if attention_delivery is None or role == 'orchestrator':
+            raise HubError('attention_delivery_unavailable', 503)
+        result = attention_delivery.owner_configure(owner, project, role=role, **payload.model_dump())
+        attention_broker.signal(('worker', project, role))
+        return result
+
+    @app.post('/api/hub/v1/projects/{project}/worker-attention-routes/{role}/revoke')
+    def revoke_worker_attention_route(project: str, role: str, payload: Revision, request: Request):
+        owner = role_owner(request, mutation=True)
+        if attention_delivery is None or role == 'orchestrator':
+            raise HubError('attention_delivery_unavailable', 503)
+        result = attention_delivery.owner_revoke(owner, project, payload.expected_revision, role)
+        attention_broker.signal(('worker', project, role))
+        return result
+
+    @app.get('/api/hub/v1/roles')
+    def list_roles(request: Request, limit: int = 50, after: str | None = None):
+        from .roles import RoleRepository
+        return RoleRepository(repo).owner_list(role_owner(request), limit, after)
+
+    @app.get('/api/hub/v1/task-progress/{task_id}')
+    def get_task_progress(task_id: str, request: Request):
+        from .task_progress import TaskProgress
+        return TaskProgress(repo).owner_get(role_owner(request), task_id)
+
+    @app.get('/api/hub/v1/orchestration/requests/{request_id}')
+    def get_orchestration_request(request_id: str, request: Request):
+        from .dispatch import DispatchRepository
+        return DispatchRepository(repo).owner_get_request(role_owner(request), request_id)
+
+    @app.get('/api/hub/v1/orchestration/requests/{request_id}/dispatches')
+    def get_orchestration_dispatches(request_id: str, request: Request, limit: int = 50, after: str | None = None):
+        from .dispatch import DispatchRepository
+        return DispatchRepository(repo).owner_list_dispatches(role_owner(request), request_id, limit, after)
+
+    @app.get('/api/hub/v1/projects/{project}/orchestration-requests')
+    def list_orchestration_requests(project: str, request: Request, limit: int = 50, after: str | None = None):
+        from .dispatch import DispatchRepository
+        return DispatchRepository(repo).owner_list_requests(role_owner(request), project, limit, after)
+
+    @app.get('/api/hub/v1/projects/{project}/orchestration-requests/{request_id}/view', response_model=OrchestrationRequestView)
+    def orchestration_request_view(project: str, request_id: str, request: Request, limit: int = 25, after: str | None = None):
+        """Read one bounded snapshot; stale is the last checkpoint, not live liveness."""
+        from .orchestration_view import request_view
+        return request_view(repo, role_owner(request), project, request_id, limit, after)
+
+    @app.get('/api/hub/v1/projects/{project}/orchestration-requests/{request_id}/tracking-tasks', response_model=OrchestrationTrackingTaskIds)
+    def orchestration_request_tracking_tasks(project: str, request_id: str, request: Request, limit: int = 50, after: str | None = None):
+        """Owner-only linked task IDs, including tasks not yet dispatched."""
+        return repo.owner_tracking_request_tasks(role_owner(request), project, request_id, limit, after)
+
+    @app.get('/api/hub/v1/projects/{project}/orchestration-attention')
+    def list_orchestration_attention(project: str, request: Request, limit: int = 50, after: str | None = None):
+        from .dispatch import DispatchRepository
+        return DispatchRepository(repo).owner_attention(role_owner(request), project, limit, after)
+
+    @app.get('/api/hub/v1/orchestration/dispatches/{dispatch_id}/reports')
+    def get_orchestration_reports(dispatch_id: str, request: Request, limit: int = 50, after_revision: int = 0):
+        from .dispatch import DispatchRepository
+        return DispatchRepository(repo).owner_records(role_owner(request), dispatch_id, 'dispatch_report', limit, after_revision)
+
+    @app.get('/api/hub/v1/orchestration/dispatches/{dispatch_id}/decisions')
+    def get_orchestration_decisions(dispatch_id: str, request: Request, limit: int = 50, after_revision: int = 0):
+        from .dispatch import DispatchRepository
+        return DispatchRepository(repo).owner_records(role_owner(request), dispatch_id, 'decision', limit, after_revision)
+
+    @app.get('/api/hub/v1/roles/{role}')
+    def get_role(role: str, request: Request):
+        from .roles import RoleRepository
+        return RoleRepository(repo).owner_get(role_owner(request), role)
+
+    @app.put('/api/hub/v1/roles/{role}')
+    def configure_role(role: str, payload: RoleWrite, request: Request):
+        actor_id = role_owner(request, mutation=True)
+        from .roles import RoleRepository
+        return RoleRepository(repo).configure(actor_id, role, **payload.model_dump())
+
+    @app.post('/api/hub/v1/roles/{role}/clear-expired')
+    def clear_expired_role(role: str, payload: RoleRecovery, request: Request):
+        actor_id = role_owner(request, mutation=True)
+        from .roles import RoleRepository
+        return RoleRepository(repo).owner_clear_expired(actor_id, role, payload.expected_revision, payload.reason, session_bridge.sessions._now)
+
+    @app.get("/api/hub/v1/projects/{project}/tracking-tasks")
+    def project_tracking_tasks(project: str, request: Request, limit: int = 50, after_task_id: str | None = None,
+                               unfinished: bool = False):
+        """Human-only inert tracking, scoped to an active project."""
+        human(request)
+        if not 1 <= limit <= 200:
+            raise HubError('invalid_limit', 422)
+        if after_task_id is not None:
+            try:
+                if str(uuid.UUID(after_task_id)) != after_task_id:
+                    raise ValueError()
+            except (ValueError, TypeError, AttributeError):
+                raise HubError('invalid_cursor', 422) from None
+        rows = repo.tracking_tasks(project, limit, after_task_id, unfinished)
+        more = len(rows) > limit
+        return {'project': project, 'tasks': rows[:limit], 'truncated': more,
+                'next_after': rows[limit - 1]['id'] if more else None}
+
+    @app.get('/api/hub/v1/tracking-tasks/{task_id}/history')
+    def tracking_task_history(task_id: str, request: Request, kind: str, before: int | None = None):
+        human(request)
+        return repo.tracking_history(task_id, kind, before)
+
+    @app.post('/api/hub/v1/tracking-tasks/{task_id}/review')
+    def review_tracking_task(task_id: str, payload: TrackingReview, request: Request):
+        return repo.review_tracking_task(human(request, mutation=True), task_id, payload.expected_revision,
+                payload.client_request_id, verdict=payload.verdict, note=payload.note,
+                evidence_links=payload.evidence_links)
+
     @app.get("/api/hub/v1/agents", response_model=AgentListDTO, response_model_exclude_unset=True)
     async def list_agents(request: Request):
         actor(request)
@@ -1099,6 +1584,24 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     def list_runs(request: Request):
         actor(request)
         return {"items": repo.list_runs()}
+
+    @app.get("/api/hub/v1/container-pilot/runs/{run_id}/release-evidence",
+             response_model=PilotReleaseEvidenceDTO)
+    def container_pilot_release_evidence(run_id: str, request: Request):
+        principal = human(request)
+        from .pilot_release_evidence import release_evidence_owner_allowed
+        owner_actor = connection_config.owner if connection_config is not None else None
+        if not release_evidence_owner_allowed(principal, settings.auth_config, owner_actor):
+            raise HTTPException(403, detail={'code': 'release_evidence_owner_required'})
+        workflow = container_pilot_workflow
+        if workflow is None and owned_pilot_service is not None:
+            workflow = owned_pilot_service.workflow
+        if workflow is None and queued_pilot_runtime is not None:
+            workflow = queued_pilot_runtime.bridge.workflow
+        if workflow is None:
+            raise HTTPException(423, detail={'code': 'container_pilot_not_enabled'})
+        from .pilot_release_evidence import pilot_release_evidence
+        return pilot_release_evidence(repo, workflow, run_id)
 
     @app.post("/api/hub/v1/runs", status_code=201, response_model=RunDTO)
     def create_run(payload: NewRun, request: Request):

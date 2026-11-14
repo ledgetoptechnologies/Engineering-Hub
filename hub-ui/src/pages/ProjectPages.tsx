@@ -20,6 +20,7 @@ import type { Project } from "../types";
 import { readProject } from "../projectsApi";
 import { ComponentsPanel, GroupedProjectsPanel } from "../ComponentsPanel";
 import { ReviewsPanel } from "../ReviewsPanel";
+import { ProjectTrackingPanel } from "../ProjectTrackingPanel";
 
 const STATUSES: Task["status"][] = ["assigned", "claimed", "in_review", "verified"];
 const columnName: Record<Task["status"], string> = {
@@ -242,7 +243,6 @@ function ActivityFeed({ hub, project, fallback }: { hub: Hub; project: string; f
   if (!items.length) return <EmptyState title="No activity yet." />;
   return (
     <>
-      <p className="panel-description">Every recorded change, newest first. Titles are shown as they are now.</p>
       <ol className="timeline" aria-label="Activity history">
         {items.map((item) => (
           <li key={item.sequence}>
@@ -438,6 +438,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
               <TaskTable hub={projectHub} tasks={stats.tasks} empty="No tasks for this project yet." />
             </section>
           )}
+          {!project.archived && <ProjectTrackingPanel key={id} project={id} demo={hub.demo} csrf={hub.writable ? hub.session?.csrf_token : null} onUnauthorized={hub.clearPrivateWorkspace} />}
           <WithdrawnList hub={hub} kind="task" project={id} />
         </>
       )}

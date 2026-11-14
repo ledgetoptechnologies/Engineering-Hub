@@ -35,8 +35,9 @@ BUS = {'send_message','get_send_receipt','presence_status','receive_messages','w
  'claim_message','ack_message','reject_message','get_message','knowledge_put','knowledge_get',
  'knowledge_list','knowledge_search','semantic_search','semantic_status','file_put','file_get',
  'file_list','file_history','feedback_submit','feedback_get','feedback_list','feedback_update','bus_info'}
-HUB = {'hub_overview','hub_task_get','hub_task_claim','hub_task_candidate','hub_task_review',
- 'hub_decision_request','hub_run_list','hub_topic_peers','hub_topic_preflight','hub_staging_task_propose',
+HUB = {'hub_overview','hub_project_tasks','hub_tracking_task_propose', 'hub_tracking_task_origin', 'hub_orchestration_request_tasks', 'hub_orchestration_request_origin_task_summary','hub_tracking_task_update',
+ 'hub_tracking_task_list','hub_tracking_task_review', 'hub_role_list', 'hub_role_get', 'hub_role_acquire', 'hub_role_renew', 'hub_role_release', 'hub_role_claim', 'hub_role_claims', 'hub_role_claim_release', 'hub_task_progress_get', 'hub_task_progress_update', 'hub_orchestration_request_create', 'hub_orchestration_request_get', 'hub_orchestration_request_list', 'hub_dispatch_create', 'hub_dispatch_get', 'hub_dispatch_list', 'hub_role_dispatch_inbox', 'hub_dispatch_report', 'hub_dispatch_checkpoint', 'hub_dispatch_decisions', 'hub_dispatch_reports', 'hub_orchestrator_attention_list', 'hub_orchestrator_attention_reconcile_closed', 'hub_addressed_attention_list', 'hub_addressed_attention_ack', 'hub_worker_dispatch_pending', 'hub_worker_dispatch_ack', 'hub_worker_decision_inspect', 'hub_orchestrator_report_inspect', 'hub_tracking_task_history', 'hub_tracking_task_compact', 'hub_tracking_claim_withdraw', 'hub_tracking_draft_propose','hub_task_get','hub_task_claim','hub_task_candidate','hub_task_review',
+ 'hub_decision_request', 'hub_decision_get','hub_run_list','hub_topic_peers','hub_topic_preflight','hub_staging_task_propose',
  'hub_planning_list','hub_planning_get','hub_planning_put',
  'hub_label_set_create','hub_label_set_put_image','hub_label_set_results',
  'hub_label_set_list','hub_entity_put_image','hub_entity_images','hub_entity_withdraw',
@@ -237,7 +238,7 @@ def remove_owned_volume(name, owner):
 
 
 def smoke(image, commit):
-    if not re.fullmatch(r'ghcr\.io/ledgetoptechnologies/engineering-hub-control:(?:build-)[a-z0-9-]+|ghcr\.io/ledgetoptechnologies/engineering-hub-control@sha256:[a-f0-9]{64}', image):
+    if not re.fullmatch(r'sha256:[a-f0-9]{64}|ghcr\.io/ledgetoptechnologies/engineering-hub-control:(?:build-)[a-z0-9-]+|ghcr\.io/ledgetoptechnologies/engineering-hub-control@sha256:[a-f0-9]{64}', image):
         raise ValueError('Expected the explicit Hub release artifact')
     if not re.fullmatch(r'[a-f0-9]{40}', commit):
         raise ValueError('Expected exact source commit')

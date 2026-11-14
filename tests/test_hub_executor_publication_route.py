@@ -12,6 +12,18 @@ def workflow(name):
     return (ROOT / '.github/workflows' / name).read_text()
 
 
+def test_all_executor_and_core_python_inputs_use_same_immutable_base():
+    core = (ROOT / 'docker/Dockerfile.hub-control').read_text()
+    executor = (ROOT / 'docker/Dockerfile.hub-executor').read_text()
+    pattern = r'python:3\.12-slim@sha256:([0-9a-f]{64})'
+    core_pins = re.findall(r'^FROM ' + pattern + r'(?: AS builder)?$', core, re.M)
+    executor_pins = re.findall(r'^FROM ' + pattern + r' AS python-runtime$', executor, re.M)
+    assert len(core_pins) == 2 and len(executor_pins) == 1
+    assert core_pins[0] == core_pins[1] == executor_pins[0]
+    for name in ('hub-executor-compatibility.yml', 'hub-executor-publication.yml'):
+        assert re.findall(pattern, workflow(name)) == executor_pins
+
+
 def test_default_route_remains_readonly_and_manual_main_only():
     text = workflow('hub-executor-compatibility.yml')
     triggers, jobs = text.split('jobs:\n', 1)
@@ -52,3 +64,12 @@ def test_child_only_adds_required_typed_local_call_and_retains_guards():
     assert 'run: python -B scripts/hub_executor_compatibility_ci.py validate' in text
     assert 'run: python -B scripts/publish_hub_executor.py' in text
     assert 'ref: ${{ github.sha }}' in text and 'persist-credentials: false' in text
+
+
+def test_executor_workflows_use_one_explicit_isolated_engine():
+    for name in ('hub-executor-compatibility.yml', 'hub-executor-publication.yml'):
+        source = (ROOT / '.github' / 'workflows' / name).read_text()
+        assert 'rootless: true' in source
+        assert 'EH_EXECUTOR_DOCKER_HOST: ${{ steps.executor-engine.outputs.sock }}' in source
+        assert 'docker --host "${{ steps.executor-engine.outputs.sock }}" pull' in source
+        assert "github.ref == 'refs/heads/main'" in source

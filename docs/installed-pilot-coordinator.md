@@ -8,7 +8,7 @@ an installed pilot, host approval or a network connection to TrueNAS.
 ## Separate validation and serving
 
 The explicit module operations are `validate --config <absolute-path>` and
-`serve --config <absolute-path>`. Both require Linux PID1, real/effective
+`serve --config <absolute-path> --session-config <absolute-path>`. Both require Linux PID1, real/effective
 UID/GID10001, and a canonical regular single-link configuration file owned by
 that UID, mode0600 on a read-only mount. The file must remain stable while read
 and cannot sit beneath the writable database parent. No paths are provisioned
@@ -17,12 +17,34 @@ or repaired. A valid file or canonical JSON is not approval of its contents.
 `validate` reads only the configuration and validates its data/model shape.
 It does not open secrets, sockets, providers or the database, contact an
 identity provider, or establish host readiness. It does not validate an actual
-supervisor's drain behavior. `serve` separately resolves four distinct TEST
+supervisor's drain behavior. When `--session-config` is supplied, `validate`
+also checks the protected file's closed shape, static manifest/engine binding and
+report freshness using the same checks as composition. It opens no secrets or
+sockets and does not establish operator authority, current host state or readiness.
+`serve` requires
+an independently reviewed manual-session file on a read-only mount, read via
+the protected current-UID mode0600 file and mode0700 parent checks. Parsing it
+does not prove its operator assertions. The session begins pending and requires
+the named human's acceptance and a fresh signed executor observation; the report
+must reflect independently established inventory, writer exclusion and absence
+of unresolved effects. `serve` separately resolves four distinct TEST
 credentials and calls the owned queue service. A missing required core Unix
 client API is rejected before secrets or owner state are touched. That check
 is compatibility evidence, not authentication of the core artifact.
+For a static check of independently prepared files, an operator may run
+`python -I -m hub_container_executor.colocated_pair_preflight --runner <path> --coordinator <path> --session <path>`
+under the files' owner. It reads protected files from read-only mounts and
+compares manifest, protocol mode, executor bearer digest and independently
+enrolled release pins. `static_pair_consistent_not_approved` means only those
+data agree. It does not resolve bearer values, prove that differently mounted
+socket paths reach the same socket, check host ownership, validate live launch
+identity, grant operator acceptance or start any service.
+The executor wheel also requires a core with the protected reader's
+`require_readonly` keyword; the image compatibility check and `serve` reject an
+older core before reading session material. Use a separately reviewed matching
+core image, not merely the same package version.
 
-The closed `engineering-hub.installed-coordinator.v1` configuration contains:
+The closed `engineering-hub.installed-coordinator.v3` configuration contains:
 
 - `manifest`: the complete existing canonical pilot manifest.
 - `database_path`, `coordinator_socket_path`, `executor_socket_path`, and
@@ -34,6 +56,10 @@ The closed `engineering-hub.installed-coordinator.v1` configuration contains:
 - `machine_id`: exactly `staging-pc`; `action_key`: exactly
   `engineering-hub:container-pilot`; `allowed_actors`: a unique nonempty subset
   of `codex`, `hermes`, `claude`.
+- `allowed_task_ids`: a nonempty unique list of at most 64 canonical lowercase
+  UUID task IDs, selected and approved by the operator. `single_pilot_protocol`
+  is an explicit boolean. The task list is an additional veto; it neither
+  approves a task nor replaces review, manual acceptance or fencing.
 - `public_auth`: existing Cloudflare Access configuration fields `base_url`,
   `cloudflare_issuer`, `cloudflare_audience`, `cloudflare_allowed_emails`.
   This configures no Access application/policy and does not reuse or alter Ops.
@@ -46,13 +72,29 @@ The closed `engineering-hub.installed-coordinator.v1` configuration contains:
 
 ## Existing authority remains mandatory
 
-The concrete additional target policy only permits an allowed actor, this action,
-staging, and the exact manifest candidate commit/config digest. It is a veto,
+The concrete additional target policy only permits an allowed actor and task ID,
+this action, staging, and the exact manifest candidate commit/config digest. It is a veto,
 not a substitute for the existing repository task ownership, independent review,
 queue fencing, physical-machine reservation, manifest/build enrollment or current
 host approval. The existing event-driven runtime and cancellation/drain ownership
 remain in control. No automatic recovery, replay, lease-based reassignment or
 production authority is introduced.
+
+### Migrating an existing configuration
+
+Versions v1 and v2 remain parseable for structural inspection, but cannot be
+validated as activation-ready or served without an explicit task scope. Preserve
+the existing protected configuration. Prepare a separate canonical v3 document
+using its independently verified fields, an explicit `single_pilot_protocol`
+boolean matching the approved runner, and the operator's reviewed task IDs.
+Do not infer IDs from pending work. Have the operator review the complete
+candidate and approve the separate protected read-only file before replacing or
+mounting any active configuration. Validate the coordinator and colocated pair;
+these checks do not approve the host, fence old writers or start work. Existing
+held records must not be deleted or automatically replayed during migration.
+An omitted held task stays held with its reservation; resolve it only through
+the existing authorized process, including a separately approved scope change
+if that task must be included. Do not silently include it or replay it.
 
 `ContainerPilotClient.for_private_unix` creates a fresh client using the existing
 private path checks: current-UID mode0700 parent, trusted no-follow ancestors and

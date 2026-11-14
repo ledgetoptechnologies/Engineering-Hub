@@ -14,6 +14,8 @@ from hub_container_executor.asgi import create_app
     ('POST', '/v1/container-pilot/commands'),
     ('GET', '/v1/container-pilot/commands/00000000-0000-4000-8000-000000000000'),
     ('POST', '/v1/container-pilot/commands/00000000-0000-4000-8000-000000000000/reconcile'),
+    ('POST', '/v2/container-pilot/commands'),
+    ('GET', '/v2/container-pilot/capability'),
 ])
 @pytest.mark.parametrize('headers', [
     [(b'authorization', b'Bearer test-only'), (b'authorization', b'Bearer test-only')],

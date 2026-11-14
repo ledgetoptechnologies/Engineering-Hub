@@ -111,7 +111,13 @@ def attach_archive_routes(app, *, reader, actor):
             _error(503, 'archive_unavailable')
         return reader
 
-    @app.get('/api/hub/v1/archive/messages', response_model=ArchivePageDTO)
+    @app.get('/api/hub/v1/archive/messages', response_model=ArchivePageDTO,
+             openapi_extra={'parameters': [
+                 {'name': 'limit', 'in': 'query', 'required': False,
+                  'schema': {'type': 'integer', 'minimum': 1, 'maximum': 50, 'default': 50}},
+                 {'name': 'after_id', 'in': 'query', 'required': False,
+                  'schema': {'type': 'string', 'minLength': 36, 'maxLength': 36, 'pattern': _UUID}},
+             ]})
     async def messages(request: Request):
         identity = principal(request)
         await _closed_request(request, {'limit', 'after_id'})

@@ -56,7 +56,7 @@ def test_pure_action_derivation_preserves_full_historical_key_algorithm(tmp_path
     config, _ = load_optional_config(config_file(tmp_path))
     registry, mapping = configured_staging_actions(config, machine_id='staging-pc')
     for recipe in ('static', 'ci'):
-        expected = 'modular.' + hashlib.sha256(('engineering-hub\0' + recipe).encode()).hexdigest()
+        expected = 'staging-service.' + hashlib.sha256(json.dumps(['engineering-hub', recipe], separators=(',', ':')).encode()).hexdigest()[:24]
         assert mapping['engineering-hub', recipe] == expected
         assert registry[expected] == WorkAction('staging-pc', project='engineering-hub')
     assert len(registry) == 2

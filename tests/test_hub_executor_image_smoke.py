@@ -117,6 +117,7 @@ def test_start_failure_still_runs_owned_cleanup(monkeypatch):
 
 
 def test_cleanup_refuses_unknown_owner(monkeypatch):
+    monkeypatch.setattr(MODULE, 'docker_command', lambda a: (['docker', *a], {}))
     monkeypatch.setattr(MODULE.subprocess, 'run', lambda *a, **k:
         subprocess.CompletedProcess(a, 0, json.dumps([runtime('someone-else')]), ''))
     monkeypatch.setattr(MODULE, 'run', lambda *a, **k: pytest.fail('remove called'))
@@ -136,9 +137,71 @@ def test_probe_fixed_installed_paths_and_required_core_api():
 
 
 def test_subprocess_failure_does_not_reflect_output(monkeypatch):
+    monkeypatch.setattr(MODULE, 'docker_command', lambda a: (['docker', *a], {}))
     def fail(*args, **kwargs):
         raise subprocess.CalledProcessError(1, args, stderr='private-engine-output')
     monkeypatch.setattr(MODULE.subprocess, 'run', fail)
     with pytest.raises(RuntimeError) as error:
         MODULE.run('docker', 'fixture')
     assert 'private-engine-output' not in str(error.value)
+
+
+@pytest.mark.parametrize('host', ['', 'tcp://localhost:2375', 'unix:///run/docker.sock',
+    'unix:///run/a/../docker.sock', 'unix:///var/run/docker.sock'])
+def test_docker_command_rejects_ambient_and_shared_endpoints(monkeypatch, host):
+    monkeypatch.setenv('EH_EXECUTOR_DOCKER_HOST', host)
+    with pytest.raises(ValueError):
+        MODULE.docker_command(['image', 'inspect', IMAGE])
+
+
+def test_docker_command_binds_socket_and_preserves_registry_config(monkeypatch):
+    from types import SimpleNamespace
+    host = 'unix:///run/eh-fixture/engine.sock'
+    class SocketPath:
+        def __init__(self, path): self.path = path
+        def __str__(self): return self.path
+        def resolve(self, strict): return self
+        def stat(self): return SimpleNamespace(st_mode=0o140600, st_dev=1, st_ino=2)
+    monkeypatch.setattr(MODULE, 'Path', SocketPath)
+    original_stat = MODULE.os.stat
+    def stat_shared(path, *args, **kwargs):
+        if str(path) in ('/run/docker.sock', '/var/run/docker.sock'):
+            raise FileNotFoundError()
+        return original_stat(path, *args, **kwargs)
+    monkeypatch.setattr(MODULE.os, 'stat', stat_shared)
+    monkeypatch.setattr(MODULE, '_engine_pin', None)
+    monkeypatch.setattr(MODULE.subprocess, 'run', lambda *a, **k: subprocess.CompletedProcess(a, 0, 'daemon-id', ''))
+    monkeypatch.setattr(MODULE.shutil, 'which', lambda name, path: '/usr/bin/docker')
+    monkeypatch.setenv('EH_EXECUTOR_DOCKER_HOST', host)
+    monkeypatch.setenv('DOCKER_CONFIG', '/fixture/auth')
+    monkeypatch.setenv('DOCKER_CONTEXT', 'wrong')
+    monkeypatch.setenv('DOCKER_HOST', 'tcp://wrong')
+    command, env = MODULE.docker_command(['container', 'inspect', 'fixture'])
+    assert command == ['/usr/bin/docker', '--host', host, 'container', 'inspect', 'fixture']
+    assert env['DOCKER_CONFIG'] == '/fixture/auth'
+    assert 'DOCKER_CONTEXT' not in env and 'DOCKER_HOST' not in env
+
+
+@pytest.mark.parametrize('changed', ['inode', 'daemon', 'host'])
+def test_engine_replacement_fails_closed_before_next_effect(monkeypatch, changed):
+    from types import SimpleNamespace
+    values = {'inode': 2, 'daemon': 'daemon-a'}
+    environment = {'EH_EXECUTOR_DOCKER_HOST': 'unix:///run/fixture/engine.sock',
+                   'DOCKER_CONFIG': '/fixture/config'}
+    class SocketPath:
+        def __init__(self, path): self.path = path
+        def __str__(self): return self.path
+        def resolve(self, strict): return self
+        def stat(self): return SimpleNamespace(st_mode=0o140600, st_dev=1, st_ino=values['inode'])
+    def missing(path): raise FileNotFoundError()
+    monkeypatch.setattr(MODULE, 'Path', SocketPath)
+    monkeypatch.setattr(MODULE, 'os', SimpleNamespace(environ=environment, stat=missing))
+    monkeypatch.setattr(MODULE, '_engine_pin', None)
+    monkeypatch.setattr(MODULE.shutil, 'which', lambda name, path: '/usr/bin/docker')
+    monkeypatch.setattr(MODULE.subprocess, 'run', lambda *a, **k: subprocess.CompletedProcess(a, 0, values['daemon'], ''))
+    MODULE.docker_command(['image', 'inspect', 'fixture'])
+    if changed == 'inode': values['inode'] = 3
+    elif changed == 'daemon': values['daemon'] = 'daemon-b'
+    else: environment['EH_EXECUTOR_DOCKER_HOST'] = 'unix:///run/other/engine.sock'
+    with pytest.raises(ValueError, match='changed during transaction'):
+        MODULE.docker_command(['container', 'create'])

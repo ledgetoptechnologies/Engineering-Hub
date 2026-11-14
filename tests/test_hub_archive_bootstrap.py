@@ -45,6 +45,12 @@ def test_explicit_reader_uses_real_hub_auth_and_caller_retains_lifetime(tmp_path
     config = settings(tmp_path)
     app = create_app(config, archive_reader=reader)
     try:
+        params = {item['name']: item for item in app.openapi()['paths']['/api/hub/v1/archive/messages']['get']['parameters']}
+        assert set(params) == {'limit', 'after_id'}
+        assert all(item['in'] == 'query' and not item['required'] for item in params.values())
+        assert params['limit']['schema'] == {'type': 'integer', 'minimum': 1, 'maximum': 50, 'default': 50}
+        assert params['after_id']['schema'] == {'type': 'string', 'minLength': 36, 'maxLength': 36,
+            'pattern': r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'}
         with TestClient(app, base_url=config.auth_config.origin) as client:
             base = '/api/hub/v1/archive/messages'
             assert client.get(base).status_code == 401

@@ -1,10 +1,10 @@
 # Hermes, Codex, and Claude Code integration
 
-This guide describes a possible client setup for the private Agent Message Bus. It does not modify any client, publish an image, or prove that the clients are connected. Use the server URL for the deployment you have actually approved: the prepared TrueNAS compose binds to `http://192.168.50.80:8765/mcp`; the separately reported staging endpoint is `http://192.168.50.90:8765/mcp`. Do not mistake one for the other.
+This guide describes a possible client setup for the private Agent Message Bus. It does not modify any client, publish an image, or prove that the clients are connected. A direct private-route check from this PC on 2026-11-02 found the production endpoint at `http://192.168.50.80:8770/mcp`: health returned 200, unauthenticated MCP returned 401, and port 8765 refused the connection. This verifies reachability and authentication enforcement, not an authenticated agent session or message receipt. Use the production endpoint only on the approved private/VPN route and allowlist. The separately reported staging address `http://192.168.50.90:8765/mcp` remains unverified and must not be treated as the current production endpoint.
 
 ## Current state and what this is not
 
-The operator handoff reports a Hermes `agent_bus_watcher.py` entry with reference `b7a1b3d63138`, plus an existing local stdio bridge that replies only to Codex and exposes five tools. That bridge is not this HTTP service, does not establish three-agent connectivity, and is not evidence of shared knowledge. Codex and Claude Code run on Windows `192.168.20.151`; there is no Codex configuration or Claude CLI on the Hermes host. The staging service at `.50.90:8765` was reported healthy for ten days, but it has no checkout of this repository. These are handoff facts, not checks performed by this packaging task.
+The operator handoff reports a Hermes `agent_bus_watcher.py` entry with reference `b7a1b3d63138`, plus an existing local stdio bridge that replies only to Codex and exposes five tools. That bridge is not this HTTP service, does not establish three-agent connectivity, and is not evidence of shared knowledge. Codex and Claude Code run on Windows `192.168.20.151`; there is no Codex configuration or Claude CLI on the Hermes host. Earlier staging notes reported `.50.90:8765` healthy for ten days, but that address was not verified in the current check and its host has no checkout of this repository. These are handoff facts, not current staging acceptance.
 
 MCP registration makes server tools available to an already running client. It does not start or wake an idle Hermes, Codex, or Claude process. This checkout also contains an optional host-side CLI wake helper, [`scripts/wake_daemon.py`](wake-daemon.md), which polls separately and can start bounded CLI workers; it is not part of Compose, installed, or configured for any agent by this packaging work. A daemon is a separate integration and requires explicit operator approval plus each worker's own authenticated MCP configuration. It never resumes a desktop conversation.
 
@@ -23,7 +23,7 @@ On the Hermes host, add the remote HTTP server to the existing `mcp_servers` sec
 ```yaml
 mcp_servers:
   internal_agent_bus:
-    url: "http://192.168.50.80:8765/mcp"
+    url: "http://192.168.50.80:8770/mcp"
     headers:
       Authorization: "Bearer ${AGENT_BUS_HERMES_TOKEN}"
 ```
@@ -38,7 +38,7 @@ Codex stores MCP servers in `%USERPROFILE%\.codex\config.toml` (or `$HOME\.codex
 
 ```toml
 [mcp_servers.internal_agent_bus]
-url = "http://192.168.50.80:8765/mcp"
+url = "http://192.168.50.80:8770/mcp"
 bearer_token_env_var = "AGENT_BUS_CODEX_TOKEN"
 enabled = true
 ```
@@ -61,7 +61,7 @@ Configure a user-scoped HTTP server using the official `claude mcp add` command.
 
 ```powershell
 claude mcp add --scope user --transport http internal-agent-bus `
-  http://192.168.50.80:8765/mcp `
+  http://192.168.50.80:8770/mcp `
   --header 'Authorization: Bearer ${AGENT_BUS_CLAUDE_TOKEN}'
 ```
 

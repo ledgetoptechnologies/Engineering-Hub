@@ -39,6 +39,19 @@ class ProjectComponentRepository:
             raise HubError('project_registry_required', 409)
         self.repo._project(project, db, require_active=active)
 
+    def _existing_secondary_scope(self, db, item):
+        """EHS callers must still see the stored link before reading or changing it."""
+        if session_context.current.get() is None:
+            return  # Preserve existing human and legacy family-bearer behavior.
+        secondary = item.get('legacy_project_id')
+        if secondary is not None:
+            try:
+                self._project(db, secondary, active=False)
+            except HubError:
+                # An inaccessible, retired or missing secondary must not become
+                # an oracle about another project's identity or existence.
+                raise HubError('hub_component_unavailable', 404) from None
+
     @staticmethod
     def _identity(value):
         try:
@@ -113,7 +126,9 @@ class ProjectComponentRepository:
             if prior:
                 if prior['fingerprint'] != fingerprint:
                     raise HubError('idempotency_conflict', 409)
-                return self._fetch(db, prior['component_id'])
+                current = self._fetch(db, prior['component_id'])
+                self._existing_secondary_scope(db, current)
+                return current
             if db.execute('SELECT 1 FROM hub_project_components WHERE project=? AND slug=?', (project, slug)).fetchone():
                 raise HubError('component_exists', 409)
             if (db.execute('SELECT count(*) FROM hub_project_components WHERE project=?', (project,)).fetchone()[0] >= 1000
@@ -128,8 +143,10 @@ class ProjectComponentRepository:
     def get_component(self, identity):
         self._identity(identity)
         with self.repo._connection() as db:
+            db.execute('BEGIN')
             item = self._fetch(db, identity)
             self._project(db, item['project'], active=False)
+            self._existing_secondary_scope(db, item)
             return item
 
     def list_components(self, project, *, include_retired=False, kind=None, status=None, after=None, limit=100):
@@ -142,6 +159,7 @@ class ProjectComponentRepository:
         if after is not None:
             self._identity(after)
         with self.repo._connection() as db:
+            db.execute('BEGIN')
             self._project(db, project, active=False)
             result = []
             for row in db.execute('SELECT data FROM hub_project_components WHERE project=? AND id>? ORDER BY id',
@@ -151,6 +169,12 @@ class ProjectComponentRepository:
                         or kind is not None and item['kind'] != kind
                         or status is not None and item['status'] != status):
                     continue
+                try:
+                    self._existing_secondary_scope(db, item)
+                except HubError as error:
+                    if error.code != 'hub_component_unavailable':
+                        raise
+                    continue  # Filter authorization before counting or paging.
                 result.append(item)
                 if len(result) == limit + 1:
                     break
@@ -169,6 +193,7 @@ class ProjectComponentRepository:
         with self.repo._transaction() as db:
             item = self._fetch(db, identity)
             self._project(db, item['project'], active=True)
+            self._existing_secondary_scope(db, item)
             self.repo._cas(item, expected_revision)
             fields = self._fields(**{key: item[key] if value is _UNSET else value for key, value in changes.items()})
             if fields['legacy_project_id'] is not None:

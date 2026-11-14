@@ -303,8 +303,8 @@ def test_integrated_mcp_initialize_and_list_on_configured_https_origin(hub):
         response = mcp_rpc(client, "tools/list", name=name)
         assert response.status_code == 200, response.text
         assert {tool["name"] for tool in response.json()["result"]["tools"]} == {
-            "hub_overview", "hub_task_get", "hub_task_claim", "hub_task_candidate",
-            "hub_task_review", "hub_decision_request", "hub_run_list",
+            "hub_overview", "hub_project_tasks", "hub_tracking_task_propose", "hub_tracking_task_origin", "hub_orchestration_request_tasks", "hub_orchestration_request_origin_task_summary", "hub_tracking_task_update", "hub_tracking_task_list", "hub_tracking_task_review", "hub_role_list", "hub_role_get", "hub_role_acquire", "hub_role_renew", "hub_role_release", "hub_role_claim", "hub_role_claims", "hub_role_claim_release", "hub_task_progress_get", "hub_task_progress_update", "hub_orchestration_request_create", "hub_orchestration_request_get", "hub_orchestration_request_list", "hub_dispatch_create", "hub_dispatch_get", "hub_dispatch_list", "hub_role_dispatch_inbox", "hub_dispatch_report", "hub_dispatch_checkpoint", "hub_dispatch_decisions", "hub_dispatch_reports", "hub_orchestrator_attention_list", "hub_orchestrator_attention_reconcile_closed", "hub_addressed_attention_list", "hub_addressed_attention_ack", "hub_worker_dispatch_pending", "hub_worker_dispatch_ack", "hub_worker_decision_inspect", "hub_orchestrator_report_inspect", "hub_tracking_task_history", "hub_tracking_task_compact", "hub_tracking_claim_withdraw", "hub_tracking_draft_propose", "hub_task_get", "hub_task_claim", "hub_task_candidate",
+            "hub_task_review", "hub_decision_request", "hub_decision_get", "hub_run_list",
             "hub_topic_peers", "hub_topic_preflight", "hub_staging_task_propose",
             "hub_planning_list", "hub_planning_get", "hub_planning_put",
             "hub_label_set_create", "hub_label_set_put_image", "hub_label_set_results", "hub_label_set_list",
@@ -371,3 +371,104 @@ def test_integrated_mcp_and_rest_share_persisted_state_across_app_lifespans(hub)
             returned = json.loads(result["content"][0]["text"])
         assert returned["owner"] == "codex"
         assert reopened.get(BASE + "/overview", headers=agent_headers()).status_code == 200
+
+def test_human_project_tracking_is_scoped_paginated_and_non_executable(hub):
+    client, app, settings = hub
+    path = BASE + '/projects/3d-viewer/tracking-tasks'
+    assert client.get(path).status_code == 401
+    assert client.get(path, headers=agent_headers()).status_code == 403
+    human_headers(client, app, settings)
+    first = app.state.repository.propose_tracking_task('codex','3d-viewer','First','human-tracking-1')
+    second = app.state.repository.propose_tracking_task('codex','3d-viewer','Second','human-tracking-2')
+    app.state.repository.propose_tracking_task('codex','project-alpha','Private other','human-tracking-3')
+    app.state.repository.update_tracking_task('codex',first['id'],1,'human-tracking-update',
+        progress='Claimed done',evidence_links=[{'label':'Proof','url':'https://example.com/proof'}],completion_claim=True)
+    page = client.get(path,params={'limit':1}).json()
+    assert page['truncated'] is True and page['next_after'] == page['tasks'][0]['id']
+    next_page=client.get(path,params={'limit':1,'after_task_id':page['next_after']}).json()
+    assert {page['tasks'][0]['id'],next_page['tasks'][0]['id']} == {first['id'],second['id']}
+    assert all(item['project']=='3d-viewer' and item['execution_authorization'] is False for item in page['tasks']+next_page['tasks'])
+    claimed=next(item for item in page['tasks']+next_page['tasks'] if item['id']==first['id'])
+    assert claimed['status']=='completion_claimed' and claimed['updates'][0]['evidence_links'][0]['label']=='Proof'
+    assert client.get(path,params={'limit':0}).status_code == 422
+    assert client.get(path,params={'after_task_id':'bad'}).status_code == 422
+    assert client.post(path).status_code == 405
+
+
+def test_unfinished_tracking_filters_before_pagination_and_reopened_returns(hub, monkeypatch):
+    import uuid
+    client, app, settings = hub
+    human_headers(client, app, settings)
+    repo = app.state.repository
+    ids = iter(uuid.UUID(int=i, version=4) for i in range(1, 100))
+    monkeypatch.setattr('engineering_hub.repository.uuid.uuid4', lambda: next(ids))
+    evidence = [{'label': 'Proof', 'url': 'https://example.com/proof'}]
+    verified = []
+    for i in range(52):
+        item = repo.propose_tracking_task('codex', '3d-viewer', f'Finished {i}', f'list-done-{i}')
+        repo.update_tracking_task('codex', item['id'], 1, f'list-claim-{i}',
+                                  progress='Done', evidence_links=evidence, completion_claim=True)
+        verified.append(repo.review_tracking_task('claude', item['id'], 2, f'list-review-{i}',
+                         verdict='verify', note='Checked', evidence_links=evidence))
+    open_item = repo.propose_tracking_task('codex', '3d-viewer', 'Open work', 'list-open')
+    claim = repo.propose_tracking_task('codex', '3d-viewer', 'Needs review', 'list-needs-review')
+    repo.update_tracking_task('codex', claim['id'], 1, 'list-new-claim',
+                              progress='Ready', evidence_links=evidence, completion_claim=True)
+    repo.propose_tracking_task('codex', 'project-alpha', 'Other project', 'list-other')
+    path = BASE + '/projects/3d-viewer/tracking-tasks'
+    legacy = client.get(path, params={'limit': 50}).json()
+    assert legacy['truncated'] and len(legacy['tasks']) == 50
+    assert all(item['status'] == 'completion_verified' for item in legacy['tasks'])
+    first = client.get(path, params={'limit': 1, 'unfinished': 'true'}).json()
+    second = client.get(path, params={'limit': 1, 'unfinished': 'true', 'after_task_id': first['next_after']}).json()
+    assert first['truncated'] and not second['truncated']
+    assert {first['tasks'][0]['id'], second['tasks'][0]['id']} == {open_item['id'], claim['id']}
+    assert {first['tasks'][0]['status'], second['tasks'][0]['status']} == {'open', 'completion_claimed'}
+    assert client.get(path, params={'unfinished': 'not-a-bool'}).status_code == 422
+    repo.review_tracking_task('claude', verified[0]['id'], 3, 'list-reopen',
+                              verdict='reopen', note='More work', evidence_links=[])
+    page = client.get(path, params={'unfinished': 'true'}).json()
+    assert {item['id'] for item in page['tasks']} == {verified[0]['id'], open_item['id'], claim['id']}
+
+
+def test_human_tracking_review_requires_session_csrf_and_current_claim(hub):
+    client, app, settings = hub
+    item = app.state.repository.propose_tracking_task('codex', '3d-viewer', 'Review task', 'hr-propose')
+    links = [{'label': 'Evidence', 'url': 'https://example.com/evidence'}]
+    app.state.repository.update_tracking_task('codex', item['id'], 1, 'hr-claim', progress='Finished',
+                                              evidence_links=links, completion_claim=True)
+    path = BASE + '/tracking-tasks/' + item['id'] + '/review'
+    payload = {'expected_revision': 2, 'client_request_id': 'hr-review', 'verdict': 'verify',
+               'note': 'Evidence inspected', 'evidence_links': links}
+    assert client.post(path, json=payload).status_code == 401
+    assert client.post(path, headers=agent_headers(), json=payload).status_code == 403
+    headers = human_headers(client, app, settings)
+    assert client.post(path, json=payload).status_code == 403
+    verified = client.post(path, headers=headers, json=payload)
+    assert verified.status_code == 200 and verified.json()['status'] == 'completion_verified'
+    assert verified.json()['reviews'][0]['claim_revision'] == 2
+    assert client.post(path, headers=headers, json={**payload, 'client_request_id': 'stale'}).status_code == 409
+
+def test_human_tracking_review_csrf_and_competing_revision(hub):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    client, app, settings = hub
+    item = app.state.repository.propose_tracking_task('codex', '3d-viewer', 'Competing review', 'competition-propose')
+    links = [{'label':'Evidence', 'url':'https://example.com/evidence'}]
+    app.state.repository.update_tracking_task('codex', item['id'], 1, 'competition-claim',
+        progress='Done', evidence_links=links, completion_claim=True)
+    path = BASE + '/tracking-tasks/' + item['id'] + '/review'
+    headers = human_headers(client, app, settings)
+    payload = {'expected_revision':2, 'verdict':'verify', 'note':'Checked', 'evidence_links':links}
+    assert client.post(path, headers={**headers, 'X-Hub-CSRF':'invalid'}, json={**payload, 'client_request_id':'bad-csrf'}).status_code == 403
+    barrier = Barrier(2)
+    def submit(key):
+        barrier.wait(timeout=5)
+        return client.post(path, headers=headers, json={**payload, 'client_request_id':key}).status_code
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(submit, key) for key in ('review-a','review-b')]
+        statuses = sorted(f.result(timeout=10) for f in futures)
+    assert statuses == [200,409]
+    stored = app.state.repository._read(item['id'], 'tracking_task')
+    assert stored['revision'] == 3 and len(stored['reviews']) == 1
+    assert stored['reviews'][0]['claim_revision'] == 2

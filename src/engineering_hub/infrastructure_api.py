@@ -4,6 +4,7 @@ import json
 from fastapi import Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .openapi_body import request_body
 from .infrastructure_service import InfrastructureService
 from .repository import HubError
 from .work_queue_api import _authorization
@@ -16,6 +17,7 @@ class Closed(BaseModel):
 class DeviceInput(Closed):
     name: str = Field(min_length=1,max_length=100)
     hostname: str | None = Field(default=None,max_length=253)
+    metrics_host: str | None = Field(default=None,max_length=64)
     addresses: list[str] = Field(max_length=16)
     network: str | None = Field(default=None,max_length=64)
     vlan: int | None = Field(default=None,ge=1,le=4094)
@@ -87,7 +89,11 @@ def attach_infrastructure_routes(app,service,actor,*,metrics=None,metrics_identi
         service.require(identity,action)
         return identity
 
-    @app.get('/api/hub/v1/infrastructure/devices')
+    @app.get('/api/hub/v1/infrastructure/devices', openapi_extra={'parameters': [
+        {'name': 'include_retired', 'in': 'query', 'required': False,
+         'description': 'Include retired devices when true.',
+         'schema': {'type': 'boolean', 'default': False}},
+    ]})
     def devices(request:Request):
         identity=authorized(request)
         values=request.query_params.getlist('include_retired')
@@ -105,26 +111,49 @@ def attach_infrastructure_routes(app,service,actor,*,metrics=None,metrics_identi
             raise HubError('infrastructure_metrics_not_configured',404)
         return await metrics.read(identity)
 
+    @app.get('/api/hub/v1/infrastructure/metrics/history', openapi_extra={'parameters': [
+        {'name': 'host', 'in': 'query', 'required': True,
+         'description': 'Opaque host key returned by infrastructure metrics discovery.',
+         'schema': {'type': 'string', 'pattern': '^(?:host|target):[0-9a-f]{64}$'}},
+        {'name': 'range', 'in': 'query', 'required': True,
+         'description': 'Fixed history interval.',
+         'schema': {'type': 'string', 'enum': ['1h', '6h', '24h', '7d']}},
+    ]})
+    async def machine_metric_history(request:Request):
+        identity=metrics_identity(request) if metrics_identity is not None else authorized(request,'metrics_read')
+        params=request.query_params
+        if set(params)!={'host','range'} or any(len(params.getlist(name))!=1 for name in params):
+            raise HubError('invalid_infrastructure_filter')
+        if metrics is None or not hasattr(metrics,'history'):
+            raise HubError('infrastructure_metrics_not_configured',404)
+        return await metrics.history(identity,params['host'],params['range'])
+
     @app.get('/api/hub/v1/infrastructure/devices/{device_id}')
     def detail(device_id:str,request:Request):
         identity=authorized(request)
         return service.get_device(identity,device_id)
 
-    @app.put('/api/hub/v1/infrastructure/devices/{device_id}')
+    @app.put('/api/hub/v1/infrastructure/devices/{device_id}', openapi_extra=request_body(DeviceInput))
     async def save(device_id:str,request:Request):
         identity=authorized(request,'device_write')
         payload=(await _payload(request,DeviceInput)).model_dump()
+        if authorized(request,'device_write') != identity:
+            raise HubError('forbidden',403)
         revision=payload.pop('expected_revision')
         return service.upsert_device(identity,{'id':device_id,**payload},expected_revision=revision)
 
-    @app.post('/api/hub/v1/infrastructure/devices/{device_id}/maintenance')
+    @app.post('/api/hub/v1/infrastructure/devices/{device_id}/maintenance', openapi_extra=request_body(MaintenanceInput))
     async def open_maintenance(device_id:str,request:Request):
         identity=authorized(request,'maintenance_write')
         payload=await _payload(request,MaintenanceInput)
+        if authorized(request,'maintenance_write') != identity:
+            raise HubError('forbidden',403)
         return service.append_maintenance(identity,device_id,**payload.model_dump())
 
-    @app.post('/api/hub/v1/infrastructure/maintenance/{maintenance_id}/resolve')
+    @app.post('/api/hub/v1/infrastructure/maintenance/{maintenance_id}/resolve', openapi_extra=request_body(ResolutionInput))
     async def resolve(maintenance_id:str,request:Request):
         identity=authorized(request,'maintenance_write')
         payload=await _payload(request,ResolutionInput)
+        if authorized(request,'maintenance_write') != identity:
+            raise HubError('forbidden',403)
         return service.resolve_maintenance(identity,maintenance_id,**payload.model_dump())

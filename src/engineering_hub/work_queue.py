@@ -19,6 +19,7 @@ import inspect
 import math
 import os
 import re
+import sqlite3
 import time
 import uuid
 
@@ -60,13 +61,35 @@ class WorkTarget:
     task_id: str
     source_commit: str
     artifact_digest: str
+    review_revision: int | None = None
+    submission_id: str | None = None
+    ci_attempt_job_id: str | None = None
+    build_receipt_digest: str | None = None
+    execution_release_digest: str | None = None
 
     def __post_init__(self):
         try:
             valid = type(self.task_id) is str and str(uuid.UUID(self.task_id)) == self.task_id
         except ValueError:
             valid = False
-        if not valid or type(self.source_commit) is not str or re.fullmatch(r'[a-f0-9]{40}', self.source_commit) is None or type(self.artifact_digest) is not str or re.fullmatch(r'sha256:[a-f0-9]{64}', self.artifact_digest) is None:
+        if (not valid or type(self.source_commit) is not str
+                or re.fullmatch(r'[a-f0-9]{40}', self.source_commit) is None
+                or type(self.artifact_digest) is not str
+                or re.fullmatch(r'sha256:[a-f0-9]{64}', self.artifact_digest) is None
+                or self.ci_attempt_job_id is not None
+                and (type(self.ci_attempt_job_id) is not str
+                or re.fullmatch(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', self.ci_attempt_job_id) is None)
+                or self.build_receipt_digest is not None
+                and (type(self.build_receipt_digest) is not str
+                or re.fullmatch(r'sha256:[a-f0-9]{64}', self.build_receipt_digest) is None)
+                or self.execution_release_digest is not None
+                and (type(self.execution_release_digest) is not str
+                or re.fullmatch(r'sha256:[a-f0-9]{64}', self.execution_release_digest) is None)
+                or self.review_revision is not None
+                and (type(self.review_revision) is not int or self.review_revision < 1)
+                or self.submission_id is not None and (type(self.submission_id) is not str
+                or re.fullmatch(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', self.submission_id) is None)
+                or (self.review_revision is None) != (self.submission_id is None)):
             raise HubError('invalid_work_target')
 
 
@@ -280,6 +303,44 @@ class WorkQueue:
         except Exception:
             return False
 
+    def _modular_target_in_transaction(self, db, actor, action_key, environment, target):
+        """Bind modular source and independent review to this SQLite snapshot."""
+        # The retired namespace can contain legacy jobs that never passed this
+        # transaction gate. Preserve them, but do not claim or replay them.
+        from .staging_action_key import legacy_staging_action
+        if legacy_staging_action(action_key, target):
+            return False
+        if not action_key.startswith('staging-service.'):
+            return True
+        if (environment != 'staging' or target.submission_id is None or target.review_revision is None
+                or target.ci_attempt_job_id is not None or target.build_receipt_digest is not None
+                or target.execution_release_digest is not None):
+            return False
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_staging_submissions'").fetchone():
+            return False
+        row = db.execute('SELECT data FROM hub_staging_submissions WHERE id=?', (target.submission_id,)).fetchone()
+        if row is None:
+            return False
+        try:
+            item = json.loads(row['data'])
+            from .staging_source_binding import UNBOUND_HOLD, valid_source_binding
+            if item.get('hold_reason') == UNBOUND_HOLD or not valid_source_binding(item):
+                return False
+            task = self.repo._get(db, target.task_id, 'task')
+            self.repo._no_active_run(db, target.task_id)
+            from .staging_action_key import staging_action_key
+            key = staging_action_key(item['project'], item['recipe'])
+            return (key == action_key and item['actor'] == actor and item['phase'] in ('deposited', 'queued')
+                    and item['review_task_id'] == target.task_id
+                    and item['review_task_revision'] == target.review_revision
+                    and item['source_commit'] == target.source_commit
+                    and target.artifact_digest == 'sha256:' + item['source_digest']
+                    and task['project'] == item['project']
+                    and self.repo.reviewed_task_matches(target.task_id, actor, target.review_revision,
+                                                        target.source_commit, db=db))
+        except (KeyError, TypeError, ValueError, HubError):
+            return False
+
     def _event(self, db, action, job_id, actor):
         db.execute('UPDATE hub_work_jobs SET revision=revision+1 WHERE id=?', (job_id,))
         revision = db.execute('SELECT revision FROM hub_work_jobs WHERE id=?', (job_id,)).fetchone()[0]
@@ -313,18 +374,37 @@ class WorkQueue:
         self.repo._project(action.project)
         if type(target) is not WorkTarget:
             raise HubError('invalid_work_target')
+        # Capture task state before the external target verifier; taskless
+        # trusted coordination actions retain their existing semantics.
+        with self.repo._connection() as db:
+            before = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='task'", (target.task_id,)).fetchone()
+            task_snapshot = before['data'] if before is not None else None
         if not self._target_verified(actor, action_key, environment, target):
             raise HubError('work_target_not_verified', 403)
-        target_json = json.dumps(dict(task_id=target.task_id, source_commit=target.source_commit, artifact_digest=target.artifact_digest), sort_keys=True, separators=(',', ':'))
+        target_fields = {name: getattr(target, name) for name in target.__dataclass_fields__ if getattr(target, name) is not None}
+        target_json = json.dumps(target_fields, sort_keys=True, separators=(',', ':'))
         fingerprint = json.dumps([action_key, environment, action.machine_id, action.project, action.requires_execution_proof, approval_id, target_json], separators=(',', ':'))
         with self.repo._transaction() as db:
             if not self.repo.task_allows_environment(target.task_id, environment, db=db):
+                raise HubError('work_target_not_verified', 403)
+            if not self._modular_target_in_transaction(db, actor, action_key, environment, target):
                 raise HubError('work_target_not_verified', 403)
             old = db.execute('SELECT * FROM hub_work_jobs WHERE actor=? AND request_id=?', (actor, request_id)).fetchone()
             if old:
                 if old['fingerprint'] != fingerprint:
                     raise HubError('work_request_conflict', 409)
                 return self._public(old)
+            current = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='task'", (target.task_id,)).fetchone()
+            if (current['data'] if current is not None else None) != task_snapshot:
+                raise HubError('work_review_changed', 409)
+            if current is not None:
+                task = json.loads(current['data'])
+                if not (task.get('project') == action.project and
+                        self.repo._reviewed_task_data_matches(task, actor, task.get('revision'),
+                                                              target.source_commit, db=db)):
+                    raise HubError('work_review_changed', 409)
+            if self.repo._open_work_job(db, target.task_id):
+                raise HubError('work_task_already_queued', 409)
             if db.execute('SELECT COUNT(*) FROM hub_work_jobs').fetchone()[0] >= self.max_jobs:
                 raise HubError('work_queue_capacity', 503)
             job_id = str(uuid.uuid4())
@@ -333,6 +413,60 @@ class WorkQueue:
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,'queued',?)''',
                 (job_id, actor, request_id, fingerprint, action_key, environment, action.machine_id, action.project, approval_id, target_json, int(action.requires_execution_proof), self._now()))
             self._event(db, 'work.submitted', job_id, actor)
+            return self._public(db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (job_id,)).fetchone())
+
+    def cancel_unclaimed(self, *, actor, job_id):
+        """Cancel an eligible never-claimed queue entry; controller resources are separate."""
+        if type(actor) is not str or actor not in AGENTS:
+            raise HubError('invalid_work_actor')
+        _key(job_id)
+        with self.repo._transaction() as db:
+            row = db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (job_id,)).fetchone()
+            if row is None:
+                raise HubError('work_job_not_found', 404)
+            if row['actor'] != actor:
+                raise HubError('forbidden', 403)
+            # Check the durable job project inside the cancellation transaction.
+            # Legacy agents may clear an archived project's unclaimed job;
+            # installation principals are not supported by this queue yet.
+            self.repo._project(row['project'], db, require_active=False)
+            # Modular source deposits and resource registration straddle queue
+            # insertion; only the controller can safely cancel that lifecycle.
+            # A durable submission precedes queue admission in both schemas.
+            try:
+                target = json.loads(row['target'])
+                if type(target) is not dict:
+                    raise ValueError('invalid target')
+                staging_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_staging_submissions'").fetchone()
+                controller_owned = (row['action_key'].startswith(('modular.', 'staging-service.'))
+                    or row['request_id'].startswith('staging:')
+                    or staging_table and db.execute(
+                        "SELECT 1 FROM hub_staging_submissions WHERE id IN (?,?) OR json_extract(data,'$.job_id')=? OR (actor=? AND request_id=?) LIMIT 1",
+                        (target.get('task_id'), target.get('submission_id'), job_id, actor,
+                         row['request_id'][len('staging:'):] if row['request_id'].startswith('staging:') else None)).fetchone())
+            except (ValueError, TypeError, sqlite3.DatabaseError):
+                raise HubError('work_controller_cancel_required', 409) from None
+            if controller_owned:
+                raise HubError('work_controller_cancel_required', 409)
+            if row['state'] == 'cancelled':
+                return self._public(row)
+            # A retained pilot intent is authoritative evidence that this job
+            # entered an owned lifecycle, even if another row looks unclaimed.
+            # A corrupt or partially recovered mapping must never be cancelled.
+            pilot_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_queued_pilot_jobs'").fetchone()
+            if pilot_table and db.execute('SELECT 1 FROM hub_queued_pilot_jobs WHERE job_id=? LIMIT 1',
+                                          (job_id,)).fetchone():
+                raise HubError('work_not_unclaimed', 409)
+            if (row['state'] != 'queued' or row['revision'] != 1
+                    or row['worker'] is not None or row['fence'] is not None
+                    or row['lease_until'] is not None
+                    or db.execute('SELECT 1 FROM hub_work_machines WHERE job_id=? LIMIT 1', (job_id,)).fetchone()
+                    or db.execute("SELECT 1 FROM hub_audit WHERE entity_id=? AND action='work.claimed' LIMIT 1", (job_id,)).fetchone()):
+                raise HubError('work_not_unclaimed', 409)
+            updated = db.execute("UPDATE hub_work_jobs SET state='cancelled' WHERE id=? AND state='queued' AND revision=1 AND worker IS NULL AND fence IS NULL AND lease_until IS NULL", (job_id,)).rowcount
+            if updated != 1:
+                raise HubError('work_not_unclaimed', 409)
+            self._event(db, 'work.cancelled', job_id, actor)
             return self._public(db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (job_id,)).fetchone())
 
     def _admitted(self, worker, row):
@@ -449,12 +583,18 @@ class WorkQueue:
                     continue
             elif not self._eligible_target(row):
                 continue
+            if not self._modular_target_in_transaction(db, row['actor'], row['action_key'], row['environment'],
+                                                         WorkTarget(**json.loads(row['target']))):
+                continue
             if not self._admitted(worker, row):
                 continue
             return row
         return None
 
     def _reserve_claim(self, db, row, worker, now, lease_seconds):
+        if not self._modular_target_in_transaction(db, row['actor'], row['action_key'], row['environment'],
+                                                   WorkTarget(**json.loads(row['target']))):
+            return None
         db.execute('INSERT OR IGNORE INTO hub_work_machines VALUES(?,0,NULL)', (row['machine_id'],))
         db.execute('UPDATE hub_work_machines SET generation=generation+1,job_id=? WHERE machine_id=?', (row['id'], row['machine_id']))
         fence = db.execute('SELECT generation FROM hub_work_machines WHERE machine_id=?', (row['machine_id'],)).fetchone()[0]
@@ -567,6 +707,8 @@ class WorkQueue:
                     or action.project != row['project']
                     or action.requires_execution_proof != bool(row['requires_execution_proof'])
                     or row['environment'] not in action.environments
+                    or not self._modular_target_in_transaction(db, row['actor'], row['action_key'],
+                        row['environment'], WorkTarget(**json.loads(row['target'])))
                     or not self._admitted(worker, row)
                     or not self._approved(row)
                     or not self._target_verified(row['actor'], row['action_key'], row['environment'],
@@ -628,8 +770,15 @@ class WorkQueue:
                     pass
             if not verified:
                 raise HubError('work_reconciliation_required', 403)
-            db.execute('UPDATE hub_work_jobs SET state=? WHERE id=?', (outcome, job_id))
-            db.execute('UPDATE hub_work_machines SET job_id=NULL WHERE machine_id=? AND job_id=?', (row['machine_id'], job_id))
+            updated = db.execute(
+                "UPDATE hub_work_jobs SET state=? WHERE id=? AND state='held' AND revision=? "
+                'AND machine_id=? AND worker IS ? AND fence IS ?',
+                (outcome, job_id, row['revision'], row['machine_id'], row['worker'], row['fence'])).rowcount
+            released = db.execute(
+                'UPDATE hub_work_machines SET job_id=NULL WHERE machine_id=? AND job_id=? AND generation=?',
+                (row['machine_id'], job_id, row['fence'])).rowcount
+            if updated != 1 or released != 1:
+                raise HubError('work_reservation_changed', 409)
             self._event(db, 'work.reconciled', job_id, 'system:work-queue')
             return self._public(db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (job_id,)).fetchone())
 
@@ -659,13 +808,26 @@ class WorkQueue:
         # A status read never mutates expired jobs; expose ambiguity explicitly.
         now = self._now()
         with self.repo._connection() as db:
-            rows = db.execute('SELECT * FROM hub_work_jobs ORDER BY sequence DESC LIMIT ?', (limit,)).fetchall()
+            # Keep the rows, totals and pause flags in one read snapshot. End
+            # it before calling external target verification below.
+            db.execute('BEGIN')
+            # Read each visible job and the machine reservation in one SQLite
+            # statement so a concurrent release/reclaim cannot splice snapshots.
+            rows = db.execute('SELECT j.*, m.job_id AS _reservation_holder '
+                              'FROM hub_work_jobs AS j LEFT JOIN hub_work_machines AS m '
+                              'ON m.machine_id=j.machine_id ORDER BY j.sequence DESC LIMIT ?', (limit,)).fetchall()
+            visible = {row['id']: row for row in rows}
             queue_paused = bool(db.execute('SELECT paused FROM hub_work_policy WHERE id=1').fetchone()[0])
             master_paused = bool(self.repo._paused(db))
+            counts = dict(db.execute('SELECT state,COUNT(*) FROM hub_work_jobs GROUP BY state').fetchall())
+            db.commit()
             paused = queue_paused or master_paused
             jobs = []
             for row in rows:
                 item = self._public(row)
+                holder_id = item.pop('_reservation_holder')
+                visible_holder = visible.get(holder_id)
+                disclosed_holder = None
                 reconciliation = row['state'] == 'held' or (row['state'] == 'claimed' and row['lease_until'] <= now)
                 reason = 'requires_reconciliation' if reconciliation else None
                 if row['state'] == 'queued':
@@ -680,12 +842,16 @@ class WorkQueue:
                         reason = 'admission_not_configured'
                     elif not self._target_verified(row['actor'], row['action_key'], row['environment'], WorkTarget(**json.loads(row['target']))):
                         reason = 'target_not_verified'
-                    elif db.execute('SELECT job_id FROM hub_work_machines WHERE machine_id=? AND job_id IS NOT NULL', (row['machine_id'],)).fetchone():
+                    elif holder_id is not None:
                         reason = 'machine_reserved'
+                        # Never add an identity outside the existing result scope.
+                        if (visible_holder is not None and visible_holder['machine_id'] == row['machine_id']
+                                and visible_holder['state'] in ('claimed', 'held')):
+                            disclosed_holder = holder_id
                 item.update(requires_reconciliation=reconciliation,
                             eligible=row['state'] == 'queued' and reason is None,
                             eligible_requires_worker_admission=self.claim_verifier is not None and type(self.claim_verifier) is not ClosedClaimPolicy,
-                            blocked_reason=reason)
+                            blocked_reason=reason, reservation_holder_job_id=disclosed_holder)
                 jobs.append(item)
             return {'paused': paused, 'queue_paused': queue_paused, 'master_paused': master_paused,
                     'claim_admission_state': ('unconfigured' if type(self.claim_verifier) is ClosedClaimPolicy
@@ -696,5 +862,5 @@ class WorkQueue:
                                      'requires_execution_proof': action.requires_execution_proof,
                                      'coordination_only': not action.requires_execution_proof}
                                 for key, action in self.actions.items()},
-                    'counts': dict(db.execute('SELECT state,COUNT(*) FROM hub_work_jobs GROUP BY state').fetchall()),
+                    'counts': counts,
                     'jobs': jobs}

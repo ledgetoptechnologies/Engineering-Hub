@@ -200,7 +200,7 @@ class InfrastructureRegistry:
     def upsert_device(self, principal, device, *, expected_revision):
         self._authorize(principal, 'device_write')
         required = {'id', 'name', 'addresses', 'role'}
-        optional = {'hostname', 'network', 'vlan', 'retired'}
+        optional = {'hostname', 'metrics_host', 'network', 'vlan', 'retired'}
         if type(device) is not dict or not required <= set(device) or set(device) - required - optional:
             raise HubError('invalid_device_schema')
         identity = _slug(device['id'])
@@ -212,6 +212,12 @@ class InfrastructureRegistry:
                            for part in hostname.split('.'))):
                 raise HubError('invalid_device_hostname')
             hostname = hostname.lower()
+        # The exact Prometheus host label, for a machine that reports under another name.
+        # Case is kept: label matching is exact, never inferred from the hostname.
+        metrics_host = device.get('metrics_host')
+        if metrics_host is not None and (type(metrics_host) is not str
+                                         or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', metrics_host) is None):
+            raise HubError('invalid_device_metrics_host')
         addresses = device['addresses']
         if type(addresses) is not list or len(addresses) > 16:
             raise HubError('invalid_device_addresses')
@@ -243,7 +249,7 @@ class InfrastructureRegistry:
             if old is None and db.execute('SELECT count(*) FROM infra_devices').fetchone()[0] >= 256:
                 raise HubError('device_limit', 409)
             at = self._now().isoformat()
-            item = dict(id=identity, name=name, hostname=hostname, addresses=addresses, network=network,
+            item = dict(id=identity, name=name, hostname=hostname, metrics_host=metrics_host, addresses=addresses, network=network,
                         vlan=vlan, role=role, retired=retired, revision=expected_revision+1,
                         created_at=old['created_at'] if old else at, updated_at=at)
             db.execute('INSERT INTO infra_devices VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data',

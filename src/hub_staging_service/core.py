@@ -157,18 +157,21 @@ def tree_manifest(path, limit):
     return result, total
 
 
-def make_job_readable(path, limit):
+def make_job_readable(path, limit, *, executable_paths=frozenset()):
     """Validate an owned immutable tree before exposing it via a read-only bind.
 
     Rootless Docker maps the host owner to container root; the configured job
     UID therefore needs read/traverse bits. Only this resource tree changes;
     its private worker/resource ancestors remain inaccessible to other hosts.
     """
-    tree_manifest(path, limit)
+    manifest, _ = tree_manifest(path, limit)
+    ensure(type(executable_paths) is frozenset and executable_paths <= manifest.keys(),
+           'invalid_source_executable_paths')
     for directory, dirs, files in os.walk(path, followlinks=False):
         Path(directory).chmod(0o755)
         for name in files:
-            (Path(directory) / name).chmod(0o644)
+            item = Path(directory) / name
+            item.chmod(0o755 if item.relative_to(path).as_posix() in executable_paths else 0o644)
 
 
 def terminal_receipt_config(value, worker_root):
@@ -244,6 +247,9 @@ class Service:
             CREATE TABLE IF NOT EXISTS sources (
                 id TEXT PRIMARY KEY, project TEXT NOT NULL, digest TEXT NOT NULL,
                 bytes INTEGER NOT NULL, inode INTEGER NOT NULL, created REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS source_bindings (
+                source_id TEXT PRIMARY KEY, source_inode INTEGER NOT NULL,
+                source_created REAL NOT NULL, binding TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS terminal_receipts (
                 command_id TEXT PRIMARY KEY, slot_id TEXT NOT NULL UNIQUE,
                 root TEXT NOT NULL, capture TEXT NOT NULL, binding TEXT NOT NULL);
@@ -480,18 +486,29 @@ class Service:
                'worker_storage_capacity', 409)
 
     def put_source(self, payload):
-        ensure(isinstance(payload, dict) and set(payload) == {'source_id', 'project', 'source_digest', 'source_zip_base64'},
-               'source_schema')
+        fields = {'source_id', 'project', 'source_digest', 'source_zip_base64'}
+        ensure(isinstance(payload, dict) and set(payload) in
+               (fields, fields | {'source_commit', 'source_commit_object_base64'}), 'source_schema')
         source_id = identifier(payload['source_id'])
         ensure(payload['project'] in self.projects, 'project_not_allowed', 403)
         raw = archive(payload['source_zip_base64'])
         digest = hashlib.sha256(raw).hexdigest()
         ensure(payload['source_digest'] == digest, 'source_digest_mismatch')
         extract(raw)  # Includes complete CRC/readback and expansion checks before deposit.
+        binding = None
+        if 'source_commit' in payload:
+            from .source_provenance import verify
+            try:
+                binding = verify(raw, payload['source_commit_object_base64'], payload['source_commit'])
+            except ValueError:
+                raise Rejected('source_binding_invalid') from None
+        binding_json = json.dumps(binding, sort_keys=True, separators=(',', ':')) if binding is not None else None
         with self.lock:
             row = self.db.execute('SELECT * FROM sources WHERE id=?', (source_id,)).fetchone()
             if row:
-                ensure(row['project'] == payload['project'] and row['digest'] == digest, 'source_identity_conflict', 409)
+                ensure(row['project'] == payload['project'] and row['digest'] == digest
+                       and self._source_binding(source_id, payload['project'], digest) == binding,
+                       'source_identity_conflict', 409)
                 self._source(source_id, payload['project'], digest)
             else:
                 ensure(self._receipt_fault is None, 'terminal_receipt_recovery_required', 409)
@@ -499,13 +516,36 @@ class Service:
                 self._capacity(len(raw))
                 path = self.sources / (source_id + '.zip')
                 ensure(not path.exists() and not path.is_symlink(), 'source_path_conflict', 409)
-                with path.open('xb') as stream:
-                    stream.write(raw); stream.flush(); os.fsync(stream.fileno())
-                path.chmod(0o600)
-                self.db.execute('INSERT INTO sources VALUES (?,?,?,?,?,?)',
-                    (source_id, payload['project'], digest, len(raw), path.stat().st_ino, time.time()))
-                self.db.commit()
-            return {'source_id': source_id, 'source_digest': digest, 'size_bytes': len(raw), 'project': payload['project']}
+                created_inode = None
+                self.db.execute('BEGIN IMMEDIATE')
+                try:
+                    # A previous worker does not enable SQLite foreign keys,
+                    # so its exact legacy DELETE may leave this one orphan.
+                    # Absence of the source row makes this binding stale.
+                    self.db.execute('DELETE FROM source_bindings WHERE source_id=?', (source_id,))
+                    with path.open('xb') as stream:
+                        created_inode = os.fstat(stream.fileno()).st_ino
+                        stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+                    path.chmod(0o600)
+                    created_at = time.time()
+                    self.db.execute('INSERT INTO sources VALUES (?,?,?,?,?,?)',
+                        (source_id, payload['project'], digest, len(raw), created_inode, created_at))
+                    if binding_json is not None:
+                        self.db.execute('INSERT INTO source_bindings '
+                            '(source_id,source_inode,source_created,binding) VALUES (?,?,?,?)',
+                            (source_id, created_inode, created_at, binding_json))
+                    self.db.commit()
+                except Exception:
+                    self.db.rollback()
+                    if (created_inode is not None and not path.is_symlink() and path.exists()
+                            and path.stat().st_ino == created_inode):
+                        path.unlink()
+                    raise
+            result = {'source_id': source_id, 'source_digest': digest, 'size_bytes': len(raw),
+                      'project': payload['project']}
+            if binding is not None:
+                result['source_binding'] = binding
+            return result
 
     def _source(self, source_id, project, digest):
         identifier(source_id)
@@ -517,6 +557,29 @@ class Service:
         raw = path.read_bytes()
         ensure(hashlib.sha256(raw).hexdigest() == digest, 'source_identity_drift', 409)
         return raw
+
+    def _source_binding(self, source_id, project, digest):
+        row = self.db.execute('SELECT * FROM sources WHERE id=?', (identifier(source_id),)).fetchone()
+        ensure(row is not None and row['project'] == project and row['digest'] == digest,
+               'source_not_registered', 404)
+        binding_row = self.db.execute('SELECT source_inode,source_created,binding FROM source_bindings WHERE source_id=?',
+                                      (source_id,)).fetchone()
+        if binding_row is None:
+            return None
+        if (binding_row['source_inode'] != row['inode']
+                or binding_row['source_created'] != row['created']):
+            # The older worker can delete and recreate a source with the same
+            # UUID without knowing this side table. The file-incarnation facts
+            # prevent attaching the previous proof to that new unverified row.
+            self.db.execute('DELETE FROM source_bindings WHERE source_id=?', (source_id,))
+            self.db.commit()
+            return None
+        try:
+            value = json.loads(binding_row['binding'])
+        except (ValueError, TypeError):
+            raise Rejected('source_binding_corrupt', 409) from None
+        ensure(type(value) is dict, 'source_binding_corrupt', 409)
+        return value
 
     def cleanup_sources(self, now=None):
         """Collect expired owned deposits after every referencing job is retired.
@@ -541,6 +604,7 @@ class Service:
                 ensure(not path.is_symlink() and path.is_file() and path.stat().st_ino == row['inode'], 'source_cleanup_identity_drift', 409)
                 path.unlink()
                 self.db.execute('DELETE FROM sources WHERE id=?', (row['id'],))
+                self.db.execute('DELETE FROM source_bindings WHERE source_id=?', (row['id'],))
                 self.db.commit()
 
     def _source_job_retired(self, source, operation, payload):
@@ -580,7 +644,12 @@ class Service:
 
     def submit(self, payload):
         fields = {'job_id', 'command_id', 'idempotency_key', 'project', 'recipe', 'source_commit', 'source_digest', 'resource_ids'}
-        ensure(isinstance(payload, dict) and set(payload) in (fields | {'source_id'}, fields | {'source_zip_base64'}), 'job_schema')
+        legacy = (fields | {'source_id'}, fields | {'source_zip_base64'})
+        bound = fields | {'source_id', 'require_source_binding', 'expected_source_binding'}
+        ensure(isinstance(payload, dict) and set(payload) in (*legacy, bound), 'job_schema')
+        if 'require_source_binding' in payload:
+            ensure(payload['require_source_binding'] is True and type(payload['expected_source_binding']) is dict,
+                   'job_schema')
         identifier(payload['job_id']); identifier(payload['command_id'])
         ensure(isinstance(payload['idempotency_key'], str) and 0 < len(payload['idempotency_key']) <= 128,
                'invalid_idempotency_key')
@@ -598,6 +667,21 @@ class Service:
                 return existing
             raw = self._source(payload['source_id'], payload['project'], payload['source_digest']) if 'source_id' in payload else archive(payload['source_zip_base64'])
             ensure(hashlib.sha256(raw).hexdigest() == payload['source_digest'], 'source_digest_mismatch')
+            binding = (self._source_binding(payload['source_id'], payload['project'], payload['source_digest'])
+                       if 'source_id' in payload else None)
+            if payload.get('require_source_binding') is True:
+                ensure(binding is not None and
+                       json.dumps(binding, sort_keys=True, separators=(',', ':')) ==
+                       json.dumps(payload['expected_source_binding'], sort_keys=True, separators=(',', ':')),
+                       'source_binding_required', 409)
+            if binding is not None:
+                from .source_provenance import verify_tree_binding
+                try:
+                    verify_tree_binding(raw, binding)
+                except ValueError:
+                    raise Rejected('source_binding_invalid', 409) from None
+                ensure(binding['commit_oid'] == payload['source_commit'], 'source_binding_mismatch', 409)
+                payload = dict(payload, source_binding=binding)
             extract(raw)
             ensure(self.active is None and not self.db.execute("SELECT 1 FROM operations WHERE state IN ('held','running','accepted')").fetchone(),
                    'worker_busy_or_held', 409)
@@ -670,6 +754,10 @@ class Service:
     def _execute_operation(self, payload, raw):
         lease = None
         try:
+            executable_paths = frozenset()
+            if payload.get('source_binding') is not None:
+                from .source_provenance import verified_executable_paths
+                executable_paths = verified_executable_paths(raw, payload['source_binding'])
             with self.lock:
                 self.db.execute("UPDATE operations SET state='running' WHERE command_id=?", (payload['command_id'],))
                 self.db.commit()
@@ -686,7 +774,7 @@ class Service:
                         (resource_id, payload['job_id'], kind, 1, 'building', path.stat().st_ino, '{}', 0, '[]'))
                     self.db.commit()
             extract(raw, paths['workspace'])
-            make_job_readable(paths['workspace'], MAX_EXPANDED)
+            make_job_readable(paths['workspace'], MAX_EXPANDED, executable_paths=executable_paths)
             profile = self.projects[payload['project']][payload['recipe']]
             if lease is None:
                 result = self.backend.run(paths, profile, payload['command_id'])
@@ -700,8 +788,11 @@ class Service:
                     self.db.execute("UPDATE resources SET state='ready',manifest=?,bytes=? WHERE id=?",
                                     (json.dumps(manifest), size, payload['resource_ids'][kind]))
                     self.db.commit()
-            result.update(source_commit=payload['source_commit'], source_commit_verification='declared',
+            result.update(source_commit=payload['source_commit'], source_commit_verification=(
+                              'git-sha1-tree-v1' if payload.get('source_binding') else 'declared'),
                           source_digest=payload['source_digest'], resource_ids=payload['resource_ids'])
+            if payload.get('source_binding') is not None:
+                result['source_binding'] = payload['source_binding']
             state = 'succeeded'
         except Exception as exc:
             from .docker import DockerBackend, FrozenDiagnosticFailure
@@ -735,6 +826,9 @@ class Service:
         if self.scratch_slot is not None and (lease is None or not lease.backend_absent):
             state = 'held'
             result = {'error': 'scratch_cleanup_unproven'}
+        if state in TERMINAL and payload.get('source_binding') is not None:
+            result.update(source_commit=payload['source_commit'], source_digest=payload['source_digest'],
+                          source_commit_verification='git-sha1-tree-v1', source_binding=payload['source_binding'])
         with self.lock:
             self._terminal_receipt(payload['command_id'], state, result)
             if lease is not None and lease.backend_absent:

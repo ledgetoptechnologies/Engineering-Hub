@@ -9,6 +9,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from .image_version_reports import ImageVersionsSummary
+from .decision_projection import public_decision
 
 
 AgentId = Literal['hermes', 'codex', 'claude']
@@ -28,6 +29,67 @@ RunEventState = Literal['running', 'succeeded', 'failed', 'rolled_back', 'held']
 
 class ResponseDTO(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
+
+
+class OrchestrationChecklistItem(ResponseDTO):
+    id: str
+    text: str
+    done: bool
+
+
+class OrchestrationProgress(ResponseDTO):
+    checklist: list[OrchestrationChecklistItem]
+    percent: float | None
+    eta_seconds: int | None
+    agent_eta_guess: int | None
+    status_line: str
+    blocked_on: str
+    updated_at: str
+
+
+class OrchestrationPendingDecision(ResponseDTO):
+    id: str
+    title: str
+    options: list[str]
+    updated_at: str
+
+
+class OrchestrationDispatchView(ResponseDTO):
+    id: str
+    task_id: str
+    task_title: str
+    task_status: str
+    task_completion_verified: bool
+    role: str
+    state: str
+    updated_at: str
+    stale_checkpoint: bool
+    report: str
+    dispatch_completion_verified: bool
+    pending_decision: OrchestrationPendingDecision | None
+    progress: OrchestrationProgress | None
+
+
+class OrchestrationRequestViewHeader(ResponseDTO):
+    id: str
+    title: str
+    updated_at: str
+
+
+class OrchestrationRequestView(ResponseDTO):
+    project: ProjectId
+    request: OrchestrationRequestViewHeader
+    dispatches: list[OrchestrationDispatchView]
+    next_after: str | None
+    snapshot: Literal['single_read_transaction']
+    freshness: Literal['checkpoint_only']
+    execution_authorization: Literal[False]
+
+
+class OrchestrationTrackingTaskIds(ResponseDTO):
+    request_id: str
+    task_ids: list[str]
+    next_after: str | None
 
 
 class EntityDTO(ResponseDTO):
@@ -115,6 +177,13 @@ class DecisionDTO(EntityDTO):
     withdrawn_family: AgentId | None = None
     withdrawn_session_id: SessionId | None = None
 
+    @model_validator(mode='before')
+    @classmethod
+    def redact_dispatch_origin(cls, value):
+        # Dispatch lineage is private coordination metadata. Keep the strict
+        # response contract for every other unexpected field.
+        return public_decision(value)
+
     @model_validator(mode='after')
     def installation_withdrawal_required(self):
         if self.withdrawn_by is not None and self.withdrawn_by.startswith('installation:'):
@@ -131,7 +200,8 @@ class RunEventDTO(ResponseDTO):
     event_id: str | None = None
     reason: Literal['candidate_outcome_uncertain', 'staging_paused', 'rollback_failed',
                     'rollback_outcome_uncertain', 'rollback_smoke_failed',
-                    'rollback_smoke_outcome_uncertain'] | None = None
+                    'rollback_smoke_outcome_uncertain', 'disposable_cleanup_requires_quiescence',
+                    'disposable_cleanup_outcome_uncertain'] | None = None
 
     @model_validator(mode='after')
     def held_reason_only(self):
@@ -169,6 +239,45 @@ class RunDTO(EntityDTO):
     execution_actor: ExecutorId | None
     execution_manifest_digest: Digest | None
     events: list[RunEventDTO]
+
+
+class PilotCommandEvidenceDTO(ResponseDTO):
+    action: Literal['deploy_container', 'smoke_container', 'rollback_container', 'smoke_container_rollback', 'cleanup_candidate', 'cleanup_rollback']
+    command_id: str
+    state: Literal['not_started', 'unknown', 'held', 'succeeded', 'failed', 'ack_pending', 'inconsistent']
+    expected_image_config_id: Digest
+    reported_image_config_id: Digest | None
+    reported_health: Literal['unknown', 'healthy', 'unhealthy'] | None
+    worker_state: Literal['pending', 'running', 'succeeded', 'failed', 'held'] | None
+    worker_evidence_verified: bool | None
+    protocol_verified: bool
+    journal_verified: bool
+    reason: Literal[
+        'inspect_required', 'paused', 'target_busy', 'stale_fence', 'identity_conflict',
+        'manifest_mismatch', 'policy_mismatch', 'image_unavailable', 'daemon_unavailable',
+        'container_conflict', 'evidence_mismatch', 'health_failed', 'effect_failed',
+        'recovery_required',
+    ] | None
+
+
+class PilotReleaseEvidenceDTO(ResponseDTO):
+    run_id: str
+    task_id: str
+    project: ProjectId
+    source_commit: Commit
+    review: RunReviewDTO
+    run_status: RunState
+    candidate_image_config_id: Digest
+    pilot_manifest_digest: Digest
+    rollback_image_config_id: Digest
+    candidate_deploy: PilotCommandEvidenceDTO
+    candidate_health_check: PilotCommandEvidenceDTO
+    rollback_deploy: PilotCommandEvidenceDTO
+    rollback_health_check: PilotCommandEvidenceDTO
+    candidate_cleanup: PilotCommandEvidenceDTO | None
+    rollback_cleanup: PilotCommandEvidenceDTO | None
+    evidence_basis: Literal['authenticated_worker_report']
+    independently_verified: Literal[False]
 
 
 class RecoveryDTO(ResponseDTO):

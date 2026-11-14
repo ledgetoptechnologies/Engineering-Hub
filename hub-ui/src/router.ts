@@ -18,12 +18,20 @@ export type Route =
   | { page: "notes" }
   | { page: "planning" }
   | { page: "agents" }
+  | { page: "agent-installations" }
+  | { page: "agent-map" }
   | { page: "staging" }
+  | { page: "staging-queues" }
+  | { page: "staging-resources" }
   | { page: "infrastructure" }
-  | { page: "device"; id: string };
+  | { page: "device"; id: string }
+  // Demo-only until the orchestration backend exists; App gates it with orchestrationEnabled().
+  | { page: "orchestration" }
+  | { page: "orchestration-request"; id: string };
 
 const projectId = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const setId = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const requestId = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const reviewId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 // Section anchors from the single-page dashboard keep working as links.
 const legacy: Record<string, Route> = {
@@ -33,7 +41,8 @@ const legacy: Record<string, Route> = {
   planning: { page: "planning" },
   agents: { page: "agents" },
   staging: { page: "staging" },
-  "software-queue": { page: "staging" },
+  // The validation queue now lives on the staging queues sub-page.
+  "software-queue": { page: "staging-queues" },
 };
 
 // Guards belong to mounted editors only. Removing one (including on auth loss)
@@ -73,8 +82,16 @@ export function parseRoute(value: string): Route {
     case "work": return { page: "work" };
     case "notes": return { page: "notes" };
     case "planning": return { page: "planning" };
-    case "agents": return { page: "agents" };
-    case "staging": return { page: "staging" };
+    case "agents":
+      return parts.length === 2 && parts[1] === "installations" ? { page: "agent-installations" }
+        : parts.length === 2 && parts[1] === "map" ? { page: "agent-map" } : { page: "agents" };
+    case "staging":
+      if (parts.length === 2 && parts[1] === "queues") return { page: "staging-queues" };
+      if (parts.length === 2 && parts[1] === "resources") return { page: "staging-resources" };
+      return { page: "staging" };
+    case "orchestration":
+      if (parts.length === 1) return { page: "orchestration" };
+      return parts.length === 2 && requestId.test(parts[1]) ? { page: "orchestration-request", id: parts[1] } : { page: "orchestration" };
     case "infrastructure":
       if (parts.length === 1) return { page: "infrastructure" };
       return parts.length === 2 && projectId.test(parts[1]) ? { page: "device", id: parts[1] } : { page: "infrastructure" };
@@ -100,6 +117,11 @@ export function pathOf(route: Route): string {
     case "labels": return `/projects/${route.project}/labels/${route.set}`;
     case "review": return `/projects/${route.project}/reviews/${route.id}`;
     case "device": return `/infrastructure/${route.id}`;
+    case "orchestration-request": return `/orchestration/${route.id}`;
+    case "agent-installations": return "/agents/installations";
+    case "agent-map": return "/agents/map";
+    case "staging-queues": return "/staging/queues";
+    case "staging-resources": return "/staging/resources";
     default: return `/${route.page}`;
   }
 }
@@ -118,8 +140,15 @@ export function link(path: string): string {
   return pathMode ? path + location.search : "#" + path;
 }
 
+function isRouteHash(url: { pathname: string; hash: string }): boolean {
+  // An explicit #/ route works at any path. Old single-page anchors are routes
+  // only at the app root; on a real path #name is that page's fragment.
+  return url.hash.startsWith('#/') ||
+    ((url.pathname === '/' || url.pathname === '/index.html') && Object.hasOwn(legacy, url.hash.slice(1)));
+}
+
 function routeAt(url: { pathname: string; hash: string }): Route {
-  return url.hash.length > 1 ? parseRoute(url.hash) : parseRoute(url.pathname);
+  return isRouteHash(url) ? parseRoute(url.hash) : parseRoute(url.pathname);
 }
 const current = () => routeAt(location);
 const here = () => location.pathname + location.search + location.hash;
@@ -162,9 +191,16 @@ function enablePathMode() {
   if (pathMode) return;
   pathMode = true;
   // Move an old #/ address onto the real path without adding a history entry.
-  if (location.hash.length > 1 && !restoring) {
+  if (isRouteHash(location) && !restoring) {
     const value = accepted?.position ?? position() ?? freshPosition();
-    history.replaceState(stateAt(value), "", pathOf(parseRoute(location.hash)) + location.search);
+    const inner = location.hash.startsWith('#/') ? location.hash.slice(1) : '';
+    const fragmentAt = inner.indexOf('#');
+    const beforeFragment = fragmentAt < 0 ? inner : inner.slice(0, fragmentAt);
+    const fragment = fragmentAt < 0 ? '' : inner.slice(fragmentAt);
+    const queryAt = beforeFragment.indexOf('?');
+    const innerQuery = queryAt < 0 ? '' : beforeFragment.slice(queryAt + 1);
+    const query = location.search + (innerQuery ? (location.search ? '&' : '?') + innerQuery : '');
+    history.replaceState(stateAt(value), "", pathOf(parseRoute(location.hash)) + query + fragment);
     accepted = { url: here(), position: value };
   }
   notify();

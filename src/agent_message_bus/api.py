@@ -282,19 +282,21 @@ def router(service: Service) -> APIRouter:
     @api.post("/messages/{message_id}/ack")
     def ack(message_id: str, request: Request):
         identity = agent(request)
-        try: message = service.repository.acknowledge(message_id, identity)
+        try: message, replayed = service.repository.acknowledge_with_outcome(message_id, identity)
         except NotFound as exc: raise HTTPException(404, str(exc)) from exc
         except InvalidTransition as exc: raise HTTPException(409, str(exc)) from exc
-        service.audit_message("acknowledge", identity, message, request=request); return message_dict(message)
+        service.audit_message("acknowledge", identity, message, result="replayed" if replayed else "ok", request=request)
+        return message_dict(message)
 
     @api.post("/messages/{message_id}/reject")
     def reject(message_id: str, payload: RejectRequest, request: Request):
         identity = agent(request)
-        try: message = service.repository.reject(message_id, identity, payload.reason)
+        try: message, replayed = service.repository.reject_with_outcome(message_id, identity, payload.reason)
         except NotFound as exc: raise HTTPException(404, str(exc)) from exc
         except InvalidTransition as exc: raise HTTPException(409, str(exc)) from exc
         except MessageError as exc: raise HTTPException(400, str(exc)) from exc
-        service.audit_message("reject", identity, message, request=request); return message_dict(message)
+        service.audit_message("reject", identity, message, result="replayed" if replayed else "ok", request=request)
+        return message_dict(message)
 
     @api.post("/admin/cleanup")
     def run_cleanup(request: Request, _admin: str = Depends(admin)):

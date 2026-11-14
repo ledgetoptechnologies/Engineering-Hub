@@ -53,8 +53,7 @@ test("splits the staging engine from other programs, and offers no controls", as
   await expect(panel(page)).not.toContainText("registry.example.test");
   await expect(panel(page)).not.toContainText("sha256");
   await expect(panel(page).getByRole("button")).toHaveText(["Refresh"]);
-  // The only mention of readiness is the disclaimer that this isn't one.
-  await expect(panel(page).getByText(/\bready\b/i)).toHaveText([/^What the staging PC reported .*doesn't mean the PC is ready for work/]);
+  await expect(panel(page).getByText(/\bready\b/i)).toHaveCount(0);
   expect(blocking(await audit(page, "page", 1440))).toEqual([]);
 });
 
@@ -138,12 +137,12 @@ test("a page left open goes out of date by its own clock, without reading again"
 test("steps aside for people who aren't the staging admin, and on Hubs without it", async ({ page }) => {
   await fixture(page, [{ status: 403, body: { detail: { code: "staging_admin_required" } } }]);
   await page.goto("/#/staging");
-  await expect(page.getByRole("region", { name: "Staging resources" })).toBeVisible();
+  await expect(page.locator("#staging")).toBeVisible();
   await expect(panel(page)).toHaveCount(0);
   await page.unrouteAll();
   await fixture(page, [{ status: 403, body: { detail: { code: "gateway_route_forbidden" } } }]);
   await page.reload();
-  await expect(page.getByRole("region", { name: "Staging resources" })).toBeVisible();
+  await expect(page.locator("#staging")).toBeVisible();
   await expect(panel(page)).toHaveCount(0);
 });
 

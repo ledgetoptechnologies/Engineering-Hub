@@ -11,6 +11,7 @@ import pytest
 from agent_message_bus.auth import AuthSettings
 from engineering_hub.mcp import HubMCPAuthMiddleware, build_hub_mcp
 from engineering_hub.repository import HubError, HubRepository
+from tests.work_queue_review_faults import corrupt_review_after_active_work
 from engineering_hub.work_queue import WorkAction, WorkQueue
 from engineering_hub.work_queue_api import attach_work_queue_routes
 
@@ -134,7 +135,15 @@ def test_discovery_and_every_tool_authentication(rig):
 def test_unconfigured_mcp_queue_never_claims_readiness(rig):
     with rig[3](None) as client:
         names = {tool['name'] for tool in rpc(client, 'tools/list').json()['result']['tools']}
-        assert len(names) == 14 and not TOOLS & names
+        assert names == {
+            'hub_overview', 'hub_project_tasks', 'hub_tracking_task_propose', 'hub_tracking_task_origin', 'hub_orchestration_request_tasks', 'hub_orchestration_request_origin_task_summary', 'hub_tracking_task_update',
+            'hub_tracking_task_list', 'hub_tracking_task_review', 'hub_role_list', 'hub_role_get', 'hub_role_acquire', 'hub_role_renew', 'hub_role_release', 'hub_role_claim', 'hub_role_claims', 'hub_role_claim_release', 'hub_task_progress_get', 'hub_task_progress_update', 'hub_orchestration_request_create', 'hub_orchestration_request_get', 'hub_orchestration_request_list', 'hub_dispatch_create', 'hub_dispatch_get', 'hub_dispatch_list', 'hub_role_dispatch_inbox', 'hub_dispatch_report', 'hub_dispatch_checkpoint', 'hub_dispatch_decisions', 'hub_dispatch_reports', 'hub_orchestrator_attention_list', 'hub_orchestrator_attention_reconcile_closed', 'hub_addressed_attention_list', 'hub_addressed_attention_ack', 'hub_worker_dispatch_pending', 'hub_worker_dispatch_ack', 'hub_worker_decision_inspect', 'hub_orchestrator_report_inspect', 'hub_tracking_task_history',
+            'hub_tracking_task_compact', 'hub_tracking_claim_withdraw', 'hub_tracking_draft_propose', 'hub_task_get', 'hub_task_claim', 'hub_task_candidate',
+            'hub_task_review', 'hub_decision_request', 'hub_decision_get', 'hub_run_list',
+            'hub_topic_peers', 'hub_topic_preflight', 'hub_staging_task_propose',
+            'hub_planning_list', 'hub_planning_get', 'hub_planning_put', 'hub_entity_withdraw',
+        }
+        assert not TOOLS & names
         assert call(client, 'hub_work_status', {}).get('isError') is True
         response = client.get('/api/hub/v1/work/status', headers={'Authorization': 'Bearer test-codex'})
         assert response.status_code == 423
@@ -195,7 +204,7 @@ def test_mcp_closed_input_sanitizes_validation(tool, payload, rig):
     assert 'private-input' not in str(result)
 
 
-def test_production_remains_blocked_and_stale_review_not_claimable(rig):
+def test_production_remains_blocked_and_active_review_is_frozen(rig):
     client, repo, _, _, _, payload = rig
     production = call(client, 'hub_work_submit', payload(environment='production', approval_id='ordinary-decision-id'))
     assert production['state'] == 'queued'
@@ -203,7 +212,10 @@ def test_production_remains_blocked_and_stale_review_not_claimable(rig):
     body = payload()
     call(client, 'hub_work_submit', body)
     item = repo.get_task(body['target']['task_id'])
-    repo.set_candidate('codex', item['id'], item['revision'], 'c' * 40)
+    with pytest.raises(HubError, match='active_work_job'):
+        repo.set_candidate('codex', item['id'], item['revision'], 'c' * 40)
+    assert repo.get_task(item['id'])['candidate_commit'] == COMMIT
+    corrupt_review_after_active_work(repo, body['target']['task_id'])
     assert call(client, 'hub_work_claim', {'instance_id': str(uuid4())})['job'] is None
 
 

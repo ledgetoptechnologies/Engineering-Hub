@@ -51,6 +51,19 @@ def snapshot(path):
         return enrollment._snapshot(db)
 
 
+def test_unkeyed_decisions_preserve_old_enrollment_schema(ledger, monkeypatch):
+    path, repo, _, _ = ledger
+    # The previous enrollment allowlist was identical except for this table.
+    old_ddl = {name: ddl for name, ddl in enrollment._DDL.items() if name != 'hub_decision_requests'}
+    monkeypatch.setattr(enrollment, '_DDL', old_ddl)
+    assert 'hub_decision_requests' not in snapshot(path)['tables']
+    repo.create_decision('codex', 'engineering-hub', 'Another question', ['Yes', 'No'])
+    assert 'hub_decision_requests' not in snapshot(path)['tables']
+    repo.create_decision('codex', 'engineering-hub', 'Keyed question', ['Yes', 'No'], client_request_id='key')
+    with pytest.raises(enrollment.EnrollmentError):
+        snapshot(path)
+
+
 def test_plan_is_read_only_fingerprints_no_secrets_and_apply_preserves_every_existing_row(ledger):
     path, legacy, store, session = ledger
     before = path.read_bytes()
@@ -87,6 +100,12 @@ async def test_cold_copy_preserves_real_auth_queue_and_delivery_history_after_ow
     # delivery, job execution, or a production state-migration procedure.
     source, repo, _, github_session = ledger
     task = repo.list_tasks()[0]
+    # Queue admission requires the exact task candidate to be independently
+    # reviewed. Keep these real transitions in the copied history as well.
+    task = repo.claim_task('codex', task['id'], task['revision'])
+    task = repo.set_candidate('codex', task['id'], task['revision'], 'a' * 40)
+    task = repo.review_task('claude', task['id'], task['revision'], 'a' * 40, 'approve')
+    assert task['status'] == 'verified' and task['review']['actor'] == 'claude'
     config = AuthConfig(
         base_url='https://hub.example.com', human_auth_mode='cloudflare_access',
         cloudflare_issuer='https://disposable-test.cloudflareaccess.com',
@@ -447,3 +466,88 @@ e.apply_plan(plan, e.plan_digest(plan), writers_stopped=True, backup_verified=Tr
         owner.assert_active(path)
         repo = HubRepository(path, pilot_owner=owner)
         assert len(repo.list_tasks()) == len(repo.list_decisions()) == 1
+
+
+def test_bound_oauth_tables_are_exact_atomic_group_for_offline_scan(ledger):
+    from engineering_hub.bound_oauth_draft import BoundOAuthDraftStore
+    path, repo, store, _ = ledger
+    BoundOAuthDraftStore(store)
+    snapshot(path)
+    with repo._transaction() as db:
+        db.execute('DROP TABLE auth_bound_oauth_sessions')
+    with pytest.raises(enrollment.EnrollmentError):
+        snapshot(path)
+
+
+def test_owned_bound_schema_requires_explicit_offline_preparation(tmp_path):
+    from engineering_hub.bound_oauth_draft import BoundOAuthDraftStore, enroll_owned_bound_schema
+    private = tmp_path/'owned'
+    private.mkdir(mode=0o700)
+    path = private/'hub.db'
+    with PilotOwner(path, allow_ephemeral_test_storage=True) as owner:
+        repo = HubRepository(path, pilot_owner=owner)
+        store = SessionStore(path, repository=repo)
+        with pytest.raises(ValueError, match='offline enrollment'):
+            BoundOAuthDraftStore(store)
+        with pytest.raises(ValueError, match='offline'):
+            enroll_owned_bound_schema(repo, writers_stopped=False, backup_verified=True)
+        enroll_owned_bound_schema(repo, writers_stopped=True, backup_verified=True)
+        BoundOAuthDraftStore(store)
+        with pytest.raises(ValueError, match='already present'):
+            enroll_owned_bound_schema(repo, writers_stopped=True, backup_verified=True)
+
+
+def test_owned_bound_preparation_rolls_back_first_ddl_on_second_failure(tmp_path, monkeypatch):
+    from engineering_hub import bound_oauth_draft as draft
+    private=tmp_path/'owned-fault'; private.mkdir(mode=0o700)
+    path=private/'hub.db'
+    with PilotOwner(path, allow_ephemeral_test_storage=True) as owner:
+        repo=HubRepository(path,pilot_owner=owner)
+        bad=dict(draft._SCHEMAS)
+        bad['auth_bound_oauth_sessions']='CREATE TABLE invalid SQL'
+        monkeypatch.setattr(draft,'_SCHEMAS',bad)
+        with pytest.raises(sqlite3.Error):
+            draft.enroll_owned_bound_schema(repo,writers_stopped=True,backup_verified=True)
+        with repo._connection() as db:
+            assert db.execute("SELECT name FROM sqlite_master WHERE name LIKE 'auth_bound_oauth_%'").fetchall() == []
+
+
+def test_bound_preparation_denies_competing_owner_and_installs_exact_schema(tmp_path):
+    from engineering_hub import bound_oauth_draft as draft
+    private=tmp_path/'owned-contention'; private.mkdir(mode=0o700)
+    path=private/'hub.db'
+    with PilotOwner(path, allow_ephemeral_test_storage=True) as owner:
+        repo=HubRepository(path,pilot_owner=owner)
+        with pytest.raises(PilotOwnershipError):
+            PilotOwner(path, require_existing=True, allow_ephemeral_test_storage=True)
+        draft.enroll_owned_bound_schema(repo,writers_stopped=True,backup_verified=True)
+        with repo._connection() as db:
+            draft._check_schema(db)
+            observed=dict(db.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name LIKE 'auth_bound_oauth_%'").fetchall())
+        assert observed == draft._SCHEMAS
+
+
+def test_bound_preparation_serializes_with_legacy_sqlite_writer(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from engineering_hub import bound_oauth_draft as draft
+    private=tmp_path/'owned-writer'; private.mkdir(mode=0o700)
+    path=private/'hub.db'
+    with PilotOwner(path, allow_ephemeral_test_storage=True) as owner:
+        repo=HubRepository(path,pilot_owner=owner)
+        entered=Event(); release=Event()
+        def legacy_writer():
+            with sqlite3.connect(path, timeout=5) as db:
+                db.execute('BEGIN IMMEDIATE')
+                entered.set()
+                assert release.wait(3)
+        def prepare():
+            return draft.enroll_owned_bound_schema(repo,writers_stopped=True,backup_verified=True)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            writer=pool.submit(legacy_writer)
+            assert entered.wait(2)
+            pending=pool.submit(prepare)
+            assert not pending.done()
+            release.set(); writer.result(timeout=3); pending.result(timeout=3)
+        with repo._connection() as db:
+            draft._check_schema(db)

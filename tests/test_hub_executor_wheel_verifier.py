@@ -5,6 +5,9 @@ import hashlib
 import importlib.util
 import io
 import json
+import re
+import subprocess
+import sys
 from pathlib import Path
 import stat
 import warnings
@@ -99,12 +102,12 @@ def test_valid_raw_crlf_wheel_matches_external_pins_without_import_or_extraction
     path, digest, marker = wheel(tmp_path)
     assert b"\r\n" in path.read_bytes()  # Raw ZIP bytes must survive text-mode translation.
     assert verify(path, digest) == dict(source_commit=COMMIT, wheel_sha256=digest,
-        core_image=CORE, python_files_verified=11)
+        core_image=CORE, python_files_verified=14)
     assert not marker.exists()
     assert sorted(item.name for item in tmp_path.iterdir()) == ["executor.whl"]
 
 
-@pytest.mark.parametrize('module', ['installed_coordinator', 'launch_supervisor', 'launcher_cli', 'configuration_commitment'])
+@pytest.mark.parametrize('module', ['installed_coordinator', 'colocated_session', 'colocated_pair_preflight', 'coordinator_observation_transport', 'launch_supervisor', 'launcher_cli', 'configuration_commitment'])
 def test_rejects_self_consistent_wheel_missing_current_installation_module(tmp_path, module):
     def mutate(files):
         del files['hub_container_executor/' + module + '.py']
@@ -252,7 +255,11 @@ def test_recipe_is_separate_pinned_offline_consumer_not_mutable_checkout_install
     assert lines[0] == "ARG CORE_IMAGE"
     assert "ARG CORE_IMAGE=" not in text
     assert "FROM ${CORE_IMAGE} AS core" in lines
-    assert any(line.startswith("FROM python:3.12-slim@sha256:") for line in lines)
+    # This is the exact Python base pinned for the reviewed 70312191 core;
+    # version-prefix equality alone permits copying a venv onto another patch.
+    assert [line for line in lines if line.endswith(" AS python-runtime")] == [
+        "FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS python-runtime"
+    ]
     assert "FROM scratch" in lines
     assert "COPY executor.whl /build/engineering_hub_container_executor-0.1.0-py3-none-any.whl" in lines
     assert "COPY validate_executor_wheel.py /build/validate_executor_wheel.py" in lines
@@ -270,3 +277,18 @@ def test_recipe_is_separate_pinned_offline_consumer_not_mutable_checkout_install
     assert 'CMD ["--config", "/operator/runner.json"]' in lines
     assert not any(line.startswith(("ADD ", "COPY .", "HEALTHCHECK ", "EXPOSE ")) for line in lines)
     assert not any(term in text for term in ("pip install -e", "curl ", "wget ", "apt-get", "docker.sock", "signing_key"))
+
+
+def test_recipe_checks_venv_python_patch_before_imports(tmp_path):
+    text = (ROOT / 'docker/Dockerfile.hub-executor').read_text()
+    command = re.search(r'RUN --network=none /opt/venv/bin/python -I -B -c "([^"]+)"', text).group(1)
+    check = command.split('; root=', 1)[0]
+    config = tmp_path / 'pyvenv.cfg'
+    check = check.replace("'/opt/venv/pyvenv.cfg'", repr(str(config)))
+    config.write_text('version_info = ' + '.'.join(map(str, sys.version_info[:3])) + '\n')
+    assert subprocess.run([sys.executable, '-I', '-c', check], capture_output=True).returncode == 0
+    config.write_text('version_info = 0.0.0\n')
+    mismatch = subprocess.run([sys.executable, '-I', '-c', check], capture_output=True)
+    assert mismatch.returncode != 0 and b'Core venv Python version mismatch' in mismatch.stderr
+    config.write_text('home = /usr/local/bin\n')
+    assert subprocess.run([sys.executable, '-I', '-c', check], capture_output=True).returncode != 0

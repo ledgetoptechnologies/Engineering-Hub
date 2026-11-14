@@ -66,8 +66,6 @@ export function StagingRuntimePanel({ mode, read: given, onUnauthorized, now = (
         <button className="secondary" type="button" disabled={load === "loading"} onClick={() => setAttempt(value => value + 1)}>
           {load === "loading" ? "Reading…" : "Refresh"}</button>
       </span></div>
-    <p className="panel-description">What the staging PC reported when it was last checked. This is an observation only:
-      it doesn't mean the PC is ready for work, and nothing can be started or stopped from here.</p>
     {mode === "demo" && <p role="status">Demo: illustrative programs only. Nothing is read from the staging PC.</p>}
     {load === "loading" && !runtime && <p role="status">Reading what's running on the staging PC…</p>}
     {load === "failed" && <p className="notice error" role="alert">{failure}

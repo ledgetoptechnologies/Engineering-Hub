@@ -1,0 +1,215 @@
+"""Explicit, foreground project-tracking MCP client for an enrolled EHS session.
+
+Task content comes from standard input, not process arguments. This client does
+not enroll, grant rights, create agent turns, execute work or verify evidence.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import re
+import sys
+import time
+from pathlib import Path
+
+import httpx
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+
+from agent_message_bus.agent_session_client import ClientError
+from engineering_hub.attention_client import _call, _profile, _installation_profile
+from engineering_hub import tracking_outbox
+
+_MAX_INPUT = 65536
+_TOOLS = {
+    'list': ('hub_tracking_task_list', {'project'}, {'limit', 'after_task_id', 'unfinished'}),
+    'propose': ('hub_tracking_task_propose', {'project', 'title', 'client_request_id'},
+                {'details', 'links', 'origin_request_id'}),
+    'propose-draft': ('hub_tracking_draft_propose', {'project', 'title', 'client_request_id', 'intake_id'},
+                      {'details', 'links', 'origin_request_id'}),
+    'update': ('hub_tracking_task_update', {'task_id', 'expected_revision', 'client_request_id', 'progress', 'evidence_links'},
+               {'completion_claim'}),
+    'withdraw-claim': ('hub_tracking_claim_withdraw', {'task_id', 'expected_revision', 'expected_claim_revision',
+                                                       'client_request_id', 'reason'}, set()),
+    'review': ('hub_tracking_task_review', {'task_id', 'expected_revision', 'client_request_id', 'verdict', 'note', 'evidence_links'},
+               set()),
+    'history': ('hub_tracking_task_history', {'task_id', 'kind'}, {'before'}),
+    'origin': ('hub_tracking_task_origin', {'task_id'}, set()),
+    'request-summary': ('hub_orchestration_request_origin_task_summary', {'project', 'request_id'},
+                        {'limit', 'after'}),
+}
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):
+        # argparse normally echoes unknown arguments, which could accidentally
+        # contain private task content or a credential.
+        raise ClientError('invalid_tracking_request')
+
+
+def _arguments(action, value):
+    if action not in _TOOLS or type(value) is not dict:
+        raise ClientError('invalid_tracking_request')
+    tool, required, optional = _TOOLS[action]
+    if not required <= value.keys() or value.keys() - required - optional:
+        raise ClientError('invalid_tracking_request')
+    return tool, value
+
+
+async def invoke(session, installation, session_id, action, arguments):
+    """Invoke one explicitly selected operation after exact session verification."""
+    tool, arguments = _arguments(action, arguments)
+    identity = await _call(session, 'session_identity', {})
+    if identity.get('installation_id') != installation or identity.get('session_id') != session_id:
+        raise ClientError('tracking_session_mismatch')
+    result = await _call(session, tool, arguments)
+    return {'type': 'tracking_result', 'trust': 'untrusted_hub_data', 'operation': action,
+            'execution_authorization': False, 'result': result}
+
+
+async def _run(args, arguments, *, binding=None, action=None):
+    origin, token, installation, session_id, expires = _profile(
+        args.profile_dir.expanduser().absolute(), args.session, args.private_vpn)
+    if binding is not None and (binding['origin'] != origin or binding['installation_id'] != installation):
+        raise ClientError('tracking_outbox_binding_mismatch')
+    headers = {'Authorization': 'Bearer ' + token, 'Accept-Encoding': 'identity'}
+    async with asyncio.timeout(max(1, min(60, expires - time.time()))):
+        async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(15),
+                                     follow_redirects=False, trust_env=False) as http:
+            async with streamable_http_client(origin + '/mcp', http_client=http, terminate_on_close=True) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await asyncio.wait_for(session.initialize(), timeout=15)
+                    return await invoke(session, installation, session_id, action or args.action, arguments)
+
+
+def main(argv=None):
+    parser = _Parser(description='Explicit project tracking; JSON operation arguments on stdin.')
+    parser.add_argument('--profile-dir', type=Path)
+    parser.add_argument('--session')
+    parser.add_argument('--private-vpn', action='store_true')
+    parser.add_argument('--outbox-dir', type=Path)
+    parser.add_argument('action', choices=sorted((*(set(_TOOLS) - {'propose-draft'}), 'stage', 'draft', 'bind-staged', 'recover-staged', 'send-staged', 'list-staged', 'inventory-staged', 'inspect-staged', 'status-staged')))
+    try:
+        args = parser.parse_args(argv)
+        raw = sys.stdin.buffer.read(_MAX_INPUT + 1)
+        if len(raw) > _MAX_INPUT:
+            raise ClientError('invalid_tracking_request')
+        arguments = json.loads(raw)
+        if args.action in ('stage', 'draft', 'bind-staged', 'recover-staged', 'send-staged', 'list-staged', 'inventory-staged', 'inspect-staged', 'status-staged'):
+            if args.outbox_dir is None or type(arguments) is not dict:
+                raise ClientError('invalid_tracking_request')
+            if args.action == 'list-staged':
+                if arguments.keys() - {'limit', 'after'}:
+                    raise ClientError('invalid_tracking_request')
+                page = tracking_outbox.reference_page(args.outbox_dir, limit=arguments.get('limit', 1000),
+                                                      after=arguments.get('after'))
+                result = {'type': 'tracking_outbox_references', 'record_ids': page['record_ids']}
+                # Preserve the original {}/small-outbox response shape.
+                if arguments or page['next_after'] is not None:
+                    result['next_after'] = page['next_after']
+            elif args.action == 'inventory-staged':
+                if arguments.keys() - {'limit', 'after'}:
+                    raise ClientError('invalid_tracking_request')
+                page = tracking_outbox.inventory_page(args.outbox_dir, limit=arguments.get('limit', 25),
+                                                       after=arguments.get('after'))
+                result = {'type': 'tracking_outbox_inventory', 'trust': 'private_untrusted_local_data',
+                          'execution_authorization': False, **page}
+            elif args.action == 'stage':
+                if set(arguments) != {'action', 'arguments'} or arguments['action'] not in ('propose', 'update', 'review', 'withdraw-claim'):
+                    raise ClientError('invalid_tracking_request')
+                _arguments(arguments['action'], arguments['arguments'])
+                if args.profile_dir is None or args.session is None:
+                    raise ClientError('invalid_tracking_request')
+                origin, installation = _installation_profile(
+                    args.profile_dir.expanduser().absolute(), args.private_vpn)
+                record_id = tracking_outbox.stage(args.outbox_dir, origin, installation, None,
+                                                   arguments['action'], arguments['arguments'])
+                result = {'type': 'tracking_outbox_staged', 'record_id': record_id,
+                          'sent': False, 'execution_authorization': False}
+            elif args.action == 'draft':
+                if set(arguments) != {'action', 'arguments'} or arguments['action'] != 'propose':
+                    raise ClientError('invalid_tracking_request')
+                _arguments('propose', arguments['arguments'])
+                payload = arguments['arguments']
+                if (type(payload['project']) is not str or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', payload['project'])
+                        or type(payload['title']) is not str or not payload['title'].strip() or len(payload['title']) > 200
+                        or type(payload['client_request_id']) is not str or not payload['client_request_id'].strip()
+                        or len(payload['client_request_id']) > 128):
+                    raise ClientError('invalid_tracking_request')
+                record_id = tracking_outbox.stage(args.outbox_dir, None, None, None, 'propose-draft', payload)
+                result = {'type': 'tracking_outbox_draft', 'record_id': record_id,
+                          'state': 'unbound', 'sent': False, 'execution_authorization': False}
+            else:
+                if (set(arguments) != {'record_id'}
+                        and not (args.action == 'recover-staged' and set(arguments) == {'record_id', 'accepted_attempt_id'})):
+                    raise ClientError('invalid_tracking_request')
+                record = tracking_outbox.read(args.outbox_dir, arguments['record_id'])
+                if record['action'] not in ('propose', 'propose-draft', 'update', 'review', 'withdraw-claim'):
+                    raise ClientError('invalid_tracking_request')
+                _arguments(record['action'], record['arguments'])
+                known_recovery_task = tracking_outbox.validate_recovery(args.outbox_dir, record)
+                if args.action == 'inspect-staged':
+                    result = {'type': 'tracking_outbox_record', 'trust': 'private_local_data',
+                              'execution_authorization': False, 'record': record}
+                    if tracking_outbox.is_draft(record):
+                        result['binding'] = tracking_outbox.binding(args.outbox_dir, record)
+                elif args.action == 'bind-staged':
+                    if args.profile_dir is None or not tracking_outbox.is_draft(record):
+                        raise ClientError('invalid_tracking_request')
+                    origin, installation = _installation_profile(args.profile_dir.expanduser().absolute(), args.private_vpn)
+                    tracking_outbox.bind(args.outbox_dir, record, origin, installation)
+                    result = {'type': 'tracking_outbox_bound', 'record_id': record['id'],
+                              'sent': False, 'execution_authorization': False}
+                elif args.action == 'recover-staged':
+                    if args.profile_dir is None:
+                        raise ClientError('invalid_tracking_request')
+                    if 'accepted_attempt_id' in arguments and type(arguments['accepted_attempt_id']) is not str:
+                        raise ClientError('invalid_tracking_request')
+                    origin, installation = _installation_profile(args.profile_dir.expanduser().absolute(), args.private_vpn)
+                    attempt = tracking_outbox.stage_recovery(args.outbox_dir, record, origin, installation,
+                                                             accepted_attempt_id=arguments.get('accepted_attempt_id'))
+                    result = {'type': 'tracking_outbox_recovery', 'record_id': attempt,
+                              'source_record_id': record['id'], 'sent': False, 'execution_authorization': False}
+                elif args.action == 'status-staged':
+                    bound = tracking_outbox.binding(args.outbox_dir, record) if tracking_outbox.is_draft(record) else record
+                    receipt = tracking_outbox.receipt(args.outbox_dir, record)
+                    if receipt is not None and ((known_recovery_task is not None and receipt['task_id'] != known_recovery_task)
+                                                or (record.get('expected_task_id') is not None
+                                                    and receipt['task_id'] != record['expected_task_id'])):
+                        raise ClientError('tracking_recovery_task_mismatch')
+                    result = {'type': 'tracking_outbox_status', 'record_id': record['id'],
+                              'state': 'hub_accepted' if receipt is not None else 'unbound' if bound is None else 'unconfirmed',
+                              'task_id': receipt['task_id'] if receipt is not None else None,
+                              'execution_authorization': False}
+                else:
+                    if args.profile_dir is None or args.session is None:
+                        raise ClientError('invalid_tracking_request')
+                    bound = tracking_outbox.bound_for_send(args.outbox_dir, record) if tracking_outbox.is_draft(record) else record
+                    result = asyncio.run(_run(args, record['arguments'], binding=bound, action=record['action']))
+                    tracking_outbox.record_acceptance(args.outbox_dir, record, result)
+        else:
+            if args.outbox_dir is not None or args.profile_dir is None or args.session is None:
+                raise ClientError('invalid_tracking_request')
+            _arguments(args.action, arguments)
+            result = asyncio.run(_run(args, arguments))
+        print(json.dumps(result, ensure_ascii=True, separators=(',', ':')))
+    except ClientError as error:
+        if str(error) == 'tracking_inventory_too_many_entries':
+            print('tracking_inventory_too_many_entries; use list-staged and inspect-staged', file=sys.stderr)
+            return 1
+        if str(error) == 'tracking_binding_durability_unavailable':
+            print('tracking_draft_binding_unavailable_on_this_platform; retain the local draft', file=sys.stderr)
+            return 1
+        print('tracking_operation_unconfirmed; check or retry with the same request id', file=sys.stderr)
+        return 1
+    except (Exception, KeyboardInterrupt):
+        # A lost response may follow a commit. Retry a write only with its same
+        # client_request_id and unchanged payload; never print peer/secret data.
+        print('tracking_operation_unconfirmed; check or retry with the same request id', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

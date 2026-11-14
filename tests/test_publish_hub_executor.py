@@ -398,6 +398,7 @@ def test_terminal_probe_identity_and_resource_mismatch_rejected(monkeypatch, fie
 
 @pytest.mark.parametrize('wrong_owner', [False, True])
 def test_attach_timeout_cleans_only_verified_owned_locator(monkeypatch, wrong_owner):
+    monkeypatch.setattr(SMOKE, 'docker_command', lambda a: (['docker', *a], {}))
     calls, cleaned = [], []
     monkeypatch.setattr(P.uuid, 'uuid4', lambda: types.SimpleNamespace(hex='f' * 32))
     monkeypatch.setattr(P, 'image', lambda *a: {})
@@ -423,10 +424,13 @@ def test_attach_timeout_cleans_only_verified_owned_locator(monkeypatch, wrong_ow
 def candidate(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     values, local, target = P.invocation(environment())
+    identity = {'socket': 'unix:///run/test/engine.sock', 'device': 1, 'inode': 2, 'daemon_id': 'daemon'}
+    monkeypatch.setattr(P.ci, 'engine_identity', lambda: identity)
     receipt = {'state': 'passed', 'inputs': values, 'image_published': False,
                'compatibility': {'core_config_digest': 'sha256:' + values['CORE_CONFIG'],
                                  'core_commit': values['CORE_COMMIT'],
                                  'installed_core_identity': 'passed',
+                                 'engine_identity': identity,
                                  'executor_imports': {'image_id': CONFIG}}}
     Path('executor-compatibility-receipt.json').write_text(json.dumps(receipt))
     monkeypatch.setattr(P, 'verify_wheel', lambda **k: {})
@@ -612,3 +616,12 @@ def test_approved_workflow_is_manual_main_only_and_artifacts_are_json_only():
     assert 'executor-compatibility-receipt.json' in source
     assert 'executor-publication-receipt.json' in source
     assert 'docker push' not in source  # Only bounded helper can push.
+
+
+def test_changed_engine_identity_stops_before_publication(monkeypatch, candidate):
+    calls = []
+    monkeypatch.setattr(P.ci, 'engine_identity', lambda: {'daemon_id': 'different'})
+    monkeypatch.setattr(P, 'run', lambda *a, **k: calls.append(a))
+    with pytest.raises(ValueError, match='engine identity changed'):
+        P.publish(*candidate)
+    assert calls == []

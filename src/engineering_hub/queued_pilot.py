@@ -266,7 +266,11 @@ class QueuedContainerPilot:
     def _review(self, db, actor, target, *, original=None):
         task = self.repo._get(db, target.task_id, 'task')
         review = task.get('review')
-        if (actor not in AGENTS or task['owner'] != actor or task['project'] != 'engineering-hub'
+        # This pilot persists only the three-field target in its durable intent.
+        # Do not admit additional build/release or staging bindings until a
+        # trusted producer and durable verifier can carry and recheck them.
+        if (target != WorkTarget(target.task_id, target.source_commit, target.artifact_digest)
+                or actor not in AGENTS or task['owner'] != actor or task['project'] != 'engineering-hub'
                 or task['status'] != 'verified' or task['candidate_commit'] != target.source_commit
                 or target.source_commit != self.target.candidate_commit
                 or target.artifact_digest != self.target.artifact_digest
@@ -304,7 +308,9 @@ class QueuedContainerPilot:
                 self._active_admission(kinds={'claim', 'command'})
             return (worker == self.worker and action_key == self.action_key
                 and environment == 'staging' and machine_id == self.machine_id
-                and type(target) is WorkTarget and target.source_commit == self.target.candidate_commit
+                and type(target) is WorkTarget
+                and target == WorkTarget(target.task_id, target.source_commit, target.artifact_digest)
+                and target.source_commit == self.target.candidate_commit
                 and target.artifact_digest == self.target.artifact_digest)
         except Exception:
             return False
@@ -427,7 +433,10 @@ class QueuedContainerPilot:
         if self.async_admission_required and operation in {'create_run', 'command'}:
             # Local binding/ledger reads can consume the proof window too.
             self._active_admission(kinds={'claim'} if operation == 'create_run' else {'command'})
-        return True
+        # Return the exact owning queue job for create_run so the repository
+        # can distinguish this admitted job from a competing open job on the
+        # same task. All other authorized operations retain the boolean result.
+        return job_id if operation == 'create_run' else True
 
     def _intent(self, job):
         self._guard(admission=True)
@@ -472,6 +481,10 @@ class QueuedContainerPilot:
                 or str(uuid.UUID(attempt['advance_owner'])) != attempt['advance_owner']):
             return None
         target = self.workflow._target(run, pin=False)
+        if target.validated_manifest().disposable_final_cleanup:
+            # A successful stop/empty scope is not independent quiescence.
+            # Keep physical capacity held until an explicit release policy exists.
+            return None
         rows = PilotRecovery._rows(db, run['id'])
         evidence = []
         for saved in rows:
@@ -533,11 +546,32 @@ class QueuedContainerPilot:
             pass
         return self.queue.get_job(job['id'])
 
+    def _preclaim_guard(self):
+        """Allow only an exact stopped runtime task to abandon a pre-claim veto."""
+        try:
+            self._guard(admission=True)
+        except HubError as error:
+            # Shutdown can close shared admission after the runtime schedules
+            # its active task but before this first, pre-claim guard executes.
+            # Check the original runtime and binding again without admitting work.
+            from .queued_pilot_runtime import QueuedPilotRuntime
+            runtime = self._runtime
+            if (error.code != 'execution_policy_admission_closed'
+                    or type(runtime) is not QueuedPilotRuntime):
+                raise
+            runtime._identity()
+            self._guard()
+            if not (runtime._claims_suspended and runtime._active is asyncio.current_task()):
+                raise
+            return False
+        return True
+
     async def run_once(self):
         """Claim one eligible staging job; no worker loop or implicit retry."""
         if self.async_admission_required:
             return await self._run_once_async()
-        self._guard(admission=True)
+        if not self._preclaim_guard():
+            return None
         self._runtime_admission()
         job = self.queue.claim(worker=self.worker, lease_seconds=600, action_keys=(self.action_key,))
         if job is None:
@@ -561,7 +595,8 @@ class QueuedContainerPilot:
                 return self._hold(job)
 
     async def _run_once_async(self):
-        self._guard(admission=True)
+        if not self._preclaim_guard():
+            return None
         self._runtime_admission()
         preview = self._claim_preview.set(asyncio.current_task())
         try:
@@ -595,7 +630,8 @@ class QueuedContainerPilot:
         job = None
         try:
             with self._consume(prepared, subject):
-                self._guard(admission=True)
+                if not self._preclaim_guard():
+                    return None
                 self._runtime_admission()
                 if claim_subject() != subject:
                     return None

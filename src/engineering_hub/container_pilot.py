@@ -12,7 +12,7 @@ import sqlite3
 import uuid
 from pathlib import Path
 
-from .container_pilot_client import ContainerPilotClient, ContainerPilotRequest, ContainerPilotResponse
+from .container_pilot_client import ContainerPilotClient, ContainerPilotRequest, ContainerPilotResponse, single_pilot_outcome_digest
 from .container_pilot_manifest import PilotManifest
 from .repository import HubError
 from .pilot_ownership import PilotOwner
@@ -130,13 +130,24 @@ class ContainerPilotWorkflow:
         except Exception:
             raise HubError('container_pilot_ownership_unavailable', 409) from None
 
-    def __init__(self, repo, client, targets, *, pilot_owner=None):
+    def __init__(self, repo, client, targets, *, pilot_owner=None, single_pilot_protocol=False):
+        if type(single_pilot_protocol) is not bool:
+            raise ValueError('single_pilot_protocol_requires_boolean')
+        client_mode = getattr(client, 'single_pilot_protocol', False)
+        if type(client_mode) is not bool or client_mode is not single_pilot_protocol:
+            raise ValueError('single_pilot_client_mode_mismatch')
+        if single_pilot_protocol and not callable(getattr(client, 'acknowledge_command', None)):
+            raise ValueError('single_pilot_ack_client_required')
+        self.single_pilot_protocol = single_pilot_protocol
         if repo.execution_principal is None:
             raise ValueError('execution_identity_required')
         if not isinstance(targets, (list, tuple)) or any(type(t) is not ContainerPilotTarget for t in targets):
             raise ValueError('invalid_pilot_targets')
         for target in targets:
-            self._validate_client_deadline(client, target.validated_manifest())
+            manifest = target.validated_manifest()
+            if manifest.disposable_final_cleanup and not single_pilot_protocol:
+                raise ValueError('disposable_cleanup_requires_single_pilot')
+            self._validate_client_deadline(client, manifest)
         self.repo, self.client = repo, client
         self.pilot_owner = pilot_owner
         self._assert_pilot_owner()
@@ -164,6 +175,18 @@ class ContainerPilotWorkflow:
             for statement in statements:
                 self._assert_pilot_owner()
                 db.execute(statement)
+            marker_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_single_pilot_protocol'").fetchone()
+            if marker_table:
+                row = db.execute('SELECT mode FROM hub_single_pilot_protocol WHERE id=1').fetchone()
+                if row is None or row[0] != 'v1' or not single_pilot_protocol:
+                    raise ValueError('single_pilot_protocol_required')
+            elif single_pilot_protocol:
+                if db.execute('SELECT 1 FROM hub_container_pilot_commands LIMIT 1').fetchone():
+                    raise ValueError('fresh_single_pilot_controller_required')
+                db.execute('CREATE TABLE hub_single_pilot_protocol (id INTEGER PRIMARY KEY CHECK(id=1), mode TEXT NOT NULL)')
+                db.execute("INSERT INTO hub_single_pilot_protocol VALUES(1,'v1')")
+            if single_pilot_protocol:
+                db.execute('CREATE TABLE IF NOT EXISTS hub_single_pilot_ack_receipts (run_id TEXT NOT NULL, action TEXT NOT NULL, payload TEXT NOT NULL, outcome_digest TEXT NOT NULL, PRIMARY KEY(run_id,action))')
             columns = {row[1] for row in db.execute('PRAGMA table_info(hub_container_pilot_commands)')}
             if 'response_json' not in columns:
                 # Preserve legacy unknown/held reservations; never reconstruct
@@ -223,9 +246,54 @@ class ContainerPilotWorkflow:
                 raise HubError('container_pilot_manifest_changed', 409)
         return target
 
+    def _historical_target(self, run, *, db=None):
+        """Resolve the immutable manifest recorded for read-only run evidence.
+
+        Unlike ``_target``, this resolver never authorizes commands, claims or
+        recovery. Effects continue to require the currently configured target.
+        """
+        self._assert_pilot_owner()
+        digest = run.get('execution_manifest_digest') if type(run) is dict else None
+        if not isinstance(digest, str):
+            raise HubError('container_pilot_manifest_history_missing', 409)
+        if db is None:
+            with self.repo._connection() as connection:
+                return self._historical_target(run, db=connection)
+        row = db.execute(
+                'SELECT binding FROM hub_container_pilot_manifest_views WHERE manifest_digest=?',
+                (digest,),
+            ).fetchone()
+        pinned = db.execute(
+                'SELECT binding FROM hub_container_pilot_bindings WHERE run_id=?',
+                (run.get('id'),),
+            ).fetchone()
+        if row is None:
+            raise HubError('container_pilot_manifest_history_missing', 409)
+        try:
+            binding = json.loads(row['binding'])
+            target = ContainerPilotTarget(**binding)
+            canonical = json.dumps(asdict(target), sort_keys=True, separators=(',', ':'))
+            if canonical != row['binding']:
+                raise ValueError('noncanonical_manifest_history')
+            target.validated_manifest()
+            if target.manifest_digest != digest:
+                raise ValueError('manifest_history_digest_mismatch')
+        except Exception:
+            raise HubError('container_pilot_manifest_history_invalid', 409) from None
+        if pinned is not None and pinned['binding'] != canonical:
+            raise HubError('container_pilot_manifest_changed', 409)
+        if (run.get('target') != target.target_id
+                or run.get('artifact_digest') != target.artifact_digest
+                or run.get('commit') != target.candidate_commit
+                or run.get('policy_revision') != target.policy_revision
+                or run.get('execution_actor') != self.repo.execution_principal):
+            raise HubError('container_pilot_manifest_mismatch', 403)
+        self._assert_pilot_owner()
+        return target
+
     def _event(self, run, event, *, phase, reason=None):
         self._assert_pilot_owner()
-        if phase not in {'deploy_container', 'smoke_container', 'rollback_container', 'smoke_container_rollback'}:
+        if phase not in {'deploy_container', 'smoke_container', 'rollback_container', 'smoke_container_rollback', 'cleanup_candidate', 'cleanup_rollback'}:
             raise ValueError('invalid_pilot_phase')
         event_id = str(uuid.uuid5(uuid.UUID(run['id']), 'container_pilot_v1:event:' + phase + ':' + event))
         return self.repo.append_run_event(self.repo.execution_principal, run['id'], event,
@@ -264,14 +332,34 @@ class ContainerPilotWorkflow:
         if state not in {'succeeded', 'failed'}:
             return 'held'
         if state == 'failed':
+            # Even a terminal failure of the current operation does not prove
+            # that earlier deploy operations had no effects. In particular,
+            # create may have succeeded before start failed, and the legacy
+            # failure response carries no candidate identity or quiescence.
+            # Hold for inspection instead of using it to authorize rollback.
+            if command.action == 'deploy_container':
+                return 'held'
+            if command.action == 'smoke_container' and (
+                    response.reason != 'health_failed' or response.evidence.health != 'unhealthy'
+                    or response.evidence.evidence_verified is not True
+                    or response.evidence.image_config_id != target.artifact_digest
+                    or not response.evidence.container_id):
+                return 'held'
             return 'failed'
+        # A successful phase cannot simultaneously report a veto or failure.
+        # The executor's successful outcomes carry no reason; treating a
+        # contradictory response as success could authorize the next effect.
+        if response.reason is not None:
+            return 'held'
         evidence = response.evidence
-        rollback = command.action in {'rollback_container', 'smoke_container_rollback'}
+        rollback = command.action in {'rollback_container', 'smoke_container_rollback', 'cleanup_rollback'}
         expected = target.rollback_image_config_id if rollback else target.artifact_digest
         if (not evidence.evidence_verified or evidence.image_config_id != expected
                 or not evidence.container_id):
             return 'held'
         if command.action in {'smoke_container', 'smoke_container_rollback'} and evidence.health != 'healthy':
+            return 'held'
+        if command.action in {'cleanup_candidate', 'cleanup_rollback'} and evidence.health != 'unknown':
             return 'held'
         return 'succeeded'
 
@@ -283,6 +371,83 @@ class ContainerPilotWorkflow:
             manifest_digest=target.manifest_digest, candidate_commit=target.candidate_commit,
             policy_revision=target.policy_revision, fencing_generation=run['fencing_generation'])
 
+    def _terminal_evidence_matches(self, run, target, expected):
+        """Require the same phase identity chain before reporting a terminal run."""
+        from .pilot_recovery import ACTIONS, PilotRecovery
+        try:
+            with self.repo._connection() as db:
+                rows = PilotRecovery._rows(db, run['id'])
+            evidence = []
+            for saved in rows:
+                if saved['action'] not in ACTIONS or saved['response_json'] is None:
+                    return False
+                command = self._request(run, target, saved['action'])
+                payload = json.dumps(command.model_dump(), sort_keys=True, separators=(',', ':'))
+                if saved['payload'] != payload:
+                    return False
+                response = self._validated_response(ContainerPilotResponse.model_validate_json(
+                    saved['response_json'], strict=True))
+                state = self._verified_state(response, command, target)
+                if state != saved['state']:
+                    return False
+                if (saved['action'] == 'smoke_container' and state == 'failed'
+                        and response.evidence.evidence_verified is not True):
+                    return False
+                evidence.append(dict(action=saved['action'], state=state,
+                                     container_id=response.evidence.container_id))
+            phases = {item['action']: item for item in evidence}
+            deploy, smoke = phases.get('deploy_container'), phases.get('smoke_container')
+            if (smoke is not None and smoke['state'] == 'failed'
+                    and (deploy is None or not deploy['container_id']
+                         or smoke['container_id'] != deploy['container_id'])):
+                return False
+            return PilotRecovery._derive(evidence) == expected
+        except Exception:
+            return False
+
+    @staticmethod
+    def _store_ack_receipt(db, run_id, action, payload, digest):
+        db.execute('INSERT OR IGNORE INTO hub_single_pilot_ack_receipts VALUES(?,?,?,?)', (run_id,action,payload,digest))
+        row = db.execute('SELECT payload,outcome_digest FROM hub_single_pilot_ack_receipts WHERE run_id=? AND action=?', (run_id,action)).fetchone()
+        if row is None or tuple(row) != (payload,digest):
+            raise ValueError('single pilot acknowledgment receipt conflict')
+
+    async def _ack_retained(self, run, target, action, command, *, finalize=True):
+        """Retry only the exact idempotent ACK; never resubmit an effect."""
+        with self.repo._connection() as db:
+            row = db.execute('SELECT payload,state,response_json FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
+                             (run['id'], action)).fetchone()
+        if row is None or row['state'] != 'ack_pending':
+            return None
+        canonical = json.dumps(command.model_dump(), sort_keys=True, separators=(',', ':'))
+        if row['payload'] != canonical or row['response_json'] is None:
+            return 'held'
+        try:
+            response = self._validated_response(ContainerPilotResponse.model_validate_json(row['response_json']))
+            state = self._verified_state(response, command, target)
+            if (state not in {'succeeded','failed'} or (state == 'failed' and
+                    (response.reason != 'health_failed' or response.evidence.health != 'unhealthy'
+                     or response.evidence.evidence_verified is not True))):
+                return 'held'
+            digest = single_pilot_outcome_digest(response)
+            self._assert_pilot_owner()
+            acknowledgment = self._validated_response(await self.client.acknowledge_command(command,digest))
+            if single_pilot_outcome_digest(acknowledgment) != digest:
+                return 'held'
+            self._assert_pilot_owner()
+            if not finalize:
+                return state
+            with self.repo._transaction() as db:
+                self._assert_pilot_owner()
+                updated = db.execute("UPDATE hub_container_pilot_commands SET state=? WHERE run_id=? AND action=? AND state='ack_pending' AND payload=? AND response_json=?",
+                    (state,run['id'],action,canonical,row['response_json']))
+                if updated.rowcount != 1:
+                    return 'held'
+                self._store_ack_receipt(db, run['id'], action, canonical, digest)
+            return state
+        except Exception:
+            return 'held'
+
     async def _command(self, run, target, action):
         bridge = getattr(self.repo, '_queued_pilot', None)
         if bridge is not None and bridge.async_admission_required:
@@ -291,6 +456,10 @@ class ContainerPilotWorkflow:
         self.repo._assert_queued_pilot('command', run_id=run['id'], action=action)
         command = self._request(run, target, action)
         canonical = json.dumps(command.model_dump(), sort_keys=True, separators=(',', ':'))
+        if self.single_pilot_protocol:
+            pending = await self._ack_retained(run, target, action, command)
+            if pending is not None:
+                return pending
         with self.repo._transaction() as db:
             self._assert_pilot_owner()
             row = db.execute('SELECT payload,state FROM hub_container_pilot_commands WHERE run_id=? AND action=?', (run['id'], action)).fetchone()
@@ -314,10 +483,17 @@ class ContainerPilotWorkflow:
         except Exception:
             state = 'held'  # No endpoint, credential or exception output retained.
         self._assert_pilot_owner()
+        if self.single_pilot_protocol and state in {'succeeded','failed'}:
+            if state == 'failed' and (response.reason != 'health_failed' or response.evidence.health != 'unhealthy' or response.evidence.evidence_verified is not True):
+                state = 'held'
+            else:
+                state = 'ack_pending'
         with self.repo._transaction() as db:
             self._assert_pilot_owner()
             db.execute('UPDATE hub_container_pilot_commands SET state=?,response_json=? WHERE run_id=? AND action=?',
                        (state, response_json, run['id'], action))
+        if self.single_pilot_protocol and state == 'ack_pending':
+            return await self._ack_retained(run, target, action, command) or 'held'
         return state
 
     async def _command_with_preparation(self, run, target, action, bridge):
@@ -327,6 +503,10 @@ class ContainerPilotWorkflow:
         bridge.command_metadata(run['id'], action)
         command = self._request(run, target, action)
         canonical = json.dumps(command.model_dump(), sort_keys=True, separators=(',', ':'))
+        if self.single_pilot_protocol:
+            pending = await self._ack_retained(run, target, action, command)
+            if pending is not None:
+                return pending
         with self.repo._connection() as db:
             row = db.execute('SELECT payload,state FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
                              (run['id'], action)).fetchone()
@@ -363,10 +543,17 @@ class ContainerPilotWorkflow:
             except Exception:
                 state = 'held'
             self._assert_pilot_owner()
+            if self.single_pilot_protocol and state in {'succeeded','failed'}:
+                if state == 'failed' and (response.reason != 'health_failed' or response.evidence.health != 'unhealthy' or response.evidence.evidence_verified is not True):
+                    state = 'held'
+                else:
+                    state = 'ack_pending'
             with self.repo._transaction() as db:
                 self._assert_pilot_owner()
                 db.execute('UPDATE hub_container_pilot_commands SET state=?,response_json=? WHERE run_id=? AND action=?',
                            (state, response_json, run['id'], action))
+            if self.single_pilot_protocol and state == 'ack_pending':
+                return await self._ack_retained(run, target, action, command) or 'held'
             return state
         # The retained child owns both accepted I/O and its evidence write. It
         # does not inherit permission for another command or queue admission.
@@ -422,8 +609,19 @@ class ContainerPilotWorkflow:
                         run = self._event(run, 'failed', phase=action)
                         break
                 else:
+                    if not self._terminal_evidence_matches(run, target, 'succeeded'):
+                        return self._hold(run, 'candidate_outcome_uncertain', phase='smoke_container')
+                    if target.validated_manifest().disposable_final_cleanup:
+                        if self.repo.get_paused():
+                            raise HubError('paused', 423)
+                        state = await self._command(run, target, 'cleanup_candidate')
+                        return self._hold(run, 'disposable_cleanup_requires_quiescence' if state == 'succeeded'
+                                          else 'disposable_cleanup_outcome_uncertain', phase='cleanup_candidate')
                     return self._event(run, 'succeeded', phase='smoke_container')
             if run['status'] == 'failed':
+                if not (self._terminal_evidence_matches(run, target, 'failed')
+                        or self._terminal_evidence_matches(run, target, 'rolled_back')):
+                    return self._hold(run, 'candidate_outcome_uncertain', phase='smoke_container')
                 for action in ('rollback_container', 'smoke_container_rollback'):
                     if self.repo.get_paused():
                         raise HubError('paused', 423)
@@ -432,6 +630,18 @@ class ContainerPilotWorkflow:
                         phase = 'rollback' if action == 'rollback_container' else 'rollback_smoke'
                         reason = phase + ('_failed' if state == 'failed' else '_outcome_uncertain')
                         return self._hold(run, reason, phase=action)
+                    if (action == 'rollback_container'
+                            and not (self._terminal_evidence_matches(run, target, 'failed')
+                                     or self._terminal_evidence_matches(run, target, 'rolled_back'))):
+                        return self._hold(run, 'rollback_outcome_uncertain', phase=action)
+                if not self._terminal_evidence_matches(run, target, 'rolled_back'):
+                    return self._hold(run, 'rollback_smoke_outcome_uncertain', phase='smoke_container_rollback')
+                if target.validated_manifest().disposable_final_cleanup:
+                    if self.repo.get_paused():
+                        raise HubError('paused', 423)
+                    state = await self._command(run, target, 'cleanup_rollback')
+                    return self._hold(run, 'disposable_cleanup_requires_quiescence' if state == 'succeeded'
+                                      else 'disposable_cleanup_outcome_uncertain', phase='cleanup_rollback')
                 return self._event(run, 'rolled_back', phase='smoke_container_rollback')
             return run
         finally:

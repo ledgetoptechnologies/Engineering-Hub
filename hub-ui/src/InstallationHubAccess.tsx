@@ -166,6 +166,7 @@ export function InstallationHubAccess({ hub, installation, catalog, client, allo
         <fieldset disabled={busy}>
           <legend>What it may do there</legend>
           <p className="panel-footnote">Each right is separate: claiming tasks doesn't include reading them.</p>
+          {catalog.capabilities.includes("decision.read") && <p className="panel-footnote">Reading questions includes their answers, which may contain sensitive information.</p>}
           {catalog.capabilities.map(id => <label key={id} className="checkbox-field">
             <input type="checkbox" checked={editing.capabilities.includes(id)}
               onChange={() => setEditing({ ...editing, capabilities: toggle(editing.capabilities, id) })} />{capabilityLabel(id)}</label>)}
