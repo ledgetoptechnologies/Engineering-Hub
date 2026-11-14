@@ -157,18 +157,21 @@ def tree_manifest(path, limit):
     return result, total
 
 
-def make_job_readable(path, limit):
+def make_job_readable(path, limit, *, executable_paths=frozenset()):
     """Validate an owned immutable tree before exposing it via a read-only bind.
 
     Rootless Docker maps the host owner to container root; the configured job
     UID therefore needs read/traverse bits. Only this resource tree changes;
     its private worker/resource ancestors remain inaccessible to other hosts.
     """
-    tree_manifest(path, limit)
+    manifest, _ = tree_manifest(path, limit)
+    ensure(type(executable_paths) is frozenset and executable_paths <= manifest.keys(),
+           'invalid_source_executable_paths')
     for directory, dirs, files in os.walk(path, followlinks=False):
         Path(directory).chmod(0o755)
         for name in files:
-            (Path(directory) / name).chmod(0o644)
+            item = Path(directory) / name
+            item.chmod(0o755 if item.relative_to(path).as_posix() in executable_paths else 0o644)
 
 
 def terminal_receipt_config(value, worker_root):
@@ -751,6 +754,10 @@ class Service:
     def _execute_operation(self, payload, raw):
         lease = None
         try:
+            executable_paths = frozenset()
+            if payload.get('source_binding') is not None:
+                from .source_provenance import verified_executable_paths
+                executable_paths = verified_executable_paths(raw, payload['source_binding'])
             with self.lock:
                 self.db.execute("UPDATE operations SET state='running' WHERE command_id=?", (payload['command_id'],))
                 self.db.commit()
@@ -767,7 +774,7 @@ class Service:
                         (resource_id, payload['job_id'], kind, 1, 'building', path.stat().st_ino, '{}', 0, '[]'))
                     self.db.commit()
             extract(raw, paths['workspace'])
-            make_job_readable(paths['workspace'], MAX_EXPANDED)
+            make_job_readable(paths['workspace'], MAX_EXPANDED, executable_paths=executable_paths)
             profile = self.projects[payload['project']][payload['recipe']]
             if lease is None:
                 result = self.backend.run(paths, profile, payload['command_id'])

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -61,6 +62,76 @@ class CoreTests(unittest.TestCase):
     def tearDown(self):
         self.service.close()
         self.temp.cleanup()
+
+    @unittest.skipUnless(os.name == 'posix', 'Executable file modes require POSIX')
+    def test_bound_git_modes_reach_the_executed_workspace(self):
+        from hub_staging_service.source_provenance import _archive_tree, _object_id
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, 'w') as bundle:
+            for name, mode, data in [('build.sh', 0o100755, b'#!/bin/sh\nexit 0\n'),
+                                     ('data.txt', 0o100644, b'data')]:
+                item = zipfile.ZipInfo(name)
+                item.create_system = 3
+                item.external_attr = mode << 16
+                bundle.writestr(item, data)
+        raw = output.getvalue()
+        tree = _archive_tree(raw)[0]
+        obj = (f'tree {tree}\nauthor Test <test@example.invalid> 1 +0000\n'
+               f'committer Test <test@example.invalid> 1 +0000\n\nfixture\n').encode()
+        commit = _object_id(b'commit', obj)
+        payload = job(raw)
+        source_id = uid()
+        receipt = self.service.put_source({'source_id': source_id, 'project': 'demo',
+            'source_digest': payload['source_digest'], 'source_zip_base64': payload.pop('source_zip_base64'),
+            'source_commit': commit, 'source_commit_object_base64': base64.b64encode(obj).decode()})
+        payload.update(source_id=source_id, source_commit=commit, require_source_binding=True,
+                       expected_source_binding=receipt['source_binding'])
+
+        class ExecutingBackend(Backend):
+            def run(self, paths, profile, command_id):
+                script = paths['workspace'] / 'build.sh'
+                assert stat.S_IMODE(script.stat().st_mode) == 0o755
+                assert stat.S_IMODE((paths['workspace'] / 'data.txt').stat().st_mode) == 0o644
+                subprocess.run([str(script)], check=True, timeout=5)
+                return super().run(paths, profile, command_id)
+
+        self.service.backend = ExecutingBackend()
+        self.service.submit(payload)
+        self.service.wait()
+        self.assertEqual(self.service.status(payload['job_id'])['state'], 'succeeded')
+
+        # Legacy, unbound sources retain their existing non-executable policy.
+        legacy = Path(self.temp.name) / 'legacy-check'
+        legacy.mkdir()
+        extract(raw, legacy)
+        make_job_readable(legacy, 1024)
+        self.assertEqual(stat.S_IMODE((legacy / 'build.sh').stat().st_mode), 0o644)
+
+    def test_unverified_modes_cannot_change_permissions(self):
+        from unittest.mock import patch
+        from hub_staging_service.source_provenance import (
+            _archive_tree, _object_id, verify, verified_executable_paths, SourceProvenanceError)
+        valid = zipped(mode=0o100644)
+        tree = _archive_tree(valid)[0]
+        obj = (f'tree {tree}\nauthor Test <test@example.invalid> 1 +0000\n'
+               f'committer Test <test@example.invalid> 1 +0000\n\nfixture\n').encode()
+        binding = verify(valid, base64.b64encode(obj).decode(), _object_id(b'commit', obj))
+        with patch('hub_staging_service.core.Path.chmod') as chmod:
+            with self.assertRaises(SourceProvenanceError):
+                verified_executable_paths(zipped(mode=0o100777), binding)
+            chmod.assert_not_called()
+        invalid = zipped(mode=0o100777)
+        with patch('hub_staging_service.core.Path.chmod') as chmod, \
+             patch.object(self.service.backend, 'run') as run:
+            with self.assertRaises(Rejected):
+                self.service.put_source({'source_id': uid(), 'project': 'demo',
+                    'source_digest': hashlib.sha256(invalid).hexdigest(),
+                    'source_zip_base64': base64.b64encode(invalid).decode(),
+                    'source_commit': binding['commit_oid'],
+                    'source_commit_object_base64': base64.b64encode(obj).decode()})
+            chmod.assert_not_called()
+            run.assert_not_called()
+        self.assertEqual(self.service.db.execute('SELECT COUNT(*) FROM sources').fetchone()[0], 0)
 
     def test_verified_source_rejects_different_commit_at_job_admission(self):
         from hub_staging_service.source_provenance import _archive_tree, _object_id

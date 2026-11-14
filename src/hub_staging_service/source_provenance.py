@@ -199,3 +199,15 @@ def verify_tree_binding(raw: bytes, binding: object) -> dict[str, object]:
             or expanded != binding["expanded_bytes"] or entries != binding["entries"]):
         _fail("source_binding_mismatch")
     return binding
+
+
+def verified_executable_paths(raw: bytes, binding: object) -> frozenset[str]:
+    """Return executable source paths only after revalidating the exact bytes.
+
+    Archive admission enforces Unix regular-file entries with only Git's
+    100644/100755 modes. Do not use this for an unbound legacy archive.
+    """
+    verify_tree_binding(raw, binding)
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        return frozenset(info.filename for info in archive.infolist()
+                         if info.external_attr >> 16 == stat.S_IFREG | 0o755)
