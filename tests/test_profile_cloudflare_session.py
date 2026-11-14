@@ -78,4 +78,3 @@ async def test_bound_github_cloudflare_profile_get_without_csrf_and_expiry(tmp_p
                 core.state.sessions.clock = lambda: clock() + 86400*1000
             monkeypatch.setattr(repo, '_staging_profile_read', expire)
             assert (await client.get(path, headers=headers)).status_code == 401
-
