@@ -185,6 +185,119 @@ def test_real_mcp_and_owner_http_recover_request_and_reports(unified):
     assert client.get(base + '/requests/' + request['id']).status_code == 401
 
 
+@pytest.mark.parametrize('deny_response', ['none', 'decision', 'project'])
+def test_dispatch_mutations_do_not_grant_dispatch_read(unified, monkeypatch, deny_response):
+    from types import SimpleNamespace
+    client, app, bus, _ = unified
+    session_env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    caps = ('dispatch.write', 'dispatch.report', 'role.read', 'role.lease', 'role.claim', 'tracking.read')
+    orch_id, orch, _ = pair(session_env, name='write-only-orchestrator', caps=caps)
+    worker_id, worker, _ = pair(session_env, name='write-only-worker', caps=caps)
+    roles = RoleRepository(app.state.repository)
+    roles.configure(OWNER, 'orchestrator', 0, [PROJECT], [orch_id], ['src'], 'Coordinate', [])
+    roles.configure(OWNER, 'backend', 0, [PROJECT], [worker_id], ['src'], 'Work', [])
+    task = app.state.repository.propose_tracking_task('codex', PROJECT, 'Synthetic', 'synthetic-task')
+    orch_call, _ = sdk(client, orch)
+    worker_call, _ = sdk(client, worker)
+    for invoke, role in ((orch_call, 'orchestrator'), (worker_call, 'backend')):
+        data(invoke('hub_role_acquire', {'role': role, 'expected_revision': 1, 'lease_seconds': 60}))
+    data(worker_call('hub_role_claim', {'role': 'backend', 'generation': 1, 'task_id': task['id'],
+                                      'client_request_id': 'claim'}))
+    req_args = {'generation': 1, 'project': PROJECT, 'title': 'Synthetic request', 'client_request_id': 'request'}
+    request = data(orch_call('hub_orchestration_request_create', req_args))
+    assert request == {'id': request['id'], 'revision': 1, 'response_scope': 'coordination_receipt',
+                       'execution_authorization': False}
+    assert data(orch_call('hub_orchestration_request_create', req_args)) == request
+    dispatch_args = {'generation': 1, 'request_id': request['id'], 'task_id': task['id'],
+                     'role': 'backend', 'window_seconds': 10, 'client_request_id': 'dispatch'}
+    dispatch = data(orch_call('hub_dispatch_create', dispatch_args))
+    assert dispatch == {'id': dispatch['id'], 'revision': 1, 'response_scope': 'coordination_receipt',
+                        'execution_authorization': False}
+    assert data(orch_call('hub_dispatch_create', dispatch_args)) == dispatch
+    report_args = {'dispatch_id': dispatch['id'], 'expected_revision': 1, 'generation': 1,
+                   'state': 'blocked', 'note': 'Private worker note', 'client_request_id': 'report'}
+    report = data(worker_call('hub_dispatch_report', report_args))
+    assert report == {'id': dispatch['id'], 'revision': 2, 'response_scope': 'coordination_receipt',
+                      'execution_authorization': False}
+    assert data(worker_call('hub_dispatch_report', report_args)) == report
+    checkpoint_args = {'dispatch_id': dispatch['id'], 'expected_revision': 2, 'generation': 1,
+                       'client_request_id': 'checkpoint'}
+    checkpoint = data(orch_call('hub_dispatch_checkpoint', checkpoint_args))
+    assert checkpoint == {'id': dispatch['id'], 'response_scope': 'mutation_receipt',
+                          'current_state_included': False}
+    assert data(orch_call('hub_dispatch_checkpoint', checkpoint_args)) == checkpoint
+    assert orch_call('hub_dispatch_get', {'dispatch_id': dispatch['id']})['isError']
+    # The same accepted retry may return the full row only after a fresh read grant.
+    session_env.bridge.grant_put(OWNER, orch_id, 1, [PROJECT], [*caps, 'dispatch.read'])
+    full = data(orch_call('hub_dispatch_checkpoint', checkpoint_args))
+    assert full['report'] == 'Private worker note' and full['revision'] == 2
+    later = data(worker_call('hub_dispatch_report', {
+        'dispatch_id': dispatch['id'], 'expected_revision': 2, 'generation': 1,
+        'state': 'working', 'note': 'Later private note', 'client_request_id': 'later-report',
+    }))
+    assert later['revision'] == 3 and later['response_scope'] == 'coordination_receipt'
+    # Dispatch receipts are revision-bound, unlike immutable request creation;
+    # neither write-only retry reveals a later revision or its report.
+    for invoke, tool, arguments in ((worker_call, 'hub_dispatch_report', report_args),
+                                    (orch_call, 'hub_dispatch_checkpoint', checkpoint_args)):
+        result = invoke(tool, arguments)
+        assert result['isError'] and 'dispatch_changed' in result['content'][0]['text']
+        assert 'Later private note' not in str(result)
+    # The same ID-only shape covers a checkpoint that actually transitions to
+    # stale; it cannot reveal the resulting revision or state to a write-only
+    # caller. The test inspects the synthetic repository only as the oracle.
+    session_env.bridge.grant_put(OWNER, orch_id, 2, [PROJECT], list(caps))
+    bus.state.agent_sessions.clock.value += 11
+    stale = data(orch_call('hub_dispatch_checkpoint', {
+        'dispatch_id': dispatch['id'], 'expected_revision': 3, 'generation': 1,
+        'client_request_id': 'stale-checkpoint',
+    }))
+    assert stale == checkpoint
+    saved = app.state.repository._read(dispatch['id'], 'role_dispatch')
+    assert saved['revision'] == 4 and saved['state'] == 'stale'
+    # Ask requires explicit decision grants and returns its newly created
+    # decision ID even without dispatch.read; replay cannot substitute a later
+    # decision because the dispatch receipt is revision-bound.
+    session_env.bridge.grant_put(OWNER, worker_id, 1, [PROJECT],
+                                 [*caps, 'decision.request', 'decision.read'])
+    ask_args = {'dispatch_id': dispatch['id'], 'expected_revision': 4, 'generation': 1,
+                'state': 'ask', 'note': 'Question details', 'ask_title': 'Choose',
+                'ask_options': ['Yes', 'No'], 'client_request_id': 'ask'}
+    bridge = session_env.bridge
+    live = bridge._live
+    checks = {'count': 0, 'active': deny_response != 'none', 'deny_project': False}
+    def response_expiry(db, secret, revision=None, capability=None, *, session_id=None):
+        if checks['active'] and capability == 'decision.read':
+            checks['count'] += 1
+            if checks['count'] >= 2:
+                if deny_response == 'decision':
+                    raise HubError('hub_capability_forbidden', 403)
+                checks['deny_project'] = True
+        return live(db, secret, revision, capability, session_id=session_id)
+    monkeypatch.setattr(bridge, '_live', response_expiry)
+    from engineering_hub.session_hub_bridge import _Operation
+    project = _Operation.project
+    def response_project_expiry(operation, project_id):
+        if checks['deny_project']:
+            raise HubError('project_archived', 409)
+        return project(operation, project_id)
+    monkeypatch.setattr(_Operation, 'project', response_project_expiry)
+    ask = data(worker_call('hub_dispatch_report', ask_args))
+    expected = {'id': dispatch['id'], 'revision': 5, 'response_scope': 'coordination_receipt',
+                'execution_authorization': False}
+    if deny_response == 'none':
+        expected['decision_id'] = ask['decision_id']
+    assert ask == expected
+    checks['count'] = 0
+    checks['deny_project'] = False
+    assert data(worker_call('hub_dispatch_report', ask_args)) == ask
+    checks['active'] = False
+    checks['deny_project'] = False
+    decision_id = app.state.repository._read(dispatch['id'], 'role_dispatch')['decision_id']
+    decision = data(worker_call('hub_decision_get', {'decision_id': decision_id}))
+    assert decision['title'] == 'Choose'
+
+
 def test_owner_project_request_view_http_snapshot_and_privacy(unified):
     from types import SimpleNamespace
     client, app, bus, _ = unified

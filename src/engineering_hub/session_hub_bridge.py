@@ -503,6 +503,10 @@ class SessionHubBridge:
                                     'hub_role_acquire': 'role.read', 'hub_role_renew': 'role.read',
                                     'hub_role_release': 'role.read', 'hub_role_claim': 'role.read',
                                     'hub_role_claim_release': 'role.read',
+                                    'hub_orchestration_request_create': 'dispatch.read',
+                                    'hub_dispatch_create': 'dispatch.read',
+                                    'hub_dispatch_report': 'dispatch.read',
+                                    'hub_dispatch_checkpoint': 'dispatch.read',
                                 }.get(fn.__name__)
                                 if fn.__name__ == 'hub_entity_withdraw':
                                     # Scope validation rejects other kinds before
@@ -535,6 +539,36 @@ class SessionHubBridge:
                                                 'task_id': result['task_id'], 'revision': result['revision'],
                                                 'response_scope': 'coordination_receipt',
                                                 'execution_authorization': False}
+                                        elif fn.__name__ == 'hub_dispatch_checkpoint':
+                                            # Checkpoint may be a no-op or change a stale
+                                            # state; its resulting revision would reveal that
+                                            # transition to a caller without dispatch.read.
+                                            result = {'id': result['id'], 'response_scope': 'mutation_receipt',
+                                                'current_state_included': False}
+                                        elif fn.__name__ in {'hub_orchestration_request_create', 'hub_dispatch_create',
+                                                            'hub_dispatch_report'}:
+                                            # Exact idempotency receipts are revision-bound in
+                                            # DispatchRepository; no current report or routing
+                                            # fields are disclosed without dispatch.read.
+                                            decision_id = result.get('decision_id') if (
+                                                fn.__name__ == 'hub_dispatch_report'
+                                                and arguments.get('state') == 'ask') else None
+                                            decision_project = result.get('project') if decision_id is not None else None
+                                            result = {'id': result['id'], 'revision': result['revision'],
+                                                'response_scope': 'coordination_receipt',
+                                                'execution_authorization': False}
+                                            if decision_id is not None:
+                                                # Ask creates this decision atomically and requires
+                                                # decision.request and decision.read. Revision-bound
+                                                # replay cannot return a later decision.
+                                                try:
+                                                    bridge._live(operation.db, operation.secret,
+                                                        operation.principal.authorization_revision, 'decision.read',
+                                                        session_id=operation.principal.session_id)
+                                                    operation.project(decision_project)
+                                                    result['decision_id'] = decision_id
+                                                except (HubError, AgentSessionError):
+                                                    pass
                                         else:
                                             result = {'id': result['id'], 'response_scope': 'mutation_receipt',
                                                       'current_state_included': False}

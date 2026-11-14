@@ -66,7 +66,18 @@ read access from creation or withdrawal authority. Role lease mutations without
 `role.read` return only coordination data needed to continue safely: role ID,
 revision, generation, expiry, handoff revision and takeover state. Role claim
 mutations without `role.read` return only claim ID, role ID, task ID and
-revision. These receipts convey no execution authority. The capability and
+revision. Orchestration request creation, dispatch creation and report without
+`dispatch.read` return only ID and revision as a coordination receipt.
+An `ask` report also returns the decision ID it creates when `decision.read`
+and project access remain valid at response time; that operation independently requires both
+`decision.request` and `decision.read`. If access expires after the write, the
+decision ID is omitted from the receipt.
+Checkpoint instead returns an ID-only receipt: its resulting revision can reveal
+whether a state transition occurred. Accepted idempotent retries are revision-bound
+and never return a later report; a changed dispatch gives a `dispatch_changed`
+error, which reveals that its revision changed. A current read grant is needed
+for full state. These
+receipts convey no execution authority. The capability and
 project scope are rechecked while holding the session writer; a response
 already in flight cannot be recalled by a later revoke. Existing legacy family
 bearer behavior is unchanged. This describes only the named mutation tools,

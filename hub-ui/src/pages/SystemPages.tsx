@@ -2,7 +2,7 @@ import { AgentConnectionsPanel } from "../AgentConnectionsPanel";
 import { useEffect, useState } from "react";
 import { HubApiError } from "../api";
 import { relativeAge } from "../dashboardText";
-import { listTopics, rememberedTopics, rememberTopic, type TopicEntry } from "../topicsApi";
+import { listTopics, rememberedTopics, rememberTopic, visibleTopics, type TopicEntry } from "../topicsApi";
 import { link } from "../router";
 import { connectionView, observationTime } from "../agentStatus";
 import type { Hub } from "../hub";
@@ -67,6 +67,32 @@ export function AgentsPage({ hub, actions, view = "overview" }: { hub: Hub; acti
   return view === "installations" ? <AgentInstallationsPage hub={hub} actions={actions} /> : <AgentsOverview hub={hub} actions={actions} />;
 }
 
+export function TopicList({ topics, current, onSelect, hasServer }: {
+  topics: TopicEntry[]; current: string; onSelect: (topic: string) => void; hasServer: boolean;
+}) {
+  return <>
+    <ul className="topic-list" aria-label="Topics">
+      {topics.map((entry) => (
+        <li key={entry.topic}>
+          <button type="button" className={entry.topic === current ? "topic-item current" : "topic-item"}
+            aria-current={entry.topic === current ? "true" : undefined} onClick={() => onSelect(entry.topic)}>
+            <span className="topic-name">{entry.topic}</span>
+            <span className="topic-meta">
+              {entry.source === "device" ? "This device" : "Hub directory"}
+              {entry.peer_count !== null ? ` · ${entry.peer_count} agents` : ""}
+              {entry.last_activity_at ? ` · ${relativeAge(entry.last_activity_at)}` : ""}
+            </span>
+          </button>
+        </li>
+      ))}
+    </ul>
+    <p className="panel-footnote">
+      {hasServer ? "Hub directory entries are available to your account. This device entries are local selections."
+        : "Topics saved or selected on this device. The Hub can't list the topics available to your account yet."}
+    </p>
+  </>;
+}
+
 function AgentsOverview({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const { peers, demo, stale, topicStale } = hub;
   const [serverTopics, setServerTopics] = useState<TopicEntry[] | null>(null);
@@ -83,9 +109,7 @@ function AgentsOverview({ hub, actions }: { hub: Hub; actions: React.ReactNode }
     return () => controller.abort();
   }, [demo, hub.data]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { setRemembered(rememberTopic(hub.topic)); }, [hub.topic]);
-  const topics: TopicEntry[] = serverTopics ?? remembered.map((topic) => ({ topic, last_activity_at: null, peer_count: null, source: "device" }));
-  if (!topics.some((entry) => entry.topic === hub.topic))
-    topics.unshift({ topic: hub.topic, last_activity_at: null, peer_count: null, source: "device" });
+  const topics = visibleTopics(serverTopics, remembered, hub.topic);
   return (
     <>
       <PageHeader eyebrow="AGENTS" title="Agents">
@@ -108,24 +132,7 @@ function AgentsOverview({ hub, actions }: { hub: Hub; actions: React.ReactNode }
                 <button className="secondary small" disabled={hub.loading}>Check</button>
               </div>
             </form>
-            <ul className="topic-list" aria-label="Topics">
-              {topics.map((entry) => (
-                <li key={entry.topic}>
-                  <button type="button" className={entry.topic === hub.topic ? "topic-item current" : "topic-item"}
-                    aria-current={entry.topic === hub.topic ? "true" : undefined} onClick={() => hub.selectTopic(entry.topic)}>
-                    <span className="topic-name">{entry.topic}</span>
-                    <span className="topic-meta">
-                      {entry.peer_count !== null ? `${entry.peer_count} agents` : ""}
-                      {entry.last_activity_at ? ` · ${relativeAge(entry.last_activity_at)}` : ""}
-                    </span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-            <p className="panel-footnote">
-              {serverTopics ? "Topics available to your account."
-                : "Topics checked on this device only. The Hub can't list the topics available to your account yet."}
-            </p>
+            <TopicList topics={topics} current={hub.topic} onSelect={hub.selectTopic} hasServer={serverTopics !== null} />
           </div>
           <div className="topic-detail" aria-label={`Readiness for ${hub.topic}`}>
             <h3 className="agent-section-title">Readiness on <code>{hub.topic}</code></h3>

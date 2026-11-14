@@ -377,6 +377,26 @@ async function emitRegistry(page: Page, kind: string, overrides: Record<string, 
   }, { kind, overrides });
 }
 
+test("topic directory distinguishes local selections without changing the Hub list", async ({ page }) => {
+  await page.clock.install({ time: NOW });
+  await mockLive(page);
+  const hubItems = [{ topic: "server-topic", peer_count: 2, last_activity_at: null }];
+  await page.route("**/api/hub/v1/topics", route => route.fulfill({ json: { items: hubItems } }));
+  await page.goto("/#/agents");
+  const list = page.getByRole("list", { name: "Topics" });
+  const server = list.getByRole("button", { name: /server-topic/ });
+  await expect(server).toContainText("Hub directory · 2 agents");
+  for (const topic of ["local-one", "local-two"]) {
+    await page.getByLabel("TOPIC ROOT").fill(topic);
+    await page.getByRole("button", { name: "Check", exact: true }).click();
+    await expect(list.getByRole("button", { name: new RegExp(topic) })).toContainText("This device");
+  }
+  await expect(list.getByRole("button", { name: /local-one/ })).toHaveCount(0);
+  await expect(server).toContainText("Hub directory · 2 agents");
+  await expect(page.getByText("Hub directory entries are available to your account. This device entries are local selections.")).toBeVisible();
+  expect(hubItems).toEqual([{ topic: "server-topic", peer_count: 2, last_activity_at: null }]);
+});
+
 test("colon topic passes strict ingress without discarding task or decision records", async ({ page }) => {
   await page.clock.install({ time: NOW });
   const mock = await mockLive(page);
