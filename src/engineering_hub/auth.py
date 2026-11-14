@@ -342,7 +342,7 @@ def require_human(request: Request, config: AuthConfig, store: SessionStore, mut
     return session["actor"]
 
 
-def human_transaction_guard(request: Request, config: AuthConfig, store: SessionStore, actor: str):
+def human_transaction_guard(request: Request, config: AuthConfig, store: SessionStore, actor: str, *, mutation=True):
     """Revalidate the exact browser session using the caller's ledger writer.
 
     The caller supplies the same Hub SQLite transaction used for admission.
@@ -350,7 +350,7 @@ def human_transaction_guard(request: Request, config: AuthConfig, store: Session
     check. Time-based expiry is checked at that point, not during SQLite commit
     or an already-admitted remote operation.
     """
-    if require_human(request, config, store, mutation=True) != actor:
+    if require_human(request, config, store, mutation=mutation) != actor:
         raise HTTPException(403, "Human identity changed")
     token = request.cookies.get(config.cookie_name)
     if type(token) is not str or not token or store.repository is None:
@@ -359,9 +359,9 @@ def human_transaction_guard(request: Request, config: AuthConfig, store: Session
     csrf = request.headers.get('x-hub-csrf', '')
 
     def guard(db):
-        if (request.headers.get('authorization') or request.headers.get('origin') != config.origin
-                or request.cookies.get(config.cookie_name) != token
-                or not secrets.compare_digest(request.headers.get('x-hub-csrf', ''), csrf)):
+        if (request.headers.get('authorization') or request.cookies.get(config.cookie_name) != token
+                or (mutation and (request.headers.get('origin') != config.origin
+                    or not secrets.compare_digest(request.headers.get('x-hub-csrf', ''), csrf)))):
             raise HTTPException(403, "Request verification failed")
         now = store.clock()
         if config.human_auth_mode == 'github':
@@ -369,7 +369,7 @@ def human_transaction_guard(request: Request, config: AuthConfig, store: Session
                              (token_hash,)).fetchone()
             valid = (row is not None and row[0] == config.beau_github_id
                      and actor == f'human:{row[0]}' and row[2] > now
-                     and secrets.compare_digest(row[1], csrf))
+                     and (not mutation or secrets.compare_digest(row[1], csrf)))
         elif config.human_auth_mode == 'cloudflare_access':
             identity = getattr(request.state, 'cloudflare_identity', None)
             valid = False
@@ -383,7 +383,7 @@ def human_transaction_guard(request: Request, config: AuthConfig, store: Session
                          and actor == row[1] == enrolled[1] == identity.actor
                          and secrets.compare_digest(enrolled[0], binding)
                          and secrets.compare_digest(row[0], binding)
-                         and secrets.compare_digest(row[2], csrf))
+                         and (not mutation or secrets.compare_digest(row[2], csrf)))
         elif config.human_auth_mode == 'github_cloudflare':
             from .bound_oauth_draft import _binding, _check_schema
             try:
@@ -395,7 +395,7 @@ def human_transaction_guard(request: Request, config: AuthConfig, store: Session
                                  (token_hash,)).fetchone()
                 valid = (row is not None and row[3] > now and row[1] == config.beau_github_id
                          and actor == identity.actor and secrets.compare_digest(row[0], binding)
-                         and secrets.compare_digest(row[2], csrf))
+                         and (not mutation or secrets.compare_digest(row[2], csrf)))
             except (ValueError, PermissionError):
                 valid = False
         else:

@@ -230,7 +230,7 @@ class StagingResourceStore:
         return {'project': project, 'recipe': recipe, 'generation': generation, 'digest': digest,
                 'profile': normalized, 'created_at': now, 'execution_authorization': False}
 
-    def get_profile(self, actor, project, recipe, generation=None):
+    def get_profile(self, actor, project, recipe, generation=None, *, admission_guard=None):
         """Return only a profile in an active project with explicit read access."""
         _actor(actor)
         self._recipe_name(recipe)
@@ -245,7 +245,7 @@ class StagingResourceStore:
                 allowed = grants.get(actor) if type(grants) is dict else None
                 if type(allowed) is not list or any(type(value) is not str for value in allowed) or 'read' not in allowed:
                     raise HubError('staging_forbidden', 403)
-        with self.repo._transaction() as db:
+        with self.repo._transaction(before_commit=admission_guard) as db:
             require_access(db)
             if generation is None:
                 row = db.execute('SELECT * FROM hub_staging_profile_enrollments WHERE project=? AND recipe=? ORDER BY generation DESC LIMIT 1',

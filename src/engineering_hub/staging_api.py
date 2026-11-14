@@ -107,7 +107,7 @@ async def _payload(request, model, *, maximum=65536):
 
 def attach_staging_routes(app, controller, actor, human, preview_broker=None, preview_session=None,
                           module_status=None, diagnostic_session=None, observer=None,
-                          human_admission=None):
+                          human_admission=None, human_read_admission=None):
     """Compose existing authenticated callbacks; attaching starts no work."""
     def configured():
         if controller is None:
@@ -277,7 +277,12 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
     def get_profile(project: Project, recipe: Annotated[str, Path(pattern=r'^[a-z0-9][a-z0-9_-]{0,63}$')],
                     request: Request, generation: int | None = Query(default=None, ge=1, lt=2**31)):
         principal = authenticated(request)
-        return configured().resources.get_profile(principal, project, recipe, generation)
+        guard = None
+        if principal.startswith('human:'):
+            if not callable(human_read_admission):
+                raise HubError('staging_human_admission_unavailable', 503)
+            guard = human_read_admission(request, principal)
+        return configured().resources.get_profile(principal, project, recipe, generation, admission_guard=guard)
 
     @app.put('/api/hub/v1/staging/projects/{project}/profiles/{recipe}', openapi_extra=request_body(StagingProfileEnrollment))
     async def enroll_profile(project: Project, recipe: Annotated[str, Path(pattern=r'^[a-z0-9][a-z0-9_-]{0,63}$')], request: Request):

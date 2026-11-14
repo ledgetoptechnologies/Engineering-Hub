@@ -225,6 +225,7 @@ export const CAPABILITY_LABEL: Record<string, string> = {
   "project.read": "Read project details", "component.read": "Read components", "component.write": "Edit components",
   "task.read": "Read tasks", "task.propose": "Propose tasks", "task.claim": "Claim tasks", "task.candidate": "Submit work for review",
   "task.review": "Review others' work", "planning.read": "Read plans and ideas", "planning.write": "Write plans and ideas",
+  "staging.profile.read": "Read staging recipe profiles in selected projects",
   "decision.request": "Ask you questions", "decision.read": "Read all questions and answers in selected projects",
   "entity.withdraw": "Withdraw its own tasks and questions",
 };

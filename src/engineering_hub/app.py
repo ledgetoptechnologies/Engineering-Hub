@@ -1078,7 +1078,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         preview_broker=staging_module.preview_broker, preview_session=preview_session,
         module_status=staging_module.status, diagnostic_session=diagnostic_session, observer=staging_observer,
         human_admission=lambda request, principal: human_transaction_guard(
-            request, settings.auth_config, sessions, principal))
+            request, settings.auth_config, sessions, principal),
+        human_read_admission=lambda request, principal: human_transaction_guard(
+            request, settings.auth_config, sessions, principal, mutation=False))
     from .shared_staging_api import attach_shared_staging_routes
     attach_shared_staging_routes(app, shared_staging, human)
 
@@ -1552,7 +1554,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
 
     @app.get('/api/hub/v1/tasks/{task_id}/staging-profile')
     def get_task_staging_profile(task_id: str, request: Request):
-        return repo.get_task_staging_profile(actor(request), task_id)
+        principal = actor(request)
+        guard = (human_transaction_guard(request, settings.auth_config, sessions, principal, mutation=False)
+                 if principal.startswith('human:') else None)
+        return repo.get_task_staging_profile(principal, task_id, admission_guard=guard)
 
     @app.post("/api/hub/v1/tasks/{task_id}/claim", response_model=TaskDTO, response_model_exclude_unset=True)
     def claim(task_id: str, payload: Revision, request: Request):

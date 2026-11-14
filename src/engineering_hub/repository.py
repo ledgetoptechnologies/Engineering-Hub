@@ -934,10 +934,10 @@ class HubRepository:
         except (sqlite3.Error, ValueError, TypeError, KeyError):
             raise HubError('staging_profile_unavailable', 404) from None
 
-    def get_task_staging_profile(self, actor, identity):
+    def get_task_staging_profile(self, actor, identity, *, admission_guard=None):
         """Project-scoped candidate tuple and profile, never an execution grant."""
         self._actor(actor)
-        with self._transaction() as db:
+        with self._transaction(before_commit=admission_guard) as db:
             try:
                 task = self._get(db, identity, 'task')
                 self._staging_profile_read(db, actor, task['project'])
