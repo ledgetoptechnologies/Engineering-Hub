@@ -380,7 +380,7 @@ test("a device page charts history, keeps gaps, and changes range on request", a
   });
   await page.goto("/#/infrastructure/build-pc");
   const cpu = page.getByRole("img", { name: /^CPU:/ });
-  await expect(cpu).toHaveAttribute("aria-label", "CPU: now 40%, peak 60%");
+  await expect(cpu).toHaveAttribute("aria-label", /^CPU: latest sample 40% at .+, peak 60%$/);
   await expect(page.getByRole("img", { name: /^Network:/ })).toBeVisible();
   await expect(page.getByRole("img", { name: /^Memory:/ })).toHaveCount(0);
   await cpu.focus();
@@ -392,6 +392,24 @@ test("a device page charts history, keeps gaps, and changes range on request", a
   expect(ranges[0]).toBe("24h");
   await page.setViewportSize({ width: 375, height: 812 });
   expect(blocking(await audit(page, "page", 375))).toEqual([]);
+});
+
+test("history labels a trailing gap with its sample time", async ({ page }) => {
+  await fixture(page, { metrics: [metrics(value => { value.devices[0].device_id = "build-pc"; })] });
+  await page.route("**/api/hub/v1/infrastructure/metrics/history**", route => {
+    const url = new URL(route.request().url());
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+      schema_version: 1, generated_at: "2026-11-06T12:00:00Z", host_key: url.searchParams.get("host"),
+      range: url.searchParams.get("range"), step_seconds: 30, source: { status: "ok" },
+      series: [{ key: "cpu", label: null, unit: "ratio", points: [[1000, 0.7], [1030, null]] }],
+    }) });
+  });
+  await page.goto("/#/infrastructure/build-pc");
+  const label = await page.evaluate(() => new Date(1030 * 1000).toLocaleString());
+  const chart = page.getByRole("img", { name: /^CPU:/ });
+  await expect(chart).toHaveAttribute("aria-label", `CPU: latest sample not reported at ${label}, peak 70%`);
+  await expect(chart.locator("xpath=ancestor::figure").locator("figcaption"))
+    .toContainText(`Latest sample: not reported at ${label} · 70% peak`);
 });
 
 test("history that can't be read says so and offers a retry", async ({ page }) => {

@@ -20,8 +20,20 @@ const SOURCE_TEXT = {
 const MAX_DISKS = 4, HEIGHT = 168, LEFT = 44, RIGHT = 8, TOP = 8, BOTTOM = 22;
 
 function latest(points: HistoryPoint[]): number | null {
-  for (let index = points.length - 1; index >= 0; index--) if (points[index][1] !== null) return points[index][1];
-  return null;
+  return points.at(-1)?.[1] ?? null;
+}
+/** The series is a snapshot, not a live reading; label its final sample's time. */
+function latestText(points: HistoryPoint[], format: (value: number | null) => string): string {
+  const point = points.at(-1);
+  return point ? `${format(point[1])} at ${new Date(point[0] * 1000).toLocaleString()}` : "not reported";
+}
+export function selectHistoryDisks(series: HistorySeries[]): HistorySeries[] {
+  return series.filter(item => item.key === "disk").sort((a, b) => {
+    const left = latest(a.points), right = latest(b.points);
+    if (left === null) return right === null ? 0 : 1;
+    if (right === null) return -1;
+    return right - left;
+  }).slice(0, MAX_DISKS);
 }
 function peak(points: HistoryPoint[]): number | null {
   const values = points.flatMap(point => point[1] === null ? [] : [point[1]]);
@@ -66,7 +78,7 @@ function useWidth() {
   return [ref, width] as const;
 }
 
-function Chart({ title, lines, range, format, ratio }: { title: string; lines: Line[]; range: HistoryRange; format: (value: number | null) => string; ratio: boolean }) {
+export function Chart({ title, lines, range, format, ratio }: { title: string; lines: Line[]; range: HistoryRange; format: (value: number | null) => string; ratio: boolean }) {
   const [ref, width] = useWidth();
   const [hover, setHover] = useState<number | null>(null);
   const points = lines[0].points, count = points.length;
@@ -85,11 +97,11 @@ function Chart({ title, lines, range, format, ratio }: { title: string; lines: L
     event.preventDefault();
     setHover(current => Math.min(count - 1, Math.max(0, (current ?? count - 1) + (event.key === "ArrowLeft" ? -1 : 1))));
   };
-  const summary = lines.map(line => `${lines.length > 1 ? line.name + " " : ""}now ${format(latest(line.points))}, peak ${format(peak(line.points))}`).join("; ");
+  const summary = lines.map(line => `${lines.length > 1 ? line.name + " " : ""}latest sample ${latestText(line.points, format)}, peak ${format(peak(line.points))}`).join("; ");
   return <figure className="history-chart">
     <figcaption>
       <strong>{title}</strong>
-      {lines.length === 1 && <span>{format(latest(points))} now · {format(peak(points))} peak</span>}
+      {lines.length === 1 && <span>Latest sample: {latestText(points, format)} · {format(peak(points))} peak</span>}
     </figcaption>
     <div className="history-plot" ref={ref}>
       <svg width={width} height={HEIGHT} role="img" aria-label={`${title}: ${summary}`} tabIndex={0}
@@ -116,7 +128,7 @@ function Chart({ title, lines, range, format, ratio }: { title: string; lines: L
       </div>}
     </div>
     {lines.length > 1 && <ul className="history-legend">{lines.map(line => <li key={line.name}>
-      <span className={`history-swatch history-series-${line.slot}`} aria-hidden="true" />{line.name} <strong>{format(latest(line.points))}</strong></li>)}</ul>}
+      <span className={`history-swatch history-series-${line.slot}`} aria-hidden="true" />{line.name} <strong>{latestText(line.points, format)}</strong></li>)}</ul>}
   </figure>;
 }
 
@@ -143,7 +155,7 @@ export function MachineHistory({ hub, hostKey }: { hub: Hub; hostKey: string }) 
   const charts = useMemo(() => {
     const single = (key: HistorySeries["key"]) => bySeries(series, key).slice(0, 1).map(item => ({ name: key, slot: 1, points: item.points }));
     // The fullest few, coloured by name so a mount keeps its colour when the order changes.
-    const disks = bySeries(series, "disk").sort((a, b) => (latest(b.points) ?? 0) - (latest(a.points) ?? 0)).slice(0, MAX_DISKS)
+    const disks = selectHistoryDisks(series)
       .sort((a, b) => (a.label ?? "").localeCompare(b.label ?? "")).map((item, index) => ({ name: item.label ?? "Disk", slot: index + 1, points: item.points }));
     const network = [...bySeries(series, "network_rx").slice(0, 1).map(item => ({ name: "Down", slot: 1, points: item.points })),
       ...bySeries(series, "network_tx").slice(0, 1).map(item => ({ name: "Up", slot: 2, points: item.points }))];
