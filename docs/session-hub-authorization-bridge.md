@@ -53,6 +53,25 @@ capabilities, duplicate entries and empty arrays are rejected. Both target and
 secondary project references require authorization. Human `GET /api/hub/v1/projects`
 provides the active project IDs/names for the picker.
 
+For EHS staging task proposal, claim, candidate and review; tracking proposal,
+update, review and compaction; and component create, update and retirement,
+a caller without the
+corresponding `task.read`, `tracking.read` or `component.read` receives only
+an ID-only mutation receipt. This includes idempotent retries, which otherwise
+could return current details added by another actor. A caller with the current
+read grant receives the existing full current entity, which is not an
+immutable receipt of its original mutation. `hub_entity_withdraw` uses
+`task.read` for tasks and `decision.read` for decisions; it does not infer
+read access from creation or withdrawal authority. Role lease mutations without
+`role.read` return only coordination data needed to continue safely: role ID,
+revision, generation, expiry, handoff revision and takeover state. Role claim
+mutations without `role.read` return only claim ID, role ID, task ID and
+revision. These receipts convey no execution authority. The capability and
+project scope are rechecked while holding the session writer; a response
+already in flight cannot be recalled by a later revoke. Existing legacy family
+bearer behavior is unchanged. This describes only the named mutation tools,
+not a completed audit of every Hub write endpoint.
+
 `GET /installations/{UUID}/hub-grant` returns:
 
 ```json

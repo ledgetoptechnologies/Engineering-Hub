@@ -421,6 +421,7 @@ def test_tracking_mutation_does_not_disclose_cross_project_or_archived_ids(unifi
     env.bridge.projects.archive_project(OWNER, '3d-viewer', 1)
     valid = data(invoke('hub_tracking_task_propose', {'project': PROJECT, 'title': 'Valid',
                                                       'client_request_id': 'valid-tracking'}))
+    assert valid == {'id': valid['id'], 'response_scope': 'mutation_receipt', 'current_state_included': False}
     missing = '00000000-0000-4000-8000-000000000000'
     for tool, args in (
         ('hub_tracking_task_update', {'expected_revision': 1, 'client_request_id': 'update-test',
@@ -435,19 +436,206 @@ def test_tracking_mutation_does_not_disclose_cross_project_or_archived_ids(unifi
         assert 'hub_tracking_task_unavailable' in results[0]['content'][0]['text']
     updated = data(invoke('hub_tracking_task_update', {'task_id': valid['id'], 'expected_revision': 1,
         'client_request_id': 'valid-update', 'progress': 'Progress', 'evidence_links': [], 'completion_claim': False}))
-    assert updated['revision'] == 2
+    assert updated == valid
     links = [{'label': 'Evidence', 'url': 'https://example.com/evidence'}]
     claim = data(invoke('hub_tracking_task_update', {'task_id': valid['id'], 'expected_revision': 2,
         'client_request_id': 'valid-claim', 'progress': 'Done', 'evidence_links': links, 'completion_claim': True}))
     _, reviewer, _ = pair(env, name='reviewer', family='claude', caps=('tracking.review',))
     review, _ = sdk(client, reviewer)
-    verified = data(review('hub_tracking_task_review', {'task_id': valid['id'], 'expected_revision': claim['revision'],
+    verified = data(review('hub_tracking_task_review', {'task_id': valid['id'], 'expected_revision': 3,
         'client_request_id': 'valid-review', 'verdict': 'verify', 'note': 'Checked', 'evidence_links': links}))
-    assert verified['status'] == 'completion_verified'
+    assert claim == valid and verified == valid
+    assert repo._read(valid['id'], 'tracking_task')['status'] == 'completion_verified'
     env.bridge.grant_revoke(OWNER, installation, 1)
-    assert invoke('hub_tracking_task_update', {'task_id': valid['id'], 'expected_revision': verified['revision'],
+    assert invoke('hub_tracking_task_update', {'task_id': valid['id'], 'expected_revision': 4,
         'client_request_id': 'revoked', 'progress': 'No', 'evidence_links': [], 'completion_claim': False})['isError']
-    assert repo._read(valid['id'], 'tracking_task')['revision'] == verified['revision']
+    assert repo._read(valid['id'], 'tracking_task')['revision'] == 4
+
+
+def test_tracking_write_only_receipts_do_not_disclose_later_history(unified):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, creator, _ = pair(env, name='tracking-propose-only', caps=('tracking.propose',))
+    _, updater, _ = pair(env, name='tracking-update-only', caps=('tracking.update',))
+    _, reviewer, _ = pair(env, name='tracking-review-only', family='claude', caps=('tracking.review',))
+    create, _ = sdk(client, creator)
+    update, _ = sdk(client, updater)
+    review, _ = sdk(client, reviewer)
+    proposal = {'project': PROJECT, 'title': 'Public task title', 'client_request_id': 'stable-proposal'}
+    receipt = data(create('hub_tracking_task_propose', proposal))
+    assert receipt == {'id': receipt['id'], 'response_scope': 'mutation_receipt', 'current_state_included': False}
+    identity = receipt['id']
+
+    # Another authorized actor adds private evidence after the original write.
+    # A retry must not become a read of their current task or review history.
+    private = 'private-progress-not-for-write-only'
+    repo = app.state.repository
+    item = repo.update_tracking_task('claude', identity, 1, 'private-progress',
+        progress=private, evidence_links=[])
+    assert private in json.dumps(item)
+    assert data(create('hub_tracking_task_propose', proposal)) == receipt
+
+    progress = {'task_id': identity, 'expected_revision': item['revision'], 'client_request_id': 'update',
+                'progress': 'Another update', 'evidence_links': [], 'completion_claim': False}
+    assert data(update('hub_tracking_task_update', progress)) == receipt
+    item = repo._read(identity, 'tracking_task')
+    compact = {'task_id': identity, 'expected_revision': item['revision'], 'client_request_id': 'compact'}
+    assert data(update('hub_tracking_task_compact', compact)) == receipt
+    item = repo._read(identity, 'tracking_task')
+    links = [{'label': 'Evidence', 'url': 'https://example.com/evidence'}]
+    claim = {'task_id': identity, 'expected_revision': item['revision'], 'client_request_id': 'claim',
+             'progress': 'Claimed', 'evidence_links': links, 'completion_claim': True}
+    assert data(update('hub_tracking_task_update', claim)) == receipt
+    item = repo._read(identity, 'tracking_task')
+    verified = {'task_id': identity, 'expected_revision': item['revision'], 'client_request_id': 'review',
+                'verdict': 'verify', 'note': 'private-review-note', 'evidence_links': links}
+    assert data(review('hub_tracking_task_review', verified)) == receipt
+    assert data(review('hub_tracking_task_review', verified)) == receipt
+    assert data(create('hub_tracking_task_propose', proposal)) == receipt
+
+    # Granting read enables the existing full response; revoking just that
+    # capability restores the receipt even for an idempotent retry.
+    env.bridge.grant_put(OWNER, installation, 1, [PROJECT], ['tracking.propose', 'tracking.read'])
+    full = data(create('hub_tracking_task_propose', proposal))
+    assert full['status'] == 'completion_verified' and 'private-review-note' in json.dumps(full)
+    env.bridge.grant_put(OWNER, installation, 2, [PROJECT], ['tracking.propose'])
+    assert data(create('hub_tracking_task_propose', proposal)) == receipt
+
+
+def test_tracking_read_capability_loss_at_response_returns_only_receipt(unified, monkeypatch):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    _, token, _ = pair(env, name='response-read-expiry', caps=('tracking.propose', 'tracking.read'))
+    invoke, _ = sdk(client, token)
+    original_live = env.bridge._live
+    def expire_read(db, secret, revision=None, capability=None, *, session_id=None):
+        if capability == 'tracking.read':
+            raise HubError('hub_grant_required', 403)
+        return original_live(db, secret, revision, capability, session_id=session_id)
+    monkeypatch.setattr(env.bridge, '_live', expire_read)
+    result = data(invoke('hub_tracking_task_propose', {'project': PROJECT, 'title': 'Committed safely',
+                                                       'client_request_id': 'expiry-after-commit'}))
+    assert result == {'id': result['id'], 'response_scope': 'mutation_receipt', 'current_state_included': False}
+    assert app.state.repository._read(result['id'], 'tracking_task')['title'] == 'Committed safely'
+
+
+def test_task_and_component_mutations_without_read_return_only_id(unified):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, name='write-only-tasks',
+        caps=('task.propose', 'task.claim', 'task.candidate', 'component.write'))
+    _, reviewer, _ = pair(env, name='write-only-task-reviewer', family='claude', caps=('task.review',))
+    invoke, _ = sdk(client, token); review, _ = sdk(client, reviewer)
+    repo, components = app.state.repository, env.bridge.components
+    def receipt(identity):
+        return {'id': identity, 'response_scope': 'mutation_receipt', 'current_state_included': False}
+
+    proposal = {'project': PROJECT, 'title': 'Work', 'client_request_id': 'staging-proposal'}
+    task = data(invoke('hub_staging_task_propose', proposal)); tid = task['id']
+    assert task == receipt(tid)
+    assert data(invoke('hub_task_claim', {'task_id': tid, 'expected_revision': 1})) == receipt(tid)
+    assert data(invoke('hub_task_candidate', {'task_id': tid, 'expected_revision': 2, 'commit': 'a' * 40})) == receipt(tid)
+    assert data(review('hub_task_review', {'task_id': tid, 'expected_revision': 3,
+        'commit': 'a' * 40, 'verdict': 'approve'})) == receipt(tid)
+    assert data(invoke('hub_staging_task_propose', proposal)) == receipt(tid)
+    assert repo.get_task(tid)['status'] == 'verified'
+
+    cp = {'payload': {'project': PROJECT, 'slug': 'bounded-component', 'name': 'Original',
+                      'client_request_id': 'component-proposal'}}
+    component = data(invoke('hub_component_create', cp)); cid = component['id']
+    assert component == receipt(cid)
+    components.update_component(OWNER, cid, 1, description='private-metadata')
+    assert data(invoke('hub_component_create', cp)) == receipt(cid)
+    assert data(invoke('hub_component_update', {'payload': {'component_id': cid,
+        'expected_revision': 2, 'name': 'Original'}})) == receipt(cid)
+    assert components.get_component(cid)['revision'] == 2  # No-op stays a no-op.
+    assert data(invoke('hub_component_update', {'payload': {'component_id': cid,
+        'expected_revision': 2, 'name': 'New'}})) == receipt(cid)
+    assert data(invoke('hub_component_retire', {'payload': {'component_id': cid,
+        'expected_revision': 3}})) == receipt(cid)
+    env.bridge.grant_put(OWNER, installation, 1, [PROJECT],
+        ['task.propose', 'task.claim', 'task.candidate', 'task.read', 'component.write', 'component.read'])
+    assert data(invoke('hub_staging_task_propose', proposal))['status'] == 'verified'
+    assert data(invoke('hub_component_create', cp))['description'] == 'private-metadata'
+    env.bridge.grant_put(OWNER, installation, 2, [PROJECT],
+        ['task.propose', 'task.claim', 'task.candidate', 'component.write'])
+    assert data(invoke('hub_staging_task_propose', proposal)) == receipt(tid)
+    assert data(invoke('hub_component_create', cp)) == receipt(cid)
+
+
+def test_withdraw_uses_the_matching_entity_read_grant(unified):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, name='withdraw-write-only',
+        caps=('entity.withdraw', 'task.propose', 'decision.request'))
+    invoke, _ = sdk(client, token)
+    task = data(invoke('hub_staging_task_propose', {'project': PROJECT, 'title': 'Task',
+                                                   'client_request_id': 'withdraw-proposal'}))
+    decision = data(invoke('hub_decision_request', {'project': PROJECT, 'title': 'Decision',
+                                                    'options': ['Yes', 'No']}))
+    def receipt(identity):
+        return {'id': identity, 'response_scope': 'mutation_receipt', 'current_state_included': False}
+    task_request = {'kind': 'task', 'entity_id': task['id'], 'expected_revision': 1, 'reason': 'No longer needed'}
+    decision_request = {'kind': 'decision', 'entity_id': decision['id'], 'expected_revision': 1, 'reason': 'No longer needed'}
+    assert data(invoke('hub_entity_withdraw', task_request)) == receipt(task['id'])
+    assert data(invoke('hub_entity_withdraw', decision_request)) == receipt(decision['id'])
+    assert data(invoke('hub_entity_withdraw', task_request)) == receipt(task['id'])
+    assert data(invoke('hub_entity_withdraw', decision_request)) == receipt(decision['id'])
+    env.bridge.grant_put(OWNER, installation, 1, [PROJECT],
+                         ['entity.withdraw', 'task.propose', 'decision.request', 'task.read'])
+    assert data(invoke('hub_entity_withdraw', task_request))['status'] == 'withdrawn'
+    assert data(invoke('hub_entity_withdraw', decision_request)) == receipt(decision['id'])
+    env.bridge.grant_put(OWNER, installation, 2, [PROJECT],
+                         ['entity.withdraw', 'task.propose', 'decision.request', 'decision.read'])
+    assert data(invoke('hub_entity_withdraw', task_request)) == receipt(task['id'])
+    assert data(invoke('hub_entity_withdraw', decision_request))['status'] == 'withdrawn'
+
+
+def test_role_lease_only_receipts_do_not_disclose_handoff_or_release_reason(unified):
+    from engineering_hub.roles import RoleRepository
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    first_id, first, _ = pair(env, name='role-first', caps=('role.lease', 'role.claim', 'tracking.read'))
+    second_id, second, _ = pair(env, name='role-second', family='claude',
+                                caps=('role.lease', 'role.claim', 'tracking.read'))
+    roles = RoleRepository(app.state.repository)
+    roles.configure(OWNER, 'bounded-privacy', 0, [PROJECT], [first_id, second_id], ['private/path'],
+                    'private-standing-rules', [])
+    task = app.state.repository.propose_tracking_task('codex', PROJECT, 'Work', 'role-task')
+    a, _ = sdk(client, first); b, _ = sdk(client, second)
+    lease = data(a('hub_role_acquire', {'role': 'bounded-privacy', 'expected_revision': 1, 'lease_seconds': 60}))
+    assert lease['response_scope'] == 'coordination_receipt' and lease['generation'] == 1
+    assert 'private-standing-rules' not in json.dumps(lease) and 'handoff' not in lease
+    claim = data(a('hub_role_claim', {'role': 'bounded-privacy', 'generation': 1, 'task_id': task['id'],
+                                     'client_request_id': 'first-claim'}))
+    assert claim['response_scope'] == 'coordination_receipt'
+    released_claim = data(a('hub_role_claim_release', {'role': 'bounded-privacy', 'generation': 1,
+        'task_id': task['id'], 'expected_revision': claim['revision'], 'reason': 'private-release-reason'}))
+    assert 'private-release-reason' not in json.dumps(released_claim)
+    released = data(a('hub_role_release', {'role': 'bounded-privacy', 'expected_revision': lease['revision'],
+        'generation': 1, 'expected_handoff_revision': lease['handoff_revision'], 'handoff': 'private-handoff'}))
+    acquired = data(b('hub_role_acquire', {'role': 'bounded-privacy', 'expected_revision': released['revision'],
+                                          'lease_seconds': 60}))
+    assert acquired['takeover'] == 'handoff_recorded' and acquired['handoff_revision'] == 1
+    assert 'private-handoff' not in json.dumps(acquired)
+    reclaimed = data(b('hub_role_claim', {'role': 'bounded-privacy', 'generation': acquired['generation'],
+        'task_id': task['id'], 'client_request_id': 'second-claim'}))
+    assert reclaimed['revision'] > claim['revision'] and 'private-release-reason' not in json.dumps(reclaimed)
+    renewed = data(b('hub_role_renew', {'role': 'bounded-privacy', 'expected_revision': acquired['revision'],
+        'generation': acquired['generation'], 'lease_seconds': 60}))
+    assert renewed['lease_expires_at'] and 'private-handoff' not in json.dumps(renewed)
+    env.bridge.grant_put(OWNER, second_id, 1, [PROJECT], ['role.lease', 'role.claim', 'role.read', 'tracking.read'])
+    full = data(b('hub_role_renew', {'role': 'bounded-privacy', 'expected_revision': renewed['revision'],
+        'generation': renewed['generation'], 'lease_seconds': 60}))
+    assert full['handoff']['text'] == 'private-handoff'
+    env.bridge.grant_put(OWNER, second_id, 2, [PROJECT], ['role.lease', 'role.claim', 'tracking.read'])
+    limited = data(b('hub_role_renew', {'role': 'bounded-privacy', 'expected_revision': full['revision'],
+        'generation': full['generation'], 'lease_seconds': 60}))
+    assert limited['response_scope'] == 'coordination_receipt' and 'private-handoff' not in json.dumps(limited)
+    roles.configure(OWNER, 'mixed-scope', 0, [PROJECT, '3d-viewer'], [first_id], [], 'private-mixed', [])
+    denied = a('hub_role_acquire', {'role': 'mixed-scope', 'expected_revision': 1, 'lease_seconds': 60})
+    assert denied['isError'] and 'private-mixed' not in json.dumps(denied)
+    assert roles.owner_get(OWNER, 'mixed-scope')['lease'] is None
 
 
 def test_tracking_history_and_compaction_obey_live_project_grants(unified):
@@ -536,7 +724,9 @@ def test_session_id_tools_do_not_disclose_unavailable_entities(unified):
     _, reviewer, _ = pair(env, name='task-reviewer', family='claude', caps=('task.review',))
     review, _ = sdk(client, reviewer)
     assert data(review('hub_task_review', {'task_id': own_task['id'], 'expected_revision': candidate['revision'],
-        'commit': 'a' * 40, 'verdict': 'approve'}))['review']['verdict'] == 'approve'
+        'commit': 'a' * 40, 'verdict': 'approve'})) == {
+            'id': own_task['id'], 'response_scope': 'mutation_receipt', 'current_state_included': False}
+    assert repo.get_task(own_task['id'])['review']['verdict'] == 'approve'
     assert data(invoke('hub_component_get', {'component_id': own_component['id']}))['id'] == own_component['id']
     edited = data(invoke('hub_component_update', {'payload': {'component_id': own_component['id'], 'expected_revision': 1, 'name': 'New'}}))
     assert data(invoke('hub_component_retire', {'payload': {'component_id': own_component['id'], 'expected_revision': edited['revision']}}))['status'] == 'retired'
@@ -847,8 +1037,11 @@ def test_real_owner_api_and_existing_mcp_tools_unified(unified):
     review_invoke, _ = sdk(client, review_token)
     installation_review = data(review_invoke('hub_task_review', {'task_id': claimed['id'],
         'expected_revision': 3, 'commit': 'a' * 40, 'verdict': 'approve'}))
-    assert installation_review['review']['family'] == 'claude'
-    assert installation_review['review']['actor'].startswith('installation:')
+    assert installation_review == {'id': claimed['id'], 'response_scope': 'mutation_receipt',
+                                   'current_state_included': False}
+    actual_review = app.state.repository.get_task(claimed['id'])['review']
+    assert actual_review['family'] == 'claude'
+    assert actual_review['actor'].startswith('installation:')
     sibling = env.sessions.exchange(secret)
     target = sibling['session']['id']
     recovery_path = prefix + '/tasks/' + claimed['id'] + '/recover-claim'

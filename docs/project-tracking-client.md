@@ -57,6 +57,13 @@ secrets and private client data out of tracking records.
 A successful write is not work execution or proof. Errors are intentionally generic: a lost response
 can follow a committed write. Read back or retry the exact unchanged payload
 with the same client_request_id; never invent a new ID for an uncertain retry.
+An EHS tracking write without a current `tracking.read` grant returns only the
+task ID and `response_scope: mutation_receipt`, not the current task, revision,
+status or history. An authorized, accepted retry returns the same minimal
+receipt even if another actor later changes the task; an expired or revoked
+session or grant can deny the retry. With current project-scoped `tracking.read`, the
+existing full current-task response remains available; it is not an immutable
+receipt of the original write. Legacy family-bearer behavior is unchanged.
 The client checks the exact session identity, uses its protected local profile,
 refuses redirects and environment proxies, and makes one bounded operation.
 It sends no notification and does not imply another agent has received it.

@@ -491,6 +491,51 @@ class SessionHubBridge:
                                     result = {'items': [project_view(p) for p in items if not p['archived']]}
                                 else:
                                     result = fn(*args, **kwargs)
+                                read_required = {
+                                    'hub_tracking_task_propose': 'tracking.read', 'hub_tracking_task_update': 'tracking.read',
+                                    'hub_tracking_task_review': 'tracking.read', 'hub_tracking_task_compact': 'tracking.read',
+                                    'hub_staging_task_propose': 'task.read', 'hub_task_claim': 'task.read',
+                                    'hub_task_candidate': 'task.read', 'hub_task_review': 'task.read',
+                                    'hub_component_create': 'component.read', 'hub_component_update': 'component.read',
+                                    'hub_component_retire': 'component.read',
+                                    'hub_role_acquire': 'role.read', 'hub_role_renew': 'role.read',
+                                    'hub_role_release': 'role.read', 'hub_role_claim': 'role.read',
+                                    'hub_role_claim_release': 'role.read',
+                                }.get(fn.__name__)
+                                if fn.__name__ == 'hub_entity_withdraw':
+                                    # Scope validation rejects other kinds before
+                                    # this point; never infer a read grant from the
+                                    # source entity or its creation capability.
+                                    read_required = {'task': 'task.read', 'decision': 'decision.read'}[arguments['kind']]
+                                if read_required is not None:
+                                    # Mutations can be granted without the associated read. In
+                                    # particular, an idempotent retry may return a row
+                                    # changed by another actor since the original write.
+                                    # Do not turn a write grant into a history read.
+                                    try:
+                                        bridge._live(operation.db, operation.secret,
+                                            operation.principal.authorization_revision, read_required,
+                                            session_id=operation.principal.session_id)
+                                        for project in result.get('projects', [result.get('project')]):
+                                            operation.project(project)
+                                    except (HubError, AgentSessionError):
+                                        if fn.__name__ in {'hub_role_acquire', 'hub_role_renew', 'hub_role_release'}:
+                                            lease = result.get('lease')
+                                            result = {'role_id': result['role_id'], 'revision': result['revision'],
+                                                'generation': result['generation'],
+                                                'lease_expires_at': lease['expires_at'] if lease else None,
+                                                'handoff_revision': result['handoff']['revision'],
+                                                'takeover': result.get('takeover'),
+                                                'response_scope': 'coordination_receipt',
+                                                'execution_authorization': False}
+                                        elif fn.__name__ in {'hub_role_claim', 'hub_role_claim_release'}:
+                                            result = {'id': result['id'], 'role_id': result['role_id'],
+                                                'task_id': result['task_id'], 'revision': result['revision'],
+                                                'response_scope': 'coordination_receipt',
+                                                'execution_authorization': False}
+                                        else:
+                                            result = {'id': result['id'], 'response_scope': 'mutation_receipt',
+                                                      'current_state_included': False}
                                 if operation.capability.endswith('.read') or operation.capability == 'task.list':
                                     operation.before_commit(bridge.repo.path, None)
                                 return result
