@@ -81,6 +81,30 @@ def test_real_transport_task_lifecycle_uses_token_identity(hub):
     assert call(client, "hub_task_get", {"task_id": task["id"]})["structuredContent"]["status"] == "verified"
 
 
+def test_real_transport_profile_candidate_requires_explicit_independent_tuple_review(hub):
+    from engineering_hub.staging_resources import StagingResourceStore
+    from tests.test_staging_profile_task_binding import PROFILE, confirmation
+    client, repo = hub
+    store = StagingResourceStore(repo, admin_actors=frozenset({'human:1'}))
+    store.set_policy('human:1', '3d-viewer', 0, {'codex': ['read'], 'claude': ['read']})
+    profile = store.enroll_profile('human:1', '3d-viewer', 'static', 0, PROFILE)
+    task = repo.create_task('human:1', '3d-viewer', 'Review profile', 'profile-mcp')
+    task = call(client, 'hub_task_claim', {'task_id': task['id'], 'expected_revision': task['revision']})['structuredContent']
+    args = {'task_id': task['id'], 'expected_revision': task['revision'], 'commit': 'a' * 40,
+            'profile_selection': {'recipe': 'static', 'generation': 1}}
+    task = call(client, 'hub_task_candidate', args)['structuredContent']
+    assert 'staging_profile' not in task
+    get = {'task_id': task['id'], 'include_staging_profile': True}
+    assert call(client, 'hub_task_get', get, 'fixture-hermes')['isError']
+    assert call(client, 'hub_task_get', get, 'fixture-claude')['structuredContent']['staging_profile']['digest'] == profile['digest']
+    review = {'task_id': task['id'], 'expected_revision': task['revision'], 'commit': 'a' * 40, 'verdict': 'approve'}
+    assert call(client, 'hub_task_review', review, 'fixture-claude')['isError']
+    review['profile_confirmation'] = confirmation(profile)
+    reviewed = call(client, 'hub_task_review', review, 'fixture-claude')['structuredContent']
+    assert reviewed['status'] == 'verified'
+    assert not repo.reviewed_task_matches(task['id'], 'codex', reviewed['revision'], 'a' * 40)
+
+
 def test_project_tasks_refresh_current_state_and_disclose_truncation(hub):
     client, repo = hub
     first = repo.create_task('human:123', '3d-viewer', 'First task', 'continuity-1')

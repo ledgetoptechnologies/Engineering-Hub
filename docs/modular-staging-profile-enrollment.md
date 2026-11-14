@@ -1,11 +1,17 @@
 # Modular staging profile enrollment: source prerequisite
 
-This opt-in prerequisite records an owner-selected, nonsecret profile and makes
+This prerequisite records an owner-selected, nonsecret profile and makes
 its identity available to project-authorized readers. It does not change worker
 configuration, attest that a worker uses the profile, modify a task review,
 dispatch a job, clear a hold, or grant execution or release authority. Existing
 unbound tasks and jobs retain their current behavior; this change is not a
 complete solution for profile-bound staging admission.
+
+There is no separate profile-enrollment feature switch. The routes are
+registered with the staging API and become usable when the existing modular
+staging controller is configured; its resource-store preparation creates the
+additive enrollment table. A database restore can lose enrollments and audit
+entries written after the backup, and older software does not enforce them.
 
 `modular-staging-profile-v1` uses the exact closed fields in
 `engineering_hub.modular_staging_profile.FIELDS`, an explicit integer CPU quota

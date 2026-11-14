@@ -6193,6 +6193,43 @@
         }
       }
     },
+    "/api/hub/v1/tasks/{task_id}/staging-profile": {
+      "get": {
+        "summary": "Get Task Staging Profile",
+        "operationId": "get_task_staging_profile_api_hub_v1_tasks__task_id__staging_profile_get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/tasks/{task_id}/claim": {
       "post": {
         "summary": "Claim",
@@ -7648,6 +7685,16 @@
             "type": "string",
             "pattern": "^[0-9a-f]{40}$",
             "title": "Commit"
+          },
+          "profile_selection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProfileSelection"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false,
@@ -9892,6 +9939,62 @@
         ],
         "title": "PlanningWrite"
       },
+      "ProfileConfirmation": {
+        "properties": {
+          "recipe": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "title": "Recipe"
+          },
+          "generation": {
+            "type": "integer",
+            "exclusiveMaximum": 2147483648.0,
+            "minimum": 1.0,
+            "title": "Generation"
+          },
+          "project": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+            "title": "Project"
+          },
+          "digest": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$",
+            "title": "Digest"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "recipe",
+          "generation",
+          "project",
+          "digest"
+        ],
+        "title": "ProfileConfirmation"
+      },
+      "ProfileSelection": {
+        "properties": {
+          "recipe": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "title": "Recipe"
+          },
+          "generation": {
+            "type": "integer",
+            "exclusiveMaximum": 2147483648.0,
+            "minimum": 1.0,
+            "title": "Generation"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "recipe",
+          "generation"
+        ],
+        "title": "ProfileSelection"
+      },
       "ProjectDTO": {
         "properties": {
           "id": {
@@ -10562,6 +10665,16 @@
               "reject"
             ],
             "title": "Verdict"
+          },
+          "profile_confirmation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProfileConfirmation"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false,

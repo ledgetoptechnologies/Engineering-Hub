@@ -603,10 +603,13 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
                 'next_after': rows[limit - 1]['id'] if more else None}
 
     @registration.tool()
-    def hub_task_get(task_id: str, ctx: Context) -> dict:
+    def hub_task_get(task_id: str, ctx: Context, include_staging_profile: StrictBool = False) -> dict:
         """Read an assigned Hub task."""
-        identity(ctx)
-        return invoke(repo.get_task, task_id)
+        principal = identity(ctx)
+        item = invoke(repo.get_task, task_id)
+        if include_staging_profile:
+            item = dict(item, staging_profile=invoke(repo.get_task_staging_profile, principal, task_id))
+        return item
 
     @registration.tool()
     def hub_task_claim(task_id: str, expected_revision: int, ctx: Context) -> dict:
@@ -614,14 +617,16 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         return invoke(repo.claim_task, identity(ctx), task_id, expected_revision)
 
     @registration.tool()
-    def hub_task_candidate(task_id: str, expected_revision: int, commit: str, ctx: Context) -> dict:
+    def hub_task_candidate(task_id: str, expected_revision: int, commit: str, ctx: Context,
+                           profile_selection: dict | None = None) -> dict:
         """Record an exact candidate commit for an owned task."""
-        return invoke(repo.set_candidate, identity(ctx), task_id, expected_revision, commit)
+        return invoke(repo.set_candidate, identity(ctx), task_id, expected_revision, commit, profile_selection)
 
     @registration.tool()
-    def hub_task_review(task_id: str, expected_revision: int, commit: str, verdict: str, ctx: Context) -> dict:
+    def hub_task_review(task_id: str, expected_revision: int, commit: str, verdict: str, ctx: Context,
+                        profile_confirmation: dict | None = None) -> dict:
         """Review another agent's exact candidate; self-review is forbidden."""
-        return invoke(repo.review_task, identity(ctx), task_id, expected_revision, commit, verdict)
+        return invoke(repo.review_task, identity(ctx), task_id, expected_revision, commit, verdict, profile_confirmation)
 
     @registration.tool()
     def hub_decision_request(project: str, title: str, options: list[str], ctx: Context, protected: bool = False,

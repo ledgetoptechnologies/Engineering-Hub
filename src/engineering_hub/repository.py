@@ -94,6 +94,12 @@ class HubRepository:
                 CREATE TABLE IF NOT EXISTS hub_run_requests (
                     actor TEXT NOT NULL, key TEXT NOT NULL, fingerprint TEXT NOT NULL,
                     run_id TEXT NOT NULL, PRIMARY KEY(actor,key));
+                CREATE TABLE IF NOT EXISTS hub_staging_task_profiles (
+                    task_id TEXT NOT NULL, candidate_revision INTEGER NOT NULL,
+                    project TEXT NOT NULL, recipe TEXT NOT NULL, generation INTEGER NOT NULL,
+                    digest TEXT NOT NULL, commit_oid TEXT NOT NULL,
+                    review_revision INTEGER, reviewer TEXT,
+                    PRIMARY KEY(task_id,candidate_revision));
             '''
             # executescript commits an existing transaction implicitly, which
             # would bypass the final capability check and rollback boundary.
@@ -885,7 +891,89 @@ class HubRepository:
             if (run['task_id'] == task_id or (target and run['target'] == target)) and run['status'] in {'pending', 'running', 'held', 'failed'}:
                 raise HubError('active_run', 409)
 
-    def set_candidate(self, actor, identity, expected_revision, commit):
+    def _staging_profile_read(self, db, actor, project):
+        """Profile content is private to an explicit project staging reader."""
+        self._actor(actor)
+        self._project(project, db)
+        family = session_context.family(actor) if session_context.actor_allowed(actor) else actor
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_staging_policy'").fetchone():
+            raise HubError('staging_profile_unavailable', 404)
+        row = db.execute('SELECT data FROM hub_staging_policy WHERE project=?', (project,)).fetchone()
+        try:
+            grants = json.loads(row['data'])['grants'] if row else {}
+            allowed = grants.get(family) if type(grants) is dict else None
+            if type(allowed) is not list or 'read' not in allowed or any(type(value) is not str for value in allowed):
+                raise ValueError()
+        except (ValueError, TypeError, KeyError):
+            raise HubError('staging_profile_unavailable', 404) from None
+
+    @staticmethod
+    def _profile_task_row(db, task_id):
+        return db.execute("SELECT p.* FROM hub_staging_task_profiles p WHERE p.task_id=? "
+                          "AND p.candidate_revision=(SELECT MAX(revision) FROM hub_audit "
+                          "WHERE entity_id=? AND action='task.candidate')", (task_id, task_id)).fetchone()
+
+    def _resolve_enrolled_profile(self, db, actor, project, selection):
+        from .modular_staging_profile import canonical_profile, profile_bytes, profile_digest
+        self._staging_profile_read(db, actor, project)
+        if (type(selection) is not dict or set(selection) != {'recipe', 'generation'}
+                or type(selection['recipe']) is not str
+                or re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', selection['recipe']) is None
+                or type(selection['generation']) is not int or not 1 <= selection['generation'] < 2**31):
+            raise HubError('invalid_staging_profile')
+        try:
+            row = db.execute('SELECT * FROM hub_staging_profile_enrollments WHERE project=? AND recipe=? ORDER BY generation DESC LIMIT 1',
+                             (project, selection['recipe'])).fetchone()
+            if row is None or row['generation'] != selection['generation']:
+                raise ValueError()
+            profile = canonical_profile(json.loads(row['profile']))
+            if profile_bytes(profile).decode('ascii') != row['profile'] or profile_digest(profile) != row['digest']:
+                raise ValueError()
+            return {'project': project, 'recipe': row['recipe'], 'generation': row['generation'],
+                    'digest': row['digest']}, profile
+        except (sqlite3.Error, ValueError, TypeError, KeyError):
+            raise HubError('staging_profile_unavailable', 404) from None
+
+    def get_task_staging_profile(self, actor, identity):
+        """Project-scoped candidate tuple and profile, never an execution grant."""
+        self._actor(actor)
+        with self._transaction() as db:
+            try:
+                task = self._get(db, identity, 'task')
+                self._staging_profile_read(db, actor, task['project'])
+                row = self._profile_task_row(db, identity)
+                if (row is None or row['project'] != task['project']
+                        or row['commit_oid'] != task.get('candidate_commit')
+                        or task['status'] not in {'in_review', 'verified'}):
+                    raise ValueError()
+            except (HubError, ValueError):
+                raise HubError('staging_profile_unavailable', 404) from None
+            try:
+                profile_row = db.execute('SELECT profile FROM hub_staging_profile_enrollments WHERE project=? AND recipe=? AND generation=? AND digest=?',
+                    (row['project'], row['recipe'], row['generation'], row['digest'])).fetchone()
+                from .modular_staging_profile import canonical_profile, profile_bytes, profile_digest
+                profile = canonical_profile(json.loads(profile_row['profile']))
+                if profile_bytes(profile).decode('ascii') != profile_row['profile'] or profile_digest(profile) != row['digest']:
+                    raise ValueError()
+            except (sqlite3.Error, ValueError, TypeError, KeyError):
+                raise HubError('staging_profile_unavailable', 404) from None
+            # The transaction's write reservation serializes this entire read
+            # with policy and candidate changes. Final checks and the session
+            # before-commit guard establish the read linearization point.
+            try:
+                current_task = self._get(db, identity, 'task')
+                current_row = self._profile_task_row(db, identity)
+                if current_task != task or current_row is None or tuple(current_row) != tuple(row):
+                    raise ValueError()
+                self._staging_profile_read(db, actor, task['project'])
+            except (HubError, ValueError):
+                raise HubError('staging_profile_unavailable', 404) from None
+            return {'project': row['project'], 'recipe': row['recipe'], 'generation': row['generation'],
+                    'digest': row['digest'], 'candidate_commit': row['commit_oid'],
+                    'candidate_revision': row['candidate_revision'], 'review_revision': row['review_revision'],
+                    'profile': profile, 'execution_authorization': False}
+
+    def set_candidate(self, actor, identity, expected_revision, commit, profile_selection=None):
         self._actor(actor, agent=True)
         if not isinstance(commit, str) or not re.fullmatch('[0-9a-f]{40}', commit):
             raise HubError('invalid_commit')
@@ -900,11 +988,19 @@ class HubRepository:
             self._no_active_run(db, identity)
             if self._open_work_job(db, identity):
                 raise HubError('active_work_job', 409)
+            selected = None
+            if profile_selection is not None:
+                selected, _ = self._resolve_enrolled_profile(db, actor, item['project'], profile_selection)
             item.update(candidate_commit=commit, review=None, status='in_review',
                         **({'candidate_family': item['owner_family']} if 'owner_family' in item else {}))
-            return self._save(db, actor, 'task.candidate', 'task', item)
+            item = self._save(db, actor, 'task.candidate', 'task', item)
+            if selected is not None:
+                db.execute('INSERT INTO hub_staging_task_profiles VALUES (?,?,?,?,?,?,?,?,?)',
+                    (identity, item['revision'], selected['project'], selected['recipe'], selected['generation'],
+                     selected['digest'], commit, None, None))
+            return item
 
-    def review_task(self, actor, identity, expected_revision, commit, verdict):
+    def review_task(self, actor, identity, expected_revision, commit, verdict, profile_confirmation=None):
         self._actor(actor, agent=True)
         if verdict not in {'approve', 'reject'}:
             raise HubError('invalid_verdict')
@@ -919,10 +1015,30 @@ class HubRepository:
                 raise HubError('independent_review_required', 403)
             if item['status'] != 'in_review' or not commit or item['candidate_commit'] != commit:
                 raise HubError('stale_review', 409)
+            bound = self._profile_task_row(db, identity)
+            if bound is not None:
+                self._staging_profile_read(db, actor, item['project'])
+                exact = {'project': bound['project'], 'recipe': bound['recipe'],
+                         'generation': bound['generation'], 'digest': bound['digest']}
+                if (type(profile_confirmation) is not dict or set(profile_confirmation) != set(exact)
+                        or type(profile_confirmation['generation']) is not int
+                        or any(type(profile_confirmation[key]) is not str for key in ('project', 'recipe', 'digest'))
+                        or profile_confirmation != exact or bound['commit_oid'] != commit):
+                    raise HubError('staging_profile_confirmation_required', 409)
+                current, _ = self._resolve_enrolled_profile(db, actor, item['project'],
+                    {'recipe': bound['recipe'], 'generation': bound['generation']})
+                if current != exact:
+                    raise HubError('staging_profile_changed', 409)
+            elif profile_confirmation is not None:
+                raise HubError('staging_profile_confirmation_invalid', 409)
             item.update(status='verified' if verdict == 'approve' else 'claimed',
                         review=dict(actor=actor, commit=commit, verdict=verdict,
                             **({'family': session_context.family(actor)} if session_context.actor_allowed(actor) else {})) if verdict == 'approve' else None)
-            return self._save(db, actor, 'task.reviewed', 'task', item)
+            item = self._save(db, actor, 'task.reviewed', 'task', item)
+            if bound is not None and verdict == 'approve':
+                db.execute('UPDATE hub_staging_task_profiles SET review_revision=?,reviewer=? WHERE task_id=? AND candidate_revision=?',
+                           (item['revision'], actor, identity, bound['candidate_revision']))
+            return item
 
     def reviewed_task_matches(self, identity, actor, revision, commit, *, db=None):
         """Check the exact independently reviewed candidate while holding the queue transaction."""
@@ -943,6 +1059,13 @@ class HubRepository:
         matching Hub-owned session provenance in the same database snapshot.
         Actor/family strings in the task JSON alone are never sufficient.
         """
+        if db is None:
+            with self._connection() as connection:
+                return self._reviewed_task_data_matches(task, actor, revision, commit, db=connection)
+        # Bound-profile candidates cannot be used as ordinary commit-only work.
+        # The bound worker/admission protocol is not installed yet.
+        if db is not None and self._profile_task_row(db, task['id']) is not None:
+            return False
         review = task.get('review')
         if not (type(revision) is int and task.get('revision') == revision
                 and task.get('status') == 'verified' and task.get('owner') == actor

@@ -56,6 +56,31 @@ def claim_candidate(client, item):
     return response.json()
 
 
+def test_staging_profile_task_review_http_is_scoped_and_explicit(hub):
+    from engineering_hub.staging_resources import StagingResourceStore
+    from tests.test_staging_profile_task_binding import PROFILE, confirmation
+    client, app, settings = hub
+    repo = app.state.repository
+    store = StagingResourceStore(repo, admin_actors=frozenset({'human:1'}))
+    store.set_policy('human:1', '3d-viewer', 0, {'codex': ['read'], 'claude': ['read']})
+    profile = store.enroll_profile('human:1', '3d-viewer', 'static', 0, PROFILE)
+    task = repo.create_task('human:1', '3d-viewer', 'Profile review', 'profile-http')
+    task = repo.claim_task('codex', task['id'], task['revision'])
+    path = f"{BASE}/tasks/{task['id']}"
+    response = client.post(path + '/candidate', headers=agent_headers(), json={
+        'expected_revision': task['revision'], 'commit': COMMIT,
+        'profile_selection': {'recipe': 'static', 'generation': 1}})
+    assert response.status_code == 200 and 'staging_profile' not in response.json()
+    task = response.json()
+    assert client.get(path + '/staging-profile', headers=agent_headers('hermes')).status_code == 404
+    assert client.get(path + '/staging-profile', headers=agent_headers('claude')).json()['digest'] == profile['digest']
+    review = {'expected_revision': task['revision'], 'commit': COMMIT, 'verdict': 'approve'}
+    assert client.post(path + '/review', headers=agent_headers('claude'), json=review).status_code == 409
+    review['profile_confirmation'] = confirmation(profile)
+    result = client.post(path + '/review', headers=agent_headers('claude'), json=review)
+    assert result.status_code == 200 and result.json()['status'] == 'verified'
+
+
 def test_overview_requires_identity_and_has_explicit_unknown_readiness(hub):
     client, _, _ = hub
     assert client.get(BASE + "/overview").status_code == 401

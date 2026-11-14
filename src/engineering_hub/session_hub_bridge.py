@@ -60,7 +60,10 @@ TOOLS = {
     'hub_decision_get': 'decision.read',
     'hub_entity_withdraw': 'entity.withdraw',
 }
-CAPABILITIES = tuple(sorted(set(TOOLS.values())))
+# Sensitive profile content needs its own explicit installation grant even
+# though it is requested as an opt-in projection of task operations.
+_EXTRA_CAPABILITIES = frozenset({'staging.profile.read'})
+CAPABILITIES = tuple(sorted(set(TOOLS.values()) | _EXTRA_CAPABILITIES))
 _SEAT_TOOLS = {'hub_cross_seat_current': 'cross.seat.read', 'hub_cross_seat_handoff': 'cross.seat.handoff'}
 _CROSS_TOOLS = {'hub_cross_routes': 'cross.request.read', 'hub_cross_request_create': 'cross.request.submit',
                 'hub_cross_request_get': 'cross.request.read', 'hub_cross_request_list': 'cross.request.read',
@@ -137,7 +140,7 @@ class SessionHubBridge:
         if type(seat_foundation_enabled) is not bool or type(cross_requests_enabled) is not bool or (cross_requests_enabled and not seat_foundation_enabled):
             raise ValueError('explicit_seat_foundation_flag_required')
         self.tools = {**TOOLS, **(_SEAT_TOOLS if seat_foundation_enabled else {}), **(_CROSS_TOOLS if cross_requests_enabled else {})}
-        self.capabilities = tuple(sorted(set(self.tools.values())))
+        self.capabilities = tuple(sorted(set(self.tools.values()) | _EXTRA_CAPABILITIES))
         self.seat_authority = None
         self.cross_requests = None
         self.sessions, self.repo, self.projects, self.components = sessions, repo, projects, components
@@ -509,6 +512,18 @@ class SessionHubBridge:
                         try:
                             with bridge.admit(bearer(request), fn.__name__) as operation:
                                 bridge._scope(fn.__name__, arguments, operation)
+                                profile_read = (
+                                    fn.__name__ == 'hub_task_get' and arguments.get('include_staging_profile') is True
+                                    or fn.__name__ == 'hub_task_candidate' and arguments.get('profile_selection') is not None
+                                    or fn.__name__ == 'hub_task_review' and arguments.get('profile_confirmation') is not None
+                                )
+                                if profile_read:
+                                    def check_profile_grant(_db=None):
+                                        bridge._live(operation.db, operation.secret,
+                                            operation.principal.authorization_revision, 'staging.profile.read',
+                                            session_id=operation.principal.session_id)
+                                    check_profile_grant()
+                                    operation.commit_checks.append(check_profile_grant)
                                 if fn.__name__ == 'hub_planning_put' and arguments['payload'].expected_version > 0:
                                     bridge._live(operation.db, operation.secret,
                                         operation.principal.authorization_revision, 'planning.read',

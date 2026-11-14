@@ -242,12 +242,25 @@ class AttentionRouteWrite(Input):
     lifetime_seconds: int = Field(ge=10, le=3600)
 
 
+class ProfileSelection(Input):
+    recipe: str = Field(pattern=r'^[a-z0-9][a-z0-9_-]{0,63}$')
+    generation: int = Field(ge=1, lt=2**31)
+
+
+class ProfileConfirmation(ProfileSelection):
+    project: str = Field(pattern=r'^[a-z0-9][a-z0-9-]{0,63}$')
+    digest: str = Field(pattern=r'^sha256:[a-f0-9]{64}$')
+
+
 class Candidate(Revision):
     commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    profile_selection: ProfileSelection | None = None
 
 
-class Review(Candidate):
+class Review(Revision):
+    commit: str = Field(pattern=r"^[0-9a-f]{40}$")
     verdict: Literal["approve", "reject"]
+    profile_confirmation: ProfileConfirmation | None = None
 
 
 class NewDecision(Input):
@@ -1537,18 +1550,24 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         actor(request)
         return repo.get_task(task_id)
 
+    @app.get('/api/hub/v1/tasks/{task_id}/staging-profile')
+    def get_task_staging_profile(task_id: str, request: Request):
+        return repo.get_task_staging_profile(actor(request), task_id)
+
     @app.post("/api/hub/v1/tasks/{task_id}/claim", response_model=TaskDTO, response_model_exclude_unset=True)
     def claim(task_id: str, payload: Revision, request: Request):
         return repo.claim_task(agent(request), task_id, payload.expected_revision)
 
     @app.post("/api/hub/v1/tasks/{task_id}/candidate", response_model=TaskDTO, response_model_exclude_unset=True)
     def candidate(task_id: str, payload: Candidate, request: Request):
-        return repo.set_candidate(agent(request), task_id, payload.expected_revision, payload.commit)
+        return repo.set_candidate(agent(request), task_id, payload.expected_revision, payload.commit,
+                                  payload.profile_selection.model_dump() if payload.profile_selection is not None else None)
 
     @app.post("/api/hub/v1/tasks/{task_id}/review", response_model=TaskDTO, response_model_exclude_unset=True)
     def review(task_id: str, payload: Review, request: Request):
         return repo.review_task(agent(request), task_id, payload.expected_revision,
-                                payload.commit, payload.verdict)
+                                payload.commit, payload.verdict,
+                                payload.profile_confirmation.model_dump() if payload.profile_confirmation is not None else None)
 
     @app.get("/api/hub/v1/decisions", response_model=DecisionListDTO, response_model_exclude_unset=True)
     def list_decisions(request: Request):

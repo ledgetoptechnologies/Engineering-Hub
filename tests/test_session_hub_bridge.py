@@ -185,6 +185,60 @@ def test_separate_pc_idempotency_exact_session_claim_and_family_review(env):
         env.repo.claim_task(first['proposed_by'], second['id'], 1)
 
 
+def test_scoped_sessions_review_exact_owner_profile_tuple(env):
+    from engineering_hub.staging_resources import StagingResourceStore
+    from tests.test_staging_profile_task_binding import PROFILE, confirmation
+    store = StagingResourceStore(env.repo, admin_actors=frozenset({OWNER}))
+    store.set_policy(OWNER, PROJECT, 0, {'codex': ['read'], 'claude': ['read']})
+    profile = store.enroll_profile(OWNER, PROJECT, 'static', 0, PROFILE)
+    _, author, _ = pair(env, 'profile-author', 'codex')
+    reviewer_id, reviewer, _ = pair(env, 'profile-reviewer', 'claude')
+    _, sibling, _ = pair(env, 'profile-sibling', 'codex')
+    task = proposal(env, author, 'profile-session')
+    task = call(env, author, 'hub_task_claim', lambda a: env.repo.claim_task(a, task['id'], task['revision']))
+    task = call(env, author, 'hub_task_candidate', lambda a: env.repo.set_candidate(
+        a, task['id'], task['revision'], 'a' * 40, {'recipe': 'static', 'generation': 1}))
+    assert call(env, reviewer, 'hub_task_get', lambda a: env.repo.get_task_staging_profile(a, task['id']))['digest'] == profile['digest']
+    with pytest.raises(HubError, match='independent_review_required'):
+        call(env, sibling, 'hub_task_review', lambda a: env.repo.review_task(a, task['id'], task['revision'],
+            'a' * 40, 'approve', confirmation(profile)))
+    with pytest.raises(HubError, match='staging_profile_confirmation_required'):
+        call(env, reviewer, 'hub_task_review', lambda a: env.repo.review_task(a, task['id'], task['revision'], 'a' * 40, 'approve'))
+    reviewed = call(env, reviewer, 'hub_task_review', lambda a: env.repo.review_task(a, task['id'], task['revision'],
+        'a' * 40, 'approve', confirmation(profile)))
+    assert reviewed['status'] == 'verified'
+    assert not env.repo.reviewed_task_matches(task['id'], task['owner'], reviewed['revision'], 'a' * 40)
+    env.bridge.grant_revoke(OWNER, reviewer_id, 1)
+    with pytest.raises(HubError, match='hub_grant_required'):
+        call(env, reviewer, 'hub_task_get', lambda a: env.repo.get_task_staging_profile(a, task['id']))
+
+
+def test_profile_read_rechecks_session_expiry_before_commit(env, monkeypatch):
+    from engineering_hub.staging_resources import StagingResourceStore
+    from tests.test_staging_profile_task_binding import PROFILE
+    store = StagingResourceStore(env.repo, admin_actors=frozenset({OWNER}))
+    store.set_policy(OWNER, PROJECT, 0, {'codex': ['read'], 'claude': ['read']})
+    store.enroll_profile(OWNER, PROJECT, 'static', 0, PROFILE)
+    _, author, _ = pair(env, 'profile-expiry-author', 'codex')
+    _, reviewer, _ = pair(env, 'profile-expiry-reviewer', 'claude')
+    task = proposal(env, author, 'profile-expiry')
+    task = call(env, author, 'hub_task_claim', lambda a: env.repo.claim_task(a, task['id'], task['revision']))
+    task = call(env, author, 'hub_task_candidate', lambda a: env.repo.set_candidate(
+        a, task['id'], task['revision'], 'a' * 40, {'recipe': 'static', 'generation': 1}))
+    original = env.repo._staging_profile_read
+    expired = False
+    def expire_during_read(*args, **kwargs):
+        nonlocal expired
+        value = original(*args, **kwargs)
+        if not expired:
+            expired = True
+            env.clock.value += 901
+        return value
+    monkeypatch.setattr(env.repo, '_staging_profile_read', expire_during_read)
+    with pytest.raises((HubError, AgentSessionError)):
+        call(env, reviewer, 'hub_task_get', lambda a: env.repo.get_task_staging_profile(a, task['id']))
+
+
 def test_component_scope_cas_references_and_own_withdrawal(env):
     _, token, _ = pair(env)
     item = call(env, token, 'hub_component_create', lambda a: env.components.create_component(a, PROJECT, 'pkg', 'Package', 'pkg'))
@@ -407,6 +461,78 @@ def sdk(client, token):
 def data(result):
     assert not result.get('isError')
     return result.get('structuredContent') or json.loads(result['content'][0]['text'])
+
+
+def test_profile_read_requires_separate_installation_capability_on_real_mcp(unified):
+    from engineering_hub.staging_resources import StagingResourceStore
+    from tests.test_staging_profile_task_binding import PROFILE, confirmation
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    repo = app.state.repository
+    store = StagingResourceStore(repo, admin_actors=frozenset({OWNER}))
+    store.set_policy(OWNER, PROJECT, 0, {'codex': ['read'], 'claude': ['read']})
+    profile = store.enroll_profile(OWNER, PROJECT, 'static', 0, PROFILE)
+    author_id, author_token, _ = pair(env, 'profile-author-real', 'codex',
+                                     caps=('task.claim', 'task.candidate', 'task.read'))
+    reviewer_id, reviewer_token, _ = pair(env, 'profile-reviewer-real', 'claude',
+                                         caps=('task.review', 'task.read'))
+    author, _ = sdk(client, author_token)
+    reviewer, _ = sdk(client, reviewer_token)
+    task = repo.create_task(OWNER, PROJECT, 'Private profile fixture', 'profile-real-mcp')
+    task = data(author('hub_task_claim', {'task_id': task['id'], 'expected_revision': task['revision']}))
+    candidate = {'task_id': task['id'], 'expected_revision': task['revision'], 'commit': 'a' * 40,
+                 'profile_selection': {'recipe': 'static', 'generation': 1}}
+    assert author('hub_task_candidate', candidate)['isError']
+    env.bridge.grant_put(OWNER, author_id, 1, [PROJECT],
+                         ['task.claim', 'task.candidate', 'task.read', 'staging.profile.read'])
+    task = data(author('hub_task_candidate', candidate))
+    get = {'task_id': task['id'], 'include_staging_profile': True}
+    assert reviewer('hub_task_get', get)['isError']
+    review = {'task_id': task['id'], 'expected_revision': task['revision'], 'commit': 'a' * 40,
+              'verdict': 'approve', 'profile_confirmation': confirmation(profile)}
+    assert reviewer('hub_task_review', review)['isError']
+    env.bridge.grant_put(OWNER, reviewer_id, 1, [PROJECT], ['task.review', 'task.read', 'staging.profile.read'])
+    assert data(reviewer('hub_task_get', get))['staging_profile']['digest'] == profile['digest']
+    assert data(reviewer('hub_task_review', review))['status'] == 'verified'
+
+
+@pytest.mark.parametrize('operation', ['read', 'candidate'])
+def test_profile_grant_is_rechecked_at_hub_transaction_commit(unified, monkeypatch, operation):
+    from engineering_hub.staging_resources import StagingResourceStore
+    from tests.test_staging_profile_task_binding import PROFILE
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    repo = app.state.repository
+    store = StagingResourceStore(repo, admin_actors=frozenset({OWNER}))
+    store.set_policy(OWNER, PROJECT, 0, {'codex': ['read']})
+    store.enroll_profile(OWNER, PROJECT, 'static', 0, PROFILE)
+    _, token, _ = pair(env, 'profile-commit-check', 'codex',
+                       caps=('task.claim', 'task.candidate', 'task.read', 'staging.profile.read'))
+    invoke, _ = sdk(client, token)
+    task = repo.create_task(OWNER, PROJECT, 'Private profile fixture', 'profile-commit-' + operation)
+    task = data(invoke('hub_task_claim', {'task_id': task['id'], 'expected_revision': task['revision']}))
+    candidate = {'task_id': task['id'], 'expected_revision': task['revision'], 'commit': 'a' * 40,
+                 'profile_selection': {'recipe': 'static', 'generation': 1}}
+    if operation == 'read':
+        task = data(invoke('hub_task_candidate', candidate))
+    original_live = env.bridge._live
+    checks = 0
+    def revoke_profile_at_commit(db, secret, revision=None, capability=None, *, session_id=None):
+        nonlocal checks
+        if capability == 'staging.profile.read':
+            checks += 1
+            if checks == 2:
+                raise HubError('hub_capability_forbidden', 403)
+        return original_live(db, secret, revision, capability, session_id=session_id)
+    monkeypatch.setattr(env.bridge, '_live', revoke_profile_at_commit)
+    result = (invoke('hub_task_get', {'task_id': task['id'], 'include_staging_profile': True})
+              if operation == 'read' else invoke('hub_task_candidate', candidate))
+    assert result['isError'] and checks == 2
+    assert 'npm' not in json.dumps(result)
+    if operation == 'candidate':
+        assert repo.get_task(task['id'])['candidate_commit'] is None
+        with repo._connection() as db:
+            assert db.execute('SELECT count(*) FROM hub_staging_task_profiles WHERE task_id=?', (task['id'],)).fetchone()[0] == 0
 
 
 def test_planning_write_requires_read_for_replacement_and_redacts_receipts(unified, monkeypatch):

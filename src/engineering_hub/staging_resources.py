@@ -236,11 +236,17 @@ class StagingResourceStore:
         self._recipe_name(recipe)
         if generation is not None and (type(generation) is not int or not 1 <= generation < 2**31):
             raise HubError('invalid_staging_generation')
-        with self.repo._connection() as db:
+        def require_access(db):
             if actor in self.admin_actors:
                 self.repo._project(project, db)
             else:
                 self._authorize(db, actor, project, 'read')
+                grants = self._policy(db, project).get('grants')
+                allowed = grants.get(actor) if type(grants) is dict else None
+                if type(allowed) is not list or any(type(value) is not str for value in allowed) or 'read' not in allowed:
+                    raise HubError('staging_forbidden', 403)
+        with self.repo._transaction() as db:
+            require_access(db)
             if generation is None:
                 row = db.execute('SELECT * FROM hub_staging_profile_enrollments WHERE project=? AND recipe=? ORDER BY generation DESC LIMIT 1',
                                  (project, recipe)).fetchone()
@@ -256,6 +262,18 @@ class StagingResourceStore:
                     raise ValueError('invalid persisted profile')
             except (ValueError, TypeError, OverflowError):
                 raise HubError('staging_profile_unavailable', 503) from None
+            # The transaction's write reservation serializes the read with
+            # policy, enrollment and project changes through commit. This is a
+            # read linearization point, not a guarantee after response delivery.
+            if generation is None:
+                current = db.execute('SELECT * FROM hub_staging_profile_enrollments WHERE project=? AND recipe=? ORDER BY generation DESC LIMIT 1',
+                                     (project, recipe)).fetchone()
+            else:
+                current = db.execute('SELECT * FROM hub_staging_profile_enrollments WHERE project=? AND recipe=? AND generation=?',
+                                     (project, recipe, generation)).fetchone()
+            if current is None or tuple(current) != tuple(row):
+                raise HubError('staging_profile_unavailable', 503)
+            require_access(db)
             return {'project': project, 'recipe': recipe, 'generation': row['generation'],
                     'digest': row['digest'], 'profile': profile, 'created_at': row['created_at'],
                     'execution_authorization': False}
