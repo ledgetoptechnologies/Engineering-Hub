@@ -63,8 +63,11 @@ class Settings:
     staging_config_path: Path | None = None
     infrastructure_config_path: Path | None = None
     infrastructure_default_path: Path | None = None
+    seat_foundation_enabled: bool = False
 
     def __post_init__(self):
+        if type(self.seat_foundation_enabled) is not bool:
+            raise ValueError('Explicit seat foundation flag required')
         if type(self.require_owned_ledger) is not bool:
             raise ValueError('Explicit owned-ledger flag required')
         if self.infrastructure_default_path is not None and not isinstance(self.infrastructure_default_path, Path):
@@ -185,6 +188,20 @@ class RoleWrite(Input):
 
 class RoleRecovery(Revision):
     reason: str = Field(min_length=1, max_length=1000)
+
+
+class CrossSeatTopicWrite(Input):
+    topic: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=200)
+
+
+class CrossSeatWrite(Input):
+    topic: str = Field(min_length=1, max_length=64)
+    role: str = Field(min_length=1, max_length=64)
+
+
+class CrossSeatBinding(Revision):
+    session_id: str = Field(min_length=36, max_length=36)
 
 
 class StaleServiceWrite(Input):
@@ -565,7 +582,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     session_bridge = None
     if connection_config is not None and connection_config.hub_bridge:
         from .session_hub_bridge import SessionHubBridge
-        session_bridge = SessionHubBridge(connection_service, repo, project_registry, component_registry, notes_repository)
+        session_bridge = SessionHubBridge(connection_service, repo, project_registry, component_registry, notes_repository,
+                                          seat_foundation_enabled=settings.seat_foundation_enabled)
+    if settings.seat_foundation_enabled and session_bridge is None:
+        raise ValueError('seat_foundation_requires_session_bridge')
     stale_evaluator = None
     if session_bridge is not None:
         from .pilot_ownership import PilotOwner
@@ -1218,6 +1238,33 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         if actor_id != session_bridge.sessions.owner:
             raise HubError('role_owner_required', 403)
         return actor_id
+
+    if settings.seat_foundation_enabled:
+        seats = session_bridge.seat_authority
+
+        @app.get('/api/hub/v1/projects/{project}/cross-seat-topics')
+        def owner_cross_seat_topics(project: str, request: Request, limit: int = 50, after: str | None = None):
+            return seats.owner_list(role_owner(request), project, 'cross_seat_topic', limit, after)
+
+        @app.post('/api/hub/v1/projects/{project}/cross-seat-topics')
+        def owner_create_cross_seat_topic(project: str, payload: CrossSeatTopicWrite, request: Request):
+            return seats.create_topic(role_owner(request, mutation=True), project, payload.topic, payload.name)
+
+        @app.get('/api/hub/v1/projects/{project}/cross-seats')
+        def owner_cross_seats(project: str, request: Request, limit: int = 50, after: str | None = None):
+            return seats.owner_list(role_owner(request), project, 'cross_seat', limit, after)
+
+        @app.post('/api/hub/v1/projects/{project}/cross-seats')
+        def owner_create_cross_seat(project: str, payload: CrossSeatWrite, request: Request):
+            return seats.create_seat(role_owner(request, mutation=True), project, payload.topic, payload.role)
+
+        @app.put('/api/hub/v1/cross-seats/{seat_id}/binding')
+        def owner_bind_cross_seat(seat_id: str, payload: CrossSeatBinding, request: Request):
+            return seats.bind(role_owner(request, mutation=True), seat_id, payload.expected_revision, payload.session_id)
+
+        @app.post('/api/hub/v1/cross-seats/{seat_id}/unbind')
+        def owner_unbind_cross_seat(seat_id: str, payload: Revision, request: Request):
+            return seats.unbind(role_owner(request, mutation=True), seat_id, payload.expected_revision)
 
     @app.get('/api/hub/v1/orchestration/stale-service-grant')
     def get_stale_service_grant(request: Request):

@@ -392,6 +392,17 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         from .roles import RoleRepository
         return invoke(RoleRepository(repo).list, identity(ctx), project, limit, after)
 
+    if session_bridge is not None and session_bridge.seat_authority is not None:
+        @registration.tool()
+        def hub_cross_seat_current(ctx: Context) -> dict:
+            """Read this authenticated session's owner-bound seat; no chat routing or effects."""
+            return invoke(session_bridge.seat_authority.current, identity(ctx))
+
+        @registration.tool()
+        def hub_cross_seat_handoff(generation: StrictInt, expected_revision: StrictInt, text: str, ctx: Context) -> dict:
+            """CAS-update this session's handoff under the current seat generation."""
+            return invoke(session_bridge.seat_authority.update_handoff, identity(ctx), generation, expected_revision, text)
+
     @registration.tool()
     def hub_role_get(role: str, ctx: Context) -> dict:
         """Read one granted coordination role; no execution authority is conferred."""

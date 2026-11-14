@@ -61,12 +61,13 @@ TOOLS = {
     'hub_entity_withdraw': 'entity.withdraw',
 }
 CAPABILITIES = tuple(sorted(set(TOOLS.values())))
+_SEAT_TOOLS = {'hub_cross_seat_current': 'cross.seat.read', 'hub_cross_seat_handoff': 'cross.seat.handoff'}
 
 
 class GrantWrite(Closed):
     expected_revision: int = Field(ge=0)
     projects: list[str] = Field(min_length=1, max_length=32)
-    capabilities: list[str] = Field(min_length=1, max_length=len(CAPABILITIES))
+    capabilities: list[str] = Field(min_length=1, max_length=len(CAPABILITIES) + len(_SEAT_TOOLS))
     lifetime_seconds: int = Field(default=86400, ge=60, le=604800)
 
 
@@ -126,9 +127,14 @@ class _Operation:
 
 
 class SessionHubBridge:
-    def __init__(self, sessions, repo, projects, components, knowledge):
+    def __init__(self, sessions, repo, projects, components, knowledge, *, seat_foundation_enabled=False):
         if type(sessions) is not AgentSessionRepository:
             raise ValueError('exact_agent_session_repository_required')
+        if type(seat_foundation_enabled) is not bool:
+            raise ValueError('explicit_seat_foundation_flag_required')
+        self.tools = {**TOOLS, **(_SEAT_TOOLS if seat_foundation_enabled else {})}
+        self.capabilities = tuple(sorted(set(self.tools.values())))
+        self.seat_authority = None
         self.sessions, self.repo, self.projects, self.components = sessions, repo, projects, components
         self.pid = os.getpid()
         self.knowledge_path = Path(knowledge.db_path).resolve()
@@ -162,7 +168,10 @@ class SessionHubBridge:
                     '(sequence INTEGER PRIMARY KEY AUTOINCREMENT, installation_id TEXT NOT NULL, '
                     'session_id TEXT NOT NULL, family TEXT NOT NULL, grant_revision INTEGER NOT NULL, '
                     'capability TEXT NOT NULL, project TEXT NOT NULL, path TEXT NOT NULL, version INTEGER NOT NULL)')
-            sessions._hub_bridge_tools = tuple(TOOLS)
+            if seat_foundation_enabled:
+                from .seat_authority import SeatAuthority
+                self.seat_authority = SeatAuthority(self)
+            sessions._hub_bridge_tools = tuple(self.tools)
             sessions._hub_bridge_owner = self
         except BaseException:
             self.close()
@@ -218,7 +227,7 @@ class SessionHubBridge:
                 or type(projects) is not list or not 1 <= len(projects) <= 32
                 or any(type(p) is not str for p in projects) or len(set(projects)) != len(projects)
                 or type(capabilities) is not list or not capabilities
-                or any(type(c) is not str or c not in CAPABILITIES for c in capabilities)
+                or any(type(c) is not str or c not in self.capabilities for c in capabilities)
                 or len(set(capabilities)) != len(capabilities)):
             raise HubError('invalid_hub_grant', 422)
         with self.sessions._transaction() as db:
@@ -389,15 +398,15 @@ class SessionHubBridge:
 
     @contextmanager
     def admit(self, secret, tool):
-        if tool not in TOOLS:
+        if tool not in self.tools:
             raise HubError('hub_capability_forbidden', 403)
         # Held through every downstream commit. Revokes use this same writer;
         # a revoke that wins first denies, otherwise it follows the committed op.
         with self.sessions._transaction() as db:
-            principal, grant = self._live(db, secret, capability=TOOLS[tool])
+            principal, grant = self._live(db, secret, capability=self.tools[tool])
             p = context.HubSessionPrincipal(principal.installation_id, principal.session_id,
                 principal.family, min(principal.expires_at, grant['expires_at']), grant['revision'])
-            operation = _Operation(self, p, db, secret, TOOLS[tool], tuple(json.loads(grant['projects'])))
+            operation = _Operation(self, p, db, secret, self.tools[tool], tuple(json.loads(grant['projects'])))
             token = context.current.set(operation)
             try:
                 yield operation
@@ -477,7 +486,7 @@ class SessionHubBridge:
         class Registration:
             def tool(self, *decorator_args, **decorator_kwargs):
                 def decorate(fn):
-                    if fn.__name__ not in TOOLS:
+                    if fn.__name__ not in bridge.tools:
                         return mcp.tool(*decorator_args, **decorator_kwargs)(fn)
                     if inspect.iscoroutinefunction(fn):
                         raise ValueError('synchronous_hub_bridge_tool_required')
@@ -502,6 +511,12 @@ class SessionHubBridge:
                                     result = {'items': [project_view(p) for p in items if not p['archived']]}
                                 else:
                                     result = fn(*args, **kwargs)
+                                if fn.__name__ == 'hub_cross_seat_current':
+                                    bridge.seat_authority.recheck_current(operation.principal.actor, result)
+                                    bridge._live(operation.db, operation.secret,
+                                        operation.principal.authorization_revision, 'cross.seat.read',
+                                        session_id=operation.principal.session_id)
+                                    operation.project(result['project'])
                                 read_required = {
                                     'hub_tracking_task_propose': 'tracking.read', 'hub_tracking_draft_propose': 'tracking.read',
                                     'hub_tracking_task_update': 'tracking.read',
@@ -626,7 +641,7 @@ class SessionHubBridge:
         @app.get(OWNER_CONNECTION_PREFIX + '/hub-capabilities')
         def capabilities(request: Request):
             owner(request)
-            return dict(enabled=True, capabilities=list(CAPABILITIES), features=dict(task_recovery=True))
+            return dict(enabled=True, capabilities=list(self.capabilities), features=dict(task_recovery=True))
         path = OWNER_CONNECTION_PREFIX + '/installations/{installation_id}/hub-grant'
         @app.get(path)
         def get(installation_id: str, request: Request):
