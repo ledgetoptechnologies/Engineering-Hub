@@ -149,6 +149,26 @@ async def test_loopback_session_tracking_scope_retry_and_independent_review(owne
                 assert recovered['result']['id'] == first_result['result']['id']
                 assert tracking_outbox.receipt(outbox, tracking_outbox.read(outbox, attempt_id))['task_id'] == recovered['result']['id']
                 assert tracking_outbox.read(outbox, lost_id) == lost and tracking_outbox.receipt(outbox, lost) is None
+                _, third_token, _ = pair(env, name='recovery-third', family='codex',
+                                         caps=('tracking.propose', 'tracking.read'))
+                third_principal = env.sessions.authenticate_session(third_token)
+                third_profile = tmp_path / 'third-profile'; third_profile.mkdir()
+                _write(third_profile / 'installation.private', dict(origin=url.removesuffix('/mcp'),
+                       installation_id=third_principal.installation_id))
+                _write(third_profile / 'first.session.private', dict(token=third_token,
+                       installation_id=third_principal.installation_id,
+                       session_id=third_principal.session_id, expires_at=third_principal.expires_at))
+                monkeypatch.setattr(tracking_client.sys, 'stdin', DraftInput(
+                    {'record_id': lost_id, 'accepted_attempt_id': attempt_id}))
+                assert await asyncio.to_thread(tracking_client.main, ['--outbox-dir', str(outbox),
+                    '--profile-dir', str(third_profile), 'recover-staged']) == 0
+                later_id = json.loads(capsys.readouterr().out)['record_id']
+                later = tracking_outbox.read(outbox, later_id)
+                assert later['expected_task_id'] == recovered['result']['id']
+                monkeypatch.setattr(tracking_client.sys, 'stdin', DraftInput({'record_id': later_id}))
+                assert await asyncio.to_thread(tracking_client.main, ['--outbox-dir', str(outbox),
+                    '--profile-dir', str(third_profile), '--session', 'first', 'send-staged']) == 0
+                assert json.loads(capsys.readouterr().out)['result']['id'] == recovered['result']['id']
             all_items = (await _run(args, {'project': PROJECT}))['result']['tasks']
             assert len([item for item in all_items if item['title'] == 'Outbox synthetic']) == 1
             if os.name != 'nt':

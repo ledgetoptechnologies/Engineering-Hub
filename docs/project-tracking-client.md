@@ -146,6 +146,16 @@ conflict. These checks happen after a response and cannot undo a duplicate
 on a restored or different server. An identical origin does not prove ledger
 identity or protect against server rollback; Windows local sidecars remain
 subject to filesystem durability limitations.
+
+When another recovery attempt already has a local acceptance receipt, include
+its ID explicitly as `accepted_attempt_id` alongside the original `record_id`
+in `recover-staged`. The client checks that the prior attempt belongs to the
+same original draft, binding, origin and payload, and carries its reported task
+ID into the new attempt. Missing, changed, corrupt or conflicting referenced
+evidence fails closed; the client does not search other attempts. The prior
+receipt is a historical response, not proof of current Hub state. Cross-file
+checks are not atomic, and a different or restored ledger may already have
+created a different task before a conflicting response can be rejected.
 A fresh valid session and server grant are still required
 for explicit `send-staged`; accepted sidecars also bind the selected routing
 identity. Inspect the draft and binding in a protected channel and reconcile

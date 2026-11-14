@@ -134,7 +134,8 @@ def main(argv=None):
                 result = {'type': 'tracking_outbox_draft', 'record_id': record_id,
                           'state': 'unbound', 'sent': False, 'execution_authorization': False}
             else:
-                if set(arguments) != {'record_id'}:
+                if (set(arguments) != {'record_id'}
+                        and not (args.action == 'recover-staged' and set(arguments) == {'record_id', 'accepted_attempt_id'})):
                     raise ClientError('invalid_tracking_request')
                 record = tracking_outbox.read(args.outbox_dir, arguments['record_id'])
                 if record['action'] not in ('propose', 'propose-draft', 'update', 'review', 'withdraw-claim'):
@@ -156,8 +157,11 @@ def main(argv=None):
                 elif args.action == 'recover-staged':
                     if args.profile_dir is None:
                         raise ClientError('invalid_tracking_request')
+                    if 'accepted_attempt_id' in arguments and type(arguments['accepted_attempt_id']) is not str:
+                        raise ClientError('invalid_tracking_request')
                     origin, installation = _installation_profile(args.profile_dir.expanduser().absolute(), args.private_vpn)
-                    attempt = tracking_outbox.stage_recovery(args.outbox_dir, record, origin, installation)
+                    attempt = tracking_outbox.stage_recovery(args.outbox_dir, record, origin, installation,
+                                                             accepted_attempt_id=arguments.get('accepted_attempt_id'))
                     result = {'type': 'tracking_outbox_recovery', 'record_id': attempt,
                               'source_record_id': record['id'], 'sent': False, 'execution_authorization': False}
                 elif args.action == 'status-staged':

@@ -126,3 +126,90 @@ def test_corrupt_original_blocks_recovery_send_before_network(tmp_path, monkeypa
     assert tracking_client.main(['--outbox-dir', str(outbox), '--profile-dir', str(profile),
                                  '--session', 'test', 'send-staged']) == 1
     assert not calls and not capsys.readouterr().out
+
+
+def test_explicit_prior_acceptance_is_carried_through_multiple_attempts(tmp_path):
+    outbox, _, source = setup(tmp_path)
+    first = tracking_outbox.read(outbox, tracking_outbox.stage_recovery(outbox, source, ORIGIN, SECOND))
+    tracking_outbox.record_acceptance(outbox, first, response(first))
+    third = '55555555-5555-4555-8555-555555555555'
+    second = tracking_outbox.read(outbox, tracking_outbox.stage_recovery(
+        outbox, source, ORIGIN, third, accepted_attempt_id=first['id']))
+    assert second['version'] == 4 and second['expected_task_id'] == TASK
+    assert tracking_outbox.validate_recovery(outbox, second) == TASK
+    with pytest.raises(ClientError, match='tracking_recovery_task_mismatch'):
+        tracking_outbox.record_acceptance(outbox, second, response(second, OTHER))
+    tracking_outbox.record_acceptance(outbox, second, response(second))
+    fourth = '66666666-6666-4666-8666-666666666666'
+    next_attempt = tracking_outbox.read(outbox, tracking_outbox.stage_recovery(
+        outbox, source, ORIGIN, fourth, accepted_attempt_id=second['id']))
+    assert next_attempt['version'] == 4 and tracking_outbox.validate_recovery(outbox, next_attempt) == TASK
+    assert tracking_outbox.read(outbox, source['id']) == source
+
+
+def test_prior_acceptance_requires_same_source_and_unconflicted_receipts(tmp_path):
+    outbox, _, source = setup(tmp_path)
+    first = tracking_outbox.read(outbox, tracking_outbox.stage_recovery(outbox, source, ORIGIN, SECOND))
+    with pytest.raises(ClientError):
+        tracking_outbox.stage_recovery(outbox, source, ORIGIN, SECOND, accepted_attempt_id=first['id'])
+    tracking_outbox.record_acceptance(outbox, first, response(first))
+    another_id = tracking_outbox.stage(outbox, None, None, None, 'propose-draft',
+        {'project': 'engineering-hub', 'title': 'Another', 'client_request_id': 'another'})
+    another = tracking_outbox.read(outbox, another_id)
+    tracking_outbox.bind(outbox, another, ORIGIN, FIRST)
+    with pytest.raises(ClientError):
+        tracking_outbox.stage_recovery(outbox, another, ORIGIN, SECOND, accepted_attempt_id=first['id'])
+    attempt = tracking_outbox.read(outbox, tracking_outbox.stage_recovery(
+        outbox, source, ORIGIN, SECOND, accepted_attempt_id=first['id']))
+    tracking_outbox.record_acceptance(outbox, source, response(source, OTHER))
+    with pytest.raises(ClientError):
+        tracking_outbox.validate_recovery(outbox, attempt)
+    with pytest.raises(ClientError):
+        tracking_outbox.stage_recovery(outbox, source, ORIGIN, SECOND, accepted_attempt_id=first['id'])
+
+
+@pytest.mark.parametrize('failure', ['missing', 'corrupt'])
+def test_missing_or_corrupt_prior_receipt_blocks_network(tmp_path, monkeypatch, capsys, failure):
+    outbox, profile, source = setup(tmp_path)
+    first = tracking_outbox.read(outbox, tracking_outbox.stage_recovery(outbox, source, ORIGIN, SECOND))
+    tracking_outbox.record_acceptance(outbox, first, response(first))
+    attempt = tracking_outbox.read(outbox, tracking_outbox.stage_recovery(
+        outbox, source, ORIGIN, SECOND, accepted_attempt_id=first['id']))
+    if failure == 'corrupt':
+        (outbox / (first['id'] + '.accepted')).write_bytes(b'corrupt')
+    else:
+        original_receipt = tracking_outbox.receipt
+        monkeypatch.setattr(tracking_outbox, 'receipt', lambda directory, record:
+                            None if record['id'] == first['id'] else original_receipt(directory, record))
+    calls = []
+    async def send(*args, **kwargs):
+        calls.append(True)
+        return response(attempt)
+    monkeypatch.setattr(tracking_client, '_run', send)
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': attempt['id']}))
+    assert tracking_client.main(['--outbox-dir', str(outbox), '--profile-dir', str(profile),
+                                 '--session', 'test', 'send-staged']) == 1
+    assert not calls and not capsys.readouterr().out
+
+
+def test_explicit_null_prior_does_not_silently_fall_back(tmp_path, monkeypatch, capsys):
+    outbox, profile, source = setup(tmp_path)
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': source['id'], 'accepted_attempt_id': None}))
+    assert tracking_client.main(['--outbox-dir', str(outbox), '--profile-dir', str(profile), 'recover-staged']) == 1
+    assert not capsys.readouterr().out
+
+
+def test_disappeared_prior_receipt_cannot_fall_back(tmp_path, monkeypatch):
+    outbox, _, source = setup(tmp_path)
+    prior = tracking_outbox.read(outbox, tracking_outbox.stage_recovery(outbox, source, ORIGIN, SECOND))
+    tracking_outbox.record_acceptance(outbox, prior, response(prior))
+    attempt = tracking_outbox.read(outbox, tracking_outbox.stage_recovery(
+        outbox, source, ORIGIN, SECOND, accepted_attempt_id=prior['id']))
+    original_receipt = tracking_outbox.receipt
+    def missing(directory, record):
+        return None if record['id'] == prior['id'] else original_receipt(directory, record)
+    monkeypatch.setattr(tracking_outbox, 'receipt', missing)
+    with pytest.raises(ClientError):
+        tracking_outbox.validate_recovery(outbox, attempt)
+    with pytest.raises(ClientError):
+        tracking_outbox.stage_recovery(outbox, source, ORIGIN, SECOND, accepted_attempt_id=prior['id'])

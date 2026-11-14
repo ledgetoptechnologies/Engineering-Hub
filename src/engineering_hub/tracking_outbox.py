@@ -98,12 +98,16 @@ def read(directory, record_id):
             fd = -1
             raw = source.read(_LIMIT + 1)
         record = json.loads(_protect(raw, decrypt=True))
+        if type(record) is not dict:
+            raise ClientError('invalid_tracking_outbox')
         fields = {'version', 'id', 'origin', 'installation_id', 'staged_session_id', 'action', 'arguments'}
-        if (type(record) is not dict or record.get('version') not in (1, 2, 3)
-                or set(record) != (fields | {'source_id', 'source_sha256', 'source_binding_sha256', 'expected_task_id'} if record.get('version') == 3 else fields)
+        recovery_fields = {'source_id', 'source_sha256', 'source_binding_sha256', 'expected_task_id'}
+        extra = recovery_fields | ({'prior_id', 'prior_sha256'} if record.get('version') == 4 else set()) if record.get('version') in (3, 4) else set()
+        if (record.get('version') not in (1, 2, 3, 4)
+                or set(record) != fields | extra
                 or record.get('id') != record_id or (record['version'] == 2 and not is_draft(record))):
             raise ClientError('invalid_tracking_outbox')
-        if record['version'] == 3:
+        if record['version'] in (3, 4):
             _id(record['source_id']); _id(record['installation_id'])
             if (record['source_id'] == record_id or record['action'] != 'propose-draft'
                     or record['staged_session_id'] is not None or type(record['source_sha256']) is not str
@@ -115,6 +119,12 @@ def read(directory, record_id):
                 raise ClientError('invalid_tracking_outbox')
             if record['expected_task_id'] is not None:
                 _id(record['expected_task_id'])
+            if record['version'] == 4:
+                _id(record['prior_id'])
+                if (record['prior_id'] in (record_id, record['source_id']) or record['expected_task_id'] is None
+                        or type(record['prior_sha256']) is not str or len(record['prior_sha256']) != 64
+                        or any(c not in '0123456789abcdef' for c in record['prior_sha256'])):
+                    raise ClientError('invalid_tracking_outbox')
         return record
     finally:
         if fd >= 0:
@@ -126,7 +136,22 @@ def _fingerprint(value):
                                      separators=(',', ':')).encode()).hexdigest()
 
 
-def stage_recovery(directory, source, origin, installation):
+def _accepted_prior(directory, source, original, prior_id):
+    """Validate one explicitly referenced historical response without walking a chain."""
+    prior = read(directory, _id(prior_id))
+    if (prior.get('version') not in (3, 4) or prior['source_id'] != source['id']
+            or prior['source_sha256'] != _fingerprint(source)
+            or prior['source_binding_sha256'] != _fingerprint(original)
+            or prior['origin'] != original['origin'] or prior['installation_id'] == original['installation_id']
+            or prior['arguments'] != source['arguments']):
+        raise ClientError('invalid_tracking_recovery')
+    accepted = receipt(directory, prior)
+    if accepted is None or (prior['expected_task_id'] is not None and prior['expected_task_id'] != accepted['task_id']):
+        raise ClientError('invalid_tracking_recovery')
+    return prior, accepted['task_id']
+
+
+def stage_recovery(directory, source, origin, installation, accepted_attempt_id=None):
     """Stage a separate explicit v2 retry while retaining the original draft."""
     directory = _directory(directory)
     if source.get('version') != 2 or not is_draft(source) or read(directory, source['id']) != source:
@@ -136,17 +161,26 @@ def stage_recovery(directory, source, origin, installation):
     _id(installation)
     if origin != original['origin'] or installation == original['installation_id']:
         raise ClientError('invalid_tracking_recovery')
-    record = dict(version=3, id=str(uuid.uuid4()), origin=origin, installation_id=installation,
+    expected = prior['task_id'] if prior else None
+    accepted_prior = None
+    if accepted_attempt_id is not None:
+        accepted_prior, prior_task = _accepted_prior(directory, source, original, accepted_attempt_id)
+        if expected is not None and expected != prior_task:
+            raise ClientError('tracking_recovery_task_mismatch')
+        expected = prior_task
+    record = dict(version=4 if accepted_prior is not None else 3, id=str(uuid.uuid4()), origin=origin, installation_id=installation,
                   staged_session_id=None, action='propose-draft', arguments=source['arguments'],
                   source_id=source['id'], source_sha256=_fingerprint(source),
                   source_binding_sha256=_fingerprint(original),
-                  expected_task_id=prior['task_id'] if prior else None)
+                  expected_task_id=expected)
+    if accepted_prior is not None:
+        record.update(prior_id=accepted_prior['id'], prior_sha256=_fingerprint(accepted_prior))
     return _stage_record(directory, record)
 
 
 def validate_recovery(directory, record):
     """Fail closed if the original draft, routing or known acceptance changed."""
-    if record.get('version') != 3:
+    if record.get('version') not in (3, 4):
         return
     source = read(directory, record['source_id'])
     if source.get('version') != 2 or not is_draft(source) or _fingerprint(source) != record['source_sha256']:
@@ -158,6 +192,12 @@ def validate_recovery(directory, record):
             or source['arguments'] != record['arguments']
             or (prior is not None and record['expected_task_id'] not in (None, prior['task_id']))):
         raise ClientError('invalid_tracking_recovery')
+    if record['version'] == 4:
+        accepted_prior, prior_task = _accepted_prior(directory, source, original, record['prior_id'])
+        if (_fingerprint(accepted_prior) != record['prior_sha256'] or prior_task != record['expected_task_id']
+                or (prior is not None and prior['task_id'] != prior_task)):
+            raise ClientError('tracking_recovery_task_mismatch')
+        return prior_task
     return prior['task_id'] if prior is not None else None
 
 
@@ -354,7 +394,7 @@ def record_acceptance(directory, record, response):
             or type(response.get('result')) is not dict):
         raise ClientError('invalid_tracking_receipt')
     result = response['result']
-    if record.get('version') == 3:
+    if record.get('version') in (3, 4):
         known_task = validate_recovery(directory, record)
         if record['expected_task_id'] is not None and result.get('id') != record['expected_task_id']:
             raise ClientError('tracking_recovery_task_mismatch')
