@@ -53,7 +53,7 @@ export function ReleaseEvidenceView({ evidence }: { evidence: ReleaseEvidence })
       <p>These results come from the staging worker's authenticated reports. The Hub checks that each report answers the exact
         request it sent and agrees with its own journal, but it doesn't look at the staging machine itself.</p>
       <p>This view does not verify a successful CI run or establish that the tested source produced the new image.</p>
-      <p>Run, manifest and step records are read separately and may change during refresh; this is not an atomic snapshot.</p>
+      <p>With the matching Hub version, run, manifest and step records are read together in one database snapshot. A later refresh may show changes; this page does not verify which Hub version is installed.</p>
       {evidence.run_status === "held" && <p>The run is on hold. A reported cleanup does not prove quiescence or release the reservation.</p>}
     </div>
     <dl className="release-evidence-facts">

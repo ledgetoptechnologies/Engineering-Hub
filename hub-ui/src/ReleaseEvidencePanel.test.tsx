@@ -56,6 +56,9 @@ describe("release evidence presentation", () => {
     expect(html).toContain("acknowledgment not confirmed");
     expect(html).toContain("Stop disposable candidate");
     expect(html).toContain("does not prove quiescence or release the reservation");
-    expect(html).toContain("not an atomic snapshot");
+    expect(html).toContain("With the matching Hub version, run, manifest and step records are read together in one database snapshot.");
+    expect(html).toContain("this page does not verify which Hub version is installed");
+    expect(html).toContain("Worker-reported, not independently verified");
+    expect(html).not.toContain("records are read separately");
   });
 });

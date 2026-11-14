@@ -100,7 +100,7 @@ def test_cli_stages_and_explicitly_sends_review(tmp_path, monkeypatch, capsys):
     outbox = tmp_path / 'outbox'; outbox.mkdir(mode=0o700)
     installation = 'b39e3ea5-567c-45cb-a184-01dd1c6352bb'
     _write(profile / 'installation.private', {'origin': 'https://hub.example', 'installation_id': installation})
-    payload = {'task_id': 'task', 'expected_revision': 2, 'client_request_id': 'review-stable',
+    payload = {'task_id': '11111111-1111-4111-8111-111111111111', 'expected_revision': 2, 'client_request_id': 'review-stable',
                'verdict': 'verify', 'note': 'reviewed', 'evidence_links': [{'label': 'e', 'url': 'https://example.com'}]}
     class Input:
         def __init__(self, value): self.buffer = io.BytesIO(json.dumps(value).encode())
@@ -113,12 +113,18 @@ def test_cli_stages_and_explicitly_sends_review(tmp_path, monkeypatch, capsys):
     calls = []
     async def send(args, arguments, *, binding, action):
         calls.append((arguments, binding, action))
-        return {'type': 'tracking_result', 'execution_authorization': False, 'result': {'status': 'completion_verified'}}
+        return {'type': 'tracking_result', 'operation': action, 'execution_authorization': False,
+                'result': {'id': payload['task_id'], 'status': 'completion_verified'}}
     monkeypatch.setattr(tracking_client, '_run', send)
     monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': record_id}))
     assert tracking_client.main(argv + ['send-staged']) == 0
     assert calls == [(payload, record, 'review')]
     assert json.loads(capsys.readouterr().out)['result']['status'] == 'completion_verified'
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': record_id}))
+    assert tracking_client.main(argv + ['status-staged']) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status['state'] == 'hub_accepted' and status['task_id'] == payload['task_id']
+    assert not status['execution_authorization']
 
 
 def test_cli_stages_claim_withdrawal_without_sending(tmp_path, monkeypatch, capsys):
@@ -138,6 +144,126 @@ def test_cli_stages_claim_withdrawal_without_sending(tmp_path, monkeypatch, caps
     assert not result['sent'] and not result['execution_authorization']
     record = tracking_outbox.read(outbox, result['record_id'])
     assert record['action'] == 'withdraw-claim' and record['arguments'] == payload
+
+
+def test_receipt_is_immutable_bound_and_never_a_completion_claim(tmp_path):
+    directory = tmp_path / 'outbox'; directory.mkdir(mode=0o700)
+    installation = 'b39e3ea5-567c-45cb-a184-01dd1c6352bb'
+    task_id = '11111111-1111-4111-8111-111111111111'
+    arguments = {'project': 'engineering-hub', 'title': 'Work', 'client_request_id': 'stable'}
+    ident = tracking_outbox.stage(directory, 'https://hub.example', installation, None, 'propose', arguments)
+    record = tracking_outbox.read(directory, ident)
+    assert tracking_outbox.receipt(directory, record) is None
+    response = {'type': 'tracking_result', 'operation': 'propose', 'execution_authorization': False,
+                'result': {'id': task_id, 'project': 'engineering-hub', 'status': 'completion_verified'}}
+    value = tracking_outbox.record_acceptance(directory, record, response)
+    assert value['state'] == 'hub_accepted' and value['task_id'] == task_id
+    assert 'status' not in value and not value['execution_authorization']
+    assert tracking_outbox.read(directory, ident) == record
+    assert tracking_outbox.receipt(directory, record) == value
+    assert tracking_outbox.record_acceptance(directory, record, response) == value
+    conflicting = {**response, 'result': {'id': '22222222-2222-4222-8222-222222222222', 'project': 'engineering-hub'}}
+    with pytest.raises(ClientError, match='tracking_receipt_conflict'):
+        tracking_outbox.record_acceptance(directory, record, conflicting)
+    for modified in ({**record, 'origin': 'https://different.example'},
+                     {**record, 'installation_id': 'different-installation'}):
+        with pytest.raises(ClientError):
+            tracking_outbox.receipt(directory, modified)
+        with pytest.raises(ClientError, match='tracking_outbox_changed'):
+            tracking_outbox.record_acceptance(directory, modified, response)
+
+
+def test_receipt_rejects_invalid_response_and_wrong_target(tmp_path):
+    directory = tmp_path / 'outbox'; directory.mkdir(mode=0o700)
+    task_id = '11111111-1111-4111-8111-111111111111'
+    arguments = {'task_id': task_id, 'expected_revision': 1, 'client_request_id': 'stable',
+                 'progress': 'Work', 'evidence_links': []}
+    ident = tracking_outbox.stage(directory, 'https://hub.example', 'install', None, 'update', arguments)
+    record = tracking_outbox.read(directory, ident)
+    good = {'type': 'tracking_result', 'operation': 'update', 'execution_authorization': False,
+            'result': {'id': task_id}}
+    for bad in ({**good, 'operation': 'review'}, {**good, 'execution_authorization': True},
+                {**good, 'result': {'id': '22222222-2222-4222-8222-222222222222'}},
+                {**good, 'result': {'id': 'not-a-uuid'}}, {'error': 'denied'}):
+        with pytest.raises(ClientError):
+            tracking_outbox.record_acceptance(directory, record, bad)
+        assert tracking_outbox.receipt(directory, record) is None
+    assert tracking_outbox.record_acceptance(directory, record, good)['task_id'] == task_id
+
+
+def test_concurrent_acceptance_and_flush_failure_fail_closed(tmp_path, monkeypatch):
+    directory = tmp_path / 'outbox'; directory.mkdir(mode=0o700)
+    args = {'project': 'engineering-hub', 'title': 'Work', 'client_request_id': 'stable'}
+    ident = tracking_outbox.stage(directory, 'https://hub.example', 'install', None, 'propose', args)
+    record = tracking_outbox.read(directory, ident)
+    response = {'type': 'tracking_result', 'operation': 'propose', 'execution_authorization': False,
+                'result': {'id': '11111111-1111-4111-8111-111111111111'}}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        values = list(pool.map(lambda _: tracking_outbox.record_acceptance(directory, record, response), range(8)))
+    assert all(value == values[0] for value in values)
+
+    second = tracking_outbox.stage(directory, 'https://hub.example', 'install', None, 'propose',
+                                   {**args, 'client_request_id': 'other'})
+    record2 = tracking_outbox.read(directory, second)
+    original = tracking_outbox._sync_directory
+    def fail(_directory): raise OSError('synthetic directory flush failure')
+    monkeypatch.setattr(tracking_outbox, '_sync_directory', fail)
+    with pytest.raises(OSError):
+        tracking_outbox.record_acceptance(directory, record2, response)
+    with pytest.raises(OSError):
+        tracking_outbox.receipt(directory, record2)
+    monkeypatch.setattr(tracking_outbox, '_sync_directory', original)
+    assert tracking_outbox.receipt(directory, record2)['state'] == 'hub_accepted'
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX no-follow semantics')
+def test_receipt_symlink_is_never_followed(tmp_path):
+    directory = tmp_path / 'outbox'; directory.mkdir(mode=0o700)
+    ident = tracking_outbox.stage(directory, 'https://hub.example', 'install', None, 'propose',
+        {'project': 'engineering-hub', 'title': 'Work', 'client_request_id': 'stable'})
+    record = tracking_outbox.read(directory, ident)
+    (directory / (ident + '.accepted')).symlink_to(tmp_path / 'elsewhere')
+    with pytest.raises(OSError):
+        tracking_outbox.receipt(directory, record)
+
+
+def test_cli_lost_response_and_receipt_failure_remain_unconfirmed(tmp_path, monkeypatch, capsys):
+    import io
+    profile = tmp_path / 'profile'; profile.mkdir(mode=0o700)
+    outbox = tmp_path / 'outbox'; outbox.mkdir(mode=0o700)
+    installation = 'b39e3ea5-567c-45cb-a184-01dd1c6352bb'
+    task_id = '11111111-1111-4111-8111-111111111111'
+    _write(profile / 'installation.private', {'origin': 'https://hub.example', 'installation_id': installation})
+    arguments = {'project': 'engineering-hub', 'title': 'Work', 'client_request_id': 'stable'}
+    ident = tracking_outbox.stage(outbox, 'https://hub.example', installation, None, 'propose', arguments)
+    record = tracking_outbox.read(outbox, ident)
+    class Input:
+        def __init__(self, value): self.buffer = io.BytesIO(json.dumps(value).encode())
+    argv = ['--profile-dir', str(profile), '--session', 'first', '--outbox-dir', str(outbox)]
+    async def lost(*args, **kwargs): raise OSError('synthetic lost response')
+    monkeypatch.setattr(tracking_client, '_run', lost)
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': ident}))
+    assert tracking_client.main(argv + ['send-staged']) == 1
+    assert 'same request id' in capsys.readouterr().err and tracking_outbox.receipt(outbox, record) is None
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': ident}))
+    assert tracking_client.main(argv + ['status-staged']) == 0
+    assert json.loads(capsys.readouterr().out)['state'] == 'unconfirmed'
+    async def accepted(args, payload, *, binding, action):
+        assert payload == arguments and binding == record and action == 'propose'
+        return {'type': 'tracking_result', 'operation': action, 'execution_authorization': False,
+                'result': {'id': task_id, 'project': 'engineering-hub'}}
+    monkeypatch.setattr(tracking_client, '_run', accepted)
+    original = tracking_outbox.os.link
+    def fail_link(*args): raise OSError('synthetic local receipt failure')
+    monkeypatch.setattr(tracking_outbox.os, 'link', fail_link)
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': ident}))
+    assert tracking_client.main(argv + ['send-staged']) == 1
+    assert capsys.readouterr().out == '' and tracking_outbox.receipt(outbox, record) is None
+    monkeypatch.setattr(tracking_outbox.os, 'link', original)
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'record_id': ident}))
+    assert tracking_client.main(argv + ['send-staged']) == 0
+    assert json.loads(capsys.readouterr().out)['result']['id'] == task_id
+    assert tracking_outbox.receipt(outbox, record)['task_id'] == task_id
 
 
 def test_reference_pagination_recovers_large_outbox_without_opening_or_deleting(tmp_path, monkeypatch):

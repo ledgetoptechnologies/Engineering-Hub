@@ -86,14 +86,14 @@ def main(argv=None):
     parser.add_argument('--session', required=True)
     parser.add_argument('--private-vpn', action='store_true')
     parser.add_argument('--outbox-dir', type=Path)
-    parser.add_argument('action', choices=sorted((*_TOOLS, 'stage', 'send-staged', 'list-staged', 'inspect-staged')))
+    parser.add_argument('action', choices=sorted((*_TOOLS, 'stage', 'send-staged', 'list-staged', 'inspect-staged', 'status-staged')))
     try:
         args = parser.parse_args(argv)
         raw = sys.stdin.buffer.read(_MAX_INPUT + 1)
         if len(raw) > _MAX_INPUT:
             raise ClientError('invalid_tracking_request')
         arguments = json.loads(raw)
-        if args.action in ('stage', 'send-staged', 'list-staged', 'inspect-staged'):
+        if args.action in ('stage', 'send-staged', 'list-staged', 'inspect-staged', 'status-staged'):
             if args.outbox_dir is None or type(arguments) is not dict:
                 raise ClientError('invalid_tracking_request')
             if args.action == 'list-staged':
@@ -125,8 +125,15 @@ def main(argv=None):
                 if args.action == 'inspect-staged':
                     result = {'type': 'tracking_outbox_record', 'trust': 'private_local_data',
                               'execution_authorization': False, 'record': record}
+                elif args.action == 'status-staged':
+                    receipt = tracking_outbox.receipt(args.outbox_dir, record)
+                    result = {'type': 'tracking_outbox_status', 'record_id': record['id'],
+                              'state': 'hub_accepted' if receipt is not None else 'unconfirmed',
+                              'task_id': receipt['task_id'] if receipt is not None else None,
+                              'execution_authorization': False}
                 else:
                     result = asyncio.run(_run(args, record['arguments'], binding=record, action=record['action']))
+                    tracking_outbox.record_acceptance(args.outbox_dir, record, result)
         else:
             if args.outbox_dir is not None:
                 raise ClientError('invalid_tracking_request')

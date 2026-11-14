@@ -33,7 +33,7 @@ def test_explicit_bounded_tool_arguments_only():
 
 
 @pytest.mark.asyncio
-async def test_loopback_session_tracking_scope_retry_and_independent_review(owned, tmp_path, monkeypatch):
+async def test_loopback_session_tracking_scope_retry_and_independent_review(owned, tmp_path, monkeypatch, capsys):
     repo, _, _, _ = owned
     origin = 'https://staging.test'
     auth = AuthSettings('synthetic-hermes', 'synthetic-codex', claude_token='synthetic-claude')
@@ -89,6 +89,16 @@ async def test_loopback_session_tracking_scope_retry_and_independent_review(owne
             assert successful
             retry = (await _run(args, saved['arguments'], binding=saved, action=saved['action']))['result']
             assert all(item['id'] == retry['id'] for item in successful)
+            # Exercise the real CLI path against EHS after an ambiguous earlier
+            # send: it saves a local receipt only after the same-key retry.
+            import io
+            class Input:
+                buffer = io.BytesIO(json.dumps({'record_id': rid}).encode())
+            monkeypatch.setattr(tracking_client.sys, 'stdin', Input())
+            argv = ['--profile-dir', str(profile), '--session', 'first', '--outbox-dir', str(outbox), 'send-staged']
+            assert await asyncio.to_thread(tracking_client.main, argv) == 0
+            assert json.loads(capsys.readouterr().out)['result']['id'] == retry['id']
+            assert tracking_outbox.receipt(outbox, saved)['task_id'] == retry['id']
             all_items = (await _run(args, {'project': PROJECT}))['result']['tasks']
             assert len([item for item in all_items if item['title'] == 'Outbox synthetic']) == 1
             # MCP transport may wrap the denial in an AnyIO ExceptionGroup.

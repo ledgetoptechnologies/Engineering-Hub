@@ -114,7 +114,21 @@ follow them and does not establish that a record is readable or sent;
 `inspect-staged` and `send-staged` perform their own checks. `inspect-staged`
 with `{"record_id":"..."}` explicitly prints the private local payload so it
 can be checked in a protected channel; `send-staged` with the same input sends
-the saved unchanged payload.
+the saved unchanged payload. After an identity-bound successful Hub response,
+the client validates the returned task ID and atomically stores a protected
+local acceptance sidecar bound to the exact saved envelope. `status-staged`
+with that same record ID reports either `hub_accepted` and the reported task
+ID, or `unconfirmed`. This is a local record of a successful response, not a
+current Hub read, completion verification, execution authority or proof that
+another agent acted. Older sends have no sidecar and therefore remain
+unconfirmed. A missing sidecar does not prove that the Hub rejected the write.
+A corrupt, conflicting or unreadable sidecar produces an error, never an
+accepted status. The payload and sidecar are retained; nothing is deleted.
+If publication succeeded but the subsequent POSIX directory flush failed,
+the send reports an error; after the fault clears, a status read may find the
+sidecar and flush the directory successfully. That later observation does not
+prove the sidecar would have survived an earlier power loss. Windows directory
+metadata durability remains filesystem-dependent and unverified.
 A staged review remains subject to the server's independent-review and evidence rules;
 staging or sending it does not itself prove work was completed. A successful
 idempotent retry returns the current task, which may include later changes; it
