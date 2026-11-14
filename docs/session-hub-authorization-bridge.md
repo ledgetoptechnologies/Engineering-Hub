@@ -72,6 +72,15 @@ already in flight cannot be recalled by a later revoke. Existing legacy family
 bearer behavior is unchanged. This describes only the named mutation tools,
 not a completed audit of every Hub write endpoint.
 
+An EHS component with a stored `legacy_project_id` is visible or mutable only
+when the session is also authorized for that secondary project. Direct reads,
+updates, retirement and proposal retries use the current stored link, including
+when an update would clear it. Inaccessible records are filtered before list
+pagination, and direct lookup returns the same unavailable error as a missing
+component. This does not eliminate other existence or timing inference, such
+as a slug collision. Both scopes are rechecked for each call; a grant or cursor
+is not a durable entitlement. Human and legacy family-bearer behavior is unchanged.
+
 `GET /installations/{UUID}/hub-grant` returns:
 
 ```json

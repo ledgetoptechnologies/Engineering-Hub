@@ -638,6 +638,145 @@ def test_role_lease_only_receipts_do_not_disclose_handoff_or_release_reason(unif
     assert roles.owner_get(OWNER, 'mixed-scope')['lease'] is None
 
 
+def test_component_secondary_scope_filters_before_pagination_and_denies_stale_mutations(unified):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, name='component-primary-only', caps=('component.read', 'component.write'))
+    invoke, _ = sdk(client, token)
+    repo = env.bridge.components
+    proposal = {'payload': {'project': PROJECT, 'slug': 'stale-secondary', 'name': 'Created by session',
+                            'client_request_id': 'component-stable'}}
+    original = data(invoke('hub_component_create', proposal)); target = original['id']
+    repo.update_component(OWNER, target, 1, legacy_project_id='project-alpha')
+    hidden = repo.get_component(target)
+    assert hidden['legacy_project_id'] == 'project-alpha'
+
+    # Current link, not original input, governs retries and mutations. Clearing
+    # or replacing a foreign link is also forbidden before revision handling.
+    missing = '00000000-0000-4000-8000-000000000000'
+    denied = invoke('hub_component_get', {'component_id': target})
+    absent = invoke('hub_component_get', {'component_id': missing})
+    assert denied['isError'] and absent['isError']
+    assert denied['content'][0]['text'] == absent['content'][0]['text']
+    assert 'hub_component_unavailable' in denied['content'][0]['text']
+    for args in (
+        {'component_id': target, 'expected_revision': 2, 'legacy_project_id': None},
+        {'component_id': target, 'expected_revision': 1, 'legacy_project_id': None},
+        {'component_id': target, 'expected_revision': 2, 'legacy_project_id': PROJECT},
+    ):
+        result = invoke('hub_component_update', {'payload': args})
+        assert result['isError'] and 'hub_component_unavailable' in result['content'][0]['text']
+    assert invoke('hub_component_retire', {'payload': {'component_id': target, 'expected_revision': 2}})['isError']
+    assert invoke('hub_component_create', proposal)['isError']
+    assert repo.get_component(target) == hidden
+
+    # Interleave foreign-linked records before/between visible records in UUID
+    # order; a one-item page must still advance through every visible row.
+    rows = [repo.create_component(OWNER, PROJECT, f'page-{i}', f'Page {i}', f'page-{i}') for i in range(6)]
+    ordered = sorted(rows, key=lambda x: x['id'])
+    for row in (ordered[0], ordered[2], ordered[4]):
+        repo.update_component(OWNER, row['id'], 1, legacy_project_id='project-alpha')
+    expected = {row['id'] for row in (ordered[1], ordered[3], ordered[5])}
+    cursor = None; seen = []
+    while True:
+        args = {'project': PROJECT, 'limit': 1}
+        if cursor is not None:
+            args['after'] = cursor
+        page = data(invoke('hub_component_list', args))
+        assert len(page['items']) <= 1
+        seen.extend(row['id'] for row in page['items'])
+        cursor = page['next_after']
+        if cursor is None:
+            break
+        assert cursor == page['items'][-1]['id']
+    assert set(seen) == expected and len(seen) == len(expected)
+
+    # Legacy broad bearers retain compatibility; an explicitly expanded EHS
+    # grant can read and edit the secondary link, and removal denies it again.
+    legacy, _ = sdk(client, 'synthetic-codex')
+    assert data(legacy('hub_component_get', {'component_id': target}))['legacy_project_id'] == 'project-alpha'
+    env.bridge.grant_put(OWNER, installation, 1, [PROJECT, 'project-alpha'], ['component.read', 'component.write'])
+    assert data(invoke('hub_component_get', {'component_id': target}))['legacy_project_id'] == 'project-alpha'
+    assert data(invoke('hub_component_create', proposal))['id'] == target
+    env.bridge.grant_put(OWNER, installation, 2, [PROJECT], ['component.read', 'component.write'])
+    assert invoke('hub_component_get', {'component_id': target})['isError']
+
+
+@pytest.mark.parametrize('operation', ['get', 'list'])
+def test_component_secondary_archive_before_response_fails_closed(unified, monkeypatch, operation):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    _, token, _ = pair(env, name='secondary-response', caps=('component.read',),
+                       projects=(PROJECT, 'project-alpha'))
+    invoke, _ = sdk(client, token)
+    components = env.bridge.components
+    row = components.create_component(OWNER, PROJECT, 'response-race', 'Private component text',
+                                      'response-race', legacy_project_id='project-alpha')
+    entered, release = threading.Event(), threading.Event()
+    method = 'get_component' if operation == 'get' else 'list_components'
+    original = getattr(components, method)
+    calls = 0
+    def pause_after_snapshot(*args, **kwargs):
+        nonlocal calls
+        result = original(*args, **kwargs)
+        calls += 1
+        # get is first used by bridge scope resolution, then by the tool.
+        if operation == 'list' or calls == 2:
+            entered.set()
+            assert release.wait(5)
+        return result
+    monkeypatch.setattr(components, method, pause_after_snapshot)
+    tool = 'hub_component_get' if operation == 'get' else 'hub_component_list'
+    args = {'component_id': row['id']} if operation == 'get' else {'project': PROJECT}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(invoke, tool, args)
+        try:
+            assert entered.wait(5)
+            project = env.bridge.projects.get_project('project-alpha')
+            env.bridge.projects.archive_project(OWNER, 'project-alpha', project['revision'])
+        finally:
+            release.set()
+        response = future.result(timeout=5)
+    assert response['isError'] and 'Private component text' not in json.dumps(response)
+
+
+def test_component_secondary_grant_revoke_serializes_with_inflight_list(unified, monkeypatch):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, name='secondary-grant-race', caps=('component.read',),
+                                  projects=(PROJECT, 'project-alpha'))
+    invoke, _ = sdk(client, token)
+    components = env.bridge.components
+    row = components.create_component(OWNER, PROJECT, 'grant-race', 'Visible before revoke',
+                                      'grant-race', legacy_project_id='project-alpha')
+    entered, release, contended = threading.Event(), threading.Event(), threading.Event()
+    original = components.list_components
+    def pause_after_snapshot(*args, **kwargs):
+        result = original(*args, **kwargs)
+        entered.set()
+        assert release.wait(5)
+        return result
+    monkeypatch.setattr(components, 'list_components', pause_after_snapshot)
+    def revoke_secondary():
+        if env.sessions._lock.acquire(blocking=False):
+            env.sessions._lock.release()
+            raise AssertionError('grant write did not contend with live read')
+        contended.set()
+        return env.bridge.grant_put(OWNER, installation, 1, [PROJECT], ['component.read'])
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        read = pool.submit(invoke, 'hub_component_list', {'project': PROJECT})
+        try:
+            assert entered.wait(5)
+            revoke = pool.submit(revoke_secondary)
+            assert contended.wait(5) and not revoke.done()
+        finally:
+            release.set()
+        assert data(read.result(timeout=5))['items'][0]['id'] == row['id']
+        revoke.result(timeout=5)
+    monkeypatch.setattr(components, 'list_components', original)
+    assert data(invoke('hub_component_list', {'project': PROJECT}))['items'] == []
+
+
 def test_tracking_history_and_compaction_obey_live_project_grants(unified):
     client, app, bus, _ = unified
     env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
