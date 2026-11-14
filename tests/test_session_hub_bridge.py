@@ -409,6 +409,61 @@ def data(result):
     return result.get('structuredContent') or json.loads(result['content'][0]['text'])
 
 
+def test_planning_write_requires_read_for_replacement_and_redacts_receipts(unified, monkeypatch):
+    client, app, bus, _ = unified
+    session_env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    writer_id, token, _ = pair(session_env, name='planning-write-only', caps=('planning.write',))
+    _, reader_token, _ = pair(session_env, name='planning-reader', family='claude',
+                              caps=('planning.read', 'planning.write'))
+    writer, _ = sdk(client, token)
+    reader, _ = sdk(client, reader_token)
+    payload = {'scope': 'topic', 'project': PROJECT, 'topic': 'synthetic', 'kind': 'plan',
+               'item_id': 'shared', 'title': 'Plan', 'content': 'Original private content',
+               'status': 'proposed', 'expected_version': 0}
+    original = data(reader('hub_planning_put', {'payload': payload}))
+    assert original['version'] == 1
+    denied = writer('hub_planning_put', {'payload': {**payload, 'content': 'Blind replacement', 'expected_version': 1}})
+    assert denied['isError'] and 'hub_capability_forbidden' in denied['content'][0]['text']
+    lookup = {key: payload[key] for key in ('scope', 'project', 'topic', 'kind', 'item_id')}
+    assert data(reader('hub_planning_get', lookup))['content'] == 'Original private content'
+    created = data(writer('hub_planning_put', {'payload': {**payload, 'item_id': 'new', 'content': 'Writer content'}}))
+    assert created == {'project': PROJECT, 'path': 'planning/topics/synthetic/plan/new.json', 'version': 1,
+                       'response_scope': 'mutation_receipt', 'advisory': True, 'execution_authorization': False}
+    session_env.bridge.grant_put(OWNER, writer_id, 1, [PROJECT], ['planning.write', 'planning.read'])
+    update = {**payload, 'content': 'Reviewed replacement', 'expected_version': 1}
+    live = session_env.bridge._live
+    read_checks = 0
+    def expire_before_commit(db, secret, revision=None, capability=None, *, session_id=None):
+        nonlocal read_checks
+        if capability == 'planning.read':
+            read_checks += 1
+            if read_checks == 2:
+                raise HubError('hub_capability_forbidden', 403)
+        return live(db, secret, revision, capability, session_id=session_id)
+    monkeypatch.setattr(session_env.bridge, '_live', expire_before_commit)
+    assert writer('hub_planning_put', {'payload': update})['isError']
+    monkeypatch.setattr(session_env.bridge, '_live', live)
+    current = data(reader('hub_planning_get', lookup))
+    assert current['version'] == 1 and current['content'] == 'Original private content'
+    assert data(writer('hub_planning_put', {'payload': update}))['version'] == 2
+    checks = 0
+    def expire_at_response(db, secret, revision=None, capability=None, *, session_id=None):
+        nonlocal checks
+        if capability == 'planning.read':
+            checks += 1
+            if checks >= 3:  # pre-admission, commit guard, then response projection
+                raise HubError('hub_capability_forbidden', 403)
+        return live(db, secret, revision, capability, session_id=session_id)
+    monkeypatch.setattr(session_env.bridge, '_live', expire_at_response)
+    updated = data(writer('hub_planning_put', {'payload': {**update, 'content': 'Third', 'expected_version': 2}}))
+    assert updated == {'project': PROJECT, 'path': 'planning/topics/synthetic/plan/shared.json', 'version': 3,
+                       'response_scope': 'mutation_receipt', 'advisory': True, 'execution_authorization': False}
+    monkeypatch.setattr(session_env.bridge, '_live', live)
+    assert data(reader('hub_planning_get', lookup))['content'] == 'Third'
+    session_env.bridge.grant_revoke(OWNER, writer_id, 2)
+    assert writer('hub_planning_put', {'payload': {**update, 'content': 'Forbidden', 'expected_version': 3}})['isError']
+
+
 def test_tracking_mutation_does_not_disclose_cross_project_or_archived_ids(unified):
     client, app, bus, _ = unified
     env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)

@@ -22,6 +22,20 @@ const hubConnection = (state: "connected" | "not_observed" = "connected"): NonNu
   inbox_subscriptions: 0, subscribed: false, last_stream_write_at: NOW.toISOString(), native_push_available: true,
 });
 
+test("claims and incomplete state times are not described as live work", async ({ page }) => {
+  await page.clock.install({ time: NOW });
+  const mock = await mockLive(page);
+  mock.overview.tasks[1].state_since = new Date(NOW.getTime() - 120_000).toISOString();
+  mock.overview.tasks.push({ ...mock.overview.tasks[1], id: "fixture-unknown-time", title: "Unknown state time", state_since: null });
+  await page.goto("/#/work");
+  const row = page.locator("details.task-row").filter({ hasText: mock.overview.tasks[1].title });
+  await expect(row.locator("summary .task-waiting")).toContainText("Hermes has claimed it.");
+  const owners = page.getByRole("region", { name: "Who's on what" });
+  await expect(owners).toContainText("2 claimed");
+  await expect(owners).toContainText("Oldest known state time: 2m ago · 1 unknown");
+  await expect(owners).toContainText("a claim does not confirm current execution or completion");
+});
+
 test("review verdict does not imply a run is authorized", async ({ page }) => {
   await page.clock.install({ time: NOW });
   const mock = await mockLive(page);

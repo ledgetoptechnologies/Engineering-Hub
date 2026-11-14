@@ -110,6 +110,11 @@ class _Operation:
         for check in self.commit_checks:
             check(db)
         if Path(storage_path).resolve() == self.bridge.knowledge_path:
+            if self.capability == 'planning.write' and metadata['version'] > 1:
+                # An update replaces the only stored version. Permission to
+                # read is required, but does not prove the caller read it.
+                self.bridge._live(self.db, self.secret, self.principal.authorization_revision,
+                                  'planning.read', session_id=self.principal.session_id)
             # Planning is committed in the separate shared knowledge database.
             # Record exact session attribution in that same transaction.
             p = self.principal
@@ -486,6 +491,10 @@ class SessionHubBridge:
                         try:
                             with bridge.admit(bearer(request), fn.__name__) as operation:
                                 bridge._scope(fn.__name__, arguments, operation)
+                                if fn.__name__ == 'hub_planning_put' and arguments['payload'].expected_version > 0:
+                                    bridge._live(operation.db, operation.secret,
+                                        operation.principal.authorization_revision, 'planning.read',
+                                        session_id=operation.principal.session_id)
                                 if fn.__name__ == 'hub_project_list':
                                     from .projects_api import project_view
                                     items = [bridge.projects.get_project(p) for p in operation.projects]
@@ -504,6 +513,7 @@ class SessionHubBridge:
                                     'hub_role_release': 'role.read', 'hub_role_claim': 'role.read',
                                     'hub_role_claim_release': 'role.read',
                                     'hub_task_progress_update': 'progress.read',
+                                    'hub_planning_put': 'planning.read',
                                     'hub_orchestration_request_create': 'dispatch.read',
                                     'hub_dispatch_create': 'dispatch.read',
                                     'hub_dispatch_report': 'dispatch.read',
@@ -553,6 +563,10 @@ class SessionHubBridge:
                                             result = {'id': result['id'], 'revision': result['revision'],
                                                 'response_scope': 'coordination_receipt',
                                                 'execution_authorization': False}
+                                        elif fn.__name__ == 'hub_planning_put':
+                                            result = {'project': result['project'], 'path': result['path'],
+                                                'version': result['version'], 'response_scope': 'mutation_receipt',
+                                                'advisory': True, 'execution_authorization': False}
                                         elif fn.__name__ in {'hub_orchestration_request_create', 'hub_dispatch_create',
                                                             'hub_dispatch_report'}:
                                             # Exact idempotency receipts are revision-bound in

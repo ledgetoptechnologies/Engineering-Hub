@@ -1,5 +1,6 @@
 import hashlib
 import sqlite3
+from contextlib import contextmanager
 
 import pytest
 
@@ -44,6 +45,32 @@ def test_put_get_versioning_provenance_hash_and_durability(tmp_path):
 
     reopened = KnowledgeRepository(db_path)
     assert reopened.get("agent-bus", "architecture/overview.md") == updated
+
+
+def test_put_returns_its_committed_row_not_a_later_writer(tmp_path, monkeypatch):
+    path = tmp_path / 'knowledge.sqlite3'
+    first = KnowledgeRepository(path)
+    other = KnowledgeRepository(path)
+    connect = first._connection
+    class InterleavedConnection:
+        def __init__(self, inner):
+            self.inner = inner
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+        def commit(self):
+            self.inner.commit()
+            other.put(project='shared', path='plan.md', title='Later', content='later private text',
+                      author='claude', expected_version=1)
+    @contextmanager
+    def interleave():
+        with connect() as db:
+            yield InterleavedConnection(db)
+    monkeypatch.setattr(first, '_connection', interleave)
+    result = first.put(project='shared', path='plan.md', title='First', content='first text',
+                       author='codex', expected_version=0)
+    assert result.version == 1 and result.content == 'first text' and result.updated_by == 'codex'
+    current = other.get('shared', 'plan.md')
+    assert current.version == 2 and current.content == 'later private text'
 
 
 def test_stale_or_missing_expected_version_never_overwrites(tmp_path):

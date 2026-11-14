@@ -37,8 +37,8 @@ export function waitingOn(task: Task, agentName: (id: string, family?: string | 
   if (task.status === "claimed")
     return task.owner
       ? task.repair_count > 0
-        ? `${owner} is repairing it (${task.repair_count}/3 repairs used).`
-        : `${owner} is working on it.`
+        ? `${owner} has claimed it for repair (${task.repair_count}/3 repairs used).`
+        : `${owner} has claimed it.`
       : "Claimed, but no owner is recorded.";
   if (task.status === "in_review")
     return task.review

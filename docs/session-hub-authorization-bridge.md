@@ -85,6 +85,16 @@ already in flight cannot be recalled by a later revoke. Existing legacy family
 bearer behavior is unchanged. This describes only the named mutation tools,
 not a completed audit of every Hub write endpoint.
 
+An EHS session with `planning.write` may create a new advisory item without
+`planning.read`; its response is a project/path/version receipt only. Replacing
+an existing item requires both `planning.write` and a current `planning.read`
+grant, checked at admission and again before commit. This verifies permission,
+not that the caller actually read or reconciled the previous text. CAS rejects a
+stale version but a conflict can reveal the current version. The knowledge store
+keeps the current document, not prior content versions; a successful replacement
+cannot be recovered from its provenance record. Existing legacy bearer access
+and author attribution remain unchanged.
+
 An EHS component with a stored `legacy_project_id` is visible or mutable only
 when the session is also authorized for that secondary project. Direct reads,
 updates, retirement and proposal retries use the current stored link, including

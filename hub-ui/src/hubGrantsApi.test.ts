@@ -114,7 +114,7 @@ describe("actor names", () => {
   it("explains waiting tasks with the installation and its family", () => {
     const task = { ...(wire.overview.tasks[0] as unknown as Task) };
     const name = (id: string, family?: string | null) => actorName(id, { family });
-    expect(waitingOn(task, name)).toBe("Codex on install 88736abd is working on it.");
+    expect(waitingOn(task, name)).toBe("Codex on install 88736abd has claimed it.");
     expect(waitingOn({ ...task, status: "in_review", review: null }, name))
       .toBe("Waiting for an independent review. No reviewer assigned; any agent except Codex (on any computer) can review.");
   });
