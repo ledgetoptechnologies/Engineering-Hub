@@ -26,6 +26,26 @@ TOKEN = 'synthetic-private-worker-token-never-real'
 KINDS = ('workspace', 'build', 'test_run', 'preview')
 
 
+def test_operation_rejects_success_with_failure_reason():
+    with pytest.raises(StagingClientError):
+        StagingClient._operation({'command_id': str(uuid4()), 'job_id': str(uuid4()),
+                                  'state': 'succeeded', 'result': {'error': 'stage_test_failed'}})
+
+
+@pytest.mark.asyncio
+async def test_job_read_rejects_contradictory_success_over_http(config):
+    job = str(uuid4())
+    receipt = {'command_id': str(uuid4()), 'job_id': job, 'state': 'succeeded',
+               'result': {'error': 'stage_test_failed'}}
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, json=receipt))
+    client = StagingClient(config, test_transport=transport)
+    try:
+        with pytest.raises(StagingClientError):
+            await client.job(job)
+    finally:
+        await client.aclose()
+
+
 @pytest.mark.parametrize('mutation', ['missing', 'declared', 'commit', 'digest'])
 def test_operation_rejects_contradictory_source_proof(mutation):
     binding = {'scheme': 'git-sha1-tree-v1', 'commit_oid': 'a' * 40, 'tree_oid': 'b' * 40,

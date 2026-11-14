@@ -426,6 +426,9 @@ class StagingClient:
                and result['state'] in {'accepted', 'running', 'held', 'failed', 'succeeded'}
                and type(result['result']) is dict)
         details = result['result']
+        # A successful receipt cannot simultaneously carry a failure reason.
+        # Preserve uncertainty rather than accepting contradictory terminal facts.
+        _check(result['state'] != 'succeeded' or 'error' not in details)
         _check(not set(details) - {'error', 'stages', 'preview_ready', 'source_commit',
                'source_commit_verification', 'source_digest', 'source_binding', 'resource_ids',
                'deleted_resource_ids', 'diagnostic', 'profile_digest'})

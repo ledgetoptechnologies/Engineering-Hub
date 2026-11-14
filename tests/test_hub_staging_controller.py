@@ -123,6 +123,34 @@ def env(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_success_with_failure_reason_is_held_before_finalization(env):
+    controller, client, resources, _, repo = env
+    original = client.submit
+
+    async def contradict(payload):
+        receipt = await original(payload)
+        receipt['result']['error'] = 'stage_test_failed'
+        return receipt
+
+    client.submit = contradict
+    submitted = await controller.submit('codex', payload(repo))
+    result = await controller.run_once()
+    assert result['job']['state'] == 'held'
+    assert controller.queue.get_job(submitted['job']['id'])['state'] == 'held'
+    for identity in submitted['resource_ids'].values():
+        assert resources.get_resource('codex', identity)['state'] == 'provisioning'
+    assert client.posts == 1
+    recovered = await controller.reconcile(submitted['job']['id'])
+    assert recovered['job']['state'] == 'held'
+    assert client.posts == 1
+    with repo._connection() as db:
+        reservation = db.execute(
+            'SELECT job_id FROM hub_work_machines WHERE machine_id=?', ('staging-pc',)
+        ).fetchone()
+    assert reservation is not None and reservation['job_id'] == submitted['job']['id']
+
+
+@pytest.mark.asyncio
 async def test_deposit_queue_build_proof_and_preview_bytes(env):
     repo = env[4]
     controller, client, resources, _, _ = env

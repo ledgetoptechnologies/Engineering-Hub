@@ -669,7 +669,8 @@ class StagingController:
                  and result.get('source_binding') == item['source_binding'],
                  'staging_completion_proof_invalid', 502)
         if outcome == 'succeeded':
-            _require(all(result.get(key) == item[key] for key in ('source_commit', 'source_digest', 'resource_ids'))
+            _require('error' not in result
+                     and all(result.get(key) == item[key] for key in ('source_commit', 'source_digest', 'resource_ids'))
                      and result.get('source_commit_verification') == 'git-sha1-tree-v1'
                      and result.get('source_binding') == item['source_binding'] and result.get('preview_ready') is True
                      and set(result.get('stages', {})) == {'build', 'test'}
