@@ -1,11 +1,13 @@
 # Bounded current executor observation (source only)
 
-This standalone protocol/verifier is **not integrated or activated**. It creates
-no service, transport, key, enrollment, process or task. Tests use synthetic
-in-memory Ed25519 signers, not real staging identity or inventory evidence.
+This protocol/verifier has opt-in source integrations in the executor and Hub;
+their presence does not establish that they are installed or activated. The
+verifier itself creates no service, transport, key, enrollment, process or task.
+Tests use synthetic in-memory Ed25519 signers, not real staging identity or
+inventory evidence.
 
 `engineering_hub.current_executor_observation.CurrentExecutorObserver` is a
-synchronous callable suitable for a future manual reconciliation observer. Core
+synchronous callable used by opt-in reconciliation composition. Core
 Hub can import it without the optional `hub_container_executor` package. Trusted
 composition must explicitly convert the SAME independently enrolled existing
 issuer/release into `CurrentExecutorReleasePins` (eight fields, including the
@@ -13,9 +15,9 @@ public key), and supply independently retained exact `CurrentLaunchPins`.
 Neither set of pins may be selected from an observation response, candidate Hub
 release, proxy generation or generic JSON configuration acceptance flag.
 
-The future public `LaunchSupervisor.observe_current_launch(nonce, timeout_ms)`
-must use its existing retained authority and fully revalidate the pinned Engine,
-socket/namespace, pidfd/process start/boot, container, mounts/profile and release
+`LaunchSupervisor.observe_current_launch(nonce, timeout_ms)` is implemented in
+source and must use its existing retained authority and fully revalidate the
+pinned Engine, socket/namespace, pidfd/process start/boot, container, mounts/profile and release
 before signing. Engine ID, daemon PID and start ticks share the pinned host boot.
 This verifier does not perform those remote kernel checks itself. Signatures
 prove possession of the enrolled issuer key, not the correctness of issuer claims.

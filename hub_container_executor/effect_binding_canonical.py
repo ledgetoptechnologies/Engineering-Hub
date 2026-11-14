@@ -1,7 +1,7 @@
 """Canonical *nonsecret* effect identity; not an authorization or fence.
 
-No runtime backend imports this module. Inputs must come from independently
-verified authority before use; this function validates shape only. Environment
+The opt-in bound-profile backend uses this module. Inputs must come from
+independently verified authority before use; this function validates shape only. Environment
 values, secret material, arbitrary Docker JSON, paths, and opaque extension
 fields are intentionally excluded.
 The projection is not a complete Docker request or probe digest and cannot

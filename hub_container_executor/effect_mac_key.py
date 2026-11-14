@@ -1,7 +1,8 @@
 """Opt-in private effect-binding MAC custody; not a transport or fence.
 
-No runtime code imports this module. Callers must arrange a journal owner lock,
-authenticate the effect binding, and provide a canonical domain-specific input.
+The opt-in bound-profile runtime composes this module. Callers must arrange a
+journal owner lock, authenticate the effect binding, and provide a canonical
+domain-specific input.
 This does not protect against hostile same-UID processes or prove any Docker
 effect. A creation or fsync failure preserves partial files for inspection.
 The creation key ID must be stored and supplied from an independently trusted
