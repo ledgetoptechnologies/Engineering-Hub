@@ -10,7 +10,7 @@ import sys
 import time
 import threading
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 import httpx
@@ -82,6 +82,33 @@ def test_session_scope_is_closed_canonical_and_nonempty(scope):
     data = document(); data['scope'] = scope
     with pytest.raises(module.TrustedSessionError):
         module.parse_enrollment(encode(data))
+
+
+def test_assembled_session_evidence_enforces_exact_utf8_byte_boundary():
+    data = document()
+    data['scope']['task_ids'] = [str(UUID(int=i)) for i in range(1, 33)]
+    data['report']['source'] = 's' * 128
+    data['launch']['engine_id'] = data['report']['executor']['engine_id'] = 'e' * 128
+    data['report']['evidence'] = 'x' * 6000
+    data['report']['evidence_sha256'] = 'sha256:' + hashlib.sha256(data['report']['evidence'].encode()).hexdigest()
+    enrollment = module.parse_enrollment(encode(data))
+    with pytest.raises(module.TrustedSessionError):
+        module._session_evidence(enrollment)
+    base = replace(enrollment, evidence='é')
+    available = module.MAX_ACCEPTANCE_EVIDENCE_BYTES - len(module._session_evidence(base).encode('utf-8'))
+    exact = replace(base, evidence='é' + 'x' * available)
+    assert len(module._session_evidence(exact).encode('utf-8')) == module.MAX_ACCEPTANCE_EVIDENCE_BYTES
+    with pytest.raises(module.TrustedSessionError):
+        module._session_evidence(replace(exact, evidence=exact.evidence + 'é'))
+
+
+def test_unified_prevalidation_rejects_assembled_evidence_above_broker_cap(monkeypatch):
+    profile = parse_profile(encode(profile_document()))
+    enrollment = module.parse_enrollment(encode(document()))
+    assert module.validate_unified_session(profile, enrollment)[0] == enrollment
+    monkeypatch.setattr(module, 'MAX_ACCEPTANCE_EVIDENCE_BYTES', 1)
+    with pytest.raises(module.TrustedSessionError):
+        module.validate_unified_session(profile, enrollment)
 
 
 @pytest.mark.parametrize('change', ['legacy', 'actor', 'task'])
@@ -460,6 +487,25 @@ async def test_selector_rejects_ambiguous_or_relative_activation_before_io(monke
     with pytest.raises(startup.UnifiedPilotStartupError):
         await startup.serve_configuration('/config', '/pilot', session_enrollment_path=path,
                                          reconciliation_factory=callback)
+
+
+async def test_unified_oversized_evidence_denied_before_owner_and_credentials(installed, monkeypatch):
+    from engineering_hub import unified_pilot_startup as startup
+    selected = installed['profile'].parent / 'oversized-session.json'
+    selected.write_bytes(encode(document()))
+    selected.chmod(0o600)
+    validated = startup.validate_configuration(installed['config'], installed['profile'])
+    monkeypatch.setattr(startup, 'validate_configuration', lambda *_: validated)
+    read = startup.read_protected_file
+    def read_enrollment_only(path, **kwargs):
+        assert Path(path) == selected, 'credential or CA read before enrollment rejection'
+        return read(path, **kwargs)
+    monkeypatch.setattr(startup, 'read_protected_file', read_enrollment_only)
+    monkeypatch.setattr(startup, 'PilotOwner', lambda *_a, **_kw: pytest.fail('owner opened'))
+    monkeypatch.setattr(module, 'MAX_ACCEPTANCE_EVIDENCE_BYTES', 1)
+    with pytest.raises(startup.UnifiedPilotStartupError):
+        await startup.serve_configuration(installed['config'], installed['profile'],
+                                          session_enrollment_path=selected)
 
 
 async def test_installed_selector_uses_actual_async_composition_callbacks(installed, dependencies, monkeypatch):

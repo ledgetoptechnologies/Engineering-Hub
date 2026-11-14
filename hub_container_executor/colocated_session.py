@@ -8,7 +8,7 @@ from engineering_hub.current_executor_observation import CurrentExecutorObserver
 from engineering_hub.startup_reconciliation import ExecutorSessionIdentity
 from engineering_hub.trusted_queued_session import (
     TrustedQueuedSessionComposition, TrustedSessionError, ManualSessionEnrollment,
-    MAX_REPORT_AGE_MS, _clock, _require, enrollment_bytes, parse_enrollment,
+    MAX_REPORT_AGE_MS, _clock, _require, _session_evidence, enrollment_bytes, parse_enrollment,
 )
 from .coordinator_observation_transport import CoordinatorObservationTransport
 
@@ -18,6 +18,7 @@ def validate_colocated_session(config, enrollment):
     from .installed_coordinator import CoordinatorConfiguration
     _require(type(config) is CoordinatorConfiguration and type(enrollment) is ManualSessionEnrollment)
     e = parse_enrollment(enrollment_bytes(enrollment))
+    _session_evidence(e)
     _require(config.manifest.digest() == e.manifest_digest
              and config.manifest.target_id == e.target_id and e.machine_id == 'staging-pc'
              and config.manifest.driver.implementation_commit == e.release.implementation_commit

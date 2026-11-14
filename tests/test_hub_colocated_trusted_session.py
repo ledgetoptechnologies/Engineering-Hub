@@ -323,12 +323,17 @@ def test_owned_coordinator_composes_v2_with_same_socket_and_bearer(monkeypatch):
     assert len(calls) == 1 and calls[0]._closed
 
 
-def test_legacy_session_denied_before_test_secret_resolution(monkeypatch):
+@pytest.mark.parametrize('reason', ['legacy', 'evidence_too_large'])
+def test_invalid_session_denied_before_test_secret_resolution(monkeypatch, reason):
     from hub_container_executor import installed_coordinator as module
     from engineering_hub.trusted_queued_session import SCHEMA
     raw = configuration(); raw['schema'] = SCHEMA_TASK_SCOPED; raw['single_pilot_protocol'] = True
     config = parse_configuration(canonical(raw)); data = colocated_document()
-    data['schema'] = SCHEMA; del data['scope']
+    if reason == 'legacy':
+        data['schema'] = SCHEMA; del data['scope']
+    else:
+        from engineering_hub import trusted_queued_session
+        monkeypatch.setattr(trusted_queued_session, 'MAX_ACCEPTANCE_EVIDENCE_BYTES', 1)
     data['report']['manifest_digest'] = config.manifest.digest()
     data['release']['implementation_commit'] = config.manifest.driver.implementation_commit
     data['release']['platform'] = config.manifest.runner_binding.platform.model_dump(mode='json')

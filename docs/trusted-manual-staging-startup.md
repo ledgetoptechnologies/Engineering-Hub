@@ -69,6 +69,10 @@ be the explicit boolean `true`. Missing/false/integer claims are rejected, never
 defaulted. No accepted bit is permitted. `enrollment_bytes` serializes typed data;
 it does not discover or authorize its contents.
 
+The complete displayed acceptance evidence, including scope and executor details,
+must fit within 8,192 UTF-8 bytes. An otherwise valid report near the 6,000-byte
+text limit may exceed that total; the selector rejects it before reading secrets.
+
 The report's `executor` retains the exact original `launch` fields plus
 `image_config_id` for the executor release. Every field must match independent
 enrollment with its exact type. Editing the enrolled launch or release cannot

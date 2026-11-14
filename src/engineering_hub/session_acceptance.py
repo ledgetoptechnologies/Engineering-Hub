@@ -28,6 +28,7 @@ from .startup_reconciliation import (ExecutorSessionIdentity, OperatorReconcilia
                                      StartupReconciliation)
 
 _BODY_READ_TIMEOUT_SECONDS = 2.0
+MAX_ACCEPTANCE_EVIDENCE_BYTES = 8192
 
 
 class SessionAcceptanceError(RuntimeError):
@@ -95,7 +96,7 @@ class SessionAcceptanceBroker:
                 r'human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})', operator_actor))
             _require(_sync_callable(audit))
             _require(type(lifetime_seconds) is int and 1 <= lifetime_seconds <= 3600)
-            _require(type(evidence) is str and 0 < len(evidence.encode('utf-8')) <= 8192
+            _require(type(evidence) is str and 0 < len(evidence.encode('utf-8')) <= MAX_ACCEPTANCE_EVIDENCE_BYTES
                      and '\x00' not in evidence)
             _require(type(report) is OperatorReconciliation
                      and type(executor) is ExecutorSessionIdentity

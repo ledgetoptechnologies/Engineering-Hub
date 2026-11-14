@@ -24,6 +24,7 @@ from .queued_session_acceptance import attach_queued_session_acceptance
 from .session_acceptance_audit import OwnedSessionAcceptanceAudit
 from .startup_reconciliation import (ExecutorSessionIdentity, OperatorReconciliation,
     StartupReconciliation)
+from .session_acceptance import MAX_ACCEPTANCE_EVIDENCE_BYTES
 
 SCHEMA = 'engineering-hub.manual-staging-session.v1'
 SCHEMA_SCOPED = 'engineering-hub.manual-staging-session.v2'
@@ -143,11 +144,26 @@ def parse_enrollment(raw):
         raise TrustedSessionError() from None
 
 
+def _session_evidence(e):
+    """Assemble the exact displayed report and enforce the broker's byte bound."""
+    evidence = (f'Operator-attested source: {e.source}\n'
+        f'Original observed_at_ms: {e.observed_at_ms}\nExpires_at_ms: {e.expires_at_ms}\n'
+        f'Target: {e.target_id}\nManifest: {e.manifest_digest}\n'
+        'Session scope: ' + json.dumps({'actors': e.actors, 'task_ids': e.task_ids},
+            sort_keys=True, separators=(',', ':')) + '\n'
+        'Retained report executor: ' + json.dumps(_report_executor(e.release, e.launch),
+            sort_keys=True, separators=(',', ':')) + '\n'
+        'Current signed identity is not inventory/writer-exclusion proof.\n\n' + e.evidence)
+    _require(0 < len(evidence.encode('utf-8')) <= MAX_ACCEPTANCE_EVIDENCE_BYTES)
+    return evidence
+
+
 def validate_unified_session(profile, enrollment):
     """Validate static scope and freshness without opening credentials or transport."""
     from .unified_pilot_startup import PilotProfile
     _require(type(profile) is PilotProfile and type(enrollment) is ManualSessionEnrollment)
     e = parse_enrollment(enrollment_bytes(enrollment))
+    _session_evidence(e)
     _require(profile.manifest.digest() == e.manifest_digest
              and profile.manifest.target_id == e.target_id and profile.machine_id == e.machine_id
              and profile.manifest.driver.implementation_commit == e.release.implementation_commit
@@ -256,14 +272,7 @@ class TrustedQueuedSessionComposition:
             e = self._enrollment
             # Original source time is preserved and shown; fresh challenge/epoch
             # binding is NOT a new observation of inventory or writer exclusion.
-            evidence = (f'Operator-attested source: {e.source}\n'
-                f'Original observed_at_ms: {e.observed_at_ms}\nExpires_at_ms: {e.expires_at_ms}\n'
-                f'Target: {e.target_id}\nManifest: {e.manifest_digest}\n'
-                'Session scope: ' + json.dumps({'actors': e.actors, 'task_ids': e.task_ids},
-                    sort_keys=True, separators=(',', ':')) + '\n'
-                'Retained report executor: ' + json.dumps(_report_executor(e.release, e.launch),
-                    sort_keys=True, separators=(',', ':')) + '\n'
-                'Current signed identity is not inventory/writer-exclusion proof.\n\n' + e.evidence)
+            evidence = _session_evidence(e)
             report = OperatorReconciliation(gate.challenge, owner.epoch, target.target_id,
                 self._manifest, self._identity, 'sha256:' + hashlib.sha256(evidence.encode()).hexdigest(),
                 e.inventory_reconciled, e.writers_excluded, e.unresolved_effects_absent)
