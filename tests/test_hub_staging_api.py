@@ -280,6 +280,27 @@ def test_policy_owner_only_cas_and_human_csrf(env):
     assert client.put(path, headers=headers(ADMIN, csrf=True), json=payload).status_code == 409
 
 
+def test_profile_owner_cas_and_project_scoped_reads(env):
+    client, _ = application(env[3])
+    path = PREFIX + '/projects/' + PROJECT + '/profiles/static'
+    profile = {'schema': 'modular-staging-profile-v1', 'image_id': 'sha256:' + 'a' * 64,
+               'build_argv': ['npm', 'run', 'build'], 'test_argv': ['npm', 'test'],
+               'timeout_seconds': 30, 'memory_mb': 128, 'pids': 32, 'output_bytes': 4096,
+               'log_bytes': 1024, 'workspace_bytes': 65536, 'cpu_millis': 250}
+    payload = {'expected_generation': 0, 'profile': profile}
+    assert client.put(path, headers=headers('codex'), json=payload).status_code == 403
+    assert client.put(path, headers={**headers('codex'), 'Content-Type': 'application/json'}, content='{bad').status_code == 403
+    assert client.put(path, headers=headers(ADMIN), json=payload).status_code == 403
+    assert client.put(path, headers=headers('human:2', csrf=True), json=payload).status_code == 403
+    response = client.put(path, headers=headers(ADMIN, csrf=True), json=payload)
+    assert response.status_code == 200 and response.json()['generation'] == 1
+    assert response.json()['execution_authorization'] is False
+    assert client.put(path, headers=headers(ADMIN, csrf=True), json=payload).status_code == 409
+    assert client.get(path, headers=headers('codex')).json()['profile'] == profile
+    assert client.get(path, headers=headers('claude')).status_code == 403
+    assert client.get(path + '?generation=2', headers=headers('codex')).status_code == 404
+
+
 def test_preview_uses_real_broker_human_csrf_and_normalizes_url(env):
     item = resource(env, kind='preview')
     broker = PreviewBroker(env[0], env[1], hub_origin='https://hub.example.test',

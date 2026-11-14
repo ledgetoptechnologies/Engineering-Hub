@@ -3978,6 +3978,148 @@
         }
       }
     },
+    "/api/hub/v1/staging/projects/{project}/profiles/{recipe}": {
+      "get": {
+        "summary": "Get Profile",
+        "operationId": "get_profile_api_hub_v1_staging_projects__project__profiles__recipe__get",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+              "title": "Project"
+            }
+          },
+          {
+            "name": "recipe",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "title": "Recipe"
+            }
+          },
+          {
+            "name": "generation",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1,
+                  "exclusiveMaximum": 2147483648
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Enroll Profile",
+        "operationId": "enroll_profile_api_hub_v1_staging_projects__project__profiles__recipe__put",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+              "title": "Project"
+            }
+          },
+          {
+            "name": "recipe",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "title": "Recipe"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "expected_generation": {
+                    "exclusiveMaximum": 2147483647,
+                    "minimum": 0,
+                    "title": "Expected Generation",
+                    "type": "integer"
+                  },
+                  "profile": {
+                    "additionalProperties": true,
+                    "maxProperties": 16,
+                    "title": "Profile",
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "expected_generation",
+                  "profile"
+                ],
+                "title": "StagingProfileEnrollment",
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/staging/resources/{resource_id}/preview-session": {
       "post": {
         "summary": "Preview",

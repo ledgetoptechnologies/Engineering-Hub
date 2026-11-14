@@ -66,6 +66,11 @@ class StagingPolicy(ClosedInput):
     grants: dict[str, Annotated[list[Action], Field(max_length=6)]] = Field(max_length=1000)
 
 
+class StagingProfileEnrollment(ClosedInput):
+    expected_generation: int = Field(ge=0, lt=2**31 - 1)
+    profile: dict = Field(max_length=16)
+
+
 def _unique_object(pairs):
     result = {}
     for key, value in pairs:
@@ -267,6 +272,21 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
     def get_policy(project: Project, request: Request):
         principal = authenticated(request, human_only=True)
         return configured().resources.get_policy(principal, project)
+
+    @app.get('/api/hub/v1/staging/projects/{project}/profiles/{recipe}')
+    def get_profile(project: Project, recipe: Annotated[str, Path(pattern=r'^[a-z0-9][a-z0-9_-]{0,63}$')],
+                    request: Request, generation: int | None = Query(default=None, ge=1, lt=2**31)):
+        principal = authenticated(request)
+        return configured().resources.get_profile(principal, project, recipe, generation)
+
+    @app.put('/api/hub/v1/staging/projects/{project}/profiles/{recipe}', openapi_extra=request_body(StagingProfileEnrollment))
+    async def enroll_profile(project: Project, recipe: Annotated[str, Path(pattern=r'^[a-z0-9][a-z0-9_-]{0,63}$')], request: Request):
+        principal = authenticated(request, mutation=True, human_only=True)
+        service = configured()
+        payload = await _payload(request, StagingProfileEnrollment)
+        revalidate(request, principal, human_only=True)
+        return service.resources.enroll_profile(principal, project, recipe, **payload.model_dump(),
+                                                admission_guard=admission(request, principal))
 
     @app.put('/api/hub/v1/staging/projects/{project}/policy', openapi_extra=request_body(StagingPolicy))
     async def set_policy(project: Project, request: Request):

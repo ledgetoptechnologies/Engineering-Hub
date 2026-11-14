@@ -96,6 +96,7 @@ class StagingResourceStore:
         with repo._transaction() as db:
             for sql in (
                 'CREATE TABLE IF NOT EXISTS hub_staging_policy (project TEXT PRIMARY KEY, data TEXT NOT NULL)',
+                'CREATE TABLE IF NOT EXISTS hub_staging_profile_enrollments (project TEXT NOT NULL, recipe TEXT NOT NULL, generation INTEGER NOT NULL, digest TEXT NOT NULL, profile TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(project,recipe,generation))',
                 'CREATE TABLE IF NOT EXISTS hub_staging_resource_jobs (id TEXT PRIMARY KEY, data TEXT NOT NULL)',
                 'CREATE TABLE IF NOT EXISTS hub_staging_resource_ownership (id TEXT PRIMARY KEY, job_id TEXT NOT NULL, project TEXT NOT NULL, created_by TEXT NOT NULL, source_commit TEXT NOT NULL)',
                 'CREATE INDEX IF NOT EXISTS hub_staging_resource_ownership_job ON hub_staging_resource_ownership(job_id,id)',
@@ -191,6 +192,73 @@ class StagingResourceStore:
         with self.repo._connection() as db:
             self.repo._project(project, db)
             return dict(self._policy(db, project), project=project)
+
+    @staticmethod
+    def _recipe_name(value):
+        if type(value) is not str or re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', value) is None:
+            raise HubError('invalid_staging_recipe')
+        return value
+
+    def enroll_profile(self, actor, project, recipe, expected_generation, profile, *, admission_guard=None):
+        """Owner CAS append only. This record does not approve or start work."""
+        _actor(actor)
+        if actor not in self.admin_actors:
+            raise HubError('staging_admin_required', 403)
+        self._recipe_name(recipe)
+        if type(expected_generation) is not int or not 0 <= expected_generation < 2**31 - 1:
+            raise HubError('invalid_staging_generation')
+        from .modular_staging_profile import canonical_profile, profile_bytes, profile_digest
+        try:
+            normalized = canonical_profile(profile)
+            encoded = profile_bytes(normalized).decode('ascii')
+            digest = profile_digest(normalized)
+        except (ValueError, TypeError, OverflowError):
+            raise HubError('invalid_staging_profile') from None
+        with self.repo._transaction(before_commit=admission_guard) as db:
+            self.repo._project(project, db)
+            prior = db.execute('SELECT generation FROM hub_staging_profile_enrollments WHERE project=? AND recipe=? ORDER BY generation DESC LIMIT 1',
+                               (project, recipe)).fetchone()
+            if (prior['generation'] if prior else 0) != expected_generation:
+                raise HubError('revision_conflict', 409)
+            generation, now = expected_generation + 1, _iso(self._now())
+            db.execute('INSERT INTO hub_staging_profile_enrollments VALUES (?,?,?,?,?,?,?)',
+                       (project, recipe, generation, digest, encoded, actor, now))
+            # Audit identifiers and revision only; raw commands are project-private.
+            audit_id = 'staging-profile:' + project + ':' + recipe
+            db.execute('INSERT INTO hub_audit(actor,action,entity_id,revision,created_at) VALUES(?,?,?,?,?)',
+                       (actor, 'staging.profile_enrolled', audit_id, generation, now))
+        return {'project': project, 'recipe': recipe, 'generation': generation, 'digest': digest,
+                'profile': normalized, 'created_at': now, 'execution_authorization': False}
+
+    def get_profile(self, actor, project, recipe, generation=None):
+        """Return only a profile in an active project with explicit read access."""
+        _actor(actor)
+        self._recipe_name(recipe)
+        if generation is not None and (type(generation) is not int or not 1 <= generation < 2**31):
+            raise HubError('invalid_staging_generation')
+        with self.repo._connection() as db:
+            if actor in self.admin_actors:
+                self.repo._project(project, db)
+            else:
+                self._authorize(db, actor, project, 'read')
+            if generation is None:
+                row = db.execute('SELECT * FROM hub_staging_profile_enrollments WHERE project=? AND recipe=? ORDER BY generation DESC LIMIT 1',
+                                 (project, recipe)).fetchone()
+            else:
+                row = db.execute('SELECT * FROM hub_staging_profile_enrollments WHERE project=? AND recipe=? AND generation=?',
+                                 (project, recipe, generation)).fetchone()
+            if row is None:
+                raise HubError('staging_profile_not_found', 404)
+            from .modular_staging_profile import canonical_profile, profile_bytes, profile_digest
+            try:
+                profile = canonical_profile(json.loads(row['profile']))
+                if profile_bytes(profile).decode('ascii') != row['profile'] or profile_digest(profile) != row['digest']:
+                    raise ValueError('invalid persisted profile')
+            except (ValueError, TypeError, OverflowError):
+                raise HubError('staging_profile_unavailable', 503) from None
+            return {'project': project, 'recipe': recipe, 'generation': row['generation'],
+                    'digest': row['digest'], 'profile': profile, 'created_at': row['created_at'],
+                    'execution_authorization': False}
 
     @staticmethod
     def _job(db, job_id):
