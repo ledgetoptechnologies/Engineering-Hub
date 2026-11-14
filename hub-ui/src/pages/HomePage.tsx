@@ -1,4 +1,5 @@
 import { actorName } from "../actors";
+import { reviewPassedNote } from "../dashboardText";
 import { link } from "../router";
 import { connectionView } from "../agentStatus";
 import { ImageVersionsPanel } from "../ImageVersionsPanel";
@@ -32,7 +33,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
         <a className="kpi" href={link("/work")}>
           <span className="kpi-label"><Icon kind="work" size={16} /> Work in motion</span>
           <strong>{active.length}</strong>
-          <span className="kpi-note">{tasks.length - active.length} review passed</span>
+          <span className="kpi-note">{reviewPassedNote(tasks.length - active.length)}</span>
         </a>
         <a className="kpi" href={link("/agents")}>
           <span className="kpi-label"><Icon kind="agents" size={16} /> Agent streams observed</span>

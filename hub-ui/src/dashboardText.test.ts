@@ -17,7 +17,7 @@ describe("dashboard wording", () => {
     [{ status: "in_review", owner: "claude", candidate_commit: commit },
       "Waiting for an independent review. No reviewer assigned; any agent except Claude can review."],
     [{ status: "verified", owner: "codex", review: { actor: "claude", commit, verdict: "approve" } },
-      "Review passed by Claude. Running it is separate and needs its own authorization."],
+      "Review passed by Claude. A passed review doesn't start or authorize a run. Running it needs separate authorization, which this page doesn't show."],
   ] as [Partial<Task>, string][])("derives waiting-on from recorded state %#", (change, text) => {
     expect(waitingOn(task(change), name)).toBe(text);
   });

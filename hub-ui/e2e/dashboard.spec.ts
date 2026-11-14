@@ -22,6 +22,19 @@ const hubConnection = (state: "connected" | "not_observed" = "connected"): NonNu
   inbox_subscriptions: 0, subscribed: false, last_stream_write_at: NOW.toISOString(), native_push_available: true,
 });
 
+test("review verdict does not imply a run is authorized", async ({ page }) => {
+  await page.clock.install({ time: NOW });
+  const mock = await mockLive(page);
+  await page.goto("/#/");
+  const work = page.getByRole("link", { name: /Work in motion/ });
+  await expect(work).toContainText("1 review passed · a review doesn't authorize a run");
+  await go(page, "#/work");
+  const task = page.locator("details.task-row").filter({ hasText: mock.overview.tasks[0].title });
+  await expect(task.locator("summary .task-waiting")).toBeVisible();
+  await expect(task.locator("summary .task-waiting")).toContainText("Review passed by Claude. A passed review doesn't start or authorize a run.");
+  await expect(task.locator("summary .task-waiting")).toContainText("Running it needs separate authorization, which this page doesn't show.");
+});
+
 test("Hub connection snapshots remain distinct from unconfigured topic readiness", async ({ page }) => {
   await page.clock.install({ time: NOW });
   const mock = await mockLive(page, { tracking: "not_configured" });

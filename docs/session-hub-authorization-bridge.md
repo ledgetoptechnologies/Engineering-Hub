@@ -66,7 +66,9 @@ read access from creation or withdrawal authority. Role lease mutations without
 `role.read` return only coordination data needed to continue safely: role ID,
 revision, generation, expiry, handoff revision and takeover state. Role claim
 mutations without `role.read` return only claim ID, role ID, task ID and
-revision. Orchestration request creation, dispatch creation and report without
+revision. Progress updates without `progress.read` return only the progress ID
+and resulting revision; derived ETA and rate history require a current read grant.
+Orchestration request creation, dispatch creation and report without
 `dispatch.read` return only ID and revision as a coordination receipt.
 An `ask` report also returns the decision ID it creates when `decision.read`
 and project access remain valid at response time; that operation independently requires both

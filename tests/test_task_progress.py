@@ -44,6 +44,61 @@ def test_progress_independent_revision_and_observed_eta(env):
         assert len(receipts) == 3 and all(len(row['data']) < 150 for row in receipts)
 
 
+def test_mcp_progress_write_does_not_grant_read_of_derived_history(unified, monkeypatch):
+    from types import SimpleNamespace
+    client, app, bus, _ = unified
+    session_env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    base = ('role.lease', 'role.claim', 'tracking.read', 'progress.write')
+    first_id, first_token, _ = pair(session_env, name='first-progress-writer', caps=(*base, 'progress.read'))
+    next_id, next_token, _ = pair(session_env, name='next-progress-writer', caps=base)
+    repo = app.state.repository
+    RoleRepository(repo).configure(OWNER, 'progress-writer', 0, [PROJECT], [first_id, next_id],
+                                   ['src'], 'Coordinate', [])
+    task = repo.propose_tracking_task('codex', PROJECT, 'Synthetic progress', 'progress-task')
+    first, _ = sdk(client, first_token)
+    second, _ = sdk(client, next_token)
+    lease = data(first('hub_role_acquire', {'role': 'progress-writer', 'expected_revision': 1, 'lease_seconds': 60}))
+    claim = data(first('hub_role_claim', {'role': 'progress-writer', 'generation': 1, 'task_id': task['id'],
+                                         'client_request_id': 'first-claim'}))
+    boxes = [{'id': 'a', 'text': 'First', 'done': False}, {'id': 'b', 'text': 'Second', 'done': False}]
+    old = data(first('hub_task_progress_update', {'task_id': task['id'], 'expected_revision': 0,
+        'client_request_id': 'first-progress', 'checklist': boxes, 'status_line': 'Previous private status',
+        'blocked_on': '', 'role': 'progress-writer', 'generation': 1}))
+    assert old['revision'] == 1 and old['_rate_anchor']['done'] == 0
+    data(first('hub_role_claim_release', {'role': 'progress-writer', 'generation': 1, 'task_id': task['id'],
+                                         'expected_revision': claim['revision'], 'reason': 'Handoff'}))
+    data(first('hub_role_release', {'role': 'progress-writer', 'expected_revision': lease['revision'],
+                                  'generation': 1, 'expected_handoff_revision': 0, 'handoff': 'Handoff'}))
+    data(second('hub_role_acquire', {'role': 'progress-writer', 'expected_revision': 3, 'lease_seconds': 60}))
+    data(second('hub_role_claim', {'role': 'progress-writer', 'generation': 2, 'task_id': task['id'],
+                                  'client_request_id': 'second-claim'}))
+    bus.state.agent_sessions.clock.value += 10
+    boxes[0]['done'] = True
+    args = {'task_id': task['id'], 'expected_revision': 1, 'client_request_id': 'second-progress',
+            'checklist': boxes, 'status_line': 'Current status', 'blocked_on': '',
+            'role': 'progress-writer', 'generation': 2}
+    result = data(second('hub_task_progress_update', args))
+    assert result == {'id': result['id'], 'revision': 2, 'response_scope': 'coordination_receipt',
+                      'execution_authorization': False}
+    assert data(second('hub_task_progress_update', args)) == result
+    assert second('hub_task_progress_get', {'task_id': task['id']})['isError']
+    session_env.bridge.grant_put(OWNER, next_id, 1, [PROJECT], [*base, 'progress.read'])
+    # Simulate a read grant/session expiring after the accepted write but before
+    # response projection. A later accepted retry remains safe and useful.
+    live = session_env.bridge._live
+    def expired_at_response(db, secret, revision=None, capability=None, *, session_id=None):
+        if capability == 'progress.read':
+            raise HubError('hub_capability_forbidden', 403)
+        return live(db, secret, revision, capability, session_id=session_id)
+    monkeypatch.setattr(session_env.bridge, '_live', expired_at_response)
+    assert data(second('hub_task_progress_update', args)) == result
+    monkeypatch.setattr(session_env.bridge, '_live', live)
+    full = data(second('hub_task_progress_update', args))
+    assert full['eta_seconds'] == 10 and full['_rate_anchor']['done'] == 0
+    session_env.bridge.grant_revoke(OWNER, next_id, 2)
+    assert second('hub_task_progress_update', args)['isError']
+
+
 @pytest.mark.parametrize('removed', ['role.lease', 'role.claim', 'tracking.read'])
 def test_progress_requires_current_role_and_task_grants(env, removed):
     token, task, role, progress = setup_progress(env)

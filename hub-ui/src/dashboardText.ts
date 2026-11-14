@@ -2,6 +2,13 @@
 import { actorFamily } from "./actors";
 import type { Task } from "./types";
 
+/** A review records a verdict; it does not start or authorize a run. */
+export const REVIEW_IS_NOT_A_RUN = "A passed review doesn't start or authorize a run. Running it needs separate authorization, which this page doesn't show.";
+
+export function reviewPassedNote(count: number): string {
+  return `${count} review passed · a review doesn't authorize a run`;
+}
+
 export function relativeAge(value: string | null | undefined, now = Date.now()): string | null {
   if (!value) return null;
   const timestamp = Date.parse(value);
@@ -39,6 +46,6 @@ export function waitingOn(task: Task, agentName: (id: string, family?: string | 
       : `Waiting for an independent review. No reviewer assigned${task.owner
         ? `; any agent except ${ownerFamily ? `${agentName(ownerFamily)}${ownerFamily !== task.owner ? " (on any computer)" : ""}` : owner} can review` : ""}.`;
   return task.review
-    ? `Review passed by ${agentName(task.review.actor, task.review.family)}. Running it is separate and needs its own authorization.`
-    : "Review passed. Running it is separate and needs its own authorization.";
+    ? `Review passed by ${agentName(task.review.actor, task.review.family)}. ${REVIEW_IS_NOT_A_RUN}`
+    : `Review passed. ${REVIEW_IS_NOT_A_RUN}`;
 }

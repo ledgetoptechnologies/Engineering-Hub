@@ -503,6 +503,7 @@ class SessionHubBridge:
                                     'hub_role_acquire': 'role.read', 'hub_role_renew': 'role.read',
                                     'hub_role_release': 'role.read', 'hub_role_claim': 'role.read',
                                     'hub_role_claim_release': 'role.read',
+                                    'hub_task_progress_update': 'progress.read',
                                     'hub_orchestration_request_create': 'dispatch.read',
                                     'hub_dispatch_create': 'dispatch.read',
                                     'hub_dispatch_report': 'dispatch.read',
@@ -545,6 +546,13 @@ class SessionHubBridge:
                                             # transition to a caller without dispatch.read.
                                             result = {'id': result['id'], 'response_scope': 'mutation_receipt',
                                                 'current_state_included': False}
+                                        elif fn.__name__ == 'hub_task_progress_update':
+                                            # Revision is exactly the caller's expected
+                                            # revision plus one, including accepted retries.
+                                            # Do not expose derived rate anchors or ETA.
+                                            result = {'id': result['id'], 'revision': result['revision'],
+                                                'response_scope': 'coordination_receipt',
+                                                'execution_authorization': False}
                                         elif fn.__name__ in {'hub_orchestration_request_create', 'hub_dispatch_create',
                                                             'hub_dispatch_report'}:
                                             # Exact idempotency receipts are revision-bound in
