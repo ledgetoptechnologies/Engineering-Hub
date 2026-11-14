@@ -6,6 +6,7 @@ import json
 import socket
 import sqlite3
 import stat
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -1012,7 +1013,14 @@ async def test_full_queue_catchup_preserves_cursor_and_resumes_in_sequence(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_live_stream_drop_gates_next_job_during_running_child(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("real_child", "reconnect_before_release"),
+    [(False, False), (True, False), (True, True)],
+    ids=["async-runner", "os-child-outage", "os-child-reconnect"],
+)
+async def test_live_stream_drop_gates_next_job_during_running_child(
+    tmp_path, monkeypatch, real_child, reconnect_before_release
+):
     monkeypatch.setenv("AGENT_BUS_ALLOWED_HOSTS", "127.0.0.1:*")
     app = create_app(db_path=tmp_path / "drop-bus.sqlite3", audit_path=tmp_path / "drop-audit.jsonl",
                      auth=TEST_AUTH, push_events_operational=True)
@@ -1063,12 +1071,33 @@ async def test_live_stream_drop_gates_next_job_during_running_child(tmp_path, mo
             self.second_started = asyncio.Event()
             self.third_started = asyncio.Event()
             self.release = asyncio.Event()
+            self.first_finished = asyncio.Event()
+            self.child = None
         async def run(self, message_id, resume_session_id=None):
             self.started.append(message_id)
             timeline.append(("start", message_id))
             if len(self.started) == 1:
+                if real_child:
+                    code = (
+                        "import pathlib, sys, time\n"
+                        "release = pathlib.Path(sys.argv[1])\n"
+                        "print('ready', flush=True)\n"
+                        "deadline = time.monotonic() + 15\n"
+                        "while not release.exists() and time.monotonic() < deadline:\n"
+                        "    time.sleep(0.02)\n"
+                        "sys.exit(0 if release.exists() else 2)\n"
+                    )
+                    self.child = await asyncio.create_subprocess_exec(
+                        sys.executable, "-u", "-c", code, str(tmp_path / "release-child"),
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    assert await asyncio.wait_for(self.child.stdout.readline(), 8) == b"ready\n"
                 self.first_started.set()
-                await self.release.wait()
+                if real_child:
+                    assert await asyncio.wait_for(self.child.wait(), 15) == 0
+                else:
+                    await self.release.wait()
+                self.first_finished.set()
             elif len(self.started) == 2:
                 self.second_started.set()
             else:
@@ -1099,13 +1128,25 @@ async def test_live_stream_drop_gates_next_job_during_running_child(tmp_path, mo
             await wait_until(lambda: second.id in state.queued_ids())
             drop.set()
             await wait_until(lambda: not worker.ready_event.is_set())
+            if real_child:
+                assert runner.child is not None and runner.child.returncode is None
             third = repo.insert(sender="codex", recipient="hermes", message_type="REQUEST",
                                 body={"topic": "qa", "description": "third"}, correlation_id="third")
             timeline.append("outage")
+            if reconnect_before_release:
+                allow_reconnect.set()
+                await wait_until(lambda: worker.ready_event.is_set() and
+                                 "catchup" in timeline[timeline.index("outage") + 1:])
+                assert runner.child.returncode is None
+                assert runner.started == [first.id]
             runner.release.set()
+            if real_child:
+                (tmp_path / "release-child").write_text("release")
+            await asyncio.wait_for(runner.first_finished.wait(), 8)
             await asyncio.sleep(.2)
-            assert state.queued_ids() == [second.id]
-            assert runner.started == [first.id]
+            if not reconnect_before_release:
+                assert state.queued_ids() == [second.id]
+                assert runner.started == [first.id]
             allow_reconnect.set()
             await asyncio.wait_for(runner.third_started.wait(), 8)
             await asyncio.sleep(.2)
@@ -1121,3 +1162,10 @@ async def test_live_stream_drop_gates_next_job_during_running_child(tmp_path, mo
                 if not task.done():
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
+                if runner.child is not None:
+                    if runner.child.returncode is None:
+                        try:
+                            runner.child.kill()
+                        except ProcessLookupError:
+                            pass  # The owned child exited between the check and kill.
+                    await asyncio.wait_for(runner.child.wait(), 3)
