@@ -138,3 +138,68 @@ def test_cli_stages_claim_withdrawal_without_sending(tmp_path, monkeypatch, caps
     assert not result['sent'] and not result['execution_authorization']
     record = tracking_outbox.read(outbox, result['record_id'])
     assert record['action'] == 'withdraw-claim' and record['arguments'] == payload
+
+
+def test_reference_pagination_recovers_large_outbox_without_opening_or_deleting(tmp_path, monkeypatch):
+    import uuid
+    directory = tmp_path / 'outbox'; directory.mkdir(mode=0o700)
+    ids = [str(uuid.UUID(int=i)) for i in range(1, 1038)]
+    for identity in reversed(ids):
+        (directory / (identity + '.tracking')).touch()
+    (directory / 'not-a-uuid.tracking').touch()
+    (directory / 'discarded.partial').touch()
+    # Even a UUID-shaped symlink is only a name during enumeration: reading it
+    # is separately guarded and never occurs while listing.
+    symlink_id = str(uuid.UUID(int=2000))
+    if os.name != 'nt':
+        (directory / (symlink_id + '.tracking')).symlink_to(tmp_path / 'outside')
+        ids.append(symlink_id)
+    monkeypatch.setattr(tracking_outbox, 'read', lambda *a: (_ for _ in ()).throw(AssertionError('opened a record')))
+    with pytest.raises(ClientError, match='tracking_outbox_too_many'):
+        tracking_outbox.references(directory)  # Original internal bounded API.
+    seen = []; after = None
+    while True:
+        page = tracking_outbox.reference_page(directory, limit=37, after=after)
+        assert len(page['record_ids']) <= 37
+        seen.extend(page['record_ids'])
+        after = page['next_after']
+        if after is None:
+            break
+        assert after == page['record_ids'][-1]
+    assert seen == sorted(ids) and len(set(seen)) == len(ids)
+    assert all((directory / (identity + '.tracking')).exists() for identity in ids if identity != symlink_id)
+    for bad in [0, 1001, True, '10']:
+        with pytest.raises(ClientError):
+            tracking_outbox.reference_page(directory, limit=bad)
+    for bad in ['invalid', '../bad', 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA']:
+        with pytest.raises(ClientError):
+            tracking_outbox.reference_page(directory, after=bad)
+
+
+def test_cli_list_staged_legacy_shape_and_explicit_cursor(tmp_path, monkeypatch, capsys):
+    import io
+    import uuid
+    profile = tmp_path / 'profile'; profile.mkdir(mode=0o700)
+    outbox = tmp_path / 'outbox'; outbox.mkdir(mode=0o700)
+    ids = [str(uuid.UUID(int=i)) for i in (1, 2, 3)]
+    for identity in ids:
+        (outbox / (identity + '.tracking')).touch()
+    class Input:
+        def __init__(self, value): self.buffer = io.BytesIO(json.dumps(value).encode())
+    argv = ['--profile-dir', str(profile), '--session', 'first', '--outbox-dir', str(outbox), 'list-staged']
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({}))
+    assert tracking_client.main(argv) == 0
+    assert json.loads(capsys.readouterr().out) == {'type': 'tracking_outbox_references', 'record_ids': ids}
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'limit': 2}))
+    assert tracking_client.main(argv) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first['record_ids'] == ids[:2] and first['next_after'] == ids[1]
+    # A later insertion before the cursor requires a fresh scan from start.
+    older = str(uuid.UUID(int=0)); (outbox / (older + '.tracking')).touch()
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'limit': 2, 'after': first['next_after']}))
+    assert tracking_client.main(argv) == 0
+    last = json.loads(capsys.readouterr().out)
+    assert last['record_ids'] == ids[2:] and last['next_after'] is None
+    monkeypatch.setattr(tracking_client.sys, 'stdin', Input({'limit': 2}))
+    assert tracking_client.main(argv) == 0
+    assert json.loads(capsys.readouterr().out)['record_ids'][0] == older

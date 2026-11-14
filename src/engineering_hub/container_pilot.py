@@ -246,7 +246,7 @@ class ContainerPilotWorkflow:
                 raise HubError('container_pilot_manifest_changed', 409)
         return target
 
-    def _historical_target(self, run):
+    def _historical_target(self, run, *, db=None):
         """Resolve the immutable manifest recorded for read-only run evidence.
 
         Unlike ``_target``, this resolver never authorizes commands, claims or
@@ -256,12 +256,14 @@ class ContainerPilotWorkflow:
         digest = run.get('execution_manifest_digest') if type(run) is dict else None
         if not isinstance(digest, str):
             raise HubError('container_pilot_manifest_history_missing', 409)
-        with self.repo._connection() as db:
-            row = db.execute(
+        if db is None:
+            with self.repo._connection() as connection:
+                return self._historical_target(run, db=connection)
+        row = db.execute(
                 'SELECT binding FROM hub_container_pilot_manifest_views WHERE manifest_digest=?',
                 (digest,),
             ).fetchone()
-            pinned = db.execute(
+        pinned = db.execute(
                 'SELECT binding FROM hub_container_pilot_bindings WHERE run_id=?',
                 (run.get('id'),),
             ).fetchone()

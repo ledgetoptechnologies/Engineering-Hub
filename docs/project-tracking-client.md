@@ -102,7 +102,16 @@ Protect the directory and parent from other users and do not place secrets in
 task content. These records are immutable by client convention, not against a
 same-user attacker. An interruption before stage returns is unconfirmed.
 
-On a later turn, `list-staged` with `{}` lists opaque IDs. `inspect-staged`
+On a later turn, `list-staged` with `{}` lists up to 1,000 opaque IDs. If
+`next_after` is returned, pass it as `after` in the next call; an optional
+integer `limit` from 1 to 1,000 requests a smaller page. The default response
+for an outbox of at most 1,000 records retains its original shape. Explicit
+pagination returns `next_after: null` on its last page. Names are sorted by
+UUID, not creation time: directory enumerations are independent and not an
+atomic snapshot, so restart from the beginning on later turns to discover new
+entries that sort before a saved cursor. Listing scans names only, does not
+follow them and does not establish that a record is readable or sent;
+`inspect-staged` and `send-staged` perform their own checks. `inspect-staged`
 with `{"record_id":"..."}` explicitly prints the private local payload so it
 can be checked in a protected channel; `send-staged` with the same input sends
 the saved unchanged payload.

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import heapq
 import os
 import stat
 import tempfile
@@ -92,15 +93,35 @@ def read(directory, record_id):
             os.close(fd)
 
 
-def references(directory):
+def reference_page(directory, *, limit=1000, after=None):
+    """Read a bounded UUID-sorted page of opaque names; never open a record."""
     directory = _directory(directory)
-    result = []
-    for path in directory.iterdir():
-        if path.name.endswith('.tracking'):
+    if type(limit) is not int or not 1 <= limit <= 1000:
+        raise ClientError('invalid_tracking_outbox_limit')
+    if after is not None:
+        _id(after)
+    def eligible(entries):
+        for entry in entries:
+            if not entry.name.endswith('.tracking'):
+                continue
             try:
-                result.append(_id(path.name[:-9]))
+                identity = _id(entry.name[:-9])
             except ClientError:
                 continue
-            if len(result) > 1000:
-                raise ClientError('tracking_outbox_too_many')
-    return sorted(result)
+            if after is None or identity > after:
+                yield identity
+    # scandir yields entries lazily; nsmallest retains at most limit+1 names.
+    # Names are not opened or followed here; read() independently checks the
+    # record type, permissions and contents before it can be inspected/sent.
+    with os.scandir(directory) as entries:
+        selected = heapq.nsmallest(limit + 1, eligible(entries))
+    result = selected[:limit]
+    return {'record_ids': result, 'next_after': result[-1] if len(selected) > limit else None}
+
+
+def references(directory):
+    """Legacy bounded list API; callers needing larger sets use reference_page."""
+    page = reference_page(directory)
+    if page['next_after'] is not None:
+        raise ClientError('tracking_outbox_too_many')
+    return page['record_ids']

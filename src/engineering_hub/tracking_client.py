@@ -97,9 +97,14 @@ def main(argv=None):
             if args.outbox_dir is None or type(arguments) is not dict:
                 raise ClientError('invalid_tracking_request')
             if args.action == 'list-staged':
-                if arguments:
+                if arguments.keys() - {'limit', 'after'}:
                     raise ClientError('invalid_tracking_request')
-                result = {'type': 'tracking_outbox_references', 'record_ids': tracking_outbox.references(args.outbox_dir)}
+                page = tracking_outbox.reference_page(args.outbox_dir, limit=arguments.get('limit', 1000),
+                                                      after=arguments.get('after'))
+                result = {'type': 'tracking_outbox_references', 'record_ids': page['record_ids']}
+                # Preserve the original {}/small-outbox response shape.
+                if arguments or page['next_after'] is not None:
+                    result['next_after'] = page['next_after']
             elif args.action == 'stage':
                 if set(arguments) != {'action', 'arguments'} or arguments['action'] not in ('propose', 'update', 'review', 'withdraw-claim'):
                     raise ClientError('invalid_tracking_request')

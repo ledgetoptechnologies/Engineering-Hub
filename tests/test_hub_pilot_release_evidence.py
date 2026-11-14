@@ -1,6 +1,8 @@
 """Human review DTOs expose only journaled pilot evidence."""
 import json
 import sys
+import asyncio
+import threading
 from dataclasses import asdict
 
 import pytest
@@ -136,6 +138,42 @@ def test_release_evidence_read_does_not_pin_or_mutate_a_run(repo, target):
     assert evidence.candidate_deploy.state == 'not_started'
     assert before_binding is None and after_binding is None
     assert repo.get_run(run['id'])['revision'] == before_revision
+
+
+def test_release_evidence_is_one_snapshot_during_worker_commit(repo, target, monkeypatch):
+    workflow, run = ready_run(repo, target)
+    original = workflow._historical_target
+    errors = []
+    results = []
+
+    def advance_worker():
+        try:
+            results.append(asyncio.run(workflow.advance(run['id'])))
+        except BaseException as exc:
+            errors.append(exc)
+
+    def advance_after_manifest(snapshot_run, *, db=None):
+        target_at_snapshot = original(snapshot_run, db=db)
+        worker = threading.Thread(target=advance_worker, daemon=True)
+        worker.start()
+        worker.join(timeout=10)
+        assert not worker.is_alive(), 'evidence read blocked the worker commit'
+        assert not errors
+        return target_at_snapshot
+
+    monkeypatch.setattr(workflow, '_historical_target', advance_after_manifest)
+    evidence = pilot_release_evidence(repo, workflow, run['id'])
+
+    assert results[0]['status'] == 'succeeded'
+    assert evidence.run_status == run['status']
+    assert evidence.candidate_deploy.state == 'not_started'
+    assert evidence.candidate_health_check.state == 'not_started'
+    # A later read observes the committed state and receipts together.
+    monkeypatch.setattr(workflow, '_historical_target', original)
+    current = pilot_release_evidence(repo, workflow, run['id'])
+    assert current.run_status == 'succeeded'
+    assert current.candidate_deploy.state == 'succeeded'
+    assert current.candidate_health_check.state == 'succeeded'
 
 
 def test_release_evidence_uses_saved_manifest_after_workflow_recomposition(repo, target):

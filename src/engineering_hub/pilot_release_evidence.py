@@ -25,7 +25,7 @@ def release_evidence_owner_allowed(principal, auth_config, owner_actor):
     return False
 
 
-def _command_evidence(repo, workflow, run, target, action):
+def _command_evidence(workflow, run, target, action, row):
     rollback = action in {'rollback_container', 'smoke_container_rollback', 'cleanup_rollback'}
     expected_image = target.rollback_image_config_id if rollback else target.artifact_digest
     expected = workflow._request(run, target, action)
@@ -42,11 +42,6 @@ def _command_evidence(repo, workflow, run, target, action):
         journal_verified=False,
         reason=None,
     )
-    with repo._connection() as db:
-        row = db.execute(
-            'SELECT payload,state,response_json FROM hub_container_pilot_commands '
-            'WHERE run_id=? AND action=?', (run['id'], action),
-        ).fetchone()
     if row is None:
         return result
 
@@ -108,10 +103,19 @@ def pilot_release_evidence(repo, workflow, run_id):
     if type(workflow) is not ContainerPilotWorkflow or workflow.repo is not repo:
         raise HubError('container_pilot_not_enabled', 423)
     workflow._assert_pilot_owner()
-    run = repo.get_run(run_id)
-    target = workflow._historical_target(run)
+    # Read the run, retained manifest and all command rows in one SQLite
+    # snapshot. Otherwise a concurrent worker can advance between queries,
+    # yielding a misleading mixture of older run state and newer receipts.
+    with repo._connection() as db:
+        db.execute('BEGIN')
+        run = repo._get(db, run_id, 'run')
+        target = workflow._historical_target(run, db=db)
+        rows = {row['action']: row for row in db.execute(
+            'SELECT action,payload,state,response_json FROM hub_container_pilot_commands '
+            'WHERE run_id=?', (run['id'],),
+        )}
     disposable = target.validated_manifest().disposable_final_cleanup is True
-    details = {action: (_command_evidence(repo, workflow, run, target, action)
+    details = {action: (_command_evidence(workflow, run, target, action, rows.get(action))
                         if disposable or not action.startswith('cleanup_') else None)
                for action in _ACTIONS}
     return PilotReleaseEvidenceDTO(
