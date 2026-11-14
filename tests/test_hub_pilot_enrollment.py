@@ -51,6 +51,18 @@ def snapshot(path):
         return enrollment._snapshot(db)
 
 
+def test_staging_resource_entity_without_effect_tables_is_rejected_and_preserved(ledger):
+    path, repo, _, _ = ledger
+    enrollment.inspect_plan(path)
+    with repo._transaction() as db:
+        db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
+                   (str(uuid.uuid4()), 'staging_resource', '{"synthetic":true}'))
+    before = path.read_bytes()
+    with pytest.raises(enrollment.EnrollmentError):
+        enrollment.inspect_plan(path)
+    assert path.read_bytes() == before
+
+
 def test_unkeyed_decisions_preserve_old_enrollment_schema(ledger, monkeypatch):
     path, repo, _, _ = ledger
     # The previous enrollment allowlist was identical except for this table.

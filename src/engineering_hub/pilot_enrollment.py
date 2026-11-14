@@ -243,6 +243,10 @@ def _snapshot(db, *, enrolled=False):
         else:
             raise EnrollmentError()
     # No controller ownership or incomplete external effects may be adopted.
+    # A staging-resource entity can represent an external effect even when its
+    # companion tables are absent. Missing metadata is not proof of cleanup.
+    if db.execute("SELECT 1 FROM hub_entities WHERE kind='staging_resource' LIMIT 1").fetchone():
+        raise EnrollmentError()
     for (raw,) in db.execute("SELECT data FROM hub_entities WHERE kind='run'"):
         run = json.loads(raw)
         if type(run) is not dict or run.get('status') not in {'succeeded', 'rolled_back'}:
