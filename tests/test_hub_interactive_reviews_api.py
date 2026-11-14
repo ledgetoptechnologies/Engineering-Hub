@@ -57,6 +57,31 @@ def test_agent_creation_human_phone_choice_text_and_completion(env):
     assert state['answered_count'] == 2 and state['answers']['note']['by'] == 'human:1'
 
 
+def test_openapi_success_schemas_match_actual_wire_responses(env):
+    from jsonschema import Draft202012Validator
+
+    api = client(env)
+    paths = api.app.openapi()['paths']
+
+    def check(path, method, response):
+        assert response.status_code in (200, 201)
+        schema = paths[path][method]['responses'][str(response.status_code)]['content']['application/json']['schema']
+        Draft202012Validator.check_schema(schema)
+        Draft202012Validator(schema).validate(response.json())
+
+    created = api.post(BASE, headers=AGENT, json=payload(env))
+    check(BASE, 'post', created)
+    identity = created.json()['id']
+    path = BASE + '/' + identity
+    check(BASE, 'get', api.get(BASE, headers=HUMAN, params={'project': PROJECT}))
+    check(BASE + '/{review_id}', 'get', api.get(path, headers=HUMAN))
+    check(BASE + '/{review_id}/state', 'get', api.get(path + '/state', headers=HUMAN))
+    answered = api.post(path + '/answers', headers=HUMAN, json={'expected_revision': 1,
+        'client_request_id': 'schema-answer', 'answers': [{'item_id': 'label', 'value': 'yes'}]})
+    check(BASE + '/{review_id}/answers', 'post', answered)
+    check(BASE + '/{review_id}/state', 'get', api.get(path + '/state', headers=HUMAN))
+
+
 def test_logout_csrf_and_agent_answer_denials(env):
     api = client(env)
     item = api.post(BASE, headers=AGENT, json=payload(env)).json()

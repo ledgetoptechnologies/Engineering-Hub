@@ -1884,10 +1884,124 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Successful response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "items": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "id": {
+                            "title": "Id",
+                            "type": "string"
+                          },
+                          "project": {
+                            "title": "Project",
+                            "type": "string"
+                          },
+                          "component_id": {
+                            "title": "Component Id",
+                            "type": "string"
+                          },
+                          "component_revision": {
+                            "title": "Component Revision",
+                            "type": "integer"
+                          },
+                          "topic": {
+                            "title": "Topic",
+                            "type": "string"
+                          },
+                          "dataset_digest": {
+                            "title": "Dataset Digest",
+                            "type": "string"
+                          },
+                          "schema": {
+                            "const": "choice-text.v1",
+                            "title": "Schema",
+                            "type": "string"
+                          },
+                          "title": {
+                            "title": "Title",
+                            "type": "string"
+                          },
+                          "state": {
+                            "enum": [
+                              "open",
+                              "completed"
+                            ],
+                            "title": "State",
+                            "type": "string"
+                          },
+                          "created_by": {
+                            "title": "Created By",
+                            "type": "string"
+                          },
+                          "created_at": {
+                            "title": "Created At",
+                            "type": "string"
+                          },
+                          "updated_at": {
+                            "title": "Updated At",
+                            "type": "string"
+                          },
+                          "revision": {
+                            "title": "Revision",
+                            "type": "integer"
+                          },
+                          "item_count": {
+                            "title": "Item Count",
+                            "type": "integer"
+                          },
+                          "answered_count": {
+                            "title": "Answered Count",
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "project",
+                          "component_id",
+                          "component_revision",
+                          "topic",
+                          "dataset_digest",
+                          "schema",
+                          "title",
+                          "state",
+                          "created_by",
+                          "created_at",
+                          "updated_at",
+                          "revision",
+                          "item_count",
+                          "answered_count"
+                        ],
+                        "title": "ReviewSummary",
+                        "type": "object"
+                      },
+                      "title": "Items",
+                      "type": "array"
+                    },
+                    "next_after": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Next After"
+                    }
+                  },
+                  "required": [
+                    "items",
+                    "next_after"
+                  ],
+                  "title": "ReviewPage",
+                  "type": "object"
+                }
               }
             }
           },
@@ -1908,10 +2022,198 @@
         "operationId": "create_api_hub_v1_interactive_reviews_post",
         "responses": {
           "201": {
-            "description": "Successful Response",
+            "description": "Successful response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "id": {
+                      "title": "Id",
+                      "type": "string"
+                    },
+                    "project": {
+                      "title": "Project",
+                      "type": "string"
+                    },
+                    "component_id": {
+                      "title": "Component Id",
+                      "type": "string"
+                    },
+                    "component_revision": {
+                      "title": "Component Revision",
+                      "type": "integer"
+                    },
+                    "topic": {
+                      "title": "Topic",
+                      "type": "string"
+                    },
+                    "dataset_digest": {
+                      "title": "Dataset Digest",
+                      "type": "string"
+                    },
+                    "schema": {
+                      "const": "choice-text.v1",
+                      "title": "Schema",
+                      "type": "string"
+                    },
+                    "title": {
+                      "title": "Title",
+                      "type": "string"
+                    },
+                    "items": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "id": {
+                            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$",
+                            "title": "Id",
+                            "type": "string"
+                          },
+                          "title": {
+                            "maxLength": 100,
+                            "minLength": 1,
+                            "title": "Title",
+                            "type": "string"
+                          },
+                          "prompt": {
+                            "maxLength": 4096,
+                            "minLength": 1,
+                            "title": "Prompt",
+                            "type": "string"
+                          },
+                          "choices": {
+                            "anyOf": [
+                              {
+                                "items": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "id": {
+                                      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$",
+                                      "title": "Id",
+                                      "type": "string"
+                                    },
+                                    "label": {
+                                      "maxLength": 100,
+                                      "minLength": 1,
+                                      "title": "Label",
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "id",
+                                    "label"
+                                  ],
+                                  "title": "ReviewChoice",
+                                  "type": "object"
+                                },
+                                "maxItems": 20,
+                                "minItems": 2,
+                                "type": "array"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Choices"
+                          },
+                          "asset_id": {
+                            "anyOf": [
+                              {
+                                "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Asset Id"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "title",
+                          "prompt"
+                        ],
+                        "title": "ReviewItem",
+                        "type": "object"
+                      },
+                      "title": "Items",
+                      "type": "array"
+                    },
+                    "state": {
+                      "enum": [
+                        "open",
+                        "completed"
+                      ],
+                      "title": "State",
+                      "type": "string"
+                    },
+                    "answers": {
+                      "additionalProperties": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "value": {
+                            "title": "Value",
+                            "type": "string"
+                          },
+                          "by": {
+                            "title": "By",
+                            "type": "string"
+                          },
+                          "at": {
+                            "title": "At",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "value",
+                          "by",
+                          "at"
+                        ],
+                        "title": "StoredAnswer",
+                        "type": "object"
+                      },
+                      "title": "Answers",
+                      "type": "object"
+                    },
+                    "created_by": {
+                      "title": "Created By",
+                      "type": "string"
+                    },
+                    "created_at": {
+                      "title": "Created At",
+                      "type": "string"
+                    },
+                    "updated_at": {
+                      "title": "Updated At",
+                      "type": "string"
+                    },
+                    "revision": {
+                      "title": "Revision",
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "project",
+                    "component_id",
+                    "component_revision",
+                    "topic",
+                    "dataset_digest",
+                    "schema",
+                    "title",
+                    "items",
+                    "state",
+                    "answers",
+                    "created_by",
+                    "created_at",
+                    "updated_at",
+                    "revision"
+                  ],
+                  "title": "ReviewDetail",
+                  "type": "object"
+                }
               }
             }
           }
@@ -2086,10 +2388,198 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Successful response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "id": {
+                      "title": "Id",
+                      "type": "string"
+                    },
+                    "project": {
+                      "title": "Project",
+                      "type": "string"
+                    },
+                    "component_id": {
+                      "title": "Component Id",
+                      "type": "string"
+                    },
+                    "component_revision": {
+                      "title": "Component Revision",
+                      "type": "integer"
+                    },
+                    "topic": {
+                      "title": "Topic",
+                      "type": "string"
+                    },
+                    "dataset_digest": {
+                      "title": "Dataset Digest",
+                      "type": "string"
+                    },
+                    "schema": {
+                      "const": "choice-text.v1",
+                      "title": "Schema",
+                      "type": "string"
+                    },
+                    "title": {
+                      "title": "Title",
+                      "type": "string"
+                    },
+                    "items": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "id": {
+                            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$",
+                            "title": "Id",
+                            "type": "string"
+                          },
+                          "title": {
+                            "maxLength": 100,
+                            "minLength": 1,
+                            "title": "Title",
+                            "type": "string"
+                          },
+                          "prompt": {
+                            "maxLength": 4096,
+                            "minLength": 1,
+                            "title": "Prompt",
+                            "type": "string"
+                          },
+                          "choices": {
+                            "anyOf": [
+                              {
+                                "items": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "id": {
+                                      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$",
+                                      "title": "Id",
+                                      "type": "string"
+                                    },
+                                    "label": {
+                                      "maxLength": 100,
+                                      "minLength": 1,
+                                      "title": "Label",
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "id",
+                                    "label"
+                                  ],
+                                  "title": "ReviewChoice",
+                                  "type": "object"
+                                },
+                                "maxItems": 20,
+                                "minItems": 2,
+                                "type": "array"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Choices"
+                          },
+                          "asset_id": {
+                            "anyOf": [
+                              {
+                                "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Asset Id"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "title",
+                          "prompt"
+                        ],
+                        "title": "ReviewItem",
+                        "type": "object"
+                      },
+                      "title": "Items",
+                      "type": "array"
+                    },
+                    "state": {
+                      "enum": [
+                        "open",
+                        "completed"
+                      ],
+                      "title": "State",
+                      "type": "string"
+                    },
+                    "answers": {
+                      "additionalProperties": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "value": {
+                            "title": "Value",
+                            "type": "string"
+                          },
+                          "by": {
+                            "title": "By",
+                            "type": "string"
+                          },
+                          "at": {
+                            "title": "At",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "value",
+                          "by",
+                          "at"
+                        ],
+                        "title": "StoredAnswer",
+                        "type": "object"
+                      },
+                      "title": "Answers",
+                      "type": "object"
+                    },
+                    "created_by": {
+                      "title": "Created By",
+                      "type": "string"
+                    },
+                    "created_at": {
+                      "title": "Created At",
+                      "type": "string"
+                    },
+                    "updated_at": {
+                      "title": "Updated At",
+                      "type": "string"
+                    },
+                    "revision": {
+                      "title": "Revision",
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "project",
+                    "component_id",
+                    "component_revision",
+                    "topic",
+                    "dataset_digest",
+                    "schema",
+                    "title",
+                    "items",
+                    "state",
+                    "answers",
+                    "created_by",
+                    "created_at",
+                    "updated_at",
+                    "revision"
+                  ],
+                  "title": "ReviewDetail",
+                  "type": "object"
+                }
               }
             }
           },
@@ -2124,10 +2614,127 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Successful response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "id": {
+                      "title": "Id",
+                      "type": "string"
+                    },
+                    "project": {
+                      "title": "Project",
+                      "type": "string"
+                    },
+                    "component_id": {
+                      "title": "Component Id",
+                      "type": "string"
+                    },
+                    "component_revision": {
+                      "title": "Component Revision",
+                      "type": "integer"
+                    },
+                    "topic": {
+                      "title": "Topic",
+                      "type": "string"
+                    },
+                    "dataset_digest": {
+                      "title": "Dataset Digest",
+                      "type": "string"
+                    },
+                    "schema": {
+                      "const": "choice-text.v1",
+                      "title": "Schema",
+                      "type": "string"
+                    },
+                    "title": {
+                      "title": "Title",
+                      "type": "string"
+                    },
+                    "state": {
+                      "enum": [
+                        "open",
+                        "completed"
+                      ],
+                      "title": "State",
+                      "type": "string"
+                    },
+                    "created_by": {
+                      "title": "Created By",
+                      "type": "string"
+                    },
+                    "created_at": {
+                      "title": "Created At",
+                      "type": "string"
+                    },
+                    "updated_at": {
+                      "title": "Updated At",
+                      "type": "string"
+                    },
+                    "revision": {
+                      "title": "Revision",
+                      "type": "integer"
+                    },
+                    "item_count": {
+                      "title": "Item Count",
+                      "type": "integer"
+                    },
+                    "answered_count": {
+                      "title": "Answered Count",
+                      "type": "integer"
+                    },
+                    "answers": {
+                      "additionalProperties": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "value": {
+                            "title": "Value",
+                            "type": "string"
+                          },
+                          "by": {
+                            "title": "By",
+                            "type": "string"
+                          },
+                          "at": {
+                            "title": "At",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "value",
+                          "by",
+                          "at"
+                        ],
+                        "title": "StoredAnswer",
+                        "type": "object"
+                      },
+                      "title": "Answers",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "project",
+                    "component_id",
+                    "component_revision",
+                    "topic",
+                    "dataset_digest",
+                    "schema",
+                    "title",
+                    "state",
+                    "created_by",
+                    "created_at",
+                    "updated_at",
+                    "revision",
+                    "item_count",
+                    "answered_count",
+                    "answers"
+                  ],
+                  "title": "ReviewState",
+                  "type": "object"
+                }
               }
             }
           },
@@ -2162,10 +2769,198 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Successful response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "id": {
+                      "title": "Id",
+                      "type": "string"
+                    },
+                    "project": {
+                      "title": "Project",
+                      "type": "string"
+                    },
+                    "component_id": {
+                      "title": "Component Id",
+                      "type": "string"
+                    },
+                    "component_revision": {
+                      "title": "Component Revision",
+                      "type": "integer"
+                    },
+                    "topic": {
+                      "title": "Topic",
+                      "type": "string"
+                    },
+                    "dataset_digest": {
+                      "title": "Dataset Digest",
+                      "type": "string"
+                    },
+                    "schema": {
+                      "const": "choice-text.v1",
+                      "title": "Schema",
+                      "type": "string"
+                    },
+                    "title": {
+                      "title": "Title",
+                      "type": "string"
+                    },
+                    "items": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "id": {
+                            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$",
+                            "title": "Id",
+                            "type": "string"
+                          },
+                          "title": {
+                            "maxLength": 100,
+                            "minLength": 1,
+                            "title": "Title",
+                            "type": "string"
+                          },
+                          "prompt": {
+                            "maxLength": 4096,
+                            "minLength": 1,
+                            "title": "Prompt",
+                            "type": "string"
+                          },
+                          "choices": {
+                            "anyOf": [
+                              {
+                                "items": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "id": {
+                                      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$",
+                                      "title": "Id",
+                                      "type": "string"
+                                    },
+                                    "label": {
+                                      "maxLength": 100,
+                                      "minLength": 1,
+                                      "title": "Label",
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "id",
+                                    "label"
+                                  ],
+                                  "title": "ReviewChoice",
+                                  "type": "object"
+                                },
+                                "maxItems": 20,
+                                "minItems": 2,
+                                "type": "array"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Choices"
+                          },
+                          "asset_id": {
+                            "anyOf": [
+                              {
+                                "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Asset Id"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "title",
+                          "prompt"
+                        ],
+                        "title": "ReviewItem",
+                        "type": "object"
+                      },
+                      "title": "Items",
+                      "type": "array"
+                    },
+                    "state": {
+                      "enum": [
+                        "open",
+                        "completed"
+                      ],
+                      "title": "State",
+                      "type": "string"
+                    },
+                    "answers": {
+                      "additionalProperties": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "value": {
+                            "title": "Value",
+                            "type": "string"
+                          },
+                          "by": {
+                            "title": "By",
+                            "type": "string"
+                          },
+                          "at": {
+                            "title": "At",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "value",
+                          "by",
+                          "at"
+                        ],
+                        "title": "StoredAnswer",
+                        "type": "object"
+                      },
+                      "title": "Answers",
+                      "type": "object"
+                    },
+                    "created_by": {
+                      "title": "Created By",
+                      "type": "string"
+                    },
+                    "created_at": {
+                      "title": "Created At",
+                      "type": "string"
+                    },
+                    "updated_at": {
+                      "title": "Updated At",
+                      "type": "string"
+                    },
+                    "revision": {
+                      "title": "Revision",
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "project",
+                    "component_id",
+                    "component_revision",
+                    "topic",
+                    "dataset_digest",
+                    "schema",
+                    "title",
+                    "items",
+                    "state",
+                    "answers",
+                    "created_by",
+                    "created_at",
+                    "updated_at",
+                    "revision"
+                  ],
+                  "title": "ReviewDetail",
+                  "type": "object"
+                }
               }
             }
           },
@@ -2270,10 +3065,72 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Complete asset",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "model/gltf-binary": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "Partial asset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "model/gltf-binary": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
               }
             }
           },

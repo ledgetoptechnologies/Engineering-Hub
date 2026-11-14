@@ -38,6 +38,17 @@ def test_infrastructure_devices_contract_declares_retired_filter():
                        'schema': {'type': 'boolean', 'default': False}}]
 
 
+def test_review_asset_contract_describes_complete_and_range_bytes():
+    from engineering_hub.interactive_service import TYPES
+
+    contract = json.loads((Path(__file__).parents[1] / 'contracts/hub-v1.openapi.json').read_text())
+    operation = contract['paths']['/api/hub/v1/interactive-reviews/{review_id}/assets/{asset_id}']['get']
+    for code in ('200', '206'):
+        content = operation['responses'][code]['content']
+        assert set(content) == TYPES
+        assert all(value['schema'] == {'type': 'string', 'format': 'binary'} for value in content.values())
+
+
 def test_manual_json_operations_publish_exact_required_body_schema():
     from engineering_hub.openapi_body import request_body
     from engineering_hub.interactive_reviews_api import ReviewCreate, ReviewAnswers
