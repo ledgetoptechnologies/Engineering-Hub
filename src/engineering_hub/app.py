@@ -64,9 +64,11 @@ class Settings:
     infrastructure_config_path: Path | None = None
     infrastructure_default_path: Path | None = None
     seat_foundation_enabled: bool = False
+    cross_requests_enabled: bool = False
 
     def __post_init__(self):
-        if type(self.seat_foundation_enabled) is not bool:
+        if (type(self.seat_foundation_enabled) is not bool or type(self.cross_requests_enabled) is not bool
+                or (self.cross_requests_enabled and not self.seat_foundation_enabled)):
             raise ValueError('Explicit seat foundation flag required')
         if type(self.require_owned_ledger) is not bool:
             raise ValueError('Explicit owned-ledger flag required')
@@ -202,6 +204,22 @@ class CrossSeatWrite(Input):
 
 class CrossSeatBinding(Revision):
     session_id: str = Field(min_length=36, max_length=36)
+
+
+class CrossRouteWrite(Input):
+    source_project: str = Field(min_length=1, max_length=64)
+    target_project: str = Field(min_length=1, max_length=64)
+    target_topic: str = Field(min_length=1, max_length=64)
+    participants: list[str] = Field(min_length=1, max_length=16)
+    triager: str = Field(min_length=36, max_length=36)
+    active: bool
+    share_with_source_project: bool
+    expected_revision: int = Field(ge=0)
+
+
+class CrossOwnerTransition(Revision):
+    status: Literal['accepted', 'declined', 'done', 'expired']
+    client_request_id: str = Field(min_length=1, max_length=128)
 
 
 class StaleServiceWrite(Input):
@@ -583,7 +601,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     if connection_config is not None and connection_config.hub_bridge:
         from .session_hub_bridge import SessionHubBridge
         session_bridge = SessionHubBridge(connection_service, repo, project_registry, component_registry, notes_repository,
-                                          seat_foundation_enabled=settings.seat_foundation_enabled)
+                                          seat_foundation_enabled=settings.seat_foundation_enabled,
+                                          cross_requests_enabled=settings.cross_requests_enabled)
     if settings.seat_foundation_enabled and session_bridge is None:
         raise ValueError('seat_foundation_requires_session_bridge')
     stale_evaluator = None
@@ -1265,6 +1284,33 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         @app.post('/api/hub/v1/cross-seats/{seat_id}/unbind')
         def owner_unbind_cross_seat(seat_id: str, payload: Revision, request: Request):
             return seats.unbind(role_owner(request, mutation=True), seat_id, payload.expected_revision)
+
+    if settings.cross_requests_enabled:
+        cross = session_bridge.cross_requests
+
+        @app.put('/api/hub/v1/cross-request-route')
+        def owner_cross_request_route(payload: CrossRouteWrite, request: Request):
+            return cross.set_route(role_owner(request, mutation=True), **payload.model_dump())
+
+        @app.get('/api/hub/v1/projects/{project}/cross-request-routes')
+        def owner_cross_request_routes(project: str, request: Request, limit: int = 50, after: str | None = None):
+            return cross.owner_routes(role_owner(request), project, limit, after)
+
+        @app.post('/api/hub/v1/cross-requests/{request_id}/transition')
+        def owner_transition_cross_request(request_id: str, payload: CrossOwnerTransition, request: Request):
+            return cross.owner_transition(role_owner(request, mutation=True), request_id, **payload.model_dump())
+
+        @app.get('/api/hub/v1/projects/{project}/cross-requests')
+        def owner_cross_requests(project: str, request: Request, direction: str, limit: int = 50, after: str | None = None):
+            return cross.owner_records(role_owner(request), project, direction, limit, after)
+
+        @app.get('/api/hub/v1/cross-requests/{request_id}')
+        def owner_cross_request(request_id: str, request: Request):
+            return cross.owner_get(role_owner(request), request_id)
+
+        @app.get('/api/hub/v1/cross-requests/{request_id}/messages')
+        def owner_cross_messages(request_id: str, request: Request, limit: int = 50, after: int | None = None):
+            return cross.owner_messages(role_owner(request), request_id, limit, after)
 
     @app.get('/api/hub/v1/orchestration/stale-service-grant')
     def get_stale_service_grant(request: Request):

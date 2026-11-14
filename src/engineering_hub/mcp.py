@@ -403,6 +403,48 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
             """CAS-update this session's handoff under the current seat generation."""
             return invoke(session_bridge.seat_authority.update_handoff, identity(ctx), generation, expected_revision, text)
 
+    if session_bridge is not None and session_bridge.cross_requests is not None:
+        cross = session_bridge.cross_requests
+
+        @registration.tool()
+        def hub_cross_routes(generation: StrictInt, ctx: Context, limit: StrictInt = 50, after: str | None = None) -> dict:
+            """List owner-shared destination routes for this session's current seat."""
+            return invoke(cross.routes, identity(ctx), generation, limit, after)
+
+        @registration.tool()
+        def hub_cross_request_create(generation: StrictInt, route_id: str, title: str, client_request_id: str,
+                                     ctx: Context, details: str | None = None, links: list[dict] | None = None) -> dict:
+            """Create an inert shared request; delivery is not attempted."""
+            return invoke(cross.create, identity(ctx), generation, route_id, title, details, links, client_request_id)
+
+        @registration.tool()
+        def hub_cross_request_get(generation: StrictInt, request_id: str, ctx: Context) -> dict:
+            """Read an explicitly shared request under this current seat."""
+            return invoke(cross.get, identity(ctx), generation, request_id)
+
+        @registration.tool()
+        def hub_cross_request_list(generation: StrictInt, ctx: Context, limit: StrictInt = 50, after: str | None = None) -> dict:
+            """List requests shared with this current seat before pagination."""
+            return invoke(cross.list, identity(ctx), generation, limit, after)
+
+        @registration.tool()
+        def hub_cross_request_transition(generation: StrictInt, request_id: str, expected_revision: StrictInt,
+                                         status: str, client_request_id: str, ctx: Context) -> dict:
+            """Triage as the selected target seat; no execution or completion verification."""
+            return invoke(cross.transition, identity(ctx), generation, request_id, expected_revision, status, client_request_id)
+
+        @registration.tool()
+        def hub_cross_message_append(generation: StrictInt, request_id: str, text: str,
+                                     client_request_id: str, ctx: Context) -> dict:
+            """Append an explicitly shared message; no notifications are sent."""
+            return invoke(cross.append, identity(ctx), generation, request_id, text, client_request_id)
+
+        @registration.tool()
+        def hub_cross_message_list(generation: StrictInt, request_id: str, ctx: Context,
+                                   limit: StrictInt = 50, after: StrictInt | None = None) -> dict:
+            """Read the shared conversation in sequence, with no delivery claim."""
+            return invoke(cross.messages, identity(ctx), generation, request_id, limit, after)
+
     @registration.tool()
     def hub_role_get(role: str, ctx: Context) -> dict:
         """Read one granted coordination role; no execution authority is conferred."""

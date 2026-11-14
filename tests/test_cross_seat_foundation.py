@@ -210,3 +210,49 @@ def test_disable_and_reenable_preserves_rows_and_grants(env):
                                   seat_foundation_enabled=True)
     assert call(env, token, 'hub_cross_seat_current', lambda actor: env.bridge.seat_authority.current(actor))['id'] == seat['id']
     assert env.bridge.grant_get(OWNER, identity)['state'] == 'active'
+
+
+def test_project_grant_replacement_after_binding_denies_handoff(enabled):
+    client, app, bus, _ = enabled
+    bridge = app.state.session_hub_bridge
+    scope = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=bridge)
+    installation, token, _ = pair(scope, name='seat-project-change', caps=('cross.seat.read', 'cross.seat.handoff'))
+    session_id = scope.sessions.authenticate_session(token).session_id
+    service = bridge.seat_authority
+    service.create_topic(OWNER, PROJECT, 'project-change', 'Project change')
+    seat = service.create_seat(OWNER, PROJECT, 'project-change', 'role')
+    service.bind(OWNER, seat['id'], 1, session_id)
+    bridge.grant_put(OWNER, installation, 1, ['project-alpha'], ['cross.seat.read', 'cross.seat.handoff'])
+    invoke, _ = sdk(client, token)
+    assert invoke('hub_cross_seat_handoff', {'generation': 1, 'expected_revision': 2, 'text': 'Denied'})['isError']
+    item = service.owner_list(OWNER, PROJECT, 'cross_seat', 10, None)['items'][0]
+    assert item['revision'] == 2 and item['handoff'] == ''
+
+
+def test_project_commit_recheck_denial_rolls_back_handoff(enabled, monkeypatch):
+    from agent_message_bus import session_hub_context
+    _, app, bus, _ = enabled
+    bridge = app.state.session_hub_bridge
+    scope = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=bridge)
+    _, token, _ = pair(scope, name='seat-project-commit', caps=('cross.seat.read', 'cross.seat.handoff'))
+    session_id = scope.sessions.authenticate_session(token).session_id
+    service = bridge.seat_authority
+    service.create_topic(OWNER, PROJECT, 'project-commit', 'Project commit')
+    seat = service.create_seat(OWNER, PROJECT, 'project-commit', 'role')
+    service.bind(OWNER, seat['id'], 1, session_id)
+    original_save = service.repo._save
+    def lose_project(db, actor, action, kind, item, *args, **kwargs):
+        result = original_save(db, actor, action, kind, item, *args, **kwargs)
+        if action == 'seat.handoff':
+            operation = session_hub_context.current.get()
+            assert PROJECT in operation.used_projects
+            operation.projects = ()
+        return result
+    monkeypatch.setattr(service.repo, '_save', lose_project)
+    with pytest.raises(HubError, match='hub_project_forbidden'):
+        call(scope, token, 'hub_cross_seat_handoff', lambda actor:
+             service.update_handoff(actor, 1, 2, 'Denied at commit'))
+    current = service.owner_list(OWNER, PROJECT, 'cross_seat', 10, None)['items'][0]
+    assert current['revision'] == 2 and current['handoff'] == ''
+    with service.repo._connection() as db:
+        assert not db.execute("SELECT 1 FROM hub_audit WHERE action='seat.handoff'").fetchone()

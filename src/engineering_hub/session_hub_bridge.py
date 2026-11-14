@@ -62,12 +62,16 @@ TOOLS = {
 }
 CAPABILITIES = tuple(sorted(set(TOOLS.values())))
 _SEAT_TOOLS = {'hub_cross_seat_current': 'cross.seat.read', 'hub_cross_seat_handoff': 'cross.seat.handoff'}
+_CROSS_TOOLS = {'hub_cross_routes': 'cross.request.read', 'hub_cross_request_create': 'cross.request.submit',
+                'hub_cross_request_get': 'cross.request.read', 'hub_cross_request_list': 'cross.request.read',
+                'hub_cross_request_transition': 'cross.request.triage',
+                'hub_cross_message_append': 'cross.request.message', 'hub_cross_message_list': 'cross.request.read'}
 
 
 class GrantWrite(Closed):
     expected_revision: int = Field(ge=0)
     projects: list[str] = Field(min_length=1, max_length=32)
-    capabilities: list[str] = Field(min_length=1, max_length=len(CAPABILITIES) + len(_SEAT_TOOLS))
+    capabilities: list[str] = Field(min_length=1, max_length=len(CAPABILITIES) + len(_SEAT_TOOLS) + len(_CROSS_TOOLS))
     lifetime_seconds: int = Field(default=86400, ge=60, le=604800)
 
 
@@ -127,14 +131,15 @@ class _Operation:
 
 
 class SessionHubBridge:
-    def __init__(self, sessions, repo, projects, components, knowledge, *, seat_foundation_enabled=False):
+    def __init__(self, sessions, repo, projects, components, knowledge, *, seat_foundation_enabled=False, cross_requests_enabled=False):
         if type(sessions) is not AgentSessionRepository:
             raise ValueError('exact_agent_session_repository_required')
-        if type(seat_foundation_enabled) is not bool:
+        if type(seat_foundation_enabled) is not bool or type(cross_requests_enabled) is not bool or (cross_requests_enabled and not seat_foundation_enabled):
             raise ValueError('explicit_seat_foundation_flag_required')
-        self.tools = {**TOOLS, **(_SEAT_TOOLS if seat_foundation_enabled else {})}
+        self.tools = {**TOOLS, **(_SEAT_TOOLS if seat_foundation_enabled else {}), **(_CROSS_TOOLS if cross_requests_enabled else {})}
         self.capabilities = tuple(sorted(set(self.tools.values())))
         self.seat_authority = None
+        self.cross_requests = None
         self.sessions, self.repo, self.projects, self.components = sessions, repo, projects, components
         self.pid = os.getpid()
         self.knowledge_path = Path(knowledge.db_path).resolve()
@@ -171,6 +176,9 @@ class SessionHubBridge:
             if seat_foundation_enabled:
                 from .seat_authority import SeatAuthority
                 self.seat_authority = SeatAuthority(self)
+            if cross_requests_enabled:
+                from .cross_requests import CrossRequests
+                self.cross_requests = CrossRequests(self)
             sessions._hub_bridge_tools = tuple(self.tools)
             sessions._hub_bridge_owner = self
         except BaseException:
@@ -517,6 +525,25 @@ class SessionHubBridge:
                                         operation.principal.authorization_revision, 'cross.seat.read',
                                         session_id=operation.principal.session_id)
                                     operation.project(result['project'])
+                                if fn.__name__ in {'hub_cross_routes', 'hub_cross_request_get',
+                                                   'hub_cross_request_list', 'hub_cross_message_list'}:
+                                    service = bridge.cross_requests
+                                    actor = operation.principal.actor
+                                    generation = arguments['generation']
+                                    if fn.__name__ == 'hub_cross_routes':
+                                        checked = service.routes(actor, generation, arguments.get('limit', 50), arguments.get('after'))
+                                    elif fn.__name__ == 'hub_cross_request_get':
+                                        checked = service.get(actor, generation, arguments['request_id'])
+                                    elif fn.__name__ == 'hub_cross_request_list':
+                                        checked = service.list(actor, generation, arguments.get('limit', 50), arguments.get('after'))
+                                    else:
+                                        checked = service.messages(actor, generation, arguments['request_id'],
+                                                                   arguments.get('limit', 50), arguments.get('after'))
+                                    if checked != result:
+                                        raise HubError('cross_request_unavailable', 404)
+                                    bridge._live(operation.db, operation.secret,
+                                        operation.principal.authorization_revision, 'cross.request.read',
+                                        session_id=operation.principal.session_id)
                                 read_required = {
                                     'hub_tracking_task_propose': 'tracking.read', 'hub_tracking_draft_propose': 'tracking.read',
                                     'hub_tracking_task_update': 'tracking.read',
