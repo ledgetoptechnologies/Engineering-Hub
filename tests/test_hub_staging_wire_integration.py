@@ -33,6 +33,15 @@ from hub_staging_service.core import Service
 
 
 pytestmark = pytest.mark.skipif(os.name != 'posix', reason='Real private credential file modes require POSIX')
+@pytest.fixture(autouse=True)
+def experimental_profile_protocol(monkeypatch):
+    from engineering_hub import staging_controller
+    from hub_staging_service import core
+    monkeypatch.setattr(staging_controller, '_PROFILE_PROTOCOL_READY', True)
+    monkeypatch.setattr(core, '_PROFILE_PROTOCOL_READY', True)
+    monkeypatch.setattr(core, '_SOURCE_ATTEMPT_ENABLED', True)
+
+
 HTML = b'<html>source</html>'
 PROJECTS = {'engineering-hub': {'recipes': ['static']}}
 
@@ -115,7 +124,7 @@ class Wire:
         credential.chmod(0o600)
         ca, context = private_tls(root)
         self.counts, self.received, self.guard = Counter(), [], threading.Lock()
-        self.drop_jobs = self.drop_cleanup = False
+        self.drop_jobs = self.drop_cleanup = self.drop_sources = False
         wire = self
         production_handler = handler(self.service, token, {ipaddress.ip_address('127.0.0.1')})
 
@@ -132,10 +141,13 @@ class Wire:
                 # handler exception or client-side synthetic transport is used.
                 with wire.guard:
                     drop = (self.command == 'POST' and
-                            (self.path == '/v1/jobs' and status == 202 and wire.drop_jobs or
+                            (self.path == '/v2/sources' and status == 200 and wire.drop_sources or
+                             self.path == '/v2/jobs' and status == 202 and wire.drop_jobs or
                              self.path == '/v1/cleanup' and status == 200 and wire.drop_cleanup))
                     if drop:
-                        if self.path == '/v1/jobs':
+                        if self.path == '/v2/sources':
+                            wire.drop_sources = False
+                        elif self.path == '/v2/jobs':
                             wire.drop_jobs = False
                         else:
                             wire.drop_cleanup = False
@@ -174,10 +186,17 @@ class Wire:
         try:
             resources.set_policy('human:1', 'engineering-hub', 0,
                 {'codex': ['read', 'build', 'test', 'cleanup', 'preview'],
-                 'human:1': ['read', 'cleanup', 'preview']})
+                 'claude': ['read'], 'human:1': ['read', 'cleanup', 'preview']})
         except HubError as error:
             if error.code != 'revision_conflict':
                 raise
+        from engineering_hub.modular_staging_profile import from_worker_recipe
+        with repo._connection() as db:
+            existing = db.execute('SELECT 1 FROM hub_staging_profile_enrollments WHERE project=? AND recipe=?',
+                                  ('engineering-hub', 'static')).fetchone()
+        if existing is None:
+            resources.enroll_profile('human:1', 'engineering-hub', 'static', 0,
+                from_worker_recipe(self.service.projects['engineering-hub']['static']))
         queue, actions = compose_queue(repo, existing_queue, PROJECTS_RECIPES, 'synthetic-host')
         controller = StagingController(repo, queue, StagingClient(self.config), resources=resources,
             control_principal=principal, actions=actions, poll_interval=0.01, max_poll_seconds=6)
@@ -185,7 +204,7 @@ class Wire:
         self.controller, self.resources, self.repo = controller, resources, repo
         return controller
 
-    def posts(self, path='/v1/jobs'):
+    def posts(self, path='/v2/jobs'):
         with self.guard:
             return self.counts[('POST', path)]
 

@@ -18,6 +18,34 @@ from hub_staging_service.scratch import ScratchSlot, ScratchLease, filesystem_fa
 import hub_staging_service.scratch as scratch
 
 
+@pytest.fixture(autouse=True)
+def experimental_worker_gate(monkeypatch):
+    from hub_staging_service import core
+    monkeypatch.setattr(core, '_PROFILE_PROTOCOL_READY', True)
+    monkeypatch.setattr(core, '_SOURCE_ATTEMPT_ENABLED', True)
+
+
+def prepare_job(service, item):
+    from hub_staging_service.source_provenance import _archive_tree, _object_id
+    from hub_staging_service.modular_staging_profile import from_worker_recipe, profile_digest
+    raw = base64.b64decode(item['source_zip_base64'])
+    tree = _archive_tree(raw)[0]
+    obj = (f'tree {tree}\nauthor Test <test@example.invalid> 1 +0000\n'
+           f'committer Test <test@example.invalid> 1 +0000\n\nfixture\n').encode()
+    commit = _object_id(b'commit', obj)
+    source_id = str(uuid.uuid4())
+    receipt = service.put_source({'profile_protocol':'hub-staging-profile.v2', 'source_id':source_id,
+        'project':item['project'], 'source_digest':item['source_digest'],
+        'source_zip_base64':item.pop('source_zip_base64'), 'source_commit':commit,
+        'source_commit_object_base64':base64.b64encode(obj).decode()})
+    effective = service.projects[item['project']][item['recipe']]
+    item.update(source_id=source_id, source_commit=commit, require_source_binding=True,
+        expected_source_binding=receipt['source_binding'], reviewed_profile={
+            'project':item['project'], 'recipe':item['recipe'], 'generation':1,
+            'digest':profile_digest(from_worker_recipe(effective))})
+    return item
+
+
 def config(path='/scratch'):
     return dict(path=path, filesystem_uuid='e5742e20-3dc9-4df5-92b0-8699ebc3400c',
                 mount_device='8:9', ceiling_bytes=2*1024**3, ceiling_inodes=100000,
@@ -28,7 +56,8 @@ def config(path='/scratch'):
 def payload():
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, 'w') as archive:
-        archive.writestr('index.html', 'source')
+        info = zipfile.ZipInfo('index.html'); info.create_system = 3; info.external_attr = 0o100644 << 16
+        archive.writestr(info, 'source')
     raw = stream.getvalue()
     return dict(command_id=str(uuid.uuid4()), job_id=str(uuid.uuid4()), idempotency_key=str(uuid.uuid4()),
                 project='demo', recipe='default', source_commit='a'*40,
@@ -121,9 +150,10 @@ def test_synthetic_acceptance_and_reservation_rollback_together(tmp_path, synthe
         original(self, *args)
         raise Rejected('injected_after_lease_insert')
     monkeypatch.setattr(ScratchSlot, 'reserve', reserve_then_fail)
+    job = prepare_job(service, payload())
     try:
-        with pytest.raises(Rejected):
-            service.submit(payload())
+        with pytest.raises(Rejected, match='injected_after_lease_insert'):
+            service.submit(job)
         assert service.db.execute('SELECT count(*) FROM operations').fetchone()[0] == 0
         assert service.db.execute('SELECT count(*) FROM scratch_leases').fetchone()[0] == 0
         assert list(synthetic_slot.path.iterdir()) == []
@@ -148,7 +178,7 @@ def test_synthetic_release_after_terminal_receipt_only(tmp_path, synthetic_slot,
         self._db.commit()
     monkeypatch.setattr(ScratchLease, 'release', release)
     service = Service(tmp_path/'worker', {'demo':profile()}, Backend(fail=failure), scratch_slot=synthetic_slot)
-    job = payload()
+    job = prepare_job(service, payload())
     try:
         service.submit(job); service.wait()
         assert service.status(job['job_id'])['state'] == ('failed' if failure else 'succeeded')
@@ -162,7 +192,8 @@ def test_synthetic_release_after_terminal_receipt_only(tmp_path, synthetic_slot,
 def test_synthetic_missing_absence_holds_and_restart_without_config_cannot_bypass(tmp_path, synthetic_slot):
     root = tmp_path/'worker'
     service = Service(root, {'demo':profile()}, Backend(proof=False), scratch_slot=synthetic_slot)
-    job = payload()
+    job = prepare_job(service, payload())
+    second=prepare_job(service,payload())
     service.submit(job); service.wait()
     assert service.status(job['job_id'])['state'] == 'held'
     assert service.db.execute('SELECT state FROM scratch_leases').fetchone()[0] == 'occupied'
@@ -171,7 +202,7 @@ def test_synthetic_missing_absence_holds_and_restart_without_config_cannot_bypas
     try:
         assert restarted.status(job['job_id'])['state'] == 'held'
         with pytest.raises(Rejected, match='worker_busy_or_held'):
-            restarted.submit(payload())
+            restarted.submit(second)
         assert restarted.submit(job)['state'] == 'held'
         assert restarted.backend.calls == 0
     finally:
@@ -181,21 +212,22 @@ def test_synthetic_missing_absence_holds_and_restart_without_config_cannot_bypas
 def test_synthetic_cleanup_failure_retains_exclusive_lease(tmp_path, synthetic_slot, monkeypatch):
     monkeypatch.setattr(ScratchLease, 'release', lambda self: (_ for _ in ()).throw(OSError('injected fsync failure')))
     service = Service(tmp_path/'worker', {'demo':profile()}, Backend(), scratch_slot=synthetic_slot)
-    job=payload()
+    job=prepare_job(service,payload())
+    second=prepare_job(service,payload())
     try:
         service.submit(job); service.wait()
         assert service.status(job['job_id'])['result']['error'] == 'scratch_cleanup_uncertain'
         assert service.status(job['job_id'])['state'] == 'held'
         assert service.db.execute('SELECT state FROM scratch_leases').fetchone()[0] == 'occupied'
         with pytest.raises(Rejected):
-            service.submit(payload())
+            service.submit(second)
     finally:
         service.close()
 
 
 def test_synthetic_wrong_command_never_confirms_absence(tmp_path, synthetic_slot):
     service = Service(tmp_path/'worker', {'demo':profile()}, Backend(proof=False), scratch_slot=synthetic_slot)
-    job=payload()
+    job=prepare_job(service,payload())
     try:
         service.submit(job); service.wait()
         lease=synthetic_slot.lease(service.db,job['command_id'])
@@ -274,7 +306,7 @@ def test_synthetic_cleanup_exhaustion_does_not_weaken_identity(monkeypatch):
 
 def test_synthetic_materialized_binding_cannot_change_resource_ids(tmp_path,synthetic_slot):
     service=Service(tmp_path/'worker',{'demo':profile()},Backend(proof=False),scratch_slot=synthetic_slot)
-    job=payload()
+    job=prepare_job(service,payload())
     try:
         service.submit(job);service.wait()
         row=service.db.execute('SELECT payload FROM operations').fetchone()
@@ -297,7 +329,8 @@ def test_synthetic_accepted_or_start_failure_survives_restart(tmp_path,synthetic
     monkeypatch.setattr(core.threading,'Thread',DeferredThread)
     root=tmp_path/'worker'
     service=Service(root,{'demo':profile()},Backend(),scratch_slot=synthetic_slot)
-    job=payload()
+    job=prepare_job(service,payload())
+    second=prepare_job(service,payload())
     if start_fails:
         with pytest.raises(Rejected,match='worker_start_failed'):service.submit(job)
     else:
@@ -308,7 +341,7 @@ def test_synthetic_accepted_or_start_failure_survives_restart(tmp_path,synthetic
     restarted=Service(root,{'demo':profile()},Backend(),scratch_slot=synthetic_slot)
     try:
         assert restarted.status(job['job_id'])['state']=='held'
-        with pytest.raises(Rejected):restarted.submit(payload())
+        with pytest.raises(Rejected):restarted.submit(second)
     finally:restarted.close()
 
 
@@ -317,7 +350,7 @@ def test_synthetic_filesystem_with_real_posix_cleanup_receipt(tmp_path,synthetic
     # Actual POSIX temp-directory lifecycle, but injected dedicated-fs facts.
     # This proves journal/removal behavior, not a physical quota.
     service=Service(tmp_path/'worker',{'demo':profile()},Backend(),scratch_slot=synthetic_slot)
-    job=payload()
+    job=prepare_job(service,payload())
     try:
         service.submit(job);service.wait()
         assert service.status(job['job_id'])['state']=='succeeded'
@@ -399,7 +432,7 @@ def test_synthetic_backend_false_absence_cannot_trigger_recursive_host_cleanup(t
             scratch_lease.confirm_backend_absent(command_id)
             return {}
     service=Service(tmp_path/'worker',{'demo':profile()},UnsweptBackend(),scratch_slot=synthetic_slot)
-    job=payload()
+    job=prepare_job(service,payload())
     try:
         service.submit(job);service.wait()
         assert service.status(job['job_id'])['state']=='held'

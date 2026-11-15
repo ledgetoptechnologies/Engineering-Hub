@@ -26,8 +26,11 @@ def request_for(repo):
     commit = _object_id(b'commit', obj)
     task = repo.create_task('human:1', 'engineering-hub', 'fixture', str(uuid.uuid4()))
     task = repo.claim_task('codex', task['id'], task['revision'])
-    task = repo.set_candidate('codex', task['id'], task['revision'], commit)
-    task = repo.review_task('claude', task['id'], task['revision'], commit, 'approve')
+    with repo._connection() as db:
+        profile = dict(db.execute('SELECT project,recipe,generation,digest FROM hub_staging_profile_enrollments WHERE project=? AND recipe=? ORDER BY generation DESC LIMIT 1', ('engineering-hub', 'static')).fetchone())
+    task = repo.set_candidate('codex', task['id'], task['revision'], commit,
+                              {'recipe': 'static', 'generation': profile['generation']})
+    task = repo.review_task('claude', task['id'], task['revision'], commit, 'approve', profile)
     return {'request_id': str(uuid.uuid4()), 'review_task_id': task['id'],
             'review_task_revision': task['revision'], 'project': 'engineering-hub', 'recipe': 'static',
             'source_commit': commit, 'source_digest': hashlib.sha256(raw).hexdigest(),

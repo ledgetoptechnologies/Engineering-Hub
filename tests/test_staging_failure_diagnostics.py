@@ -13,7 +13,14 @@ import pytest
 from hub_staging_service.core import Service, Rejected, recipe
 from hub_staging_service.docker import DockerBackend, FrozenDiagnosticFailure
 from tests.test_staging_service_docker import diagnostic_stage_probe, profile
-from tests.test_staging_service_scratch import payload
+from tests.test_staging_service_scratch import payload, prepare_job
+
+
+@pytest.fixture(autouse=True)
+def experimental_worker_gate(monkeypatch):
+    from hub_staging_service import core
+    monkeypatch.setattr(core, '_PROFILE_PROTOCOL_READY', True)
+    monkeypatch.setattr(core, '_SOURCE_ATTEMPT_ENABLED', True)
 
 
 def service_probe(tmp_path,monkeypatch,*,stage='build',mode='nonzero',exit_code=7,absence=True):
@@ -48,7 +55,7 @@ def service_probe(tmp_path,monkeypatch,*,stage='build',mode='nonzero',exit_code=
 def test_failed_recipe_registers_only_frozen_test_run_and_exact_manifest(tmp_path,monkeypatch,stage):
     service,backend,events=service_probe(tmp_path,monkeypatch,stage=stage)
     try:
-        job=payload();service.submit(job);service.wait()
+        job=prepare_job(service,payload());service.submit(job);service.wait()
         result=service.status(job['job_id'])
         assert result['state']=='failed' and result['result']['error']=='stage_'+stage+'_failed'
         fact=service.metadata(job['resource_ids']['test_run'])
@@ -72,7 +79,7 @@ def test_failed_recipe_registers_only_frozen_test_run_and_exact_manifest(tmp_pat
 def test_unknown_or_unfrozen_failure_is_held_and_never_registered(tmp_path,monkeypatch,mode,exit_code,absence):
     service,_,_=service_probe(tmp_path,monkeypatch,mode=mode,exit_code=exit_code,absence=absence)
     try:
-        job=payload();service.submit(job);service.wait()
+        job=prepare_job(service,payload());service.submit(job);service.wait()
         result=service.status(job['job_id'])
         assert result['state']=='held' and 'diagnostic' not in result['result']
         assert service.metadata(job['resource_ids']['test_run'])['state']=='building'
@@ -85,7 +92,7 @@ def test_log_only_failure_requires_the_same_explicit_absence_proof(tmp_path,monk
     service,backend,_=service_probe(tmp_path,monkeypatch)
     monkeypatch.setattr(backend,'_export',lambda *args,**kwargs:None)
     try:
-        job=payload();service.submit(job);service.wait()
+        job=prepare_job(service,payload());service.submit(job);service.wait()
         fact=service.metadata(job['resource_ids']['test_run'])
         assert service.status(job['job_id'])['state']=='failed' and set(fact['manifest'])=={'build.log'}
     finally:service.close()
@@ -96,7 +103,7 @@ def test_log_only_failure_requires_the_same_explicit_absence_proof(tmp_path,monk
 def test_registered_download_rejects_changed_or_unsafe_artifact(tmp_path,monkeypatch,tamper):
     service,_,_=service_probe(tmp_path,monkeypatch)
     try:
-        job=payload();service.submit(job);service.wait();identity=job['resource_ids']['test_run']
+        job=prepare_job(service,payload());service.submit(job);service.wait();identity=job['resource_ids']['test_run']
         fact=service.metadata(identity);digest=service.status(job['job_id'])['result']['diagnostic']['manifest_sha256']
         name='build/failure.json';path=service.resources/identity/'build'/'failure.json'
         if tamper=='bytes':path.write_text('different')
@@ -128,7 +135,7 @@ def test_non_scratch_engine_retarget_before_cleanup_cannot_issue_diagnostic_rece
         finally:monkeypatch.setattr(backend,'_verify_daemon',lambda:'foreign-engine-B')
     monkeypatch.setattr(backend,'_run_stages',changed)
     try:
-        job=payload();service.submit(job);service.wait()
+        job=prepare_job(service,payload());service.submit(job);service.wait()
         assert service.status(job['job_id'])['state']=='held'
         assert service.metadata(job['resource_ids']['test_run'])['state']=='building'
     finally:service.close()
@@ -140,7 +147,7 @@ def test_private_worker_get_downloads_registered_bytes_with_manifest_binding(tmp
     service,_,_=service_probe(tmp_path,monkeypatch)
     server=None;thread=None
     try:
-        job=payload();service.submit(job);service.wait();identity=job['resource_ids']['test_run']
+        job=prepare_job(service,payload());service.submit(job);service.wait();identity=job['resource_ids']['test_run']
         digest=service.status(job['job_id'])['result']['diagnostic']['manifest_sha256']
         token='synthetic-private-diagnostic-token'
         server=BoundedServer(('127.0.0.1',0),handler(service,token,{ipaddress.ip_address('127.0.0.1')}))

@@ -12,13 +12,17 @@ from tests.test_hub_staging_controller import Client, payload
 
 
 @pytest.fixture
-def shared(tmp_path):
+def shared(tmp_path, monkeypatch):
+    from engineering_hub import staging_controller
+    from tests.test_staging_profile_task_binding import PROFILE
+    monkeypatch.setattr(staging_controller, '_PROFILE_PROTOCOL_READY', True)
     repo = HubRepository(tmp_path / 'shared.db', execution_principal=CONTAINER_PILOT_EXECUTOR)
     now, principal = [1800000000], object()
     resources = StagingResourceStore(repo, admin_actors=frozenset({'human:1'}),
                                     control_principal=principal, clock=lambda: now[0])
     resources.set_policy('human:1', 'engineering-hub', 0,
-                         {'codex': ['read', 'build', 'test', 'cleanup', 'preview']})
+                         {'codex': ['read', 'build', 'test', 'cleanup', 'preview'], 'claude':['read']})
+    resources.enroll_profile('human:1', 'engineering-hub', 'static', 0, PROFILE)
     queue, actions = compose_queue(repo, None, {'engineering-hub': ['static']}, 'staging-pc')
     queue.actions['pilot-fixture'] = WorkAction('staging-pc', project='engineering-hub')
     policies = SharedExecutionPolicies(repo, queue)

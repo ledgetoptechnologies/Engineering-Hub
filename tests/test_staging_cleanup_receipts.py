@@ -12,7 +12,7 @@ import pytest
 from hub_staging_service.core import Rejected
 from hub_staging_service.core import Service
 from hub_staging_service.terminal_receipt import TerminalReceipt, FRAME_BYTES, _decode
-from tests.test_staging_service_scratch import payload, profile
+from tests.test_staging_service_scratch import payload, profile, prepare_job
 from tests.test_staging_service_terminal_receipt import configured, close, Backend
 
 
@@ -22,7 +22,7 @@ def request(job,kinds=('preview',)):
 
 
 def finished(configured):
-    service=configured(slots=8);job=payload();service.submit(job);service.wait()
+    service=configured(slots=8);job=prepare_job(service,payload());service.submit(job);service.wait()
     assert service.status(job['job_id'])['state']=='succeeded'
     return service,job
 
@@ -205,8 +205,11 @@ def test_cleanup_binding_variant_is_explicit_and_bounded(change):
 
 
 def test_legacy_cleanup_uncertainty_veto_survives_restart_without_receipt_config(tmp_path,monkeypatch):
+    from hub_staging_service import core
+    monkeypatch.setattr(core, '_PROFILE_PROTOCOL_READY', True)
+    monkeypatch.setattr(core, '_SOURCE_ATTEMPT_ENABLED', True)
     root=tmp_path/'legacy';service=Service(root,{'demo':profile()},Backend())
-    job=payload();service.submit(job);service.wait();cleanup=request(job)
+    job=prepare_job(service,payload());service.submit(job);service.wait();cleanup=request(job)
     remove=Mock(side_effect=OSError(errno.ENOSPC,'legacy uncertain deletion'))
     monkeypatch.setattr(service,'_delete_cleanup_resource',remove)
     try:

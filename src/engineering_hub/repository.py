@@ -1066,6 +1066,10 @@ class HubRepository:
         # The bound worker/admission protocol is not installed yet.
         if db is not None and self._profile_task_row(db, task['id']) is not None:
             return False
+        return self._reviewed_task_identity_matches(task, actor, revision, commit, db=db)
+
+    def _reviewed_task_identity_matches(self, task, actor, revision, commit, *, db):
+        """Shared lineage check; does not by itself authorize staging."""
         review = task.get('review')
         if not (type(revision) is int and task.get('revision') == revision
                 and task.get('status') == 'verified' and task.get('owner') == actor
@@ -1100,6 +1104,28 @@ class HubRepository:
         return (reviewer_valid and candidate_valid
                 and type(reviewer_family) is str
                 and reviewer_family != candidate_family)
+
+    def reviewed_staging_profile(self, db, identity, actor, revision, commit, project, recipe):
+        """Resolve an exact current independently reviewed tuple in one DB snapshot.
+
+        A tuple is evidence for future admission checks, not execution authority.
+        Callers must hold the appropriate transaction through admission.
+        """
+        try:
+            task = self._get(db, identity, 'task')
+            row = self._profile_task_row(db, identity)
+            if (row is None or task['project'] != project or row['project'] != project
+                    or row['recipe'] != recipe or row['commit_oid'] != commit
+                    or row['review_revision'] != revision or row['reviewer'] != task.get('review', {}).get('actor')
+                    or not self._reviewed_task_identity_matches(task, actor, revision, commit, db=db)):
+                return None
+            profile, _ = self._resolve_enrolled_profile(db, actor, project,
+                {'recipe': recipe, 'generation': row['generation']})
+            if profile['digest'] != row['digest']:
+                return None
+            return profile
+        except (HubError, KeyError, TypeError, ValueError, AttributeError, sqlite3.Error):
+            return None
 
     def _session_event_matches(self, db, task_id, action, revision, actor,
                                family, session_id=None, *, capability):

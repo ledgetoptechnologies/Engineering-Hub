@@ -24,6 +24,10 @@ from .staging_resources import KINDS
 from .staging_client import _FILE_TYPES, StagingNotAccepted, _failed_result_consistent
 from .work_queue import WorkAction, WorkQueue, WorkTarget, WorkWorker, STAGING_SERVICE_EXECUTOR
 
+# Development interlock: remove only after the bound protocol and proof path
+# are complete and reviewed. No remote source deposit or job admission.
+_PROFILE_PROTOCOL_READY = False
+
 _PROOF_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix='staging-proof')
 _PROOF_SLOT = BoundedSemaphore(1)
 # Admission receipts are retained, never silently pruned. Exhaustion is a
@@ -166,11 +170,21 @@ class StagingController:
                 if item.get('hold_reason') == _UNBOUND_HOLD or not _valid_source_binding(item):
                     return False
                 self._grants(item['actor'], item['project'])
+                if 'reviewed_profile' in item:
+                    if not _PROFILE_PROTOCOL_READY:
+                        return False
+                    with self.repo._connection() as db:
+                        reviewed = self.repo.reviewed_staging_profile(db, value.task_id, actor,
+                            value.review_revision, value.source_commit, item['project'], item['recipe'])
+                    review_valid = type(item['reviewed_profile']) is dict and reviewed == item['reviewed_profile']
+                else:
+                    review_valid = self.repo.reviewed_task_matches(value.task_id, actor,
+                        value.review_revision, value.source_commit)
                 return (actor == item['actor'] and environment == 'staging' and item['phase'] != 'depositing'
                         and action == self.actions[(item['project'], item['recipe'])]
                         and value.task_id == item['review_task_id']
                         and value.review_revision == item['review_task_revision']
-                        and self.repo.reviewed_task_matches(value.task_id, actor, value.review_revision, value.source_commit)
+                        and review_valid
                         and value.source_commit == item['source_commit']
                         and value.artifact_digest == 'sha256:' + item['source_digest'])
             except Exception:
@@ -217,7 +231,7 @@ class StagingController:
         return any(row['action_key'] not in self.queue.actions or
                    row['action_key'] not in self.actions.values() and previous_target is None for row in rows)
 
-    async def submit(self, actor, payload):
+    async def _legacysubmit(self, actor, payload):
         self._shared_guard(admission=True)
         _require(actor in AGENTS, 'staging_agent_required', 403)
         fields = {'request_id', 'review_task_id', 'review_task_revision', 'project', 'recipe',
@@ -287,6 +301,161 @@ class StagingController:
                 self._shared_guard(admission=True)
                 receipt = await self.client.put_source({'source_id': item['source_id'], 'project': project,
                     'source_digest': item['source_digest'], 'source_zip_base64': encoded,
+                    'source_commit': item['source_commit'],
+                    'source_commit_object_base64': payload['source_commit_object_base64']})
+                self._shared_guard()
+                _require(all(receipt.get(key) == item[key] for key in ('source_id', 'source_digest', 'project')),
+                         'staging_source_receipt_mismatch', 502)
+                _require(receipt.get('source_binding') == binding, 'staging_source_binding_receipt_mismatch', 502)
+                item['phase'] = 'deposited'; self._save(item)
+            if item['job_id'] is None:
+                self._shared_guard(admission=True)
+                target = WorkTarget(item['review_task_id'], item['source_commit'], 'sha256:' + item['source_digest'],
+                                    item['review_task_revision'], item['id'])
+                job = self.queue.submit(actor=actor, request_id='staging:' + item['request_id'],
+                    action_key=self.actions[(project, recipe)], environment='staging', target=target)
+                item['job_id'] = job['id']; self._save(item)
+            self.resources.bind_job(self.principal, item['job_id'], project=project, created_by=actor,
+                                    source_commit=item['source_commit'], artifact_digest=None)
+            # Recover a registration interrupted before submission-journal update.
+            with self.repo._connection() as db:
+                registered = [json.loads(row[0]) for row in db.execute("SELECT data FROM hub_entities WHERE kind='staging_resource'")]
+            for kind in sorted(KINDS):
+                if kind not in item['resource_ids']:
+                    old = next((resource for resource in registered if resource['job_id'] == item['job_id'] and resource['kind'] == kind), None)
+                    resource = old or self.resources.register_resource(self.principal, item['job_id'], kind, topic=topic)
+                    item['resource_ids'][kind] = resource['id']; self._save(item)
+            if item['phase'] == 'deposited':
+                item['phase'] = 'queued'; self._save(item)
+            self.wake.set()
+            return self.get_job(actor, item['job_id'])
+
+
+    async def submit(self, actor, payload):
+        # Durable original identity determines the protocol of a retry. Never
+        # reinterpret a bound request as v1 when the v2 gate is disabled.
+        if type(actor) is str and type(payload) is dict and type(payload.get('request_id')) is str:
+            with self.repo._connection() as db:
+                row = db.execute('SELECT data FROM hub_staging_submissions WHERE actor=? AND request_id=?',
+                                 (actor, payload['request_id'])).fetchone()
+            if row is not None:
+                previous = json.loads(row['data'])
+                _require(type(previous) is dict, 'staging_submission_changed', 409)
+                if 'reviewed_profile' in previous:
+                    return await self._v2submit(actor, payload)
+                return await self._legacysubmit(actor, payload)
+        if _PROFILE_PROTOCOL_READY:
+            return await self._v2submit(actor, payload)
+        return await self._legacysubmit(actor, payload)
+
+    async def _v2submit(self, actor, payload):
+        self._shared_guard(admission=True)
+        _require(actor in AGENTS, 'staging_agent_required', 403)
+        fields = {'request_id', 'review_task_id', 'review_task_revision', 'project', 'recipe',
+                  'source_commit', 'source_digest', 'source_zip_base64', 'source_commit_object_base64'}
+        _require(type(payload) is dict and set(payload) in (fields, fields | {'topic'}))
+        _id(payload['request_id'])
+        _id(payload['review_task_id'])
+        _require(type(payload['review_task_revision']) is int and payload['review_task_revision'] >= 1,
+                 'staging_review_required', 409)
+        project, recipe = payload['project'], payload['recipe']
+        _require((project, recipe) in self.actions, 'staging_profile_not_registered', 403)
+        self._grants(actor, project)
+        _require(type(payload['source_commit']) is str and re.fullmatch('[a-f0-9]{40}', payload['source_commit']))
+        _require(type(payload['source_digest']) is str and re.fullmatch('[a-f0-9]{64}', payload['source_digest']))
+        encoded = payload['source_zip_base64']
+        _require(type(encoded) is str and len(encoded) <= 11184812)
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except ValueError:
+            raise HubError('invalid_staging_source') from None
+        _require(len(raw) <= 8 * 1024**2 and hashlib.sha256(raw).hexdigest() == payload['source_digest'], 'staging_source_digest_mismatch')
+        _require(type(payload['source_commit_object_base64']) is str
+                 and 0 < len(payload['source_commit_object_base64']) <= 87384, 'staging_source_binding_invalid')
+        with self.repo._connection() as db:
+            prior = db.execute('SELECT data FROM hub_staging_submissions WHERE actor=? AND request_id=?',
+                               (actor, payload['request_id'])).fetchone()
+        if prior is not None:
+            previous = json.loads(prior['data'])
+            _require(all(previous.get(key) == payload.get(key) for key in (
+                'review_task_id', 'review_task_revision', 'project', 'recipe', 'source_commit', 'source_digest'))
+                and previous.get('topic') == payload.get('topic'), 'staging_request_conflict', 409)
+        _require(_PROOF_SLOT.acquire(blocking=False), 'staging_source_verification_busy', 503)
+        from hub_staging_service.source_provenance import verify
+        try:
+            future = _PROOF_EXECUTOR.submit(verify, raw, payload['source_commit_object_base64'], payload['source_commit'])
+        except BaseException:
+            _PROOF_SLOT.release()
+            raise
+        future.add_done_callback(lambda _: _PROOF_SLOT.release())
+        try:
+            binding = await asyncio.shield(asyncio.wrap_future(future))
+        except ValueError:
+            raise HubError('staging_source_binding_invalid') from None
+        topic = payload.get('topic')
+        _require(topic is None or type(topic) is str and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', topic))
+        public = {key: value for key, value in payload.items()
+                  if key not in {'source_zip_base64', 'source_commit_object_base64'}}
+        public['source_binding'] = binding
+        public['topic'] = topic  # Omitted and explicit null have one request identity.
+        async with self._short_lock():
+            with self.repo._transaction() as db:
+                # Proof verification awaits a worker thread; a grant may have
+                # been revoked while it ran. Order the current read/write
+                # decision with policy updates in this same transaction.
+                self.resources._authorize(db, actor, project, 'build')
+                self.resources._authorize(db, actor, project, 'test')
+                reviewed_profile = self.repo.reviewed_staging_profile(db, payload['review_task_id'], actor,
+                    payload['review_task_revision'], payload['source_commit'], project, recipe)
+                _require(reviewed_profile is not None, 'staging_review_required', 409)
+                public['reviewed_profile'] = reviewed_profile
+                fingerprint = hashlib.sha256(_json(public).encode()).hexdigest()
+                old = db.execute('SELECT * FROM hub_staging_submissions WHERE actor=? AND request_id=?', (actor, payload['request_id'])).fetchone()
+                if old:
+                    _require(old['fingerprint'] == fingerprint, 'staging_request_conflict', 409)
+                    item = json.loads(old['data'])
+                else:
+                    _require(_PROFILE_PROTOCOL_READY, 'staging_profile_protocol_unavailable', 503)
+                    item = dict(public, id=str(uuid.uuid4()), actor=actor, source_id=str(uuid.uuid4()),
+                                phase='depositing', job_id=None, resource_ids={}, command_id=str(uuid.uuid4()), topic=topic)
+                    db.execute('INSERT INTO hub_staging_submissions VALUES(?,?,?,?,?)',
+                               (item['id'], actor, payload['request_id'], fingerprint, _json(item)))
+            if not _PROFILE_PROTOCOL_READY:
+                # A complete, already accepted receipt may be re-read with
+                # current authorization and exact original identity. No
+                # registration, source deposit, claim or remote call occurs.
+                _require(item['phase'] in {'queued', 'dispatching', 'accepted', 'held', 'verified'}
+                         and item.get('job_id') is not None and type(item.get('resource_ids')) is dict
+                         and set(item['resource_ids']) == KINDS,
+                         'staging_profile_protocol_unavailable', 503)
+                return self.get_job(actor, item['job_id'])
+            if item['phase'] == 'deposit_unknown':
+                raise HubError('staging_source_receipt_uncertain', 409)
+            if item['phase'] == 'depositing':
+                self._shared_guard(admission=True)
+                remote = await self.client.status_v2()
+                _require(type(remote) is dict and remote.get('schema') == 'hub-staging.v2'
+                         and remote.get('profile_protocol') == 'hub-staging-profile.v2'
+                         and remote.get('profile_protocol_ready') is True,
+                         'staging_profile_protocol_unavailable', 503)
+                # Persist an original no-replay intent after the latest local
+                # policy/review checks and before any remote effect. A revoke
+                # that follows this commit is not a receiver-side fence; v2
+                # remains disabled until that contract is implemented.
+                with self.repo._transaction() as db:
+                    current = db.execute('SELECT data FROM hub_staging_submissions WHERE id=?', (item['id'],)).fetchone()
+                    _require(current is not None and json.loads(current['data']) == item,
+                             'staging_submission_changed', 409)
+                    self.resources._authorize(db, actor, project, 'build')
+                    self.resources._authorize(db, actor, project, 'test')
+                    _require(self.repo.reviewed_staging_profile(db, item['review_task_id'], actor,
+                        item['review_task_revision'], item['source_commit'], project, recipe) == item['reviewed_profile'],
+                        'staging_review_required', 409)
+                    _require(_PROFILE_PROTOCOL_READY, 'staging_profile_protocol_unavailable', 503)
+                    item['phase'] = 'deposit_unknown'
+                    db.execute('UPDATE hub_staging_submissions SET data=? WHERE id=?', (_json(item), item['id']))
+                receipt = await self.client.put_source({'source_id': item['source_id'], 'project': project,
+                    'profile_protocol': 'hub-staging-profile.v2', 'source_digest': item['source_digest'], 'source_zip_base64': encoded,
                     'source_commit': item['source_commit'],
                     'source_commit_object_base64': payload['source_commit_object_base64']})
                 self._shared_guard()
@@ -590,7 +759,7 @@ class StagingController:
         task.add_done_callback(finished)
         return await asyncio.shield(task)
 
-    async def _run_once(self):
+    async def _legacy_run_once(self):
         async with self.lock:
             self._shared_guard(admission=True)
             claim = self.queue.claim(worker=self.worker, action_keys=tuple(sorted(self.actions.values())), lease_seconds=600)
@@ -615,11 +784,15 @@ class StagingController:
                     self.resources._authorize(db, item['actor'], item['project'], 'test')
                     item['phase'], item['claim'] = 'dispatching', claim
                     db.execute('UPDATE hub_staging_submissions SET data=? WHERE id=?', (_json(item), item['id']))
-                receipt = await self.client.submit({'job_id': item['job_id'], 'command_id': item['command_id'],
+                outgoing = {'job_id': item['job_id'], 'command_id': item['command_id'],
                     'idempotency_key': item['command_id'], 'project': item['project'], 'recipe': item['recipe'],
                     'source_commit': item['source_commit'], 'source_digest': item['source_digest'],
                     'source_id': item['source_id'], 'resource_ids': item['resource_ids'],
-                    'require_source_binding': True, 'expected_source_binding': item['source_binding']})
+                    'require_source_binding': True, 'expected_source_binding': item['source_binding']}
+                if 'reviewed_profile' in item:
+                    _require(_PROFILE_PROTOCOL_READY, 'staging_profile_protocol_unavailable', 503)
+                    outgoing['reviewed_profile'] = item['reviewed_profile']
+                receipt = await self.client.submit(outgoing)
                 self._shared_guard()
                 item['phase'] = 'accepted'; self._save(item)
                 return await self._follow(item, receipt, claim)
@@ -629,6 +802,9 @@ class StagingController:
                 # hold after the queue has already finalized or been released.
                 if item.get('phase') == 'verified':
                     raise
+                if 'reviewed_profile' in item and not _PROFILE_PROTOCOL_READY:
+                    self._hold(item, claim)
+                    return self._view(item)
                 if item['phase'] in ('queued', 'deposited'):
                     return self._finish_no_effect(item, claim, 'never_sent', 'admission_changed')
                 if isinstance(error, StagingNotAccepted) and error.reason not in ('worker_busy', 'worker_busy_or_held'):
@@ -639,6 +815,11 @@ class StagingController:
                     item['rejection_reason'] = error.reason
                 self._hold(item, claim)
                 return self._view(item)
+
+
+    async def _run_once(self):
+        return await self._legacy_run_once()
+
 
     async def _follow(self, item, receipt, claim):
         deadline = time.monotonic() + self.max_poll_seconds
@@ -663,6 +844,22 @@ class StagingController:
                  'staging_source_binding_required', 409)
         outcome = receipt['state']
         result = receipt['result']
+        if 'reviewed_profile' in item:
+            profile = item['reviewed_profile']
+            _require(type(profile) is dict and set(profile) == {'project', 'recipe', 'generation', 'digest'}
+                     and profile['project'] == item.get('project') and profile['recipe'] == item.get('recipe')
+                     and type(profile['generation']) is int and 1 <= profile['generation'] < 2**31
+                     and type(profile['digest']) is str and re.fullmatch(r'sha256:[a-f0-9]{64}', profile['digest'])
+                     and result.get('profile_digest') == profile['digest'],
+                     'staging_completion_proof_invalid', 502)
+        else:
+            # A damaged v2 journal must not become a legacy completion merely
+            # because its profile field disappeared. Legacy review never had
+            # a corresponding profile-bound review row.
+            with self.repo._connection() as db:
+                bound = db.execute('SELECT 1 FROM hub_staging_task_profiles WHERE task_id=? AND review_revision=? LIMIT 1',
+                                   (item.get('review_task_id'), item.get('review_task_revision'))).fetchone()
+            _require(bound is None, 'staging_completion_proof_invalid', 502)
         if outcome == 'failed':
             _require(_failed_result_consistent(result), 'staging_completion_proof_invalid', 502)
         _require(result.get('source_commit') == item['source_commit']

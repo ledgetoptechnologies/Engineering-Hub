@@ -28,6 +28,8 @@ async def owner_session(browser):
 @pytest.fixture
 async def shared_app(rig, tmp_path, monkeypatch):
     from engineering_hub.cloudflare_access import CloudflareAccessVerifier
+    from engineering_hub import staging_controller
+    monkeypatch.setattr(staging_controller, '_PROFILE_PROTOCOL_READY', True)
     identity = await CloudflareAccessVerifier(rig.settings.auth_config.cloudflare_config).verify(rig.assertion)
     rig.owner_actor = identity.actor
     path = config_file(tmp_path)
@@ -41,6 +43,10 @@ async def shared_app(rig, tmp_path, monkeypatch):
     def factory(config):
         async def response(request):
             rig.modular_requests.append(request)
+            if request.method == 'GET' and request.url.path == '/v2/status':
+                return httpx.Response(200, json={'schema': 'hub-staging.v2',
+                    'active_command_id': None, 'projects': {'engineering-hub': ['static']},
+                    'profile_protocol': 'hub-staging-profile.v2', 'profile_protocol_ready': True})
             if rig.modular_handler is not None:
                 return await rig.modular_handler(request)
             raise AssertionError('No modular remote call expected in this fixture')
@@ -215,7 +221,7 @@ async def test_listener_stop_drains_accepted_http_upload_before_transport_and_ow
     state = shared_app
     entered, release = asyncio.Event(), asyncio.Event()
     async def upload(request):
-        assert request.url.path == '/v1/sources'
+        assert request.url.path == '/v2/sources'
         value = json.loads(request.content)
         entered.set()
         await release.wait()
@@ -224,14 +230,16 @@ async def test_listener_stop_drains_accepted_http_upload_before_transport_and_ow
         raw = base64.b64decode(value['source_zip_base64'])
         binding = verify(raw, value['source_commit_object_base64'], value['source_commit'])
         return httpx.Response(200, json={key: value[key] for key in ('source_id', 'source_digest', 'project')} |
-                             {'size_bytes': len(raw), 'source_binding': binding})
+                             {'size_bytes': len(raw), 'source_binding': binding, 'state':'historical_observation', 'authority':'observation_only'})
     state.modular_handler = upload
     stop, task, addresses = await start(state)
     request_task = None
     try:
         controller = state.core.state.modular_staging.controller
         controller.resources.set_policy(state.owner_actor, 'engineering-hub', 0,
-                                        {'codex': ['read', 'build', 'test']})
+                                        {'codex': ['read', 'build', 'test'], 'claude': ['read']})
+        from tests.test_staging_profile_task_binding import PROFILE
+        controller.resources.enroll_profile(state.owner_actor, 'engineering-hub', 'static', 0, PROFILE)
         async with connections(addresses, state) as (agent, _):
             request_task = asyncio.create_task(agent.post(BASE + '/staging/jobs', json=payload(controller.repo)))
             await asyncio.wait_for(entered.wait(), 3)
@@ -250,7 +258,7 @@ async def test_listener_stop_drains_accepted_http_upload_before_transport_and_ow
     closed(state)
     assert state.modular_clients[0].close_count == 1
     assert state.events.index('upload-remote-returned') < state.events.index('modular-client-close')
-    assert all(request.url.path != '/v1/jobs' for request in state.modular_requests)
+    assert all(request.url.path not in {'/v1/jobs', '/v2/jobs'} for request in state.modular_requests)
 
 
 def test_browser_route_allowlist_exposes_only_explicit_shared_paths():
@@ -304,17 +312,19 @@ async def test_shared_configured_action_rechecks_review_at_boundaries(shared_app
     from hub_staging_service.source_provenance import verify
     state = shared_app
     async def worker(request):
-        assert request.url.path == '/v1/sources'
+        assert request.url.path == '/v2/sources'
         value = json.loads(request.content)
         raw = base64.b64decode(value['source_zip_base64'])
         return httpx.Response(200, json={key: value[key] for key in ('source_id', 'source_digest', 'project')} |
-            {'size_bytes': len(raw), 'source_binding': verify(raw, value['source_commit_object_base64'], value['source_commit'])})
+            {'size_bytes': len(raw), 'source_binding': verify(raw, value['source_commit_object_base64'], value['source_commit']), 'state':'historical_observation', 'authority':'observation_only'})
     state.modular_handler = worker
     stop, task, addresses = await start(state)
     try:
         controller = state.core.state.shared_staging.controller
         controller.resources.set_policy(state.owner_actor, 'engineering-hub', 0,
-                                        {'codex': ['read', 'build', 'test']})
+                                        {'codex': ['read', 'build', 'test'], 'claude': ['read']})
+        from tests.test_staging_profile_task_binding import PROFILE
+        controller.resources.enroll_profile(state.owner_actor, 'engineering-hub', 'static', 0, PROFILE)
         request = payload(controller.repo)
         def corrupt():
             with controller.repo._transaction() as db:
@@ -350,7 +360,7 @@ async def test_shared_configured_action_rechecks_review_at_boundaries(shared_app
                 monkeypatch.setattr(controller.queue, 'live_claim', change_after_claim)
                 await controller.run_once()
                 assert controller.queue.get_job(job['id'])['state'] == 'failed'
-        assert all(request.url.path != '/v1/jobs' for request in state.modular_requests)
+        assert all(request.url.path not in {'/v1/jobs', '/v2/jobs'} for request in state.modular_requests)
     finally:
         stop.set()
         await task

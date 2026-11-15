@@ -28,6 +28,7 @@ from .repository import HubError, HubRepository
 
 _NAME = re.compile(r'[a-z0-9][a-z0-9_-]{0,63}\Z')
 _SHA = re.compile(r'[a-f0-9]{64}\Z')
+_PROFILE_SHA = re.compile(r'sha256:[a-f0-9]{64}\Z')
 _COMMIT = re.compile(r'[a-f0-9]{40}\Z')
 _RELATIVE = re.compile(r'[A-Za-z0-9_@./-]{1,512}\Z')
 _KINDS = frozenset({'workspace', 'build', 'test_run', 'preview'})
@@ -58,7 +59,7 @@ _DEFINITIVE_STAGING_FAILURES = frozenset({
     'stage_build_failed', 'stage_test_failed',
 })
 _FAILED_RESULT_FIELDS = frozenset({'error', 'source_commit', 'source_digest',
-    'source_commit_verification', 'source_binding', 'diagnostic'})
+    'source_commit_verification', 'source_binding', 'diagnostic', 'profile_digest'})
 
 
 def _failed_result_consistent(details):
@@ -80,6 +81,9 @@ _NOT_ACCEPTED = {
         401: frozenset({'unauthorized'}),
     },
 }
+# The v2 endpoint has the same documented pre-admission rejection points as
+# v1; unrecognized reasons remain uncertain rather than authorizing release.
+_NOT_ACCEPTED['/v2/jobs'] = _NOT_ACCEPTED['/v1/jobs']
 _REJECTION_REASONS = frozenset(reason for statuses in _NOT_ACCEPTED.values()
                                for reasons in statuses.values() for reason in reasons)
 
@@ -329,7 +333,7 @@ class StagingClient:
         try:
             content = None if payload is None else json.dumps(payload, separators=(',', ':'), allow_nan=False).encode()
             _check(content is None or len(content) <= self.MAX_UPLOAD_BYTES)
-            timeout = 30.0 if path == '/v1/sources' else 15.0
+            timeout = 30.0 if path in {'/v1/sources', '/v2/sources'} else 15.0
             headers = {'Authorization': 'Bearer ' + self._token, 'Accept-Encoding': 'identity',
                        'Accept': '*/*' if file_types else 'application/json'}
             if content is not None:
@@ -368,7 +372,7 @@ class StagingClient:
                     allowed = _NOT_ACCEPTED[path].get(response.status_code, frozenset())
                     if type(reason) is str and reason in allowed:
                         raise StagingNotAccepted(reason)
-                _check(response.status_code in ({200, 202} if path == '/v1/jobs' else {200}))
+                _check(response.status_code in ({200, 202} if path in {'/v1/jobs', '/v2/jobs'} else {200}))
                 return result
         except StagingNotAccepted:
             raise
@@ -394,13 +398,30 @@ class StagingClient:
                    and len(set(recipes)) == len(recipes))
         return result
 
+
+    @_opaque
+    async def status_v2(self):
+        result = await self._request('GET', '/v2/status')
+        _shape(result, {'schema', 'active_command_id', 'projects', 'profile_protocol', 'profile_protocol_ready'})
+        _check(result['schema'] == 'hub-staging.v2' and result['profile_protocol'] == 'hub-staging-profile.v2'
+               and type(result['profile_protocol_ready']) is bool and type(result['projects']) is dict
+               and len(result['projects']) <= 100)
+        if result['active_command_id'] is not None:
+            _uuid(result['active_command_id'])
+        for name, recipes in result['projects'].items():
+            _check(type(name) is str and _NAME.fullmatch(name) and type(recipes) is list
+                   and 0 < len(recipes) <= 32
+                   and all(type(recipe) is str and _NAME.fullmatch(recipe) for recipe in recipes)
+                   and len(set(recipes)) == len(recipes))
+        return result
+
     @_opaque
     async def runtime(self):
         from .staging_runtime import validate_runtime_snapshot
         return validate_runtime_snapshot(await self._request('GET', '/v1/runtime', maximum=128 * 1024))
 
     @_opaque
-    async def put_source(self, payload):
+    async def _legacy_put_source(self, payload):
         fields = {'source_id', 'project', 'source_digest', 'source_zip_base64'}
         _check(type(payload) is dict and set(payload) in
                (fields, fields | {'source_commit', 'source_commit_object_base64'}))
@@ -417,6 +438,48 @@ class StagingClient:
         base_result = {'source_id', 'source_digest', 'size_bytes', 'project'}
         expected_result = base_result | {'source_binding'} if proof_supplied else base_result
         _check(type(result) is dict and set(result) == expected_result)
+        _check(all(result[key] == payload[key] for key in ('source_id', 'source_digest', 'project'))
+               and type(result['size_bytes']) is int and result['size_bytes'] == size)
+        if proof_supplied:
+            binding = result['source_binding']
+            _check(type(binding) is dict and set(binding) == {'scheme', 'commit_oid', 'tree_oid',
+                'archive_sha256', 'commit_object_sha256', 'expanded_bytes', 'entries'}
+                and binding['scheme'] == 'git-sha1-tree-v1'
+                and binding['commit_oid'] == payload['source_commit']
+                and binding['archive_sha256'] == payload['source_digest']
+                and type(binding['tree_oid']) is str and _COMMIT.fullmatch(binding['tree_oid'])
+                and type(binding['commit_object_sha256']) is str and _SHA.fullmatch(binding['commit_object_sha256'])
+                and binding['commit_object_sha256'] == hashlib.sha256(proof).hexdigest()
+                and type(binding['expanded_bytes']) is int and 0 <= binding['expanded_bytes'] <= 64 * 1024**2
+                and type(binding['entries']) is int and 1 <= binding['entries'] <= 5000)
+        return result
+
+
+    async def put_source(self, payload):
+        if isinstance(payload, dict) and 'profile_protocol' in payload:
+            return await self._put_source_v2(payload)
+        return await self._legacy_put_source(payload)
+
+    @_opaque
+    async def _put_source_v2(self, payload):
+        fields = {'source_id', 'project', 'source_digest', 'source_zip_base64',
+                  'source_commit', 'source_commit_object_base64', 'profile_protocol'}
+        _check(type(payload) is dict and set(payload) == fields
+               and payload['profile_protocol'] == 'hub-staging-profile.v2')
+        _uuid(payload['source_id']); self._project(payload['project'])
+        size = self._source(payload)
+        proof_supplied = 'source_commit' in payload
+        if proof_supplied:
+            _check(type(payload['source_commit']) is str and _COMMIT.fullmatch(payload['source_commit']))
+            _check(type(payload['source_commit_object_base64']) is str
+                   and 0 < len(payload['source_commit_object_base64']) <= 87384)
+            proof = base64.b64decode(payload['source_commit_object_base64'], validate=True)
+            _check(0 < len(proof) <= 65536)
+        result = await self._request('POST', '/v2/sources', payload)
+        base_result = {'source_id', 'source_digest', 'size_bytes', 'project'}
+        expected_result = (base_result | {'source_binding'} if proof_supplied else base_result) | {'state', 'authority'}
+        _check(type(result) is dict and set(result) == expected_result)
+        _check(result['state'] == 'historical_observation' and result['authority'] == 'observation_only')
         _check(all(result[key] == payload[key] for key in ('source_id', 'source_digest', 'project'))
                and type(result['size_bytes']) is int and result['size_bytes'] == size)
         if proof_supplied:
@@ -487,7 +550,7 @@ class StagingClient:
                    and details.get('source_commit') == details['source_binding']['commit_oid']
                    and details.get('source_digest') == details['source_binding']['archive_sha256'])
         if 'profile_digest' in details:
-            _check(type(details['profile_digest']) is str and _SHA.fullmatch(details['profile_digest']))
+            _check(type(details['profile_digest']) is str and _PROFILE_SHA.fullmatch(details['profile_digest']))
         if 'resource_ids' in details:
             _shape(details['resource_ids'], _KINDS)
             identifiers = [_uuid(item) for item in details['resource_ids'].values()]
@@ -508,7 +571,7 @@ class StagingClient:
         return result
 
     @_opaque
-    async def submit(self, payload):
+    async def _legacy_submit(self, payload):
         required = {'job_id', 'command_id', 'idempotency_key', 'project', 'recipe',
                     'source_commit', 'source_digest', 'resource_ids'}
         legacy = (required | {'source_id'}, required | {'source_zip_base64'})
@@ -523,6 +586,39 @@ class StagingClient:
         ids = [_uuid(value) for value in payload['resource_ids'].values()]
         _check(len(set(ids)) == len(ids))
         result = await self._request('POST', '/v1/jobs', payload)
+        result = self._operation(result, job_id=payload['job_id'], command_id=payload['command_id'])
+        _check(all(key not in result['result'] or result['result'][key] == payload[key]
+                   for key in ('source_commit', 'source_digest', 'resource_ids')))
+        return result
+
+
+    async def submit(self, payload):
+        if isinstance(payload, dict) and 'reviewed_profile' in payload:
+            return await self._submit_v2(payload)
+        return await self._legacy_submit(payload)
+
+    @_opaque
+    async def _submit_v2(self, payload):
+        required = {'job_id', 'command_id', 'idempotency_key', 'project', 'recipe',
+                    'source_commit', 'source_digest', 'resource_ids'}
+        bound = required | {'source_id', 'require_source_binding', 'expected_source_binding'}
+        reviewed = bound | {'reviewed_profile'}
+        _check(type(payload) is dict and set(payload) == reviewed)
+        if 'reviewed_profile' in payload:
+            profile = payload['reviewed_profile']
+            _check(type(profile) is dict and set(profile) == {'project', 'recipe', 'generation', 'digest'}
+                   and profile['project'] == payload['project'] and profile['recipe'] == payload['recipe']
+                   and type(profile['generation']) is int and 1 <= profile['generation'] < 2**31
+                   and type(profile['digest']) is str and _PROFILE_SHA.fullmatch(profile['digest']))
+        if 'require_source_binding' in payload:
+            _check(payload['require_source_binding'] is True and type(payload['expected_source_binding']) is dict)
+        _uuid(payload['job_id']); _uuid(payload['command_id']); _key(payload['idempotency_key'])
+        self._project(payload['project'], payload['recipe']); self._source(payload)
+        _check(type(payload['source_commit']) is str and _COMMIT.fullmatch(payload['source_commit']))
+        _shape(payload['resource_ids'], _KINDS)
+        ids = [_uuid(value) for value in payload['resource_ids'].values()]
+        _check(len(set(ids)) == len(ids))
+        result = await self._request('POST', '/v2/jobs', payload)
         result = self._operation(result, job_id=payload['job_id'], command_id=payload['command_id'])
         _check(all(key not in result['result'] or result['result'][key] == payload[key]
                    for key in ('source_commit', 'source_digest', 'resource_ids')))

@@ -249,3 +249,24 @@ def test_private_profile_read_serializes_with_project_archive(tmp_path, monkeypa
             release.set()
             assert writer.result(5)['archived'] is True
             assert reader.result(5) in {'project_archived', 'staging_profile_unavailable'}
+
+def test_bound_admission_resolves_exact_review_without_enabling_commit_only(setup):
+    repo, store, enrollment, task = setup
+    candidate = repo.set_candidate('codex', task['id'], task['revision'], COMMIT,
+                                   {'recipe':'static', 'generation':1})
+    reviewed = repo.review_task('claude', task['id'], candidate['revision'], COMMIT,
+                                'approve', confirmation(enrollment))
+    def resolve(**overrides):
+        args = dict(identity=task['id'], actor='codex', revision=reviewed['revision'],
+                    commit=COMMIT, project=PROJECT, recipe='static')
+        args.update(overrides)
+        with repo._transaction() as db:
+            return repo.reviewed_staging_profile(db, **args)
+    assert resolve() == confirmation(enrollment)
+    for wrong in ({'actor':'hermes'}, {'revision':reviewed['revision']-1},
+                  {'commit':'a'*40}, {'project':'3d-viewer'}, {'recipe':'other'}):
+        assert resolve(**wrong) is None
+    assert not repo.reviewed_task_matches(task['id'], 'codex', reviewed['revision'], COMMIT)
+    changed = copy.deepcopy(PROFILE); changed['memory_mb'] = 256
+    store.enroll_profile('human:1', PROJECT, 'static', 1, changed)
+    assert resolve() is None

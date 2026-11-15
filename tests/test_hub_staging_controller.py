@@ -30,7 +30,10 @@ class Client:
         self.bytes = b'<html>demo</html>'
 
     async def status(self):
-        return {'projects': {'engineering-hub': ['static'], 'landscripting': ['static']}}
+        return {'schema':'hub-staging.v1', 'projects': {'engineering-hub': ['static'], 'landscripting': ['static']}}
+
+    async def status_v2(self):
+        return {'schema':'hub-staging.v2', 'profile_protocol':'hub-staging-profile.v2', 'profile_protocol_ready':True, 'projects': {'engineering-hub': ['static'], 'landscripting': ['static']}}
 
     async def put_source(self, payload):
         self.deposits += 1
@@ -42,14 +45,18 @@ class Client:
     async def submit(self, payload):
         self.posts += 1
         result = {key: payload[key] for key in ('source_commit', 'source_digest', 'resource_ids')}
-        result.update(source_commit_verification='git-sha1-tree-v1', source_binding=self.bindings[payload['source_id']], preview_ready=True,
+        result.update(source_commit_verification='git-sha1-tree-v1', source_binding=self.bindings[payload['source_id']],
+                      preview_ready=True,
                       stages={stage: {'exit_code': 0, 'log_bytes': 0} for stage in ('build', 'test')})
+        if 'reviewed_profile' in payload:
+            result['profile_digest'] = payload['reviewed_profile']['digest']
         receipt = {'job_id': payload['job_id'], 'command_id': payload['command_id'], 'state': 'succeeded', 'result': result}
         self.jobs[payload['job_id']] = receipt
         if self.fail:
             receipt.update(state='failed', result={'error': 'stage_test_failed',
                 'source_commit': payload['source_commit'], 'source_digest': payload['source_digest'],
-                'source_commit_verification': 'git-sha1-tree-v1', 'source_binding': self.bindings[payload['source_id']]})
+                'source_commit_verification': 'git-sha1-tree-v1', 'source_binding': self.bindings[payload['source_id']],
+                'profile_digest': payload['reviewed_profile']['digest']})
         for kind, identity in payload['resource_ids'].items():
             manifest = {'index.html': {'bytes': len(self.bytes), 'sha256': hashlib.sha256(self.bytes).hexdigest()}}
             self.facts[identity] = {'id': identity, 'job_id': payload['job_id'], 'kind': kind, 'state': 'ready',
@@ -98,8 +105,17 @@ def payload(repo, project='engineering-hub'):
     commit = _object_id(b'commit', obj)
     task = repo.create_task('human:1', project, 'fixture', str(uuid.uuid4()))
     task = repo.claim_task('codex', task['id'], task['revision'])
-    task = repo.set_candidate('codex', task['id'], task['revision'], commit)
-    task = repo.review_task('claude', task['id'], task['revision'], commit, 'approve')
+    with repo._connection() as db:
+        enrolled = db.execute('SELECT project,recipe,generation,digest FROM hub_staging_profile_enrollments WHERE project=? AND recipe=? ORDER BY generation DESC LIMIT 1',
+                              (project, 'static')).fetchone()
+    if enrolled is None:
+        task = repo.set_candidate('codex', task['id'], task['revision'], commit)
+        task = repo.review_task('claude', task['id'], task['revision'], commit, 'approve')
+    else:
+        profile = dict(enrolled)
+        task = repo.set_candidate('codex', task['id'], task['revision'], commit,
+                                  {'recipe': 'static', 'generation':profile['generation']})
+        task = repo.review_task('claude', task['id'], task['revision'], commit, 'approve', profile)
     return {'request_id': str(uuid.uuid4()), 'review_task_id': task['id'], 'review_task_revision': task['revision'],
             'project': project, 'recipe': 'static', 'source_commit': commit,
             'source_digest': hashlib.sha256(raw).hexdigest(), 'source_zip_base64': base64.b64encode(raw).decode(),
@@ -107,14 +123,18 @@ def payload(repo, project='engineering-hub'):
 
 
 @pytest.fixture
-def env(tmp_path):
+def env(tmp_path, monkeypatch):
+    from engineering_hub import staging_controller
+    from tests.test_staging_profile_task_binding import PROFILE
+    monkeypatch.setattr(staging_controller, '_PROFILE_PROTOCOL_READY', True)
     repo = HubRepository(tmp_path / 'hub.db')
     projects = ProjectRepository(repo)
     projects.create_project('human:1', 'landscripting', 'LandScript', 'new')
     principal, now = object(), [1800000000]
     resources = StagingResourceStore(repo, admin_actors=frozenset({'human:1'}), control_principal=principal, clock=lambda: now[0])
     for project in ('engineering-hub', 'landscripting'):
-        resources.set_policy('human:1', project, 0, {'codex': ['read', 'build', 'test', 'cleanup', 'preview'], 'human:1': ['read', 'cleanup', 'preview']})
+        resources.set_policy('human:1', project, 0, {'codex': ['read', 'build', 'test', 'cleanup', 'preview'], 'claude': ['read'], 'human:1': ['read', 'cleanup', 'preview']})
+        resources.enroll_profile('human:1', project, 'static', 0, PROFILE)
     queue, actions = compose_queue(repo, None, {'engineering-hub': ['static'], 'landscripting': ['static']}, 'staging-pc')
     client = Client()
     controller = StagingController(repo, queue, client, resources=resources, control_principal=principal,
@@ -312,7 +332,10 @@ async def test_partial_finalization_revalidates_previously_recorded_resources(en
     else:
         assert resumed['job']['state'] == ('failed' if failed else 'succeeded')
 @pytest.mark.asyncio
-async def test_same_machine_existing_production_priority_and_verifiers_preserved(tmp_path):
+async def test_same_machine_existing_production_priority_and_verifiers_preserved(tmp_path, monkeypatch):
+    from engineering_hub import staging_controller
+    from tests.test_staging_profile_task_binding import PROFILE
+    monkeypatch.setattr(staging_controller, '_PROFILE_PROTOCOL_READY', True)
     repo = HubRepository(tmp_path / 'hub.db')
     original = WorkQueue(repo, {'production': WorkAction('same-host', frozenset({'production'}), project='engineering-hub')},
                          target_verifier=lambda *args: True, approval_verifier=lambda *args: True)
@@ -321,7 +344,8 @@ async def test_same_machine_existing_production_priority_and_verifiers_preserved
     queue, actions = compose_queue(repo, original, {'engineering-hub': ['static']}, 'same-host')
     principal = object()
     resources = StagingResourceStore(repo, admin_actors=frozenset({'human:1'}), control_principal=principal)
-    resources.set_policy('human:1', 'engineering-hub', 0, {'codex': ['read', 'build', 'test']})
+    resources.set_policy('human:1', 'engineering-hub', 0, {'codex': ['read', 'build', 'test'], 'claude':['read']})
+    resources.enroll_profile('human:1', 'engineering-hub', 'static', 0, PROFILE)
     controller = StagingController(repo, queue, Client(), resources=resources, control_principal=principal, actions=actions)
     await controller.submit('codex', payload(repo))
     assert await controller.run_once() is None
@@ -634,7 +658,10 @@ async def test_explicit_start_close_without_worker_effects(env):
 
 
 @pytest.mark.asyncio
-async def test_unknown_approved_production_survives_registry_reload(tmp_path):
+async def test_unknown_approved_production_survives_registry_reload(tmp_path, monkeypatch):
+    from engineering_hub import staging_controller
+    from tests.test_staging_profile_task_binding import PROFILE
+    monkeypatch.setattr(staging_controller, '_PROFILE_PROTOCOL_READY', True)
     repo = HubRepository(tmp_path / 'hub.db')
     old = WorkQueue(repo, {'retired-production': WorkAction('same-host', frozenset({'production'}), project='engineering-hub')},
                     target_verifier=lambda *args: True, approval_verifier=lambda *args: True)
@@ -643,7 +670,8 @@ async def test_unknown_approved_production_survives_registry_reload(tmp_path):
     queue, actions = compose_queue(repo, None, {'engineering-hub': ['static']}, 'same-host')
     principal = object()
     resources = StagingResourceStore(repo, admin_actors=frozenset({'human:1'}), control_principal=principal)
-    resources.set_policy('human:1', 'engineering-hub', 0, {'codex': ['read', 'build', 'test']})
+    resources.set_policy('human:1', 'engineering-hub', 0, {'codex': ['read', 'build', 'test'], 'claude':['read']})
+    resources.enroll_profile('human:1', 'engineering-hub', 'static', 0, PROFILE)
     client = Client()
     controller = StagingController(repo, queue, client, resources=resources, control_principal=principal, actions=actions)
     await controller.submit('codex', payload(repo))
@@ -1547,7 +1575,7 @@ async def test_failed_background_still_closes_private_client(env):
 
 @pytest.mark.parametrize('worker_blocked', [False, True], ids=['completes', 'timeout-holds'])
 @pytest.mark.asyncio
-async def test_actual_client_contract_through_registered_worker_core(env, tmp_path, worker_blocked):
+async def test_actual_client_contract_through_registered_worker_core(env, tmp_path, worker_blocked, monkeypatch):
     repo = env[4]
     import httpx
     import threading
@@ -1568,7 +1596,13 @@ async def test_actual_client_contract_through_registered_worker_core(env, tmp_pa
             for kind in ('build', 'preview'):
                 (paths[kind] / 'index.html').write_bytes(b'<html>real-contract</html>')
             return {'preview_ready': True, 'stages': {stage: {'exit_code': 0, 'log_bytes': 0} for stage in ('build', 'test')}}
+    from hub_staging_service import core
+    from engineering_hub.modular_staging_profile import from_worker_recipe
+    monkeypatch.setattr(core, '_PROFILE_PROTOCOL_READY', True)
+    monkeypatch.setattr(core, '_SOURCE_ATTEMPT_ENABLED', True)
     service = Service(tmp_path / 'private-worker', {'engineering-hub': {'recipes': {'static': profile}}}, Backend())
+    env[2].enroll_profile('human:1', 'engineering-hub', 'static', 1,
+                          from_worker_recipe(service.projects['engineering-hub']['static']))
     def transport(request):
         path = request.url.path.split('/')
         if request.method == 'POST':
@@ -1578,6 +1612,10 @@ async def test_actual_client_contract_through_registered_worker_core(env, tmp_pa
             if worker_blocked and path[-1] == 'jobs':
                 assert entered_worker.wait(2), 'worker did not enter backend before polling'
             return httpx.Response(202 if path[-1] == 'jobs' else 200, json=result)
+        if path[2] == 'status':
+            return httpx.Response(200, json={'schema':'hub-staging.v2', 'active_command_id':service.active,
+                'profile_protocol':'hub-staging-profile.v2', 'profile_protocol_ready':True,
+                'projects':{'engineering-hub':['static']}})
         if path[2] == 'jobs':
             return httpx.Response(200, json=service.status(path[3]))
         if path[-1] == 'metadata':

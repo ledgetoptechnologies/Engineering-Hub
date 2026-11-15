@@ -12,7 +12,10 @@ from tests.test_shared_staging_preparation import config_file
 
 
 @pytest.fixture
-def configured(tmp_path):
+def configured(tmp_path, monkeypatch):
+    from engineering_hub import staging_controller
+    from tests.test_staging_profile_task_binding import PROFILE
+    monkeypatch.setattr(staging_controller, '_PROFILE_PROTOCOL_READY', True)
     repo = HubRepository(tmp_path / 'hub.sqlite3')
     client = Client()
     path = config_file(tmp_path, projects={'engineering-hub': {'recipes': ['static']}})
@@ -22,7 +25,8 @@ def configured(tmp_path):
     controller = module.controller
     assert controller is not None
     controller.resources.set_policy('human:1', 'engineering-hub', 0,
-                                     {'codex': ['read', 'build', 'test']})
+                                     {'codex': ['read', 'build', 'test'], 'claude': ['read']})
+    controller.resources.enroll_profile('human:1', 'engineering-hub', 'static', 0, PROFILE)
     yield controller, client, repo
     repo.close()
 

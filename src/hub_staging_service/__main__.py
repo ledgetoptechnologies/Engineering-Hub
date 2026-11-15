@@ -8,7 +8,7 @@ import mimetypes
 from pathlib import Path
 import stat
 import threading
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .core import Rejected, Service, ensure, storage_limits
 from .docker import DockerBackend
@@ -89,12 +89,29 @@ def handler(service, token, peers, *, host_snapshot=None):
                 path = unquote(urlsplit(self.path).path)
                 parts = path.strip('/').split('/')
                 if self.command == 'GET':
+                    if len(parts) == 3 and parts[:2] == ['v2', 'source-attempts']:
+                        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True, strict_parsing=True)
+                        ensure(set(query) == {'project'} and len(query['project']) == 1, 'source_attempt_query')
+                        return self.respond(200, service.source_attempt(parts[2], query['project'][0]))
+                    if len(parts) == 3 and parts[:2] == ['v2', 'source-evidence']:
+                        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True, strict_parsing=True)
+                        ensure(set(query) == {'project', 'digest', 'binding'} and all(len(values) == 1 for values in query.values())
+                               and len(query['binding'][0]) <= 1024,
+                               'source_evidence_query')
+                        binding = json.loads(query['binding'][0], object_pairs_hook=unique_object)
+                        return self.respond(200, service.source_evidence(parts[2], query['project'][0], query['digest'][0], binding))
                     if parts == ['v1', 'runtime']:
                         from .runtime_inventory import collect_runtime
                         return self.respond(200, collect_runtime(service.backend, host_snapshot))
                     if parts == ['v1', 'status']:
                         return self.respond(200, {'schema': 'hub-staging.v1', 'active_command_id': service.active,
-                                                  'projects': {name: sorted(recipes) for name, recipes in service.projects.items()}})
+                            'projects': {name: sorted(recipes) for name, recipes in service.projects.items()}})
+                    if parts == ['v2', 'status']:
+                        from . import core
+                        return self.respond(200, {'schema': 'hub-staging.v2', 'active_command_id': service.active,
+                            'profile_protocol': core.PROFILE_PROTOCOL,
+                            'profile_protocol_ready': core._PROFILE_PROTOCOL_READY and core._SOURCE_ATTEMPT_ENABLED,
+                            'projects': {name: sorted(recipes) for name, recipes in service.projects.items()}})
                     if len(parts) == 3 and parts[:2] == ['v1', 'jobs']:
                         return self.respond(200, service.status(parts[2]))
                     if len(parts) == 3 and parts[:2] == ['v1', 'operations']:
@@ -113,10 +130,16 @@ def handler(service, token, peers, *, host_snapshot=None):
                     data = self.rfile.read(int(sizes[0]))
                     ensure(len(data) == int(sizes[0]), 'incomplete_request')
                     payload = json.loads(data, object_pairs_hook=unique_object)
+                    if parts == ['v2', 'source-attempts']:
+                        return self.respond(200, service.put_source_attempt(payload))
                     if parts == ['v1', 'jobs']:
-                        return self.respond(202, service.submit(payload))
+                        return self.respond(202, service._legacy_submit(payload))
                     if parts == ['v1', 'sources']:
-                        return self.respond(200, service.put_source(payload))
+                        return self.respond(200, service._legacy_put_source(payload))
+                    if parts == ['v2', 'jobs']:
+                        return self.respond(202, service._submit_v2(payload))
+                    if parts == ['v2', 'sources']:
+                        return self.respond(200, service._put_source_v2(payload))
                     if parts == ['v1', 'cleanup']:
                         return self.respond(200, service.cleanup(payload))
                 self.respond(404, {'error': 'not_found'})

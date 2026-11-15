@@ -330,14 +330,23 @@ class WorkQueue:
             self.repo._no_active_run(db, target.task_id)
             from .staging_action_key import staging_action_key
             key = staging_action_key(item['project'], item['recipe'])
+            if 'reviewed_profile' in item:
+                from . import staging_controller
+                if not staging_controller._PROFILE_PROTOCOL_READY:
+                    return False
+                valid_review = (type(item['reviewed_profile']) is dict and
+                    self.repo.reviewed_staging_profile(db, target.task_id, actor, target.review_revision,
+                        target.source_commit, item['project'], item['recipe']) == item['reviewed_profile'])
+            else:
+                valid_review = self.repo.reviewed_task_matches(target.task_id, actor, target.review_revision,
+                                                                target.source_commit, db=db)
             return (key == action_key and item['actor'] == actor and item['phase'] in ('deposited', 'queued')
                     and item['review_task_id'] == target.task_id
                     and item['review_task_revision'] == target.review_revision
                     and item['source_commit'] == target.source_commit
                     and target.artifact_digest == 'sha256:' + item['source_digest']
                     and task['project'] == item['project']
-                    and self.repo.reviewed_task_matches(target.task_id, actor, target.review_revision,
-                                                        target.source_commit, db=db))
+                    and valid_review)
         except (KeyError, TypeError, ValueError, HubError):
             return False
 
@@ -399,9 +408,10 @@ class WorkQueue:
                 raise HubError('work_review_changed', 409)
             if current is not None:
                 task = json.loads(current['data'])
-                if not (task.get('project') == action.project and
-                        self.repo._reviewed_task_data_matches(task, actor, task.get('revision'),
-                                                              target.source_commit, db=db)):
+                review_valid = (self._modular_target_in_transaction(db, actor, action_key, environment, target)
+                    if action_key.startswith('staging-service.') else
+                    self.repo._reviewed_task_data_matches(task, actor, task.get('revision'), target.source_commit, db=db))
+                if not (task.get('project') == action.project and review_valid):
                     raise HubError('work_review_changed', 409)
             if self.repo._open_work_job(db, target.task_id):
                 raise HubError('work_task_already_queued', 409)

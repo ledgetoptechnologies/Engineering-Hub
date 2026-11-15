@@ -4,6 +4,7 @@ This does not prove Docker execution, staging host capacity, NAS or reboot accep
 """
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import patch
 import json
 import sys
 import uuid
@@ -22,6 +23,7 @@ from tests.manual_session_fixtures import synthetic_workflow_reconciliation
 from tests.test_hub_container_pilot import ACTIONS, PRINCIPAL, pilot_manifest
 from tests.test_hub_queued_pilot import ACTION, MACHINE, DistinctContainerClient, machine_job, submit
 from tests.test_hub_staging_controller import Client, payload
+from tests.test_staging_profile_task_binding import PROFILE
 
 
 pytestmark = pytest.mark.skipif(sys.platform != 'linux', reason='Actual Linux PilotOwner exclusion')
@@ -33,6 +35,8 @@ def joint_case(tmp_path, *, reopening=False, clients=None, activate=True):
     private.mkdir(mode=0o700, exist_ok=reopening)
     database = private / 'hub.sqlite3'
     owner = PilotOwner(database, allow_ephemeral_test_storage=True)
+    protocol = patch('engineering_hub.staging_controller._PROFILE_PROTOCOL_READY', True)
+    protocol.start()
     try:
         repo = HubRepository(database, execution_principal=PRINCIPAL, pilot_owner=owner)
         pilot_client, modular_client = clients or (DistinctContainerClient(), Client())
@@ -44,7 +48,9 @@ def joint_case(tmp_path, *, reopening=False, clients=None, activate=True):
         principal = object()
         resources = StagingResourceStore(repo, admin_actors=frozenset({'human:1'}), control_principal=principal)
         if not reopening:
-            resources.set_policy('human:1', 'engineering-hub', 0, {'codex': ['read', 'build', 'test']})
+            resources.set_policy('human:1', 'engineering-hub', 0,
+                                 {'codex': ['read', 'build', 'test'], 'claude': ['read']})
+            resources.enroll_profile('human:1', 'engineering-hub', 'static', 0, PROFILE)
         modular = StagingController(repo, queue, modular_client, resources=resources,
             control_principal=principal, actions=actions, execution_policies=policies)
         bridge = QueuedContainerPilot(queue, workflow, action_key=ACTION, machine_id=MACHINE,
@@ -57,6 +63,7 @@ def joint_case(tmp_path, *, reopening=False, clients=None, activate=True):
             client=pilot_client, modular=modular, modular_client=modular_client, policies=policies)
     finally:
         owner.close()
+        protocol.stop()
 
 
 @pytest.mark.asyncio
@@ -153,7 +160,8 @@ async def test_reopened_owner_preserves_exact_modular_hold_then_original_get_rec
 
 
 @pytest.mark.asyncio
-async def test_inconsistent_original_modular_submission_still_denies_reenrollment(tmp_path):
+@pytest.mark.parametrize('corruption', ['source_digest', 'profile_digest'])
+async def test_inconsistent_original_modular_submission_still_denies_reenrollment(tmp_path, corruption):
     with joint_case(tmp_path) as initial:
         initial.modular_client.lost_ack = True
         submitted = await initial.modular.submit('codex', payload(initial.repo))
@@ -162,7 +170,10 @@ async def test_inconsistent_original_modular_submission_still_denies_reenrollmen
             row = db.execute("SELECT id,data FROM hub_staging_submissions WHERE json_extract(data,'$.job_id')=?",
                              (submitted['job']['id'],)).fetchone()
             data = json.loads(row['data'])
-            data['source_digest'] = 'f' * 64
+            if corruption == 'source_digest':
+                data['source_digest'] = 'f' * 64
+            else:
+                data['reviewed_profile']['digest'] = 'sha256:' + 'f' * 64
             db.execute('UPDATE hub_staging_submissions SET data=? WHERE id=?', (json.dumps(data), row['id']))
         before = original_hold_rows(initial, submitted['job']['id'])
         clients = initial.client, initial.modular_client

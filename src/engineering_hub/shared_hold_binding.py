@@ -202,6 +202,15 @@ def modular_hold_matches(db, *, repo, queue, policies, modular_controller, reser
         public_keys = ('request_id', 'project', 'recipe', 'source_commit', 'source_digest', 'topic')
         if not legacy:
             public_keys += ('review_task_id', 'review_task_revision', 'source_binding')
+        if 'reviewed_profile' in item:
+            profile = item['reviewed_profile']
+            _require(not legacy and type(profile) is dict
+                     and set(profile) == {'project', 'recipe', 'generation', 'digest'}
+                     and profile['project'] == item['project'] and profile['recipe'] == item['recipe']
+                     and type(profile['generation']) is int and 1 <= profile['generation'] < 2**31
+                     and type(profile['digest']) is str
+                     and re.fullmatch(r'sha256:[a-f0-9]{64}', profile['digest']))
+            public_keys += ('reviewed_profile',)
         public = {key: item[key] for key in public_keys}
         _require(row['fingerprint'] == hashlib.sha256(_canonical(public).encode()).hexdigest())
         fingerprint = [job['action_key'], job['environment'], job['machine_id'], job['project'],

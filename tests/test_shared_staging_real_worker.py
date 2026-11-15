@@ -16,6 +16,12 @@ from tests.test_hub_staging_wire_integration import Wire, HTML
 
 @pytest.mark.asyncio
 async def test_shared_hub_to_worker_journal_reviewed_source_and_lost_ack(shared_app, tmp_path, monkeypatch):
+    from engineering_hub import staging_controller
+    from engineering_hub.modular_staging_profile import from_worker_recipe
+    from hub_staging_service import core
+    monkeypatch.setattr(staging_controller, '_PROFILE_PROTOCOL_READY', True)
+    monkeypatch.setattr(core, '_PROFILE_PROTOCOL_READY', True)
+    monkeypatch.setattr(core, '_SOURCE_ATTEMPT_ENABLED', True)
     state = shared_app
     worker_root = tmp_path / 'disposable-worker'
     worker_root.mkdir()
@@ -35,7 +41,9 @@ async def test_shared_hub_to_worker_journal_reviewed_source_and_lost_ack(shared_
         assert shared.status['state'] == 'active'
         assert controller.queue is shared.queue is state.core.state.work_queue
         controller.resources.set_policy(state.owner_actor, 'engineering-hub', 0,
-                                        {'codex': ['read', 'build', 'test']})
+                                        {'codex': ['read', 'build', 'test'], 'claude':['read']})
+        controller.resources.enroll_profile(state.owner_actor, 'engineering-hub', 'static', 0,
+            from_worker_recipe(wire.service.projects['engineering-hub']['static']))
         request = payload(controller.repo)
         async with connections(addresses, state) as (agent, _):
             response = await agent.post(BASE + '/staging/jobs', json=request)
@@ -44,7 +52,7 @@ async def test_shared_hub_to_worker_journal_reviewed_source_and_lost_ack(shared_
             repeated = await agent.post(BASE + '/staging/jobs', json=request)
             assert repeated.status_code == 202
             assert repeated.json()['job']['id'] == submission['job']['id']
-        assert wire.posts('/v1/sources') == 1
+        assert wire.posts('/v2/sources') == 1
         wire.drop_jobs = True
         held = await controller.run_once()
         assert held['job']['state'] == 'held'
