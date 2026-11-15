@@ -70,3 +70,14 @@ Scoped source records are currently retained without a complete scoped garbage
 collection protocol. This can exhaust the journal/source quota. Do not delete or
 reassign them until independently reviewed ownership, retention, original
 receiver/epoch fencing and bounded cleanup/recovery are implemented.
+
+The optional receiver `observer_credential` must be an object containing only
+`token_file`; it is a separate private static bearer and must differ from every
+legacy and project bearer. It permits only `GET /v2/operator/runtime` with no
+query string. The optional Hub observer config `operator_v2: true` selects this
+route and never falls back to the legacy endpoint. Absent configuration leaves
+legacy behavior unchanged. This global operator inventory can contain names and
+images belonging to other projects; provision its credential only to authorized
+operators. It remains informational and does not prove physical idleness,
+worker fencing or live credential revocation; token rotation requires receiver
+restart. These are source-only changes, not a deployed or approved grant.

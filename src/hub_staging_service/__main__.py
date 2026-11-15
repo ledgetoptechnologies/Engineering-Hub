@@ -177,7 +177,21 @@ def scoped_credentials(config, projects, legacy_token):
     return tuple(output)
 
 
-def handler(service, token, peers, *, host_snapshot=None, v2_credentials=None):
+def observer_credential(config, legacy_token, v2_credentials):
+    """Separate static, operator-only credential; rotation requires restart."""
+    ensure(type(config) is dict and set(config) == {'token_file'} and
+           type(config['token_file']) is str, 'invalid_observer_credential')
+    value = credentials(config['token_file'])
+    ensure(not hmac.compare_digest(value, legacy_token) and
+           all(not hmac.compare_digest(value, entry[1]) for entry in v2_credentials or ()),
+           'invalid_observer_credential')
+    return value
+
+
+_OBSERVER = object()
+
+
+def handler(service, token, peers, *, host_snapshot=None, v2_credentials=None, observer_token=None):
     class Handler(BaseHTTPRequestHandler):
         server_version = 'HubStaging/1'
 
@@ -206,6 +220,8 @@ def handler(service, token, peers, *, host_snapshot=None, v2_credentials=None):
             ensure(len(values) == 1, 'unauthorized', 401)
             if hmac.compare_digest(values[0], 'Bearer ' + token):
                 return None
+            if observer_token is not None and hmac.compare_digest(values[0], 'Bearer ' + observer_token):
+                return _OBSERVER
             for entry in v2_credentials or ():
                 principal, secret, projects = entry[:3]
                 if hmac.compare_digest(values[0], 'Bearer ' + secret):
@@ -216,6 +232,10 @@ def handler(service, token, peers, *, host_snapshot=None, v2_credentials=None):
             try:
                 identity = self.authorize()
                 raw_path = urlsplit(self.path).path
+                if identity is _OBSERVER:
+                    ensure(self.command == 'GET' and self.path == '/v2/operator/runtime', 'not_found', 404)
+                    from .runtime_inventory import collect_runtime
+                    return self.respond(200, collect_runtime(service.backend, host_snapshot))
                 decoded_path = unquote(raw_path)
                 if identity is not None or decoded_path == '/v2' or decoded_path.startswith('/v2/'):
                     ensure('%' not in raw_path and '\\' not in raw_path and '//' not in raw_path,
@@ -377,6 +397,8 @@ def main():
     ensure(bool(projects), 'projects_required')
     v2_credentials = (scoped_credentials(config['v2_credentials'], projects, token)
                       if 'v2_credentials' in config else None)
+    observer_token = (observer_credential(config['observer_credential'], token, v2_credentials)
+                      if 'observer_credential' in config else None)
     ensure(Path(config['worker_root']).is_absolute(), 'absolute_worker_root_required')
     bind = str(ipaddress.ip_address(config.get('bind', '127.0.0.1')))
     port = config.get('port', 8780)
@@ -404,7 +426,7 @@ def main():
         storage['terminal_receipts'] = config['terminal_receipts']
     service = Service(config['worker_root'], projects, backend, **storage)
     server = BoundedServer((bind, port), handler(service, token, peers, host_snapshot=host_snapshot,
-                                                v2_credentials=v2_credentials))
+                                                v2_credentials=v2_credentials, observer_token=observer_token))
     server.daemon_threads = True
     server.timeout = 10
     try:
