@@ -24,6 +24,7 @@ from tests.test_stale_service_authority import owned
 
 
 def test_explicit_bounded_tool_arguments_only():
+    assert _arguments('get', {'task_id': 'task'})[0] == 'hub_tracking_task_get'
     assert _arguments('list', {'project': PROJECT})[0] == 'hub_tracking_task_list'
     assert _arguments('origin', {'task_id': 'task'})[0] == 'hub_tracking_task_origin'
     assert _arguments('request-summary', {'project': PROJECT, 'request_id': 'req'})[0] == 'hub_orchestration_request_origin_task_summary'

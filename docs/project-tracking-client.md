@@ -9,7 +9,7 @@ evidence, or authorize work. Existing session and independent-review rules
 remain enforced by the server. An older Hub may not support these tools.
 
 Select `--profile-dir`, `--session`, optionally `--private-vpn`, and exactly one
-action: `list`, `propose`, `update`, `withdraw-claim`, `review`, `history`, `origin`, or
+action: `get`, `list`, `propose`, `update`, `withdraw-claim`, `review`, `history`, `origin`, or
 `request-summary`. Supply one JSON
 object containing that MCP operation's arguments on standard input. Never put
 credentials or private task content in command arguments or logs. For example,
@@ -20,7 +20,10 @@ printf '%s' '{"project":"engineering-hub","unfinished":true}' |
   python -m engineering_hub.tracking_client --profile-dir /protected/profile --session example list
 ```
 
-For `propose`, supply project, title and a stable `client_request_id`; details,
+For `get`, supply the exact task_id to read its current state under the live
+session's `tracking.read` and project grants. The new direct get is EHS-only;
+legacy bearer identities cannot use it. Older Hubs may not support it. For
+`propose`, supply project, title and a stable `client_request_id`; details,
 links and origin_request_id are optional. `update` requires task_id,
 expected_revision, client_request_id, progress and evidence_links; an optional
 completion_claim is an assertion, not verification. `review` requires task_id,

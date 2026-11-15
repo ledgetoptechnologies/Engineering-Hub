@@ -23,6 +23,7 @@ from engineering_hub import tracking_outbox
 
 _MAX_INPUT = 65536
 _TOOLS = {
+    'get': ('hub_tracking_task_get', {'task_id'}, set()),
     'list': ('hub_tracking_task_list', {'project'}, {'limit', 'after_task_id', 'unfinished'}),
     'propose': ('hub_tracking_task_propose', {'project', 'title', 'client_request_id'},
                 {'details', 'links', 'origin_request_id'}),

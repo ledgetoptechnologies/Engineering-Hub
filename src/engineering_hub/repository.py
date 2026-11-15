@@ -338,6 +338,23 @@ class HubRepository:
                               (project, after or '', limit + 1)).fetchall()
             return [json.loads(row['data']) for row in rows]
 
+    def get_tracking_task(self, actor, identity):
+        """Read one current tracking task only under its scoped EHS read grant."""
+        operation = session_context.current.get()
+        if (not session_context.actor_allowed(actor) or operation.capability != 'tracking.read'):
+            raise HubError('hub_tracking_task_unavailable', 404)
+        try:
+            if type(identity) is not str or str(uuid.UUID(identity)) != identity:
+                raise ValueError()
+            # Serialize the task/project snapshot and the session before-commit
+            # check. A revocation that wins later cannot retract a sent response.
+            with self._transaction() as db:
+                item = self._get(db, identity, 'tracking_task')
+                self._project(item['project'], db)
+                return item
+        except (HubError, ValueError, TypeError, KeyError, AttributeError):
+            raise HubError('hub_tracking_task_unavailable', 404) from None
+
     @staticmethod
     def _tracking_segment_id(identity, kind, index):
         return str(uuid.uuid5(uuid.UUID(identity), f'tracking-history:{kind}:{index}'))

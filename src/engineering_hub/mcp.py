@@ -578,6 +578,11 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         return invoke(repo.tracking_history, task_id, kind, before)
 
     @registration.tool()
+    def hub_tracking_task_get(task_id: str, ctx: Context) -> dict:
+        """Read the current task under an exact session's project-scoped tracking.read grant."""
+        return invoke(repo.get_tracking_task, identity(ctx), task_id)
+
+    @registration.tool()
     def hub_tracking_task_list(project: str, ctx: Context, limit: StrictInt = 100,
                                after_task_id: str | None = None, unfinished: StrictBool = False) -> dict:
         """Read inert tracking records; unfinished includes open work and unverified claims.
