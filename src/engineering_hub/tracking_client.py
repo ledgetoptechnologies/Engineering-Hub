@@ -190,10 +190,25 @@ def main(argv=None):
                     result = asyncio.run(_run(args, record['arguments'], binding=bound, action=record['action']))
                     tracking_outbox.record_acceptance(args.outbox_dir, record, result)
         else:
-            if args.outbox_dir is not None or args.profile_dir is None or args.session is None:
+            if args.profile_dir is None or args.session is None or (args.outbox_dir is not None and args.action != 'update'):
                 raise ClientError('invalid_tracking_request')
             _arguments(args.action, arguments)
-            result = asyncio.run(_run(args, arguments))
+            if args.action == 'update' and args.outbox_dir is not None:
+                # Persist before transport, including before an uncertain outcome.
+                origin, installation = _installation_profile(args.profile_dir.expanduser().absolute(), args.private_vpn)
+                record_id = tracking_outbox.stage(args.outbox_dir, origin, installation, None, 'update', arguments)
+                try:
+                    record = tracking_outbox.read(args.outbox_dir, record_id)
+                    result = asyncio.run(_run(args, arguments, binding=record, action='update'))
+                    tracking_outbox.record_acceptance(args.outbox_dir, record, result)
+                except (Exception, KeyboardInterrupt):
+                    print(json.dumps({'type': 'tracking_outbox_status', 'record_id': record_id,
+                                      'state': 'unconfirmed', 'execution_authorization': False}, separators=(',', ':')))
+                    print('tracking_operation_unconfirmed; retain and inspect the staged update', file=sys.stderr)
+                    return 1
+                result = {**result, 'outbox_record_id': record_id}
+            else:
+                result = asyncio.run(_run(args, arguments))
         print(json.dumps(result, ensure_ascii=True, separators=(',', ':')))
     except ClientError as error:
         if str(error) == 'tracking_inventory_too_many_entries':

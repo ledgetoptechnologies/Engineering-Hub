@@ -39,13 +39,20 @@ The claimant must withdraw its exact claim, or an independent reviewer must
 reopen it, before new progress or a replacement claim can be recorded. This
 also applies to legacy claims; their documented independent reopen path remains
 available. Exact retries of an already accepted update remain idempotent.
-Stage the exact new update in the private outbox before sending when it must
-be retained. A pending-claim conflict leaves that local record unconfirmed;
-it is not a Hub task update and does not notify the reviewer. After the claim
-is withdrawn or reopened, read the current task and reconcile the saved work.
-The saved payload has its original revision and cannot be edited in place.
-Do not blindly resend it against a changed revision or use a new request ID
-until an uncertain earlier send has been reconciled with the Hub.
+To stage an update before attempting delivery, supply `--outbox-dir` with
+the `update` action. The client publishes the unchanged private request before
+network access and returns an outbox record ID. An unconfirmed result can mean
+rejection or a lost response after acceptance; retain it and use
+`status-staged`, `inspect-staged`, and the same request ID to reconcile before
+retrying. A local status alone cannot prove non-acceptance. A pending-claim
+conflict leaves the record unconfirmed; it is not a Hub task update and does
+not notify the reviewer. Never submit a rebased update with a new request ID
+until authoritative evidence establishes the original was not accepted. Once
+non-acceptance is established and a claim is withdrawn or reopened, inspect
+the current task and explicitly prepare a new update if needed. The client
+does not silently rebase or submit it. File contents are flushed; directory
+metadata durability after power loss remains unverified on Windows. Without
+`--outbox-dir`, update keeps its existing direct-send behavior.
 
 If work previously claimed complete is found incomplete, the exact EHS
 installation that made the latest claim may use `withdraw-claim` with task_id,
