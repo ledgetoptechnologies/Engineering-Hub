@@ -1,0 +1,44 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { renderToStaticMarkup } from "react-dom/server";
+import { readTracking, TrackingItems, type TrackingTask } from "./ProjectTrackingPanel";
+
+afterEach(() => vi.unstubAllGlobals());
+
+describe("project tracking route compatibility", () => {
+  it.each([404, 403, 400])("treats missing route %i as unavailable rather than sign-out", async status => {
+    const code = status === 400 ? "gateway_invalid_path" : "gateway_route_forbidden";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({detail: {code}}), {
+      status, headers: {"content-type": "application/json"},
+    })));
+    await expect(readTracking("engineering-hub", null, new AbortController().signal)).rejects.toMatchObject({status: 503});
+  });
+  it.each([401, 403])("preserves actual authorization failure %i", async status => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({detail: {code: "forbidden"}}), {
+      status, headers: {"content-type": "application/json"},
+    })));
+    await expect(readTracking("engineering-hub", null, new AbortController().signal)).rejects.toMatchObject({status});
+  });
+});
+
+describe("project tracking presentation", () => {
+  it("shows progress, evidence and an explicitly unverified completion claim", () => {
+    const task: TrackingTask = { id: "1", revision: 2, project: "demo", title: "Tracked work", status: "completion_claimed",
+      created_by: "codex", execution_authorization: false, updates: [{ actor: "codex", progress: "Tests passed",
+        completion_claim: true, evidence_links: [{label: "Evidence", url: "https://example.com/report"},
+          {label: "Unsafe", url: "javascript:alert(1)"}] }] };
+    const html = renderToStaticMarkup(<TrackingItems tasks={[task]} />);
+    expect(html).toContain("Completion claimed — unverified");
+    expect(html).toContain("Tests passed");
+    expect(html).toContain('href="https://example.com/report"');
+    expect(html).not.toContain('href="javascript:');
+  });
+  it("shows a separately attributed verification", () => {
+    const task: TrackingTask = { id: "2", revision: 3, project: "demo", title: "Reviewed", status: "completion_verified",
+      created_by: "codex", execution_authorization: false, updates: [],
+      reviews: [{actor: "claude", verdict: "verify", note: "Checked", evidence_links: []}] };
+    const html = renderToStaticMarkup(<TrackingItems tasks={[task]} />);
+    expect(html).toContain("Completion verified by reviewer");
+    expect(html).toContain("claude");
+    expect(html).toContain("Checked");
+  });
+});

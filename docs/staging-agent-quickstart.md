@@ -330,3 +330,25 @@ job without executing it: use an isolated acceptance instance, or an approved
 worker prepared to manage the lease and report uncertainty honestly. Treat a
 lost claim response as uncertain; inspect durable state rather than issuing a
 second external effect or fabricating completion evidence.
+
+
+### Build-to-pilot binding remains unavailable
+
+The private queued pilot persists and rechecks a three-field target: task,
+source commit and artifact digest, against the explicitly enrolled immutable
+pilot manifest. The public work API currently accepts only those three fields.
+The broader internal `WorkTarget` also has CI attempt, build receipt and release
+digest fields, but this pilot has no trusted producer or durable verifier joining
+them to its intent. It rejects targets carrying any extra binding at admission;
+any retained queued rows with such fields remain unclaimed, not auto-replayed. This
+guard does not create build provenance or establish deploy/rollback readiness.
+
+A complete path must independently attest a specific successful builder attempt
+and immutable output (including source/tree, build inputs, OCI index, selected
+platform manifest and config), verify an independently approved exact record,
+and bind the immutable release/rollback identity and reviewed task to the same
+queue intent and receipt. It must recheck that complete binding transactionally
+at submission, claim and dispatch and during original-operation recovery. The
+existing development CI terminal `image_id` is the validation runner image, not
+an attested output; do not treat it as the deployable candidate. Trusted producer
+enrollment, release transitions and host execution remain separate work.

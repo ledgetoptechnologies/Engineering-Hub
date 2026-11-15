@@ -5,9 +5,16 @@ This is NOT autonomous host rollout, OAuth, TrueNAS, or machine reboot proof.
 All uniquely owned test containers and volumes are removed after verification.
 """
 import argparse
+from contextlib import contextmanager
+from contextvars import ContextVar
+from os import stat as endpoint_stat
+from os.path import realpath as endpoint_realpath
 import json
 import re
+import shutil
+import stat
 import subprocess
+import tempfile
 import uuid
 
 
@@ -109,8 +116,49 @@ print(json.dumps({'sha256': digest.hexdigest(), 'size_bytes': destination.stat()
 '''
 
 
+_docker_session = ContextVar('durable_smoke_docker_session', default=None)
+
+
+@contextmanager
+def docker_session(docker_host):
+    """Bind CLI invocations to an explicit dedicated local socket and empty config."""
+    if (not isinstance(docker_host, str)
+            or not re.fullmatch(r'unix:///run/[A-Za-z0-9_./-]+\.sock', docker_host)
+            or any(part in ('', '.', '..') for part in docker_host[8:].split('/'))
+            or docker_host in ('unix:///run/docker.sock', 'unix:///run/containerd/containerd.sock')):
+        raise ValueError('An explicit dedicated local Unix Docker socket is required')
+    socket_path = docker_host[7:]
+    if endpoint_realpath(socket_path) != socket_path:
+        raise ValueError('Docker socket aliases are not allowed')
+    socket_info = endpoint_stat(socket_path)
+    if not stat.S_ISSOCK(socket_info.st_mode):
+        raise ValueError('Docker endpoint must be an existing socket')
+    for shared in ('/run/docker.sock', '/var/run/docker.sock'):
+        try:
+            shared_info = endpoint_stat(shared)
+        except FileNotFoundError:
+            continue
+        if (shared_info.st_dev, shared_info.st_ino) == (socket_info.st_dev, socket_info.st_ino):
+            raise ValueError('Shared system Docker socket is not allowed')
+    executable = shutil.which('docker', path='/usr/bin:/bin')
+    if executable is None or not executable.startswith('/'):
+        raise RuntimeError('System Docker CLI is unavailable')
+    with tempfile.TemporaryDirectory(prefix='eh-durable-docker-config-') as config_dir:
+        prefix = (executable, '--host', docker_host)
+        env = {'PATH': '/usr/bin:/bin', 'DOCKER_CONFIG': config_dir}
+        token = _docker_session.set((prefix, env))
+        try:
+            yield prefix, env
+        finally:
+            _docker_session.reset(token)
+
+
 def _docker(args, *, check=True, timeout=30):
-    return subprocess.run(['docker', *args], check=check, capture_output=True,
+    session = _docker_session.get()
+    if session is None:
+        raise RuntimeError('Explicit Docker session required')
+    prefix, env = session
+    return subprocess.run([*prefix, *args], env=env, check=check, capture_output=True,
                           text=True, timeout=timeout)
 
 
@@ -291,9 +339,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--image', required=True)
     parser.add_argument('--expected-commit', required=True)
+    parser.add_argument('--docker-host', required=True, help='Dedicated local Unix Docker socket')
     args = parser.parse_args()
     try:
-        result = run_smoke(args.image, args.expected_commit)
+        with docker_session(args.docker_host):
+            result = run_smoke(args.image, args.expected_commit)
     except Exception:
         parser.exit(1, 'Durability smoke failed; inspect disposable resources before retrying.\n')
     print(json.dumps(result, sort_keys=True))

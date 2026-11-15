@@ -7,16 +7,18 @@ transports are accepted solely through the explicit ``test_transport`` keyword.
 from __future__ import annotations
 
 import hashlib
+import contextvars
 import json
 import os
 import re
 import stat
 import time
 from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 from urllib.parse import quote
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 
@@ -34,7 +36,7 @@ from .backend import (
     ProbeObservation,
     RunnerObservation,
 )
-from .build_record import VerifiedImage
+from .build_record import VerifiedImage, BuildRecordError, _check_buildkit_attestation
 
 API_RE = re.compile(r"1\.(?:0|[1-9][0-9]{0,2})\Z")
 OPAQUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -226,6 +228,89 @@ class TrustedPrivateOperationJournal(Protocol):
     def inspect(self, operation_id: str) -> OperationObservation | None: ...
 
 
+@dataclass(frozen=True)
+class TrustedEffectBindingProvider:
+    """Explicit operator-supplied binding factory; not host attestation.
+
+    The operator must independently enroll generation, fence and MAC custody.
+    This wrapper neither provisions nor validates those authorities.
+    """
+    create: Callable
+    compare_actual: Callable | None = None
+    recheck: Callable | None = None
+    verify_completed: Callable | None = None
+    source_ledger: object | None = None
+
+    def __post_init__(self):
+        if not callable(self.create):
+            raise TypeError("binding factory required")
+        if self.compare_actual is not None and not callable(self.compare_actual):
+            raise TypeError("actual effect comparator must be callable")
+        if self.recheck is not None and not callable(self.recheck):
+            raise TypeError("effect recheck must be callable")
+        if self.verify_completed is not None and not callable(self.verify_completed):
+            raise TypeError("completed effect verifier must be callable")
+
+
+@dataclass(frozen=True)
+class ActualEffectInputs:
+    """Observed effect inputs; not runner-generation or fence attestation."""
+    context: object
+    engine_binding: DockerEngineBinding
+    plan: ContainerPlan | None
+    observation: ContainerObservation | None
+    image: VerifiedImage
+    probes: tuple | None
+
+
+def compare_enrolled_effect(actual, expected, verify_generation):
+    """Compare actual typed inputs; external verifier must prove runner/fence.
+
+    The callback must independently authenticate the current daemon generation,
+    live fencing and enrollment. This comparison is not atomic host attestation.
+    """
+    from .effect_binding_canonical import NonsecretEffectBinding, canonical_nonsecret_binding
+    from .runtime_profile import probe_set_digest
+    if type(actual) is not ActualEffectInputs or type(expected) is not NonsecretEffectBinding or not callable(verify_generation):
+        return False
+    canonical_nonsecret_binding(expected)
+    context = actual.context
+    effect_kind = ('start' if context.kind in {'start_candidate', 'start_rollback'} else context.kind)
+    if (context.operation_id != expected.operation_id or context.request.run_id != expected.run_id
+            or context.request.fencing_generation != expected.fence or effect_kind != expected.kind):
+        return False
+    plan, observed, image = actual.plan, actual.observation, actual.image
+    if plan is not None:
+        if type(plan) is not ContainerPlan or observed is not None:
+            return False
+        if expected.resource_name != plan.resource_name or expected.container_id is not None or image != plan.image:
+            return False
+        profile = plan.profile
+    else:
+        if type(observed) is not ContainerObservation or expected.container_id != observed.container_id or expected.resource_name is not None:
+            return False
+        if (observed.selected_image.runnable_reference != image.runnable_reference
+                or observed.selected_image.platform_manifest_digest != image.platform_manifest_digest
+                or observed.selected_image.image_config_id != image.image_config_id):
+            return False
+        profile = observed.profile
+    if (type(profile) is not EffectiveProfile or image.runnable_reference != expected.image_index_digest
+            or image.platform_manifest_digest != expected.platform_manifest_digest
+            or image.image_config_id != expected.image_config_id
+            or profile.state_generation_id != expected.state_generation_id
+            or tuple(sorted(name for name, _ in profile.environment)) != tuple(sorted(expected.environment_names))
+            or profile.memory_bytes != expected.memory_bytes or profile.cpu_millicores != expected.cpu_millicores
+            or profile.pids_limit != expected.pids_limit or len(profile.tmpfs) != 1
+            or profile.tmpfs[0][1] != expected.tmpfs_bytes):
+        return False
+    if (probe_set_digest(actual.probes) if actual.probes is not None else None) != expected.probe_set_digest:
+        return False
+    return verify_generation(actual, expected) is True
+
+
+_effect_context = contextvars.ContextVar('hub_daemon_effect_context', default=None)
+
+
 class _ChunkReader:
     """Small bounded reader over HTTPX raw chunks; no archive extraction."""
 
@@ -409,12 +494,21 @@ def _archive_image(entries, image: VerifiedImage):
                 keys = {"mediaType", "digest", "size"}
                 if "platform" in child:
                     keys.add("platform")
+                if "annotations" in child:
+                    keys.add("annotations")
                 if set(child) != keys:
                     raise DaemonBackendError("daemon image descriptor shape is invalid")
                 child_id = child.get("digest")
                 child_size = child.get("size")
                 if type(child_size) is not int or not 1 <= child_size <= _MAX_METADATA_ENTRY:
                     raise DaemonBackendError("daemon image descriptor size is invalid")
+                if "annotations" in child:
+                    try:
+                        _check_buildkit_attestation(child, document["manifests"],
+                                                    load(child_id, media, child_size))
+                    except BuildRecordError:
+                        raise DaemonBackendError("invalid BuildKit attestation descriptor") from None
+                    continue
                 child_platform = child.get("platform")
                 if child_platform is not None:
                     if (not isinstance(child_platform, dict)
@@ -512,13 +606,20 @@ class DockerEngineBackend:
 
     def __init__(self, binding: DockerEngineBinding, *,
                  operation_journal: TrustedPrivateOperationJournal | None = None,
+                 effect_binding_provider: TrustedEffectBindingProvider | None = None,
                  test_transport: httpx.MockTransport | None = None):
         if type(binding) is not DockerEngineBinding:
             raise TypeError("explicit DockerEngineBinding required")
         if test_transport is not None and type(test_transport) is not httpx.MockTransport:
             raise TypeError("only an explicit httpx.MockTransport test transport is accepted")
+        if effect_binding_provider is not None and (type(effect_binding_provider) is not TrustedEffectBindingProvider
+                                                    or operation_journal is None):
+            raise TypeError("explicit trusted provider and journal required")
         self.binding = binding
         self.operation_journal = operation_journal
+        self.effect_binding_provider = effect_binding_provider
+        self.app_cgroup_observer = None
+        self.effect_response_recorder = None
         self._using_test_transport = test_transport is not None
         transport = (test_transport if test_transport is not None
                      else httpx.HTTPTransport(uds=binding.unix_socket_path))
@@ -538,6 +639,20 @@ class DockerEngineBackend:
         if not self._closed:
             self._closed = True
             self._client.close()
+
+    @contextmanager
+    def effect_context_scope(self, context):
+        """Carry the guard's exact admitted request in this synchronous call."""
+        from .adapter import EffectCallContext
+        from engineering_hub.container_pilot_client import ContainerPilotRequest
+        if (type(context) is not EffectCallContext or type(context.request) is not ContainerPilotRequest
+                or _effect_context.get() is not None):
+            raise DaemonBackendError('invalid or nested effect context')
+        token = _effect_context.set((self, context))
+        try:
+            yield
+        finally:
+            _effect_context.reset(token)
 
     def _deadline(self, timeout_ms):
         if type(timeout_ms) is not int or not 1 <= timeout_ms <= 120_000:
@@ -612,6 +727,36 @@ class DockerEngineBackend:
             method, route, deadline, expected_statuses={expected_status},
             json_body=json_body, params=params, body_limit=body_limit,
         )
+        return raw
+
+    def _effect_response(self, operation_id, step, route, deadline, *, expected_status,
+                         admitted, container_id=None, readiness_deadline=None,
+                         json_body=None, params=None, body_limit=_MAX_JSON):
+        """Optionally persist response intent before POST and safe reply before return."""
+        recorder = self.effect_response_recorder
+        if recorder is None:
+            return self._read_response('POST', route, deadline, expected_status=expected_status,
+                json_body=json_body, params=params, body_limit=body_limit)
+        from .effect_response_recorder import DurableEffectResponseRecorder
+        selected = _effect_context.get()
+        if (type(recorder) is not DurableEffectResponseRecorder or selected is None
+                or selected[0] is not self or selected[1].operation_id != operation_id
+                or recorder.journal is not self.operation_journal):
+            raise DaemonBackendError('durable response admission unavailable')
+        request_mac = recorder.begin(operation_id, step, route=route, params=params, body=json_body)
+        # Durable admission can block. Recheck both authority and app scope
+        # after it, immediately before the one permitted POST.
+        if container_id is None:
+            self._recheck_effect(admitted, deadline)
+        else:
+            self._recheck_contained_effect(admitted, container_id, deadline)
+        if readiness_deadline is not None and time.monotonic() >= readiness_deadline:
+            raise DaemonBackendError('health readiness admission deadline exceeded')
+        self._remaining(deadline)
+        raw = self._read_response('POST', route, deadline, expected_status=expected_status,
+            json_body=json_body, params=params, body_limit=body_limit)
+        recorder.complete(operation_id, step, request_mac, status=expected_status, raw=raw)
+        self._remaining(deadline)
         return raw
 
     def _archive_response(self, route, deadline):
@@ -736,19 +881,66 @@ class DockerEngineBackend:
         except (ValueError, TypeError, AttributeError):
             raise DaemonBackendError("invalid durable operation identity") from None
 
-    def _journal_begin(self, operation_id, kind):
+    def _journal_begin(self, operation_id, kind, *, resource_name=None, target_id=None,
+                       plan=None, observation=None, image=None, probes=None):
         self._operation_id(operation_id)
         if self.operation_journal is None:
             return
         try:
-            self.operation_journal.begin(operation_id, kind)
+            if self.effect_binding_provider is None:
+                self.operation_journal.begin(operation_id, kind)
+            else:
+                from .operation_journal import OperationBinding
+                selected = _effect_context.get()
+                if (selected is None or selected[0] is not self
+                        or selected[1].operation_id != operation_id
+                        or self.effect_binding_provider.compare_actual is None
+                        or self.effect_binding_provider.recheck is None
+                        or type(image) is not VerifiedImage):
+                    raise ValueError('verified effect context unavailable')
+                context = selected[1]
+                expected_kinds = {'start': {'start_candidate', 'start_rollback'},
+                                  'probe': {'probe'}, 'stop': {'stop'},
+                                  'create_candidate': {'create_candidate'},
+                                  'create_rollback': {'create_rollback'}}
+                if context.kind not in expected_kinds.get(kind, set()):
+                    raise ValueError('effect kind differs from admitted context')
+                actual = ActualEffectInputs(context, self.binding, plan, observation, image, probes)
+                if self.effect_binding_provider.compare_actual(actual) is not True:
+                    raise ValueError('actual effect differs from independent enrollment')
+                bound = self.effect_binding_provider.create(operation_id, kind, resource_name, target_id)
+                if (type(bound) is not OperationBinding or bound.owner_epoch is not None
+                        or bound.resource_name != resource_name or bound.target_id != target_id):
+                    raise ValueError("effect binding differs from actual target")
+                self.operation_journal.begin_bound(operation_id, kind, bound)
+                return actual
         except Exception:
             raise DaemonBackendError("private operation journal unavailable") from None
+
+    def _recheck_effect(self, actual, deadline):
+        """Recheck retained intent and independent generation immediately before POST."""
+        if self.effect_binding_provider is None:
+            self._remaining(deadline)
+            return
+        try:
+            selected = _effect_context.get()
+            if (type(actual) is not ActualEffectInputs or selected is None
+                    or selected[0] is not self or selected[1] is not actual.context
+                    or self.effect_binding_provider.recheck is None
+                    or self.effect_binding_provider.recheck(actual) is not True):
+                raise ValueError('effect admission no longer valid')
+            self._remaining(deadline)
+        except Exception:
+            raise DaemonBackendError('effect admission unavailable') from None
 
     def _journal_complete(self, operation_id, kind, container_id=None):
         if self.operation_journal is None:
             return
         try:
+            if self.effect_response_recorder is not None:
+                rows = self.effect_response_recorder.inspect(operation_id)
+                if not rows or any(row[3] != 'received' for row in rows):
+                    raise ValueError('response evidence incomplete')
             self.operation_journal.completed(operation_id, kind, container_id)
         except Exception:
             # The engine may already have changed state; leave the intent uncertain.
@@ -946,7 +1138,7 @@ class DockerEngineBackend:
     def _create_body(self, plan, source, environment):
         profile = plan.profile
         tmp_size, tmp_mode = profile.tmpfs[0][1], profile.tmpfs[0][2]
-        return {
+        body = {
             "Image": plan.immutable_reference,
             "User": "10001:10001",
             "Env": [f"{key}={value}" for key, value in environment],
@@ -971,6 +1163,32 @@ class DockerEngineBackend:
                 "AutoRemove": False,
             },
         }
+        if self.app_cgroup_observer is not None:
+            from .app_cgroup_observation import AppCgroupObserver
+            if type(self.app_cgroup_observer) is not AppCgroupObserver:
+                raise DaemonBackendError('app cgroup observer unavailable')
+            body["HostConfig"]["CgroupParent"] = self.app_cgroup_observer._pins.parent
+        return body
+
+    def _verify_app_cgroup(self, container_id, deadline):
+        if self.app_cgroup_observer is None:
+            return None
+        from .app_cgroup_observation import AppCgroupObserver, AppCgroupObservation
+        if type(self.app_cgroup_observer) is not AppCgroupObserver:
+            raise DaemonBackendError('app cgroup observation unavailable')
+        result = self.app_cgroup_observer.verify(container_id, deadline=deadline)
+        if type(result) is not AppCgroupObservation or result.container_id != container_id:
+            raise DaemonBackendError('app cgroup observation unavailable')
+        self._remaining(deadline)
+        return result
+
+    def _recheck_contained_effect(self, admitted, container_id, deadline):
+        evidence = self._verify_app_cgroup(container_id, deadline)
+        self._recheck_effect(admitted, deadline)
+        if evidence is not None and (time.monotonic() >= evidence.expires_monotonic
+                or int(time.time() * 1000) >= evidence.expires_wall_ms):
+            raise DaemonBackendError('app cgroup observation expired')
+        self._remaining(deadline)
 
     def create_container(self, plan: ContainerPlan, operation_id: str, timeout_ms: int) -> str:
         deadline = self._deadline(timeout_ms)
@@ -991,7 +1209,8 @@ class DockerEngineBackend:
              "Volumes": (cached[1].get("config") or {}).get("Volumes")},
         )
         self._remaining(deadline)
-        self._journal_begin(operation_id, "create_" + plan.image.role)
+        admitted = self._journal_begin(operation_id, "create_" + plan.image.role, resource_name=plan.resource_name,
+                            plan=plan, image=plan.image)
         name_route = self._route("/containers/" + quote(plan.resource_name, safe="") + "/json")
         status, _ = self._response_bytes("GET", name_route, deadline,
                                          expected_statuses={200, 404}, body_limit=_MAX_JSON)
@@ -1002,8 +1221,9 @@ class DockerEngineBackend:
         self._assert_runner(deadline)
         body = self._create_body(plan, source, environment)
         route = self._route("/containers/create")
-        raw = self._read_response("POST", route, deadline, expected_status=201,
-                                  json_body=body, params={"name": plan.resource_name})
+        self._recheck_effect(admitted, deadline)
+        raw = self._effect_response(operation_id, 'create', route, deadline, expected_status=201,
+                                    admitted=admitted, json_body=body, params={"name": plan.resource_name})
         result = _strict_json(raw)
         self._remaining(deadline)
         if (not isinstance(result, dict) or type(result.get("Id")) is not str
@@ -1225,6 +1445,9 @@ class DockerEngineBackend:
                 or not 16 <= host.get("PidsLimit") <= 256
                 or host.get("AutoRemove") is not False):
             raise DaemonBackendError("container host security profile differs")
+        if (self.app_cgroup_observer is not None
+                and host.get("CgroupParent") != self.app_cgroup_observer._pins.parent):
+            raise DaemonBackendError("container cgroup parent differs")
         for key in ("GroupAdd", "Binds", "Devices", "DeviceRequests", "DeviceCgroupRules",
                     "ExtraHosts", "Links", "VolumesFrom"):
             if host.get(key) not in (None, []):
@@ -1298,33 +1521,44 @@ class DockerEngineBackend:
         deadline = self._deadline(timeout_ms)
         self._operation_id(operation_id)
         before = self._known_container(container_id, "created", deadline)
-        self._journal_begin(operation_id, "start")
+        admitted = self._journal_begin(operation_id, "start", target_id=container_id, observation=before,
+                            image=self._container_images.get(container_id))
         self._assert_runner(deadline)
         route = self._route("/containers/" + container_id + "/start")
-        self._read_response("POST", route, deadline, expected_status=204)
+        self._recheck_effect(admitted, deadline)
+        self._effect_response(operation_id, 'start', route, deadline, expected_status=204, admitted=admitted)
         self._journal_complete(operation_id, "start", container_id)
         self._assert_runner(deadline)
         after = self.inspect_container(container_id, self._remaining_ms(deadline))
         if (type(after) is not ContainerObservation or after.status != "running"
                 or after.selected_image != before.selected_image or after.profile != before.profile):
             raise DaemonBackendError("started container state is not verified")
+        self._verify_app_cgroup(container_id, deadline)
         self._remaining(deadline)
 
     def stop_container(self, container_id: str, operation_id: str, timeout_ms: int) -> None:
         deadline = self._deadline(timeout_ms)
         self._operation_id(operation_id)
         before = self._known_container(container_id, "running", deadline)
-        self._journal_begin(operation_id, "stop")
+        admitted = self._journal_begin(operation_id, "stop", target_id=container_id, observation=before,
+                            image=self._container_images.get(container_id))
         self._assert_runner(deadline)
         route = self._route("/containers/" + container_id + "/stop")
-        self._read_response("POST", route, deadline, expected_status=204,
-                            params={"t": "5"})
+        self._recheck_contained_effect(admitted, container_id, deadline)
+        self._effect_response(operation_id, 'stop', route, deadline, expected_status=204,
+                              admitted=admitted, container_id=container_id, params={"t": "5"})
         self._journal_complete(operation_id, "stop", container_id)
         self._assert_runner(deadline)
         after = self.inspect_container(container_id, self._remaining_ms(deadline))
         if (type(after) is not ContainerObservation or after.status != "exited"
                 or after.selected_image != before.selected_image or after.profile != before.profile):
             raise DaemonBackendError("stopped container state is not verified")
+        # The post-stop inspection is useful only while the enrolled runner is
+        # still the one being inspected. A changed runner makes the outcome
+        # uncertain even if the earlier daemon returned an exited observation.
+        # This remains a point-in-time check, not an atomic daemon fence or
+        # durable quiescence evidence suitable for releasing a reservation.
+        self._assert_runner(deadline)
         self._remaining(deadline)
 
     def _exec_frame(self, raw):
@@ -1353,7 +1587,7 @@ class DockerEngineBackend:
         return bytes(output)
 
     def _one_probe(self, container_id, probe, budget_ms, deadline, source_commit, *, readiness=False,
-                   readiness_deadline=None):
+                   readiness_deadline=None, admitted=None):
         if type(readiness) is not bool or readiness and probe.kind != "health_json":
             raise DaemonBackendError("invalid health readiness classification")
         if readiness_deadline is not None and (not readiness
@@ -1377,9 +1611,14 @@ class DockerEngineBackend:
         # Once admitted, that exact attempt retains its ordinary request budget.
         if readiness_deadline is not None and time.monotonic() >= readiness_deadline:
             raise DaemonBackendError("health readiness admission deadline exceeded")
-        raw_create = self._read_response(
-            "POST", self._route("/containers/" + container_id + "/exec"),
-            probe_deadline, expected_status=201, json_body=create_body,
+        self._recheck_contained_effect(admitted, container_id, probe_deadline)
+        if readiness_deadline is not None and time.monotonic() >= readiness_deadline:
+            raise DaemonBackendError("health readiness admission deadline exceeded")
+        operation_id = _effect_context.get()[1].operation_id if self.effect_response_recorder is not None else None
+        raw_create = self._effect_response(
+            operation_id, 'probe-create:' + str(uuid4()), self._route("/containers/" + container_id + "/exec"),
+            probe_deadline, expected_status=201, admitted=admitted, container_id=container_id,
+            readiness_deadline=readiness_deadline, json_body=create_body,
         )
         created = _strict_json(raw_create)
         if (not isinstance(created, dict) or type(created.get("Id")) is not str
@@ -1387,9 +1626,10 @@ class DockerEngineBackend:
             raise DaemonBackendError("compiled probe execution identity is invalid")
         exec_id = created["Id"]
         self._assert_runner(probe_deadline)
-        raw_stream = self._read_response(
-            "POST", self._route("/exec/" + exec_id + "/start"),
-            probe_deadline, expected_status=200,
+        self._recheck_contained_effect(admitted, container_id, probe_deadline)
+        raw_stream = self._effect_response(
+            operation_id, 'probe-start:' + exec_id, self._route("/exec/" + exec_id + "/start"),
+            probe_deadline, expected_status=200, admitted=admitted, container_id=container_id,
             json_body={"Detach": False, "Tty": False}, body_limit=_MAX_EXEC_OUTPUT,
         )
         stdout = self._exec_frame(raw_stream)
@@ -1464,7 +1704,8 @@ class DockerEngineBackend:
                 or self._container_images.get(container_id, image) != image):
             raise DaemonBackendError("probe target lacks a verified source-image binding")
         self._remaining(deadline)
-        self._journal_begin(operation_id, "probe")
+        admitted = self._journal_begin(operation_id, "probe", target_id=container_id, observation=observation,
+                            image=image, probes=probes)
         health_ok = True
         for index, (probe, budget) in enumerate(zip(probes, timeout_ms, strict=True)):
             self._remaining(deadline)
@@ -1477,7 +1718,7 @@ class DockerEngineBackend:
                 while True:
                     healthy = self._one_probe(container_id, probe, budget, health_deadline,
                                               image.source_commit, readiness=True,
-                                              readiness_deadline=grace_deadline)
+                                              readiness_deadline=grace_deadline, admitted=admitted)
                     if healthy is not None:
                         break
                     remaining_grace = grace_deadline - time.monotonic()
@@ -1497,7 +1738,7 @@ class DockerEngineBackend:
                         healthy = False
                         break
             else:
-                healthy = self._one_probe(container_id, probe, budget, deadline, image.source_commit)
+                healthy = self._one_probe(container_id, probe, budget, deadline, image.source_commit, admitted=admitted)
             health_ok = health_ok and healthy
             self._remaining(deadline)
         self._journal_complete(operation_id, "probe", container_id)

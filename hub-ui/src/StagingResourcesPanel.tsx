@@ -205,8 +205,6 @@ export function StagingResourcesPanel({ mode, source: given, csrf, writable, sta
         <button className="secondary" type="button" disabled={state === "loading"} onClick={() => setRevision(value => value + 1)}>Check</button>
         <button className="dark-button" type="button" disabled={!canWrite} onClick={() => { setNotice(null); setCleaning(true); }}>Clean up staging…</button>
       </span></div>
-    <p className="panel-description">Workspaces, builds, test runs and previews the staging PC keeps for EH jobs. Cleanup shows its plan first,
-      and never removes pinned or protected items, or anything an EH job didn't create.</p>
     <StatusLine status={status} />
     {status !== null && typeof status === "object" && status.held_jobs.length > 0 &&
       <HeldJobs jobs={status.held_jobs} canRecheck={status.can_reconcile && canWrite} projectName={projectName}

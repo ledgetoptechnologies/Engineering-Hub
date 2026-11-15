@@ -240,3 +240,32 @@ async def test_reject_requires_claim_and_records_reason(client):
                                  json={"reason": "not applicable"})
     assert rejected.status_code == 200
     assert rejected.json()["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_rest_ack_and_reject_retries_are_audited_as_replays(client, app):
+    headers_h, headers_c = {"Authorization": "Bearer h-token"}, {"Authorization": "Bearer c-token"}
+    ids = []
+    for _ in range(2):
+        sent = await client.post("/api/messages", headers=headers_h, json={"recipient": "codex", "message_type": "x", "body": {}})
+        ids.append(sent.json()["id"])
+        assert (await client.post(f"/api/messages/{ids[-1]}/claim", headers=headers_c)).status_code == 200
+    first = await client.post(f"/api/messages/{ids[0]}/ack", headers=headers_c)
+    again = await client.post(f"/api/messages/{ids[0]}/ack", headers=headers_c)
+    assert first.status_code == again.status_code == 200 and first.json() == again.json()
+    reason = {"reason": "out of scope"}
+    assert (await client.post(f"/api/messages/{ids[1]}/reject", headers=headers_c, json=reason)).status_code == 200
+    assert (await client.post(f"/api/messages/{ids[1]}/reject", headers=headers_c, json=reason)).status_code == 200
+    assert (await client.post(f"/api/messages/{ids[1]}/reject", headers=headers_c, json={"reason": "other"})).status_code == 409
+    rows = [json.loads(line) for line in app.state.audit.path.read_text().splitlines()]
+    finishes = [(row["operation"], row["result"]) for row in rows if row["operation"] in {"acknowledge", "reject"}]
+    assert finishes == [("acknowledge", "ok"), ("acknowledge", "replayed"), ("reject", "ok"), ("reject", "replayed")]
+
+
+@pytest.mark.asyncio
+async def test_rest_send_refuses_nan_body(client):
+    headers_h = {"Authorization": "Bearer h-token", "content-type": "application/json"}
+    response = await client.post("/api/messages", headers=headers_h,
+                                 content=b'{"recipient":"codex","message_type":"x","body":{"n":NaN}}')
+    assert response.status_code in {400, 422}
+    assert (await client.get("/api/messages", headers={"Authorization": "Bearer c-token"})).json()["messages"] == []

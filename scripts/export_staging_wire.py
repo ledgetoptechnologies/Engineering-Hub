@@ -86,7 +86,7 @@ def fixture_document():
                             'id': JOB_ID, 'project': PROJECT, 'recipe': 'static',
                             'state': 'held', 'phase': 'held', 'source_commit': 'a' * 40}]}
 
-            async def reconcile_for(self, actor, job_id):
+            async def reconcile_for(self, actor, job_id, *, admission_guard=None):
                 if actor != 'human:1':
                     raise HubError('staging_admin_required', 403)
                 binding = store.inspect_job(control, job_id)
@@ -114,7 +114,10 @@ def fixture_document():
                 raise HubError('csrf_required', 403)
             return 'human:1'
 
-        attach_staging_routes(app, Controller(), human, human)
+        # Synthetic fixture identity has no cookie-backed session. Its guard is
+        # deliberately inert; production supplies the same-ledger session guard.
+        attach_staging_routes(app, Controller(), human, human,
+                              human_admission=lambda request, principal: lambda db: None)
         headers = {'X-Synthetic-Actor': 'human:1', 'X-Synthetic-Mutation': 'verified'}
         with TestClient(app) as client:
             status = client.get('/api/hub/v1/staging/status', headers=headers)

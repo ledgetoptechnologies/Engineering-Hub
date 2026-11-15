@@ -380,6 +380,8 @@ export function GroupedProjectsPanel({ hub, project, source: given }: { hub: Hub
   const children = hub.data.projects.filter((item) => item.parent_project === project.id && !item.archived);
   const key = children.map((item) => item.id).join(",");
   const [summaries, setSummaries] = useState<Record<string, string>>({});
+  const clear = useRef(hub.clearPrivateWorkspace);
+  clear.current = hub.clearPrivateWorkspace;
   useEffect(() => {
     const controller = new AbortController();
     setSummaries({});
@@ -387,7 +389,11 @@ export function GroupedProjectsPanel({ hub, project, source: given }: { hub: Hub
     for (const child of children.slice(0, 24)) {
       source.list(child.id, null, controller.signal)
         .then((page) => { if (!controller.signal.aborted) setSummaries((current) => ({ ...current, [child.id]: componentSummary(page.items) })); })
-        .catch(() => { if (!controller.signal.aborted) setSummaries((current) => ({ ...current, [child.id]: "" })); });
+        .catch((error) => {
+          if (controller.signal.aborted) return;
+          if (isSignOut(error)) { controller.abort(); clear.current(); return; }
+          setSummaries((current) => ({ ...current, [child.id]: "Components unavailable" }));
+        });
     }
     return () => controller.abort();
   }, [source, key]); // eslint-disable-line react-hooks/exhaustive-deps

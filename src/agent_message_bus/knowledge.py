@@ -215,8 +215,15 @@ class KnowledgeRepository:
             )
             from . import session_hub_context
             session_hub_context.before_commit(self.db_path, conn, project=project, path=path, version=version)
+            # Capture the row from this write transaction. A separate read
+            # after COMMIT can observe another writer's newer document and
+            # disclose it to a caller authorized only for this write.
+            saved = conn.execute(
+                'SELECT * FROM knowledge WHERE project=? AND path=?', (project, path),
+            ).fetchone()
+            entry = self._from_row(saved)
             conn.commit()
-            return self.get(project, path)
+            return entry
 
     def get(self, project: str, path: str) -> KnowledgeEntry:
         project = self.validate_project(project)

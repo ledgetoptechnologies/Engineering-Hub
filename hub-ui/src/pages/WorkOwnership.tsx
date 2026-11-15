@@ -18,13 +18,15 @@ export interface OwnerRow {
   key: string;
   owner: string | null;
   family: string | null;
-  notStarted: number;
-  working: number;
+  assigned: number;
+  claimed: number;
   inReview: number;
   /** Passed review within the last seven days, by when the task entered that state. */
   passedRecently: number;
   /** Earliest valid state time among open tasks, at most CLOCK_SKEW_MS ahead of now; null when there is none. */
   oldestOpenSince: string | null;
+  /** Open tasks without a valid state time, including unacceptably future times. */
+  unknownOpenTimes: number;
   open: number;
 }
 
@@ -40,8 +42,8 @@ export function ownershipRows(tasks: Task[], now = Date.now()): OwnerRow[] {
     const key = task.owner ?? UNCLAIMED;
     let row = rows.get(key);
     if (!row) {
-      row = { key, owner: task.owner, family: task.owner_family ?? null, notStarted: 0, working: 0, inReview: 0,
-        passedRecently: 0, oldestOpenSince: null, open: 0 };
+      row = { key, owner: task.owner, family: task.owner_family ?? null, assigned: 0, claimed: 0, inReview: 0,
+        passedRecently: 0, oldestOpenSince: null, unknownOpenTimes: 0, open: 0 };
       rows.set(key, row);
     }
     // A time more than CLOCK_SKEW_MS in the future can't be how long something has waited, so it
@@ -52,10 +54,11 @@ export function ownershipRows(tasks: Task[], now = Date.now()): OwnerRow[] {
       if (since !== null && now - since <= RECENT_MS) row.passedRecently++;
       continue;
     }
-    if (task.status === "assigned") row.notStarted++;
-    else if (task.status === "claimed") row.working++;
+    if (task.status === "assigned") row.assigned++;
+    else if (task.status === "claimed") row.claimed++;
     else row.inReview++;
     row.open++;
+    if (since === null) row.unknownOpenTimes++;
     const oldest = stamp(row.oldestOpenSince);
     if (since !== null && (oldest === null || since < oldest)) row.oldestOpenSince = task.state_since!;
   }
@@ -82,9 +85,9 @@ export function WorkOwnership({ hub, rows, selected, onSelect }: {
           const avatar = actorAvatar(row.owner, row.family);
           const age = relativeAge(row.oldestOpenSince);
           const counts = [
-            row.working && `${row.working} working`,
+            row.claimed && `${row.claimed} claimed`,
             row.inReview && `${row.inReview} in review`,
-            row.notStarted && `${row.notStarted} not started`,
+            row.assigned && `${row.assigned} assigned`,
             row.passedRecently && `${row.passedRecently} passed review in the last 7 days`,
           ].filter(Boolean).join(" · ");
           return <li key={row.key}>
@@ -94,13 +97,15 @@ export function WorkOwnership({ hub, rows, selected, onSelect }: {
               <span className="work-owner-text">
                 <strong>{name(row)}</strong>
                 <small>{counts}</small>
-                {row.open > 0 && <small>{age ? `Oldest open item: in its state since ${age}` : "Time in state not available"}</small>}
+                {row.open > 0 && <small>{age
+                  ? `Oldest ${row.unknownOpenTimes ? "known " : ""}state time: ${age}${row.unknownOpenTimes ? ` · ${row.unknownOpenTimes} unknown` : ""}`
+                  : "State times unavailable"}</small>}
               </span>
             </button>
           </li>;
         })}
       </ul>
-      <p className="panel-footnote">Counts come from each task's recorded owner and state. "Passed review in the last 7 days" uses when
+      <p className="panel-footnote">Counts come from each task's recorded owner and state; a claim does not confirm current execution or completion. "Passed review in the last 7 days" uses when
         a task entered that state; tasks without a valid recorded time aren't counted there. This summary doesn't show who is
         assigned to review or any test results; tasks don't track those. A recorded review appears on the task itself.</p>
     </section>

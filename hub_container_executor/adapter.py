@@ -14,7 +14,8 @@ import re
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from typing import Callable
 
 from engineering_hub.container_pilot_client import (
     ContainerPilotEvidence,
@@ -44,12 +45,36 @@ from .build_record import (
     VerifiedImage,
     verify_image_record,
 )
-from .ledger import Admission, InheritedLedgerUse, LedgerClosed, SQLiteLedger
+from .ledger import Admission, InheritedLedgerUse, LedgerClosed, SQLiteLedger, _make_response
 from .runtime_profile import derive_runtime_profile, probe_set_digest
 
 _CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _OPAQUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+
+@dataclass(frozen=True)
+class EffectCallContext:
+    """Original admitted request and durable operation; not host authority."""
+    request: ContainerPilotRequest
+    operation_id: str
+    kind: str
+
+
+@dataclass(frozen=True)
+class TrustedEffectContextGuard:
+    """Explicitly supplied verifier and scoped transport, never auto-enrolled.
+
+    The verifier must check independently enrolled live generation and fencing;
+    the request's asserted fence alone is not proof of either. The scope must
+    carry the exact context to the effect consumer without granting replay.
+    """
+    verify: Callable
+    scope: Callable
+
+    def __post_init__(self):
+        if not callable(self.verify) or not callable(self.scope):
+            raise TypeError('effect context verifier and scope required')
 
 
 class KnownTerminalFailure(RuntimeError):
@@ -75,9 +100,27 @@ class HostAdapter:
                  provenance_verifier: TrustedBuildVerifier | None = None,
                  backend: PilotBackend | None = None,
                  baseline_provider=None, state_provisioner=None, secret_resolver=None,
-                 driver_identity_verifier: TrustedDriverIdentityVerifier | None = None):
+                 driver_identity_verifier: TrustedDriverIdentityVerifier | None = None,
+                 effect_context_guard: TrustedEffectContextGuard | None = None,
+                 single_pilot_protocol: bool = False,
+                 stop_failed_candidate_before_rollback: bool = False):
         if type(manifest) is not PilotManifest:
             raise TypeError("shared PilotManifest required")
+        if type(single_pilot_protocol) is not bool:
+            raise TypeError('single pilot protocol requires explicit boolean')
+        if (type(stop_failed_candidate_before_rollback) is not bool
+                or stop_failed_candidate_before_rollback and not single_pilot_protocol):
+            raise TypeError('explicit single-pilot candidate cleanup required')
+        if manifest.disposable_final_cleanup and (not single_pilot_protocol or not stop_failed_candidate_before_rollback):
+            raise ValueError('disposable cleanup requires guarded candidate stop and single pilot protocol')
+        if effect_context_guard is not None and type(effect_context_guard) is not TrustedEffectContextGuard:
+            raise TypeError('explicit trusted effect context guard required')
+        if single_pilot_protocol:
+            from .single_pilot_evidence import require_resources
+            require_resources(backend, state_provisioner)
+        self._single_pilot_protocol = single_pilot_protocol
+        self._stop_failed_candidate_before_rollback = stop_failed_candidate_before_rollback
+        self._pilot_mutex = threading.RLock()
         self.manifest = PilotManifest.from_bytes(manifest.canonical_bytes())
         self.manifest_bytes = self.manifest.canonical_bytes()
         self.manifest_digest = self.manifest.digest()
@@ -89,6 +132,7 @@ class HostAdapter:
         self.state_provisioner = state_provisioner
         self.secret_resolver = secret_resolver
         self.driver_identity_verifier = driver_identity_verifier
+        self.effect_context_guard = effect_context_guard
         self._owner_pid = os.getpid()
         self._lifecycle = threading.Condition()
         self._active_operations = 0
@@ -101,7 +145,23 @@ class HostAdapter:
             manifest_digest=self.manifest_digest,
             candidate_commit=self.manifest.candidate.source_commit,
             policy_revision=self.manifest.policy_revision,
+            disposable_final_cleanup=self.manifest.disposable_final_cleanup is True,
         )
+        try:
+            enrolled = self.ledger.single_pilot_enabled()
+            if enrolled and not single_pilot_protocol:
+                raise PermissionError('single pilot protocol required for enrolled ledger')
+            if single_pilot_protocol and not enrolled:
+                self.ledger.enable_single_pilot_protocol()
+            if self.manifest.disposable_final_cleanup:
+                from .app_cgroup_observation import AppCgroupObserver
+                from .effect_response_recorder import DurableEffectResponseRecorder
+                if (type(getattr(backend, 'app_cgroup_observer', None)) is not AppCgroupObserver
+                        or type(getattr(backend, 'effect_response_recorder', None)) is not DurableEffectResponseRecorder):
+                    raise ValueError('disposable cleanup requires guarded response and containment evidence')
+        except BaseException:
+            self.ledger.close()
+            raise
 
     @contextmanager
     def _active_operation(self):
@@ -169,11 +229,57 @@ class HostAdapter:
 
     def get(self, command_id: str) -> ContainerPilotResponse | None:
         with self._active_operation():
-            return self.ledger.get(command_id)
+            if not self._single_pilot_protocol:
+                return self.ledger.get(command_id)
+            with self._pilot_mutex:
+                return self._single_pilot_snapshot(command_id)
+
+    def _single_pilot_snapshot(self, command_id):
+        response = self.ledger.get(command_id)
+        if response is not None:
+            return response
+        # A preflight failure can arm the gate before a command row exists.
+        # This read-only projection never clears the gate or replays an effect.
+        gate = self.ledger.inspect_single_pilot()
+        if type(gate) is not dict or gate.get('state') != 'effect_held':
+            return None
+        try:
+            request = ContainerPilotRequest.model_validate(gate.get('request'))
+        except (ValueError, TypeError):
+            return None
+        if request.command_id != command_id:
+            return None
+        return _make_response(request, state='held', reason='recovery_required')
 
     def submit(self, request: ContainerPilotRequest) -> ContainerPilotResponse:
         with self._active_operation():
-            return self._submit_active(request)
+            if not self._single_pilot_protocol:
+                return self._submit_active(request)
+            with self._pilot_mutex:
+                try:
+                    gate = self.ledger.inspect_single_pilot()
+                    if gate is not None:
+                        # A retained effect gate can predate admission (for
+                        # example, if preflight failed). Retrying it must not
+                        # create an operation without rerunning preflight.
+                        if (gate.get('state') == 'effect_held'
+                                and gate.get('request') == request.model_dump(mode='json')):
+                            return _make_response(request, state='held', reason='recovery_required')
+                        admission = self.ledger.admit(request)
+                        return admission.response
+                    prior = self.ledger.admit(request)
+                    if prior.replayed or prior.response.reason == 'identity_conflict':
+                        return prior.response
+                    self.ledger.arm_single_pilot(request)
+                    deadline = time.monotonic() + self.manifest.timeouts.total_command_ms / 1000
+                    from .single_pilot_evidence import require_journal_ready
+                    bound = require_journal_ready(self)
+                    if self.manifest.disposable_final_cleanup and bound is not True:
+                        raise ValueError('disposable cleanup requires bound effect guard')
+                    self.state_provisioner.require_complete_reservations(deadline_monotonic=deadline)
+                    return self._submit_active(request)
+                except Exception:
+                    return _make_response(request, state='held', reason='inspect_required')
 
     def _submit_active(self, request: ContainerPilotRequest) -> ContainerPilotResponse:
         admission = self.ledger.admit(request)
@@ -181,11 +287,21 @@ class HostAdapter:
             return admission.response
         deadline = time.monotonic() + self.manifest.timeouts.total_command_ms / 1000
         try:
-            return self._execute(request, deadline)
+            result = self._execute(request, deadline)
+            if self._single_pilot_protocol:
+                from .single_pilot_evidence import verify_phase
+                verify_phase(self, request, result, deadline)
+                self.ledger.record_single_pilot_verified_outcome(request, result,
+                    candidate_stop=(self._stop_failed_candidate_before_rollback and request.action == "rollback_container"))
+                return self.ledger.get(request.command_id)
+            if self.ledger.single_pilot_enabled():
+                return self.ledger.get(request.command_id)
+            return result
         except _Held as held:
             return self._finish(request, "held", held.reason)
         except _TerminalOperationFailed:
-            return self._finish(request, "failed", "effect_failed")
+            result = self._finish(request, "failed", "effect_failed")
+            return self.ledger.get(request.command_id) if self.ledger.single_pilot_enabled() else result
         except (BuildRecordError, ValueError, TypeError):
             # Never reflect parser details, paths, builder metadata or secrets.
             return self._finish(request, "held", "image_unavailable")
@@ -203,7 +319,8 @@ class HostAdapter:
                 self.baseline_provider is None or self.state_provisioner is None):
             raise _Held("recovery_required")
 
-        role = "rollback" if request.action in {"rollback_container", "smoke_container_rollback"} else "candidate"
+        role = (self.ledger.disposable_cleanup_role(request.run_id) if request.action in {'cleanup_candidate', 'cleanup_rollback'}
+                else "rollback" if request.action in {"rollback_container", "smoke_container_rollback"} else "candidate")
         image = self._verified_image(role)
         self._check_runner(deadline)
         defaults = self._image_defaults(image, deadline)
@@ -214,6 +331,8 @@ class HostAdapter:
             rollback_image = image if role == "rollback" else self._verified_image("rollback")
             rollback_defaults = defaults if role == "rollback" else self._image_defaults(rollback_image, deadline)
             self._verify_baseline_container(baseline, rollback_image, rollback_defaults, secrets, deadline)
+            if role == 'rollback' and self._stop_failed_candidate_before_rollback:
+                self._stop_same_run_candidate(request, baseline, secrets, deadline)
             method = (self.state_provisioner.prepare_candidate if role == "candidate"
                       else self.state_provisioner.prepare_rollback)
             state = self._effect(
@@ -242,6 +361,16 @@ class HostAdapter:
         profile = self._profile(image, defaults, generation_id, secrets)
         observation = self._inspect_container(container_id, image, profile, generation_id,
                                               {"running"}, deadline)
+        if request.action in {'cleanup_candidate', 'cleanup_rollback'}:
+            if request.action != 'cleanup_' + role:
+                raise _Held('identity_conflict')
+            self._effect(request, 'stop',
+                lambda operation_id, timeout: self.backend.stop_container(container_id, operation_id, timeout),
+                self.manifest.timeouts.stop_ms, deadline,
+                lambda _value: {'container_id': container_id, 'stopped': True})
+            self._inspect_container(container_id, image, profile, generation_id, {'exited'}, deadline)
+            evidence = self._evidence(container_id, image.image_config_id, 'unknown', True)
+            return self.ledger.finish(request.command_id, state='succeeded', reason=None, evidence=evidence)
         probes = self.manifest.probes.candidate if role == "candidate" else self.manifest.probes.rollback
         expected_probe_digest = self._probe_digest(probes)
         outcome = self._effect(
@@ -265,6 +394,34 @@ class HostAdapter:
         evidence = self._evidence(container_id, image.image_config_id, "healthy", True)
         self._timeout(deadline, self.manifest.timeouts.total_command_ms)
         return self.ledger.finish(request.command_id, state="succeeded", reason=None, evidence=evidence)
+
+    def _stop_same_run_candidate(self, request, baseline, secrets, deadline):
+        """Stop a running failed candidate; other rollback cases remain held."""
+        from .app_cgroup_observation import AppCgroupObserver
+        from .effect_response_recorder import DurableEffectResponseRecorder
+        if (not self._single_pilot_protocol or type(self.effect_context_guard) is not TrustedEffectContextGuard
+                or type(getattr(self.backend, 'app_cgroup_observer', None)) is not AppCgroupObserver
+                or type(getattr(self.backend, 'effect_response_recorder', None)) is not DurableEffectResponseRecorder):
+            raise _Held('recovery_required')
+        target = self.ledger.target_snapshot(request.target_id)
+        if (not target or target.get('current_run_id') != request.run_id
+                or target.get('fence') != request.fencing_generation
+                or target.get('image_config_id') != self.manifest.candidate.image_config_id
+                or not isinstance(target.get('container_id'), str)
+                or not _CONTAINER_ID.fullmatch(target['container_id'])
+                or target['container_id'] == baseline.container_id
+                or not isinstance(target.get('generation_id'), str)
+                or target['generation_id'] == baseline.state_generation_id):
+            raise _Held('recovery_required')
+        image = self._verified_image('candidate')
+        defaults = self._image_defaults(image, deadline)
+        profile = self._profile(image, defaults, target['generation_id'], secrets)
+        self._inspect_container(target['container_id'], image, profile, target['generation_id'], {'running'}, deadline)
+        self._effect(request, 'stop',
+            lambda operation_id, timeout: self.backend.stop_container(target['container_id'], operation_id, timeout),
+            self.manifest.timeouts.stop_ms, deadline,
+            lambda _value: {'container_id': target['container_id'],
+                            'generation_id': target['generation_id'], 'stopped': True})
 
     def _verified_image(self, role: str) -> VerifiedImage:
         return verify_image_record(self.manifest, role, self.record_store, self.metadata_store,
@@ -416,7 +573,17 @@ class HostAdapter:
             # Durable admission can wait on SQLite; recompute the budget only
             # after admission and never start an effect with an expired intent.
             timeout = self._timeout(deadline, phase_limit)
-            result = callback(operation_id, timeout)
+            if self.effect_context_guard is None:
+                result = callback(operation_id, timeout)
+            else:
+                context = EffectCallContext(request, operation_id, kind)
+                if self.effect_context_guard.verify(context) is not True:
+                    raise PermissionError('effect context denied')
+                with self.effect_context_guard.scope(context):
+                    # Verification and scope acquisition may block. Never pass
+                    # a stale pre-verification budget to the effect callback.
+                    timeout = self._timeout(deadline, phase_limit)
+                    result = callback(operation_id, timeout)
             # A deadline detects an overrun; it is not cancellation. Keep the
             # intent held so no later effect can run after an untrusted worker returns.
             self._timeout(deadline, phase_limit)
@@ -526,7 +693,21 @@ class HostAdapter:
     def reconcile(self, command_id: str) -> ContainerPilotResponse | None:
         """Inspect exact durable operation IDs only; never re-effect or re-probe."""
         with self._active_operation():
-            return self._reconcile_active(command_id)
+            if not self._single_pilot_protocol:
+                if self.ledger.single_pilot_enabled():
+                    return self.ledger.get(command_id)
+                return self._reconcile_active(command_id)
+            with self._pilot_mutex:
+                return self._single_pilot_snapshot(command_id)
+
+    def acknowledge_single_pilot(self, request, outcome_digest):
+        """Local trusted entry; service authentication is a separate boundary."""
+        with self._active_operation():
+            with self._pilot_mutex:
+                if not self._single_pilot_protocol:
+                    raise PermissionError('single pilot protocol unavailable')
+                self.ledger.acknowledge_single_pilot(request, outcome_digest)
+                return self.ledger.get(request.command_id)
 
     def _reconcile_active(self, command_id: str) -> ContainerPilotResponse | None:
         response = self.ledger.get(command_id)

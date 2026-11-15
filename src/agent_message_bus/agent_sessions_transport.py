@@ -11,7 +11,7 @@ from .agent_sessions import AgentSessionError
 from .agent_sessions_api import CLIENT_DOWNLOAD_PATHS
 
 PREFIX = '/api/agent-sessions/v1'
-MAX_NEW_TRANSPORTS = 1024  # Process-lifetime cap also bounds SDK-created transports.
+MAX_NEW_TRANSPORTS = 1024  # Concurrent SDK transports in the isolated EHS manager.
 MAX_NEW_STREAMS = 128
 MAX_STREAMS_PER_TRANSPORT = 2
 MAX_COMPLETED_POSTS_PER_TRANSPORT = 1
@@ -101,6 +101,27 @@ async def session_post(scope, receive, send, bridge_tools=()):
     return replay
 
 
+class IsolatedSessionTransportMiddleware:
+    """Route only already-authenticated EHS requests to their bounded manager.
+
+    Authentication and the session-owner check must wrap this middleware; the
+    principal is ASGI state set by MCPAuthMiddleware, never a client header.
+    The existing legacy Starlette app and its session manager remain unchanged.
+    """
+    def __init__(self, app, *, manager):
+        self.app, self.manager = app, manager
+
+    async def __call__(self, scope, receive, send):
+        from .agent_sessions import SessionPrincipal
+        principal = scope.get('state', {}).get('agent_session_principal')
+        if (scope['type'] == 'http' and scope.get('path', '').rstrip('/') == '/mcp'
+                and isinstance(principal, SessionPrincipal)):
+            if scope.get('path') != '/mcp':
+                return await denied(scope, receive, send, 'not_found', 404)
+            return await self.manager.handle_request(scope, receive, send)
+        return await self.app(scope, receive, send)
+
+
 class AgentSessionsBoundaryMiddleware:
     """Guard direct bus REST as well as an embedded Hub's explicit front door."""
     def __init__(self, app, *, auth, repository=None, config=None):
@@ -167,7 +188,7 @@ class MCPAuthMiddleware:
         self.agent_sessions = agent_sessions
         self.session_owners = {}
         self._new_records = {}
-        self._new_created = 0
+        self._new_pending = 0
         if on_owner is not None:
             on_owner(self)
 
@@ -180,16 +201,30 @@ class MCPAuthMiddleware:
         record['timer'].cancel()
         record['unsubscribe']()
 
-    def _register(self, sid, owner, token):
+    def _reserve_owner(self, owner, token):
         loop = asyncio.get_running_loop()
-        record = {'owner': owner}
+        record = {'owner': owner, 'sid': None, 'invalidated': False, 'released': False}
+        def invalidate():
+            record['invalidated'] = True
+            if record['sid'] is not None:
+                self._drop(record['sid'], record)
         def revoke():
-            loop.call_soon_threadsafe(self._drop, sid, record)
-        principal, unsubscribe = self.agent_sessions.subscribe_session(token, revoke)
+            loop.call_soon_threadsafe(invalidate)
+        principal, unsubscribe = self.agent_sessions.subscribe_session(token, revoke, purpose='owner')
         record['unsubscribe'] = unsubscribe
-        record['timer'] = loop.call_later(max(0, principal.expires_at - self.agent_sessions.clock()), self._drop, sid, record)
-        self.session_owners[sid] = owner
-        self._new_records[sid] = record
+        try:
+            record['timer'] = loop.call_later(max(0, principal.expires_at - self.agent_sessions.clock()), invalidate)
+        except BaseException:
+            unsubscribe()
+            raise
+        return record
+
+    @staticmethod
+    def _release_reservation(record):
+        if not record['released']:
+            record['released'] = True
+            record['timer'].cancel()
+            record['unsubscribe']()
 
 
     def close(self):
@@ -236,15 +271,28 @@ class MCPAuthMiddleware:
             if replay is None:
                 return
             receive = replay
-        if new and not sid and self._new_created >= MAX_NEW_TRANSPORTS:
-            return await denied(scope, receive, send, 'session_transport_limit', 429)
+        opening = new and not sid
+        reservation = None
+        if opening:
+            # An SDK transport can terminate without a matching middleware
+            # DELETE. Retain its owner record until credential expiry/revoke,
+            # but bound those records and outstanding opens independently.
+            if len(self._new_records) + self._new_pending >= MAX_NEW_TRANSPORTS:
+                return await denied(scope, receive, send, 'session_transport_limit', 429)
+            self._new_pending += 1
+            try:
+                reservation = self._reserve_owner(owner, token)
+            except AgentSessionError as exc:
+                self._new_pending -= 1
+                if exc.code == 'subscription_limit':
+                    return await denied(scope, receive, send, 'session_transport_limit', 429)
+                return await denied(scope, receive, send)
+            except BaseException:
+                self._new_pending -= 1
+                raise
         if not new and scope['method'] == 'GET':
             state = scope.setdefault('state', {})
             state['mcp_presence_agent'], state['mcp_presence_session_id'] = owner, sid
-        # Count every new authenticated SDK transport attempt for the entire
-        # owner lifetime, including an initialize revoked before its response.
-        if new and not sid:
-            self._new_created += 1
         status = None
         suppressed = False
         async def observed(message):
@@ -253,7 +301,7 @@ class MCPAuthMiddleware:
                 return
             if message['type'] == 'http.response.start':
                 status = message['status']
-                if scope['method'] == 'POST':
+                if scope['method'] == 'POST' and status < 400:
                     server_ids = [v.decode('ascii') for k,v in message.get('headers', []) if k.lower() == b'mcp-session-id']
                     if len(server_ids) == 1:
                         issued = server_ids[0]
@@ -261,17 +309,24 @@ class MCPAuthMiddleware:
                             raise RuntimeError('mcp_session_owner_conflict')
                         if issued not in self.session_owners:
                             if new:
-                                try:
-                                    self._register(issued, owner, token)
-                                except AgentSessionError:
+                                if reservation is None or reservation['invalidated']:
                                     suppressed = True
                                     status = 401
                                     await denied(scope, receive, send)
                                     return
+                                reservation['sid'] = issued
+                                self.session_owners[issued] = owner
+                                self._new_records[issued] = reservation
                             else:
                                 self.session_owners[issued] = owner
             await send(message)
-        await self.app(scope, receive, observed)
+        try:
+            await self.app(scope, receive, observed)
+        finally:
+            if opening:
+                self._new_pending -= 1
+                if reservation is not None and reservation['sid'] is None:
+                    self._release_reservation(reservation)
         if scope['method'] == 'DELETE' and sid and status == 200:
             if new:
                 record = self._new_records.get(sid)
@@ -330,14 +385,20 @@ class AgentSessionResponseGuardMiddleware:
         def revoke():
             loop.call_soon_threadsafe(stop)
         try:
-            principal, unsubscribe = self.repository.subscribe_session(token, revoke)
-        except AgentSessionError:
+            principal, unsubscribe = self.repository.subscribe_session(token, revoke, purpose='response')
+        except AgentSessionError as exc:
+            if exc.code == 'subscription_limit':
+                return await denied(scope, receive, send, 'session_transport_limit', 429)
             return await denied(scope, receive, send)
         key = (principal.installation_id, principal.session_id)
         if self._total >= MAX_NEW_STREAMS or self._active.get(key, 0) >= MAX_STREAMS_PER_TRANSPORT:
             unsubscribe()
             return await denied(scope, receive, send, 'session_transport_limit', 429)
-        timer = loop.call_later(max(0, principal.expires_at - self.repository.clock()), stop)
+        try:
+            timer = loop.call_later(max(0, principal.expires_at - self.repository.clock()), stop)
+        except BaseException:
+            unsubscribe()
+            raise
         self._total += 1
         self._active[key] = self._active.get(key, 0) + 1
         state['_agent_session_response_guard'] = self.repository

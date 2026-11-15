@@ -6,6 +6,8 @@ import io
 import json
 import tarfile
 from contextlib import closing
+from dataclasses import replace
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -15,13 +17,131 @@ from hub_container_executor.daemon_backend import (
     DaemonBackendError,
     DockerEngineBinding,
     DockerEngineBackend,
+    TrustedEffectBindingProvider,
+    ActualEffectInputs, compare_enrolled_effect,
 )
+from hub_container_executor.operation_journal import OperationBinding
 from hub_container_executor.build_record import verify_image_record
+from hub_container_executor.adapter import EffectCallContext
+from engineering_hub.container_pilot_client import ContainerPilotRequest
 from tests.test_hub_container_executor_build_record import FakeStore, FakeTrust, make_record
 
 INDEX_TYPE = "application/vnd.oci.image.index.v1+json"
 MANIFEST_TYPE = "application/vnd.oci.image.manifest.v1+json"
 CONFIG_TYPE = "application/vnd.oci.image.config.v1+json"
+
+
+def test_opt_in_bound_journal_matches_exact_target_before_effect(tmp_path):
+    manifest, image, _ = verified_image()
+    calls = []
+    target = 'a' * 64
+    operation = '12a15ad8-1c7c-4bd5-bfbf-e6df128ec5a7'
+    class Journal:
+        def begin_bound(self, *args):
+            calls.append(args)
+    def provider(op, kind, name, actual_target):
+        assert (op, kind, name, actual_target) == (operation, 'stop', None, target)
+        return OperationBinding('2b201b1d-2327-437e-8705-135b9ccf128b', 50, 60,
+                                None, target, 'hmac-sha256:' + 'a' * 64, 1)
+    backend = DockerEngineBackend(binding(manifest, tmp_path), operation_journal=Journal(),
+                                 effect_binding_provider=TrustedEffectBindingProvider(provider, lambda actual: True, lambda actual: True),
+                                 test_transport=httpx.MockTransport(lambda _: pytest.fail('unexpected effect')))
+    try:
+        context = EffectCallContext(ContainerPilotRequest.model_construct(run_id=str(uuid4()), fencing_generation=1), operation, 'stop')
+        with backend.effect_context_scope(context):
+            backend._journal_begin(operation, 'stop', target_id=target, image=image)
+        assert len(calls) == 1 and calls[0][:2] == (operation, 'stop')
+        backend.effect_binding_provider = TrustedEffectBindingProvider(
+            lambda *_: OperationBinding('2b201b1d-2327-437e-8705-135b9ccf128b', 50, 60,
+                                         None, 'b' * 64, 'hmac-sha256:' + 'a' * 64, 1), lambda actual: True, lambda actual: True)
+        with backend.effect_context_scope(context), pytest.raises(DaemonBackendError):
+            backend._journal_begin(operation, 'stop', target_id=target, image=image)
+        assert len(calls) == 1
+    finally:
+        backend.close()
+
+
+def test_single_pilot_bound_admission_requires_actual_backend_scope(tmp_path):
+    from types import SimpleNamespace
+    from hub_container_executor.adapter import TrustedEffectContextGuard
+    from hub_container_executor.single_pilot_evidence import require_journal_ready
+    from hub_container_executor.ledger import SQLiteLedger
+    pytest.importorskip('fcntl', reason='actual Linux owner required')
+    manifest, _, _ = verified_image()
+    calls = []
+    class Journal:
+        def require_no_pending(self, **kwargs): calls.append(kwargs)
+        def _transaction(self):
+            from contextlib import contextmanager
+            @contextmanager
+            def connection():
+                yield SimpleNamespace(execute=lambda query: SimpleNamespace(fetchone=lambda: (2,)))
+            return connection()
+    root = tmp_path / 'ledgers'
+    root.mkdir(mode=0o700)
+    options = dict(manifest_digest=manifest.digest(), candidate_commit=manifest.candidate.source_commit,
+                   policy_revision=manifest.policy_revision)
+    ledger = SQLiteLedger(root / 'ledger.sqlite', **options)
+    other = SQLiteLedger(root / 'other.sqlite', **options)
+    provider = TrustedEffectBindingProvider(lambda *_: None, lambda _: True, lambda _: True, lambda *_: True, ledger)
+    backend = DockerEngineBackend(binding(manifest, tmp_path), operation_journal=Journal(),
+                                 effect_binding_provider=provider,
+                                 test_transport=httpx.MockTransport(lambda _: pytest.fail('unexpected effect')))
+    try:
+        subject = SimpleNamespace(backend=backend, effect_context_guard=None, ledger=ledger)
+        with pytest.raises(ValueError): require_journal_ready(subject)
+        subject.effect_context_guard = TrustedEffectContextGuard(lambda _: True, lambda _: None)
+        with pytest.raises(ValueError): require_journal_ready(subject)
+        subject.effect_context_guard = TrustedEffectContextGuard(lambda _: True, backend.effect_context_scope)
+        subject.ledger = other
+        with pytest.raises(ValueError): require_journal_ready(subject)
+        assert calls == []
+        subject.ledger = ledger
+        assert require_journal_ready(subject) is True
+        assert calls == [{'allow_bound': True}]
+        ledger.close()
+        with pytest.raises(Exception): require_journal_ready(subject)
+    finally:
+        backend.close()
+        ledger.close()
+        other.close()
+
+
+def test_enrolled_actual_projection_rejects_mismatch_and_unverified_generation(tmp_path):
+    from hub_container_executor.backend import ActualImageSelection, ContainerObservation
+    from hub_container_executor.runtime_profile import probe_set_digest
+    from tests.test_hub_container_effect_binding_canonical import fixture
+    backend, manifest, image, plan, _ = create_transcript(tmp_path)
+    try:
+        operation, run_id = str(uuid4()), str(uuid4())
+        request = ContainerPilotRequest.model_construct(run_id=run_id, fencing_generation=3)
+        context = EffectCallContext(request, operation, 'create_candidate')
+        profile = plan.profile
+        expected = replace(fixture(), operation_id=operation, run_id=run_id, fence=3,
+            resource_name=plan.resource_name, image_index_digest=image.runnable_reference,
+            platform_manifest_digest=image.platform_manifest_digest, image_config_id=image.image_config_id,
+            state_generation_id=profile.state_generation_id,
+            environment_names=tuple(name for name, _ in profile.environment),
+            memory_bytes=profile.memory_bytes, cpu_millicores=profile.cpu_millicores,
+            pids_limit=profile.pids_limit, tmpfs_bytes=profile.tmpfs[0][1])
+        actual = ActualEffectInputs(context, backend.binding, plan, None, image, None)
+        assert compare_enrolled_effect(actual, expected, lambda *_: True)
+        assert not compare_enrolled_effect(actual, expected, lambda *_: False)
+        assert not compare_enrolled_effect(actual, replace(expected, fence=4), lambda *_: True)
+        assert not compare_enrolled_effect(actual, replace(expected, memory_bytes=expected.memory_bytes + 1), lambda *_: True)
+        assert not compare_enrolled_effect(actual, replace(expected, boot_id=str(uuid4())), lambda a, e: e.boot_id == expected.boot_id)
+        target = 'c' * 64
+        selected = ActualImageSelection(image.runnable_reference, image.platform_manifest_digest, image.image_config_id, image.platform)
+        observed = ContainerObservation(target, selected, profile, profile.state_generation_id, 'running')
+        probes = manifest.probes.candidate
+        probe_context = EffectCallContext(request, operation, 'probe')
+        probe_actual = ActualEffectInputs(probe_context, backend.binding, None, observed, image, probes)
+        probe_expected = replace(expected, kind='probe', resource_name=None, container_id=target,
+                                 probe_set_digest=probe_set_digest(probes))
+        assert compare_enrolled_effect(probe_actual, probe_expected, lambda *_: True)
+        assert not compare_enrolled_effect(probe_actual, replace(probe_expected, probe_set_digest='sha256:' + 'a' * 64), lambda *_: True)
+    finally:
+        backend.close()
 
 
 def sha(raw: bytes) -> str:
@@ -670,6 +790,49 @@ def test_create_uses_only_immutable_digest_and_exact_closed_profile(tmp_path):
     _exercise_create_closed_profile(tmp_path)
 
 
+def test_nonsecret_projection_runtime_tracks_backend_create_body(tmp_path):
+    """A drift check, not proof of request equivalence or authority."""
+    from uuid import uuid4
+    from hub_container_executor.backend import ContainerPlan
+    from hub_container_executor.effect_binding_canonical import (
+        NonsecretEffectBinding, canonical_nonsecret_binding,
+    )
+    manifest, image, _ = verified_image()
+    generation = safe_generation(tmp_path)
+    profile = make_profile(image)
+    plan = ContainerPlan("hub-pilot-fixture-01234567-89a-candidate", image,
+                         image.runnable_reference, False, profile)
+    backend = DockerEngineBackend(binding(manifest, tmp_path), test_transport=httpx.MockTransport(lambda _: None))
+    try:
+        body = backend._create_body(plan, generation, profile.environment)
+    finally:
+        backend.close()
+    projection = NonsecretEffectBinding(str(uuid4()), str(uuid4()), "create_candidate", 1,
+        str(uuid4()), 123, 456, str(uuid4()), plan.resource_name, None,
+        image.runnable_reference, image.platform_manifest_digest, image.image_config_id,
+        profile.state_generation_id, tuple(name for name, _ in profile.environment),
+        profile.memory_bytes, profile.cpu_millicores, profile.pids_limit, profile.tmpfs[0][1], None)
+    projected = json.loads(canonical_nonsecret_binding(projection))
+    runtime, host = projected["runtime"], body["HostConfig"]
+    assert projected["image_index_digest"] == body["Image"]
+    assert projected["environment_names"] == sorted(item.split("=", 1)[0] for item in body["Env"])
+    assert body["User"] == f'{runtime["uid"]}:{runtime["gid"]}'
+    assert host["ReadonlyRootfs"] == runtime["read_only_root"]
+    assert host["CapDrop"] == runtime["cap_drop"]
+    assert host["SecurityOpt"] == ["no-new-privileges:true"] and runtime["no_new_privileges"] is True
+    assert host["NetworkMode"] == runtime["network_mode"] and host["CgroupnsMode"] == runtime["cgroupns_mode"]
+    assert "PidMode" not in host and runtime["pid_mode"] == "private"
+    assert "IpcMode" not in host and runtime["ipc_mode"] == "private"
+    assert host["Memory"] == runtime["memory_bytes"] and host["MemorySwap"] == runtime["memory_swap_bytes"]
+    assert host["NanoCpus"] == runtime["cpu_millicores"] * 1_000_000
+    assert host["PidsLimit"] == runtime["pids_limit"]
+    assert host["Tmpfs"] == {"/tmp": f'rw,noexec,nosuid,size={runtime["tmpfs_bytes"]},mode={runtime["tmpfs_mode"]}'}
+    assert runtime["tmpfs_noexec"] is True and runtime["tmpfs_nosuid"] is True
+    assert host["Mounts"] == [{"Type": "bind", "Source": str(generation),
+                                "Target": runtime["state_destination"], "ReadOnly": False}]
+    assert runtime["state_mode"] == "rw" and host["RestartPolicy"]["Name"] == runtime["restart"]
+
+
 @pytest.mark.parametrize("mode", ["host", "", None, "missing"])
 def test_effective_cgroup_namespace_readback_must_be_explicit_private(tmp_path, monkeypatch, mode):
     original = container_inspect
@@ -771,7 +934,8 @@ def test_create_rejects_profile_mismatch_and_symlink_generation_before_post(tmp_
     backend.close()
 
 
-def probe_fixture(tmp_path, *, first_report=None, lose_start=False, role="candidate",
+def probe_fixture(tmp_path, *, first_report=None, lose_start=False, lose_create=False,
+                  lose_start_number=None, role="candidate",
                   reports=None, exec_state=None, start_callback=None):
     manifest, image, blobs = verified_image(role)
     generation = safe_generation(tmp_path)
@@ -800,12 +964,14 @@ def probe_fixture(tmp_path, *, first_report=None, lose_start=False, role="candid
             return httpx.Response(200, json=inspection)
         if path.endswith("/containers/" + container_id + "/exec"):
             exec_number += 1
+            if lose_create:
+                raise httpx.ReadTimeout("synthetic create response loss")
             arguments = json.loads(request.content)['Cmd']
             current_probe = next(probe for probe in manifest.probes.candidate
                                  if probe.expectation_id == arguments[7])
             return httpx.Response(201, json={"Id": f"{exec_number:064x}"})
         if path.endswith("/exec/" + f"{exec_number:064x}" + "/start"):
-            if lose_start:
+            if lose_start or exec_number == lose_start_number:
                 raise httpx.ReadTimeout("synthetic response loss")
             if start_callback is not None:
                 start_callback(exec_number)
@@ -836,6 +1002,95 @@ def probe_fixture(tmp_path, *, first_report=None, lose_start=False, role="candid
     observed = backend.inspect_container(container_id, 3000)
     assert observed is not None and observed.status == "running"
     return backend, manifest, image, requests
+
+
+@pytest.mark.parametrize('lost', ['create', 'start', 'second_start'])
+def test_probe_response_loss_stays_pending_and_same_id_cannot_replay(tmp_path, lost):
+    pytest.importorskip('fcntl', reason='real Linux journal ownership required')
+    from hub_container_executor.operation_journal import SQLiteOperationJournal
+
+    private = tmp_path / 'private-journal'
+    private.mkdir(mode=0o700)
+    journal_path = private / 'operations.sqlite'
+    # This is the exact caller-supplied operation ID used by run_readiness.
+    operation_id = '4c96d3f7-19c5-5ff4-a29e-302f6f661009'
+    backend, manifest, _, requests = probe_fixture(
+        tmp_path, lose_create=lost == 'create', lose_start=lost == 'start',
+        lose_start_number=2 if lost == 'second_start' else None)
+    try:
+        with SQLiteOperationJournal(journal_path, create=True,
+                                    allow_ephemeral_test_storage=True) as journal:
+            backend.operation_journal = journal
+            with pytest.raises(DaemonBackendError):
+                run_readiness(backend, manifest.probes.candidate)
+            assert journal.inspect(operation_id).state == 'pending'
+            posts = [item for item in requests if item[0] == 'POST']
+            if lost == 'second_start':
+                assert len(posts) == 4
+                assert any(item[0] == 'GET' and item[1].endswith('/exec/' + f'{1:064x}' + '/json')
+                           for item in requests)
+            with pytest.raises(DaemonBackendError):
+                run_readiness(backend, manifest.probes.candidate)
+            assert [item for item in requests if item[0] == 'POST'] == posts
+        backend.operation_journal = None
+        with SQLiteOperationJournal(journal_path, create=False,
+                                    allow_ephemeral_test_storage=True) as reopened:
+            assert reopened.inspect(operation_id).state == 'pending'
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("action", ["create", "start", "stop", "probe"])
+def test_v2_without_verified_binding_authority_never_sends_effect(tmp_path, action):
+    """Current backend is v1-only; v2 must not emit any mutating request."""
+    pytest.importorskip("fcntl", reason="real Linux journal ownership required")
+    from hub_container_executor.backend import ContainerPlan
+    from hub_container_executor.operation_journal import SQLiteOperationJournal
+
+    private = tmp_path / "v2-journal"
+    private.mkdir(mode=0o700)
+    if action == "create":
+        manifest, image, blobs = verified_image()
+        safe_generation(tmp_path)
+        plan = ContainerPlan("hub-pilot-fixture-01234567-89a-candidate", image,
+                             image.runnable_reference, False, make_profile(image))
+        requests = []
+        archive = oci_archive(image, blobs)
+        def handler(request):
+            path = request.url.path
+            requests.append((request.method, path))
+            if path.endswith("/info"):
+                return httpx.Response(200, json={"ID": manifest.runner_binding.daemon_identity,
+                    "OSType": "linux", "Architecture": "amd64"})
+            if "/images/" in path and path.endswith("/json"):
+                return httpx.Response(200, json=docker_config(image))
+            if "/images/" in path and path.endswith("/get"):
+                return httpx.Response(200, content=archive)
+            raise AssertionError("unexpected mutating request")
+        backend = DockerEngineBackend(binding(manifest, tmp_path), test_transport=httpx.MockTransport(handler))
+    elif action == "probe":
+        backend, manifest, _, requests = probe_fixture(tmp_path)
+    else:
+        backend, _, _, requests = engine29_inspection_fixture(
+            tmp_path, status="created" if action == "start" else "running")
+    try:
+        with SQLiteOperationJournal(private / "operations.sqlite", create=True,
+                                    allow_ephemeral_test_storage=True) as journal:
+            journal.enable_bindings()
+            backend.operation_journal = journal
+            before = len(requests)
+            with pytest.raises(DaemonBackendError, match="private operation journal unavailable"):
+                if action == "create":
+                    backend.create_container(plan, "4c96d3f7-19c5-5ff4-a29e-302f6f661009", 5000)
+                elif action == "start":
+                    backend.start_container("c" * 64, "4c96d3f7-19c5-5ff4-a29e-302f6f661009", 5000)
+                elif action == "stop":
+                    backend.stop_container("c" * 64, "4c96d3f7-19c5-5ff4-a29e-302f6f661009", 5000)
+                else:
+                    run_readiness(backend, manifest.probes.candidate)
+            assert all(row[0] != "POST" for row in requests[before:])
+    finally:
+        backend.close()
 
 
 def test_compiled_probes_use_fixed_exec_argv_and_return_health_evidence(tmp_path):
@@ -916,7 +1171,7 @@ def test_probe_missing_or_mismatched_verified_source_cache_denied_before_journal
         elif variant == "create-binding":
             backend._container_images["c" * 64] = replace(image, source_commit="d" * 40)
         effects = []
-        monkeypatch.setattr(backend, "_journal_begin", lambda *args: effects.append(args))
+        monkeypatch.setattr(backend, "_journal_begin", lambda *args, **kwargs: effects.append(args))
         before = len(requests)
         with pytest.raises(DaemonBackendError, match="verified source-image binding"):
             backend.run_compiled_probes("c" * 64, manifest.probes.candidate,
@@ -987,7 +1242,7 @@ def test_readiness_retries_only_proven_terminal_health_under_one_journal_operati
     monkeypatch.setattr(module.time, 'monotonic', clock.now)
     monkeypatch.setattr(module.time, 'sleep', clock.sleep)
     journal = []
-    monkeypatch.setattr(backend, '_journal_begin', lambda *args: journal.append(('begin', args)))
+    monkeypatch.setattr(backend, '_journal_begin', lambda *args, **kwargs: journal.append(('begin', args)))
     monkeypatch.setattr(backend, '_journal_complete', lambda *args: journal.append(('complete', args)))
     try:
         result = run_readiness(backend, readiness_probes(manifest))
@@ -1162,7 +1417,7 @@ def test_invalid_bypassed_grace_is_denied_before_exec_or_journal(tmp_path, monke
     probes = list(manifest.probes.candidate)
     probes[index] = probes[index].model_copy(update={'startup_grace_ms':value})
     journal=[]
-    monkeypatch.setattr(backend,'_journal_begin',lambda *args:journal.append(args))
+    monkeypatch.setattr(backend,'_journal_begin',lambda *args, **kwargs:journal.append(args))
     try:
         before=len(requests)
         with pytest.raises(DaemonBackendError):
@@ -1322,6 +1577,52 @@ def test_explicit_private_journal_records_backend_ack_and_inspection_never_uses_
     backend.close()
 
 
+@pytest.mark.parametrize('failure', ['none', 'provider', 'mismatch', 'journal'])
+def test_bound_create_is_durable_before_post_and_failures_never_post(tmp_path, monkeypatch, failure):
+    pytest.importorskip('fcntl', reason='real Linux journal ownership required')
+    from hub_container_executor.operation_journal import SQLiteOperationJournal
+    private = tmp_path / 'bound-journal'
+    private.mkdir(mode=0o700)
+    operation = '4c96d3f7-19c5-5ff4-a29e-302f6f661009'
+    backend, _manifest, _image, plan, requests = create_transcript(tmp_path)
+    try:
+        with SQLiteOperationJournal(private / 'operations.sqlite', create=True,
+                                    allow_ephemeral_test_storage=True) as journal:
+            journal.enable_bindings()
+            backend.operation_journal = journal
+            def provider(op, kind, name, target):
+                if failure == 'provider':
+                    raise ValueError('unavailable')
+                assert (op, kind, name, target) == (operation, 'create_candidate', plan.resource_name, None)
+                return OperationBinding('2b201b1d-2327-437e-8705-135b9ccf128b', 50, 60,
+                    'wrong-name' if failure == 'mismatch' else name, None,
+                    'hmac-sha256:' + 'a' * 64, 1)
+            backend.effect_binding_provider = TrustedEffectBindingProvider(provider, lambda actual: True, lambda actual: True)
+            original = backend._read_response
+            def checked(method, route, *args, **kwargs):
+                if method == 'POST' and route.endswith('/containers/create'):
+                    row = journal.inspect_record(operation)
+                    bound = journal.inspect_binding(operation)
+                    assert row.state == 'pending' and bound.resource_name == plan.resource_name
+                return original(method, route, *args, **kwargs)
+            monkeypatch.setattr(backend, '_read_response', checked)
+            if failure == 'journal':
+                monkeypatch.setattr(journal, 'begin_bound', lambda *_: (_ for _ in ()).throw(RuntimeError()))
+            context = EffectCallContext(ContainerPilotRequest.model_construct(run_id=str(uuid4()), fencing_generation=1), operation, 'create_candidate')
+            with backend.effect_context_scope(context):
+                if failure == 'none':
+                    assert backend.create_container(plan, operation, 5000) == 'c' * 64
+                    assert journal.inspect_binding(operation).resource_name == plan.resource_name
+                    assert journal.inspect_record(operation).state == 'completed'
+                else:
+                    with pytest.raises(DaemonBackendError):
+                        backend.create_container(plan, operation, 5000)
+                    assert not any(method == 'POST' for method, _ in requests)
+                    assert journal.inspect_record(operation) is None
+    finally:
+        backend.close()
+
+
 @pytest.mark.parametrize("engine29_metadata", [False, True])
 def test_start_and_stop_are_fixed_lifecycle_posts_with_actual_state_checks(tmp_path, engine29_metadata):
     manifest, image, blobs = verified_image()
@@ -1373,10 +1674,54 @@ def test_start_and_stop_are_fixed_lifecycle_posts_with_actual_state_checks(tmp_p
         ("POST", "/v1.56/containers/" + container_id + "/start", ""),
         ("POST", "/v1.56/containers/" + container_id + "/stop", "t=5"),
     ]
-    assert sum(path.endswith("/info") for _, path, _ in requests) == 4
+    assert sum(path.endswith("/info") for _, path, _ in requests) == 5
     assert not any("/exec" in path or "/pull" in path or "/build" in path
                    for _, path, _ in requests)
     backend.close()
+
+
+def test_stop_rejects_changed_runner_after_exited_observation_without_replay(tmp_path):
+    manifest, image, blobs = verified_image()
+    generation = safe_generation(tmp_path)
+    profile = make_profile(image)
+    container_id = "c" * 64
+    operation_id = "edfa4681-3a0a-5e5f-a670-2d2a91d7b70d"
+    state = {"status": "running", "inspected_exited": False, "posts": 0}
+    journal = FakePrivateJournal()
+    archive = oci_archive(image, blobs)
+
+    def handler(request):
+        path = request.url.path
+        if path.endswith('/info'):
+            identity = 'foreign-daemon' if state['inspected_exited'] else manifest.runner_binding.daemon_identity
+            return httpx.Response(200, json={'ID': identity, 'OSType': 'linux', 'Architecture': 'amd64'})
+        if '/images/' in path and path.endswith('/json'):
+            return httpx.Response(200, json=docker_config(image))
+        if '/images/' in path and path.endswith('/get'):
+            return httpx.Response(200, content=archive)
+        if path.endswith('/containers/' + container_id + '/json'):
+            body = container_inspect(image, profile, generation, container_id, state['status'])
+            if state['status'] == 'exited':
+                state['inspected_exited'] = True
+            return httpx.Response(200, json=body)
+        if path.endswith('/containers/' + container_id + '/stop'):
+            state['posts'] += 1
+            state['status'] = 'exited'
+            return httpx.Response(204)
+        raise AssertionError('unexpected synthetic route')
+
+    backend = DockerEngineBackend(binding(manifest, tmp_path),
+        test_transport=httpx.MockTransport(handler), operation_journal=journal)
+    try:
+        backend.inspect_image(image, 5000)
+        with pytest.raises(DaemonBackendError):
+            backend.stop_container(container_id, operation_id, 5000)
+        assert state['posts'] == 1
+        # The Engine response remains recorded; it is not evidence of exit or
+        # permission to replay or release the physical-machine reservation.
+        assert journal.inspect(operation_id) == OperationObservation(operation_id, 'completed', True, container_id)
+    finally:
+        backend.close()
 
 
 def test_start_refuses_effect_when_daemon_identity_changes_after_inspect(tmp_path):
@@ -1619,3 +1964,140 @@ def test_adapter_holds_lost_create_response_and_reconcile_does_not_repeat_effect
     finally:
         adapter.close()
         driver.close()
+
+
+def test_adapter_with_v2_journal_holds_before_create_and_cannot_replay(tmp_path, monkeypatch):
+    from tests.test_hub_container_executor_adapter import command, make_fixture
+
+    adapter, _placeholder_backend, _state, manifest = make_fixture(tmp_path)
+    images = {role: adapter._verified_image(role) for role in ("candidate", "rollback")}
+    image_by_ref = {image.runnable_reference: image for image in images.values()}
+    blobs_by_id = dict(adapter.metadata_store.values)
+    secrets = dict(adapter.secret_resolver.values)
+    baseline = adapter.baseline_provider.baseline
+    baseline_path = safe_generation(tmp_path, baseline.state_generation_id)
+    safe_generation(tmp_path, "candidate-g1")
+    rollback = images["rollback"]
+    defaults = adapter._defaults_from_record(rollback)
+    baseline_profile = adapter._profile(rollback, defaults,
+                                        baseline.state_generation_id, secrets)
+    baseline_observation = container_inspect(
+        rollback, baseline_profile, baseline_path, baseline.container_id, "running"
+    )
+    requests = []
+    create_posts = 0
+
+    def engine_handler(request):
+        nonlocal create_posts
+        path = request.url.raw_path.decode("ascii").split("?", 1)[0]
+        requests.append((request.method, path))
+        if path.endswith("/info"):
+            return httpx.Response(200, json={"ID": manifest.runner_binding.daemon_identity,
+                                             "OSType": "linux", "Architecture": "amd64"})
+        if "/images/" in path and path.endswith("/json"):
+            image = next(value for reference, value in image_by_ref.items()
+                         if reference.replace(":", "%3A") in path)
+            return httpx.Response(200, json=docker_config(image))
+        if "/images/" in path and path.endswith("/get"):
+            image = next(value for reference, value in image_by_ref.items()
+                         if reference.replace(":", "%3A") in path)
+            return httpx.Response(200, content=oci_archive(image, blobs_by_id))
+        if path.endswith("/containers/" + baseline.container_id + "/json"):
+            return httpx.Response(200, json=baseline_observation)
+        if "/containers/" in path and path.endswith("/json"):
+            return httpx.Response(404, json={"message": "absent"})
+        if path.endswith("/containers/create"):
+            create_posts += 1
+            raise httpx.ReadTimeout("synthetic create response loss")
+        raise AssertionError(f"unexpected fake route {request.method} {path}")
+
+    from hub_container_executor.operation_journal import OperationJournalError, SQLiteOperationJournal
+    journal_dir = tmp_path / 'effect-journal'
+    journal_dir.mkdir(mode=0o700)
+    journal = SQLiteOperationJournal(journal_dir / 'operations.sqlite', create=True,
+                                     allow_ephemeral_test_storage=True)
+    journal.enable_bindings()
+    attempts = []
+    errors = []
+    real_begin = journal.begin
+    def observe_unbound_begin(operation_id, kind):
+        attempts.append((operation_id, kind))
+        try:
+            return real_begin(operation_id, kind)
+        except OperationJournalError as error:
+            errors.append((type(error), str(error)))
+            raise
+    monkeypatch.setattr(journal, 'begin', observe_unbound_begin)
+    driver = DockerEngineBackend(
+        binding(manifest, tmp_path), operation_journal=journal,
+        test_transport=httpx.MockTransport(engine_handler)
+    )
+    adapter.backend = driver
+    request = command(manifest, "deploy_container")
+    try:
+        response = adapter.submit(request)
+        assert response.state == "held" and response.reason == "inspect_required"
+        assert create_posts == 0
+        assert len(attempts) == 1 and attempts[0][1] == 'create_candidate'
+        assert errors == [(OperationJournalError, 'Unbound intents disabled after binding migration')]
+        assert journal.inspect(attempts[0][0]) is None
+        reconciled = adapter.reconcile(request.command_id)
+        assert reconciled.state == "held"
+        assert create_posts == 0
+        assert len(attempts) == 1
+        assert not any(path.endswith("/start") or path.endswith("/exec")
+                       for _, path in requests)
+    finally:
+        adapter.close()
+        driver.close()
+        journal.close()
+
+
+def test_app_evidence_expiring_during_effect_recheck_blocks_probe_post(tmp_path, monkeypatch):
+    from hub_container_executor.app_cgroup_observation import AppCgroupObservation
+    from hub_container_executor import daemon_backend as module
+    backend, manifest, image, plan, requests = create_transcript(tmp_path)
+    clock = [10.0]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(module.time, 'time', lambda: 1000.0)
+    monkeypatch.setattr(backend, '_assert_runner', lambda deadline: None)
+    monkeypatch.setattr(backend, '_verify_app_cgroup', lambda container, deadline:
+        AppCgroupObservation(container, 1005000, 10.2))
+    monkeypatch.setattr(backend, '_recheck_effect', lambda admitted, deadline: clock.__setitem__(0, 10.3))
+    try:
+        with pytest.raises(module.DaemonBackendError, match='app cgroup observation expired'):
+            backend._one_probe('a'*64, manifest.probes.candidate[0], 1000, 20.0, image.source_commit)
+        assert requests == []
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize('operation', ['start', 'stop'])
+def test_app_membership_denial_never_reports_success_or_repeats_effect(tmp_path, monkeypatch, operation):
+    from dataclasses import replace
+    from hub_container_executor.backend import ContainerObservation, ActualImageSelection
+    from hub_container_executor import daemon_backend as module
+    backend, manifest, image, plan, requests = create_transcript(tmp_path)
+    selection = ActualImageSelection(image.runnable_reference, image.platform_manifest_digest,
+                                     image.image_config_id, image.platform)
+    before = ContainerObservation('a'*64, selection, plan.profile, plan.profile.state_generation_id,
+                                  'created' if operation == 'start' else 'running')
+    after = replace(before, status='running')
+    effects = []
+    monkeypatch.setattr(backend, '_known_container', lambda *args: before)
+    monkeypatch.setattr(backend, '_journal_begin', lambda *args, **kwargs: None)
+    monkeypatch.setattr(backend, '_journal_complete', lambda *args, **kwargs: None)
+    monkeypatch.setattr(backend, '_assert_runner', lambda *args: None)
+    monkeypatch.setattr(backend, '_recheck_effect', lambda *args: None)
+    monkeypatch.setattr(backend, '_read_response', lambda method, path, *args, **kwargs: effects.append((method,path)) or b'')
+    monkeypatch.setattr(backend, 'inspect_container', lambda *args: after)
+    def denied(*args): raise module.DaemonBackendError('synthetic membership denial')
+    monkeypatch.setattr(backend, '_verify_app_cgroup', denied)
+    try:
+        with pytest.raises(module.DaemonBackendError):
+            getattr(backend, operation + '_container')('a'*64, str(uuid4()), 1000)
+        # Start must precede any process membership check; stop must not POST.
+        assert len(effects) == (1 if operation == 'start' else 0)
+        assert requests == []
+    finally:
+        backend.close()

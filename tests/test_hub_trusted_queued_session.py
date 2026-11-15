@@ -8,8 +8,9 @@ import os
 from pathlib import Path
 import sys
 import time
+import threading
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 import httpx
@@ -39,7 +40,8 @@ def document():
     manifest = profile.manifest
     now = int(time.time() * 1000)
     evidence = 'Synthetic independently reviewed inventory and writer exclusion; NOT real host proof.'
-    result = {'schema': module.SCHEMA, 'release': {
+    result = {'schema': module.SCHEMA_SCOPED,
+        'scope': {'actors': sorted(profile.actors), 'task_ids': sorted(profile.task_ids)}, 'release': {
         'issuer_id': 'synthetic-issuer', 'public_key_hex': 'a' * 64,
         'implementation_commit': manifest.driver.implementation_commit,
         'runnable_digest': 'sha256:' + '1' * 64, 'platform_manifest_digest': 'sha256:' + '2' * 64,
@@ -66,6 +68,180 @@ def test_closed_parser_roundtrip_does_not_start_observation(monkeypatch):
     value = module.parse_enrollment(encode(document()))
     assert module.parse_enrollment(module.enrollment_bytes(value)) == value
     assert value.writers_excluded is True
+
+
+@pytest.mark.parametrize('scope', [
+    {'actors': [], 'task_ids': ['00000000-0000-4000-8000-000000000001']},
+    {'actors': ['codex', 'codex'], 'task_ids': ['00000000-0000-4000-8000-000000000001']},
+    {'actors': ['hermes', 'codex'], 'task_ids': ['00000000-0000-4000-8000-000000000001']},
+    {'actors': ['codex'], 'task_ids': []},
+    {'actors': ['codex'], 'task_ids': ['invalid']},
+    {'actors': ['codex'], 'task_ids': ['00000000-0000-4000-8000-000000000001'] * 2},
+])
+def test_session_scope_is_closed_canonical_and_nonempty(scope):
+    data = document(); data['scope'] = scope
+    with pytest.raises(module.TrustedSessionError):
+        module.parse_enrollment(encode(data))
+
+
+def test_assembled_session_evidence_enforces_exact_utf8_byte_boundary():
+    data = document()
+    data['scope']['task_ids'] = [str(UUID(int=i)) for i in range(1, 33)]
+    data['report']['source'] = 's' * 128
+    data['launch']['engine_id'] = data['report']['executor']['engine_id'] = 'e' * 128
+    data['report']['evidence'] = 'x' * 6000
+    data['report']['evidence_sha256'] = 'sha256:' + hashlib.sha256(data['report']['evidence'].encode()).hexdigest()
+    enrollment = module.parse_enrollment(encode(data))
+    with pytest.raises(module.TrustedSessionError):
+        module._session_evidence(enrollment)
+    base = replace(enrollment, evidence='é')
+    available = module.MAX_ACCEPTANCE_EVIDENCE_BYTES - len(module._session_evidence(base).encode('utf-8'))
+    exact = replace(base, evidence='é' + 'x' * available)
+    assert len(module._session_evidence(exact).encode('utf-8')) == module.MAX_ACCEPTANCE_EVIDENCE_BYTES
+    with pytest.raises(module.TrustedSessionError):
+        module._session_evidence(replace(exact, evidence=exact.evidence + 'é'))
+
+
+def test_unified_prevalidation_rejects_assembled_evidence_above_broker_cap(monkeypatch):
+    profile = parse_profile(encode(profile_document()))
+    enrollment = module.parse_enrollment(encode(document()))
+    assert module.validate_unified_session(profile, enrollment)[0] == enrollment
+    monkeypatch.setattr(module, 'MAX_ACCEPTANCE_EVIDENCE_BYTES', 1)
+    with pytest.raises(module.TrustedSessionError):
+        module.validate_unified_session(profile, enrollment)
+
+
+@pytest.mark.parametrize('change', ['legacy', 'actor', 'task'])
+def test_session_scope_cannot_expand_profile_or_use_legacy(tmp_path, dependencies, change):
+    data = document()
+    if change == 'legacy':
+        data['schema'] = module.SCHEMA; del data['scope']
+    elif change == 'actor': data['scope']['actors'] = ['hermes']
+    else: data['scope']['task_ids'] = ['00000000-0000-4000-8000-000000000002']
+    with pytest.raises(module.TrustedSessionError):
+        construct(tmp_path, data)
+    assert dependencies.events == []
+
+
+def test_session_scope_veto_and_expiry(tmp_path, dependencies, monkeypatch):
+    composition = construct(tmp_path)
+    try:
+        task = document()['scope']['task_ids'][0]
+        assert composition.scope_allows('codex', task) is True
+        assert composition.scope_allows('hermes', task) is False
+        assert composition.scope_allows('codex', '00000000-0000-4000-8000-000000000002') is False
+        monkeypatch.setattr(module, '_clock', lambda: (composition._deadline + 1, composition._last_wall))
+        assert composition.scope_allows('codex', task) is False
+    finally:
+        composition.close()
+
+
+def test_fresh_clock_and_watermarks_are_serialized_across_threads(tmp_path, dependencies, monkeypatch):
+    composition = construct(tmp_path)
+    entered, release, second_inside = threading.Event(), threading.Event(), threading.Event()
+    base_mono, base_wall = composition._last_mono, composition._last_wall
+    calls = []
+    def clock():
+        calls.append(len(calls) + 1)
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(3)
+        else:
+            second_inside.set()
+        return base_mono + len(calls), base_wall + len(calls)
+    monkeypatch.setattr(module, '_clock', clock)
+    results, errors = [], []
+    def check():
+        try:
+            results.append(composition._fresh())
+        except BaseException as error:
+            errors.append(error)
+    first = threading.Thread(target=check); second = threading.Thread(target=check)
+    try:
+        first.start(); assert entered.wait(3)
+        second.start()
+        assert not second_inside.wait(.1)
+        release.set()
+        first.join(3); second.join(3)
+        assert not first.is_alive() and not second.is_alive() and not errors
+        assert sorted(results) == [base_mono + 1, base_mono + 2]
+        assert composition._last_mono == base_mono + 2 and composition._last_wall == base_wall + 2
+    finally:
+        release.set(); first.join(3); second.join(3); composition.close()
+
+
+def test_forked_process_rejects_before_inherited_lock(tmp_path, dependencies, monkeypatch):
+    composition = construct(tmp_path)
+    class NeverAcquire:
+        def __enter__(self): pytest.fail('child acquired inherited lock')
+        def __exit__(self, *_): pass
+    composition._clock_lock = NeverAcquire()
+    monkeypatch.setattr(module.os, 'getpid', lambda: composition._pid + 1)
+    try:
+        with pytest.raises(module.TrustedSessionError):
+            composition._fresh()
+    finally:
+        monkeypatch.undo()
+        composition.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_with_narrower_session_retains_omitted_held_task(tmp_path, dependencies):
+    """Synthetic ledger restart; neither host fencing nor execution approval."""
+    from tests.test_hub_container_pilot import COMMIT, IMAGE, PRINCIPAL, pilot_manifest, reviewed_task
+    from tests.test_hub_queued_pilot import ACTION as ACTION_KEY, MACHINE as MACHINE_ID, machine_job
+    from tests.manual_session_fixtures import synthetic_workflow_reconciliation
+    from engineering_hub.work_queue import WorkTarget
+    from engineering_hub.repository import HubError
+    root = tmp_path / 'restart'; root.mkdir(mode=0o700)
+    path = root / 'hub.sqlite3'
+    owner = PilotOwner(path, allow_ephemeral_test_storage=True)
+    repo = HubRepository(path, execution_principal=PRINCIPAL, pilot_owner=owner)
+    task = reviewed_task(repo, 'restart-scope')
+    other = reviewed_task(repo, 'outside-session')['id']
+    profile = parse_profile(encode(profile_document()))
+    profile = replace(profile, task_ids=frozenset({task['id'], other}))
+    def session(task_id):
+        data = document(); data['scope']['task_ids'] = [task_id]
+        return module.TrustedQueuedSessionComposition(profile=profile, database=path,
+            enrollment=module.parse_enrollment(encode(data)), ca_pem=b'captured-ca', credential=b'captured-token')
+    first, second = session(task['id']), None
+    def build(owner, repo, composition):
+        client = DistinctContainerClient(); client.outcomes['deploy_container'] = 'held'
+        workflow = ContainerPilotWorkflow(repo, client,
+            [ContainerPilotTarget.from_manifest(pilot_manifest())], pilot_owner=owner)
+        def policy(actor, _action, _environment, target):
+            return composition.scope_allows(actor, target.task_id)
+        queue = WorkQueue(repo, {ACTION_KEY: WorkAction(MACHINE_ID, project='engineering-hub')},
+                          target_verifier=policy)
+        bridge = QueuedContainerPilot(queue, workflow, action_key=ACTION_KEY, machine_id=MACHINE_ID,
+                                      reconciliation=synthetic_workflow_reconciliation(workflow))
+        return client, queue, bridge
+    try:
+        client, queue, bridge = build(owner, repo, first)
+        with pytest.raises(HubError, match='work_target_not_verified'):
+            queue.submit(actor='codex', request_id='outside-session', action_key=ACTION_KEY,
+                         environment='staging', target=WorkTarget(other, COMMIT, IMAGE))
+        with repo._connection() as db:
+            assert db.execute('SELECT count(*) FROM hub_work_jobs').fetchone()[0] == 0
+        assert client.submissions == []
+        job = queue.submit(actor='codex', request_id='restart-scope', action_key=ACTION_KEY,
+                           environment='staging', target=WorkTarget(task['id'], COMMIT, IMAGE))
+        assert (await bridge.run_once())['state'] == 'held'
+        assert len(client.submissions) == 1
+        first.close(); owner.close()
+        owner = PilotOwner(path, allow_ephemeral_test_storage=True)
+        repo = HubRepository(path, execution_principal=PRINCIPAL, pilot_owner=owner)
+        second = session(other)
+        client, queue, bridge = build(owner, repo, second)
+        with pytest.raises(HubError, match='queued_pilot_review_changed'):
+            await bridge.recover(job['id'])
+        assert queue.get_job(job['id'])['state'] == 'held'
+        assert machine_job(SimpleNamespace(repo=repo)) == job['id']
+        assert client.submissions == [] and client.inspections == []
+    finally:
+        if second is not None: second.close()
+        first.close(); owner.close()
 
 
 @pytest.mark.parametrize('change', ['extra', 'accepted-bit', 'module', 'false', 'missing-claim',
@@ -204,6 +380,9 @@ async def test_exact_same_gate_manual_acceptance_and_real_owned_audit(tmp_path, 
         actor = state.composition._enrollment.operator_actor
         snapshot = state.broker.snapshot(actor=actor)
         assert 'Original observed_at_ms:' in snapshot['evidence']
+        assert 'Session scope:' in snapshot['evidence']
+        assert state.composition._enrollment.task_ids[0] in snapshot['evidence']
+        assert snapshot['report_digest'] == 'sha256:' + hashlib.sha256(snapshot['evidence'].encode()).hexdigest()
         assert state.client.submissions == [] and not dependencies.observers[0].closed
         assert state.gate.async_admission_required
         assert dependencies.events.count('observe') == 0
@@ -310,6 +489,25 @@ async def test_selector_rejects_ambiguous_or_relative_activation_before_io(monke
                                          reconciliation_factory=callback)
 
 
+async def test_unified_oversized_evidence_denied_before_owner_and_credentials(installed, monkeypatch):
+    from engineering_hub import unified_pilot_startup as startup
+    selected = installed['profile'].parent / 'oversized-session.json'
+    selected.write_bytes(encode(document()))
+    selected.chmod(0o600)
+    validated = startup.validate_configuration(installed['config'], installed['profile'])
+    monkeypatch.setattr(startup, 'validate_configuration', lambda *_: validated)
+    read = startup.read_protected_file
+    def read_enrollment_only(path, **kwargs):
+        assert Path(path) == selected, 'credential or CA read before enrollment rejection'
+        return read(path, **kwargs)
+    monkeypatch.setattr(startup, 'read_protected_file', read_enrollment_only)
+    monkeypatch.setattr(startup, 'PilotOwner', lambda *_a, **_kw: pytest.fail('owner opened'))
+    monkeypatch.setattr(module, 'MAX_ACCEPTANCE_EVIDENCE_BYTES', 1)
+    with pytest.raises(startup.UnifiedPilotStartupError):
+        await startup.serve_configuration(installed['config'], installed['profile'],
+                                          session_enrollment_path=selected)
+
+
 async def test_installed_selector_uses_actual_async_composition_callbacks(installed, dependencies, monkeypatch):
     """Actual fixed selector/callback wiring; synthetic observer/command client."""
     from engineering_hub import unified_pilot_startup as startup
@@ -321,10 +519,22 @@ async def test_installed_selector_uses_actual_async_composition_callbacks(instal
         original_owner(path, allow_ephemeral_test_storage=True, **kw))
     selected = installed['profile'].parent / 'actual-async-session.json'
     data = document()
+    installed['document']['allowed_actors'] = ['codex', 'hermes']
+    installed['document']['allowed_task_ids'].append('00000000-0000-4000-8000-000000000002')
+    installed['profile'].write_bytes(encode(installed['document']))
     selected.write_bytes(encode(data))
     selected.chmod(0o600)
     seen = []
     async def serve(settings, manifest, client_factory, **kwargs):
+        from engineering_hub.work_queue import WorkTarget
+        veto = kwargs['target_verifier']
+        allowed = WorkTarget(data['scope']['task_ids'][0], manifest.candidate.source_commit,
+                             manifest.candidate.image_config_id)
+        other = WorkTarget('00000000-0000-4000-8000-000000000002', allowed.source_commit,
+                           allowed.artifact_digest)
+        assert veto('codex', startup.ACTION, 'staging', allowed)
+        assert not veto('hermes', startup.ACTION, 'staging', allowed)
+        assert not veto('codex', startup.ACTION, 'staging', other)
         owner = kwargs['owner']
         target = ContainerPilotTarget.from_manifest(manifest)
         gate = kwargs['reconciliation_factory'](owner, target)

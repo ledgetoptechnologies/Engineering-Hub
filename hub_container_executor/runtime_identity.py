@@ -11,6 +11,7 @@ not continuing process integrity or cancellation of already admitted effects.
 from __future__ import annotations
 
 import base64
+import hashlib
 from dataclasses import dataclass
 import inspect
 import json
@@ -202,6 +203,7 @@ class LaunchReceiptIdentityVerifier:
             _require(os.getpid() == self._pid and math.isfinite(now) and after <= now < deadline
                      and now < start + exchange_timeout_ms / 1000)
             self._commit = enrolled.implementation_commit
+            self._issuer_key_digest = hashlib.sha256(enrolled.public_key).digest()
             self._deadline = deadline
             self._not_before = start
             # Store no mutable receipt object or transport capability for effects.
@@ -220,6 +222,30 @@ class LaunchReceiptIdentityVerifier:
                 _require(os.getpid() == self._pid and not self._closed
                          and math.isfinite(now) and self._not_before <= now < self._deadline)
                 return self._commit
+        except Exception:
+            raise RuntimeIdentityError("Trusted executor launch identity unavailable") from None
+
+    def accepted_launch_receipt(self):
+        """Return immutable verified launch fields only while this receipt is live.
+
+        This proves an issuer-signed consumer launch, not independently accepted
+        Engine identity, operator approval, or permission to execute a pilot.
+        """
+        try:
+            _require(os.getpid() == self._pid)
+            with self._lock:
+                now = time.monotonic()
+                wall = _wall_ms()
+                _require(os.getpid() == self._pid and not self._closed
+                         and math.isfinite(now) and self._not_before <= now < self._deadline
+                         and type(wall) is int and wall < self._receipt['expires_at_ms'])
+                return tuple(self._receipt[name] for name in (
+                    'receipt_id', 'launch_id', 'boot_id', 'authenticated_host_pid',
+                    'process_start_ticks', 'container_id', 'issued_at_ms', 'expires_at_ms',
+                    'issuer_id', 'implementation_commit', 'runnable_digest',
+                    'platform_manifest_digest', 'image_config_id', 'launch_profile_digest')) + (
+                        tuple(self._receipt['platform'].get(name) for name in ('os', 'architecture', 'variant')),
+                        self._issuer_key_digest,)
         except Exception:
             raise RuntimeIdentityError("Trusted executor launch identity unavailable") from None
 

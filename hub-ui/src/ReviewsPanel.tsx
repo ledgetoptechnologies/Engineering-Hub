@@ -99,7 +99,6 @@ export function ReviewsPanel({ hub, project, source: given }: { hub: Hub; projec
   return (
     <section className="panel" aria-label="Reviews">
       <div className="panel-title"><h2>Reviews</h2>{open > 0 && <span className="count attention">{open}</span>}</div>
-      <p className="panel-description">Questions an agent asked about this project's components. Open one to answer on any screen.</p>
       <ul className="preview-list">
         {sorted.map((item) => (
           <li key={item.id}><a href={link(`/projects/${project}/reviews/${item.id}`)}>

@@ -22,6 +22,33 @@ const hubConnection = (state: "connected" | "not_observed" = "connected"): NonNu
   inbox_subscriptions: 0, subscribed: false, last_stream_write_at: NOW.toISOString(), native_push_available: true,
 });
 
+test("claims and incomplete state times are not described as live work", async ({ page }) => {
+  await page.clock.install({ time: NOW });
+  const mock = await mockLive(page);
+  mock.overview.tasks[1].state_since = new Date(NOW.getTime() - 120_000).toISOString();
+  mock.overview.tasks.push({ ...mock.overview.tasks[1], id: "fixture-unknown-time", title: "Unknown state time", state_since: null });
+  await page.goto("/#/work");
+  const row = page.locator("details.task-row").filter({ hasText: mock.overview.tasks[1].title });
+  await expect(row.locator("summary .task-waiting")).toContainText("Hermes has claimed it.");
+  const owners = page.getByRole("region", { name: "Who's on what" });
+  await expect(owners).toContainText("2 claimed");
+  await expect(owners).toContainText("Oldest known state time: 2m ago · 1 unknown");
+  await expect(owners).toContainText("a claim does not confirm current execution or completion");
+});
+
+test("review verdict does not imply a run is authorized", async ({ page }) => {
+  await page.clock.install({ time: NOW });
+  const mock = await mockLive(page);
+  await page.goto("/#/");
+  const work = page.getByRole("link", { name: /Work in motion/ });
+  await expect(work).toContainText("1 review passed · a review doesn't authorize a run");
+  await go(page, "#/work");
+  const task = page.locator("details.task-row").filter({ hasText: mock.overview.tasks[0].title });
+  await expect(task.locator("summary .task-waiting")).toBeVisible();
+  await expect(task.locator("summary .task-waiting")).toContainText("Review passed by Claude. A passed review doesn't start or authorize a run.");
+  await expect(task.locator("summary .task-waiting")).toContainText("Running it needs separate authorization, which this page doesn't show.");
+});
+
 test("Hub connection snapshots remain distinct from unconfigured topic readiness", async ({ page }) => {
   await page.clock.install({ time: NOW });
   const mock = await mockLive(page, { tracking: "not_configured" });
@@ -36,7 +63,6 @@ test("Hub connection snapshots remain distinct from unconfigured topic readiness
   await expect(page.getByText("Topic readiness: Not tracked yet", { exact: true })).toBeVisible();
   await expect(page.locator(".peer-row")).toHaveCount(0);
   await expect(page.getByText("Online · verified", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("may still accept writes after the agent stops listening.", { exact: false })).toBeVisible();
 });
 
 test("retained Hub observations expire without overview or topic polling", async ({ page }) => {
@@ -378,6 +404,26 @@ async function emitRegistry(page: Page, kind: string, overrides: Record<string, 
   }, { kind, overrides });
 }
 
+test("topic directory distinguishes local selections without changing the Hub list", async ({ page }) => {
+  await page.clock.install({ time: NOW });
+  await mockLive(page);
+  const hubItems = [{ topic: "server-topic", peer_count: 2, last_activity_at: null }];
+  await page.route("**/api/hub/v1/topics", route => route.fulfill({ json: { items: hubItems } }));
+  await page.goto("/#/agents");
+  const list = page.getByRole("list", { name: "Topics" });
+  const server = list.getByRole("button", { name: /server-topic/ });
+  await expect(server).toContainText("Hub directory · 2 agents");
+  for (const topic of ["local-one", "local-two"]) {
+    await page.getByLabel("TOPIC ROOT").fill(topic);
+    await page.getByRole("button", { name: "Check", exact: true }).click();
+    await expect(list.getByRole("button", { name: new RegExp(topic) })).toContainText("This device");
+  }
+  await expect(list.getByRole("button", { name: /local-one/ })).toHaveCount(0);
+  await expect(server).toContainText("Hub directory · 2 agents");
+  await expect(page.getByText("Hub directory entries are available to your account. This device entries are local selections.")).toBeVisible();
+  expect(hubItems).toEqual([{ topic: "server-topic", peer_count: 2, last_activity_at: null }]);
+});
+
 test("colon topic passes strict ingress without discarding task or decision records", async ({ page }) => {
   await page.clock.install({ time: NOW });
   const mock = await mockLive(page);
@@ -675,7 +721,7 @@ test("live task creation uses browser session, same-origin request and CSRF with
       body: JSON.stringify({ detail: { code: "work_queue_not_configured" } }) });
   });
   try {
-    await page.goto("/#/staging");
+    await page.goto("/#/staging/queues");
     await expect
       .poll(() =>
         mock.requests.map(

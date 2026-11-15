@@ -226,7 +226,7 @@ class InteractiveReviewRepository:
                     break
             return {'items': result[:limit], 'next_after': result[limit - 1]['id'] if len(result) > limit else None}
 
-    def answer_review(self, actor, identity, expected_revision, client_request_id, answers, *, complete=False):
+    def answer_review(self, actor, identity, expected_revision, client_request_id, answers, *, complete=False, admission_guard=None):
         self.repo._actor(actor, human=True)
         key = _text(client_request_id, 128)
         if type(complete) is not bool or type(answers) is not list or len(answers) > 100 or not answers and not complete:
@@ -241,7 +241,7 @@ class InteractiveReviewRepository:
             seen.add(item_id)
             normalized.append({'item_id': item_id, 'value': _text(answer['value'], 2000)})
         fingerprint = hashlib.sha256(_json(['answer', identity, expected_revision, normalized, complete]).encode()).hexdigest()
-        with self.repo._transaction() as db:
+        with self.repo._transaction(before_commit=admission_guard) as db:
             item = self._checked(db, actor, identity, 'review_answer')
             self._allow(actor, item['project'], 'review_read', db)
             prior = self._request(db, actor, key, fingerprint)

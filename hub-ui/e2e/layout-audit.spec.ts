@@ -6,7 +6,8 @@ import { audit, blocking, type Finding } from "./audit";
 // and reports (without failing) tap targets smaller than 24px.
 const sizes = [{ name: "desktop", width: 1440, height: 900 }, { name: "phone", width: 390, height: 844 }];
 const project = "engineering-hub";
-const pages = ["/", "/inbox", "/work", "/projects", "/agents", "/staging", "/notes", "/planning",
+const pages = ["/", "/inbox", "/work", "/projects", "/agents", "/agents/installations", "/staging", "/staging/queues",
+  "/staging/resources", "/notes", "/planning",
   ...["", "/work", "/decisions", "/notes", "/plans", "/labeling", "/activity"].map(tab => `/projects/${project}${tab}`)];
 
 

@@ -11,7 +11,11 @@ python -I -B /path/to/reviewed/package_staging_source.py --repo /path/to/candida
 ```
 
 The output directory must not exist. The command resolves the ref once to a
-40-character commit and writes `source.zip` and `metadata.json`. It never contacts
+40-character commit and writes `source.zip` and `metadata.json`, including a
+base64 commit-object proof. Pass that proof as `source_commit_object_base64`
+along with an independently reviewed task ID and exact revision. The proof
+establishes object/tree consistency only, not repository membership or a
+signature. It never contacts
 staging, submits a job, installs dependencies or reads working-tree file content.
 Keep packages private when the committed source is private. A disk/write failure
 can leave an incomplete new output directory; it is not a successful package and

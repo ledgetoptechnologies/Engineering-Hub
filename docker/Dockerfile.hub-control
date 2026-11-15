@@ -6,7 +6,7 @@ RUN npm ci --ignore-scripts
 COPY hub-ui/ ./
 RUN npm run build
 
-FROM python:3.12-slim AS builder
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS builder
 # NumPy initializes its BLAS pool during import, before FastEmbed's ONNX thread
 # setting applies. Default to one thread for this bounded, already-threaded app.
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 UV_PROJECT_ENVIRONMENT=/opt/venv OPENBLAS_NUM_THREADS=1
@@ -21,7 +21,7 @@ RUN mkdir -p /opt/fastembed-cache \
     && /opt/venv/bin/python -c "from fastembed import TextEmbedding; model=TextEmbedding(model_name='BAAI/bge-small-en-v1.5', cache_dir='/opt/fastembed-cache', providers=['CPUExecutionProvider'], threads=1); list(model.embed(['Engineering Hub semantic model image preparation.']))" \
     && chmod -R a+rX /opt/fastembed-cache
 
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH="/opt/venv/bin:${PATH}" \
     HUB_UI_DIRECTORY=/app/dashboard HUB_DB=/var/lib/hub/hub.sqlite3 OPENBLAS_NUM_THREADS=1
 ARG VCS_REF=unknown

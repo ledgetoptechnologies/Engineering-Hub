@@ -173,7 +173,12 @@ def byte_range(value, size):
 
 def attach_interactive_assets(app, service, reviews, human):
     @app.head('/api/hub/v1/interactive-reviews/{review_id}/assets/{asset_id}', include_in_schema=False)
-    @app.get('/api/hub/v1/interactive-reviews/{review_id}/assets/{asset_id}')
+    @app.get('/api/hub/v1/interactive-reviews/{review_id}/assets/{asset_id}',
+             response_class=Response,
+             responses={status: {'description': description, 'content': {
+                 media: {'schema': {'type': 'string', 'format': 'binary'}}
+                 for media in sorted(TYPES)}} for status, description in
+                 ((200, 'Complete asset'), (206, 'Partial asset'))})
     async def asset(review_id: str, asset_id: str, request: Request):
         def admitted():
             actor = human(request)

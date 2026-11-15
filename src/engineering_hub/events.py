@@ -133,6 +133,8 @@ class NativeHubEventFeed:
     Check ``available`` before creating StreamingResponse(broker.sse(),
     media_type='text/event-stream'); return 503 when false. Authenticate first.
     No replay/Last-Event-ID claim is made; each connection refetches a snapshot.
+    During a bounded SQLite BUSY retry, close current subscribers and refuse new
+    streams; after the source has caught up, reopen under a fresh observer epoch.
     """
 
     def __init__(self, path: str | Path, *, queue_size=8,
@@ -148,11 +150,15 @@ class NativeHubEventFeed:
         self._scheduled = False
         self._pending_cursor = None
         self._pending_error = False
+        self._pending_suspension = False
+        self._pending_state = None
+        self._stopping = False
         self.reason = "not_started"
 
     @property
     def available(self):
-        return self.broker.available and self._source is not None and self._source.healthy
+        return (self.broker.available and self._source is not None and self._source.healthy
+                and not self._source.stats.get('degraded', False))
 
     @property
     def status(self):
@@ -165,16 +171,25 @@ class NativeHubEventFeed:
     def _error(self, _exc):
         self._schedule(error=True)
 
-    def _schedule(self, *, cursor=None, error=False):
+    def _source_state(self, state, cursor):
+        if state not in {'suspended', 'resumed'}:
+            self._schedule(error=True)
+            return
+        self._schedule(cursor=cursor, state=state)
+
+    def _schedule(self, *, cursor=None, error=False, state=None):
         # Native writes may burst while the ASGI loop is occupied: retain only
         # the latest head and at most one scheduled callback, not an unbounded
         # call_soon_threadsafe backlog. Errors always outrank invalidations.
         with self._lock:
-            if self._loop is None:
+            if self._loop is None or self._stopping:
                 return
             if cursor is not None:
                 self._pending_cursor = max(cursor, self._pending_cursor or 0)
             self._pending_error |= error
+            if state is not None:
+                self._pending_suspension |= state == 'suspended'
+                self._pending_state = state
             if not self._scheduled:
                 self._scheduled = True
                 self._loop.call_soon_threadsafe(self._drain)
@@ -182,13 +197,24 @@ class NativeHubEventFeed:
     def _drain(self):
         with self._lock:
             cursor, error = self._pending_cursor, self._pending_error
+            suspension, state = self._pending_suspension, self._pending_state
             self._pending_cursor = None
             self._pending_error = self._scheduled = False
+            self._pending_suspension, self._pending_state = False, None
+            if self._stopping or self._loop is None:
+                return
         if error:
             self.reason = "native_source_failed"
             self.broker.fail()
-        elif cursor is not None:
-            self.broker.publish(cursor)
+        else:
+            if suspension:
+                self.reason = "native_source_suspended"
+                self.broker.fail()
+            if state == 'resumed':
+                self.broker.activate(cursor)
+                self.reason = "native_source_active"
+            elif state != 'suspended' and cursor is not None:
+                self.broker.publish(cursor)
 
     async def start(self):
         if self._source is not None:
@@ -199,18 +225,26 @@ class NativeHubEventFeed:
             self.broker.fail()
             return self.status
         self._loop = asyncio.get_running_loop()
+        self._stopping = False
         try:
             self._source = self._factory(self.path, HubOutboxCursorReader(), self._notify,
                                          on_error=self._error)
+            register = getattr(self._source, 'set_state_observer', None)
+            if register is not None:
+                register(self._source_state)
             stats = await asyncio.to_thread(self._source.start)
-            self.broker.activate(int(stats["cursor"]))
-            self.reason = "native_source_active"
+            if self._source.stats.get('degraded', False):
+                self.reason = "native_source_suspended"
+                self.broker.fail()
+            else:
+                self.broker.activate(int(stats["cursor"]))
+                self.reason = "native_source_active"
             # Catch up changes delivered while start() was returning. The
             # source's stats is memory only, never another SQLite query.
             if not self._source.healthy:
                 self.reason = "native_source_failed"
                 self.broker.fail()
-            else:
+            elif self.broker.available:
                 self.broker.publish(int(self._source.stats["cursor"]))
         except Exception:
             self.reason = "native_source_failed"
@@ -221,6 +255,8 @@ class NativeHubEventFeed:
         return self.status
 
     async def stop(self):
+        with self._lock:
+            self._stopping = True
         self.broker.fail()
         source, self._source = self._source, None
         if source is not None:
@@ -228,5 +264,6 @@ class NativeHubEventFeed:
         with self._lock:
             self._loop = None
             self._pending_cursor = None
+            self._pending_suspension, self._pending_state = False, None
             self._pending_error = self._scheduled = False
         self.reason = "stopped"

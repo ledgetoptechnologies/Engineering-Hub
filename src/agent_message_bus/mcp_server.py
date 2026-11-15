@@ -324,8 +324,9 @@ def build_mcp(service: Service, *, push_publisher: PushPublisher | None = None) 
         """Acknowledge a message without deleting it."""
         if ctx is None: raise ValueError("request context required")
         identity = authenticated(ctx)
-        message = service.repository.acknowledge(message_id, identity)
-        service.audit_message("acknowledge", identity, message, request=ctx.request_context.request)
+        message, replayed = service.repository.acknowledge_with_outcome(message_id, identity)
+        service.audit_message("acknowledge", identity, message, result="replayed" if replayed else "ok",
+                              request=ctx.request_context.request)
         return message_dict(message)
 
     @mcp.tool()
@@ -333,8 +334,9 @@ def build_mcp(service: Service, *, push_publisher: PushPublisher | None = None) 
         """Reject a claimed message with a redacted audit record."""
         if ctx is None: raise ValueError("request context required")
         identity = authenticated(ctx)
-        message = service.repository.reject(message_id, identity, reason)
-        service.audit_message("reject", identity, message, request=ctx.request_context.request)
+        message, replayed = service.repository.reject_with_outcome(message_id, identity, reason)
+        service.audit_message("reject", identity, message, result="replayed" if replayed else "ok",
+                              request=ctx.request_context.request)
         return message_dict(message)
 
     @mcp.tool()

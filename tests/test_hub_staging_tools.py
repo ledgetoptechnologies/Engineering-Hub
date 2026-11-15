@@ -73,14 +73,26 @@ def test_staging_tools_are_closed_and_use_authenticated_agent(fixture):
 def test_submit_validation_never_exposes_source_or_trusts_caller_authority(fixture):
     client, calls = fixture
     payload = dict(request_id=str(uuid.uuid4()), project='engineering-hub', recipe='static',
+                   review_task_id=str(uuid.uuid4()), review_task_revision=4,
                    source_commit='a' * 40, source_digest='b' * 64,
-                   source_zip_base64='private-source-fixture')
+                   source_zip_base64='private-source-fixture',
+                   source_commit_object_base64='private-commit-fixture')
+    for missing in ('review_task_id', 'review_task_revision', 'source_commit_object_base64'):
+        incomplete = {key: value for key, value in payload.items() if key != missing}
+        result = call(client, 'hub_staging_build_submit', {'payload': incomplete})
+        assert result['isError'] and 'invalid_staging_request' in json.dumps(result)
+        assert 'private-source-fixture' not in json.dumps(result)
+        assert 'private-commit-fixture' not in json.dumps(result)
+        assert not calls
     for extra in ({'actor': 'claude'}, {'command': 'sh'}, {'image': 'latest'},
                   {'resource_ids': {}}, {'worker_url': 'http://untrusted'}):
         result = call(client, 'hub_staging_build_submit', {'payload': dict(payload, **extra)})
         assert result['isError']
         assert 'private-source-fixture' not in json.dumps(result)
+        assert 'private-commit-fixture' not in json.dumps(result)
         assert not calls
     result = call(client, 'hub_staging_build_submit', {'payload': payload})
     assert result['isError'] and 'staging_forbidden' in json.dumps(result)
-    assert calls[0][0:2] == ('submit', 'codex')
+    assert 'private-source-fixture' not in json.dumps(result)
+    assert 'private-commit-fixture' not in json.dumps(result)
+    assert calls == [('submit', 'codex', payload)]

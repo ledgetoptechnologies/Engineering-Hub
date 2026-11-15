@@ -154,6 +154,43 @@ async def test_registry_close_during_fresh_preparation_denies_next_claim_or_post
 
 
 @pytest.mark.asyncio
+async def test_runtime_shutdown_after_fresh_observation_does_not_claim(rig, monkeypatch):
+    from engineering_hub.events import NativeHubEventFeed
+    from engineering_hub.queued_pilot_runtime import QueuedPilotRuntime
+
+    with async_pilot_case(rig) as case:
+        await accept(case)
+        _, job = submit(case)
+        feed = NativeHubEventFeed(case.repo.path)
+        runtime = QueuedPilotRuntime(case.bridge, feed)
+        original = case.bridge._preclaim_guard
+        guards = 0
+        reached = asyncio.Event()
+
+        def close_after_observation():
+            nonlocal guards
+            guards += 1
+            if guards == 2:
+                case.policies.close()
+                runtime.suspend_claims()
+                reached.set()
+            return original()
+
+        monkeypatch.setattr(case.bridge, '_preclaim_guard', close_after_observation)
+        try:
+            assert (await feed.start())['available']
+            await runtime.start()
+            await asyncio.wait_for(reached.wait(), 5)
+            await asyncio.wait_for(runtime.drain_current(), 5)
+            await asyncio.wait_for(runtime.stop(), 5)
+            assert case.queue.get_job(job['id'])['state'] == 'queued'
+            assert case.repo.list_runs() == [] and case.client.submissions == []
+        finally:
+            await runtime.stop()
+            await feed.stop()
+
+
+@pytest.mark.asyncio
 async def test_prior_owner_terminal_proof_recovers_before_new_startup_opens(rig):
     _, job = submit(rig)
     original = rig.queue.complete
@@ -231,7 +268,13 @@ async def test_owner_loss_and_private_permit_and_changed_review_still_deny(rig):
     claimed = rig.queue.claim(worker=rig.bridge.worker, action_keys=(ACTION,))
     assert rig.queue.completion_verifier(claimed, job['id'], 'succeeded') is False
     current = rig.repo.get_task(task['id'])
-    rig.repo.set_candidate('codex', task['id'], current['revision'], 'f' * 40)
+    with pytest.raises(HubError, match='active_work_job'):
+        rig.repo.set_candidate('codex', task['id'], current['revision'], 'f' * 40)
+    # Simulate stale persisted review independently of the public guard.
+    with rig.repo._transaction() as db:
+        changed = rig.repo._get(db, task['id'], 'task')
+        changed.update(candidate_commit='f' * 40, review=None, status='in_review')
+        rig.repo._save(db, 'codex', 'task.candidate', 'task', changed)
     with rig.bridge._scope(job['id'], 'execute'):
         with pytest.raises(HubError):
             rig.bridge._intent(claimed)

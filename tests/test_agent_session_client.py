@@ -224,3 +224,53 @@ def test_profile_lock_does_not_overwrite_an_existing_operation(tmp_path):
         with pytest.raises(client.ClientError, match='in_progress'):
             with client._profile_lock(tmp_path):
                 pytest.fail('must not acquire a second pairing lock')
+
+
+def test_explicit_attention_listener_emits_only_fixed_hints(tmp_path, monkeypatch, capsys):
+    import io
+    from email.message import Message
+    installation = '00000000-0000-4000-8000-000000000001'
+    secret = 'ehs_' + 'z' * 43
+    client._write(tmp_path / 'installation.private', {
+        'origin': 'https://hub.example', 'family': 'codex', 'installation_id': installation})
+    client._write(tmp_path / 'first.session.private', {
+        'token': secret, 'expires_at': time.time() + 120, 'installation_id': installation})
+    requests = []
+    class Response(io.BytesIO):
+        status = 200
+        headers = Message()
+        headers['Content-Type'] = 'text/event-stream'
+    class Opener:
+        def open(self, request, timeout):
+            requests.append((request, timeout))
+            return Response(b'event: attention-ready\ndata: {}\n\nevent: attention-check\ndata: {}\n\n')
+    monkeypatch.setattr(client, 'build_opener', lambda *args: Opener())
+    assert client.main(['--profile-dir', str(tmp_path), 'listen-attention', '--session', 'first',
+                        '--project', 'engineering-hub', '--generation', '1']) == 0
+    output = capsys.readouterr().out
+    assert [json.loads(line)['event'] for line in output.splitlines()] == ['attention-ready', 'attention-check']
+    assert secret not in output and secret not in requests[0][0].full_url
+    assert requests[0][0].get_header('Authorization') == 'Bearer ' + secret
+    assert 0 < requests[0][1] <= 120
+
+
+def test_attention_listener_rejects_untrusted_frame_without_echo(tmp_path, monkeypatch, capsys):
+    import io
+    from email.message import Message
+    installation = '00000000-0000-4000-8000-000000000001'
+    client._write(tmp_path / 'installation.private', {
+        'origin': 'https://hub.example', 'family': 'codex', 'installation_id': installation})
+    client._write(tmp_path / 'first.session.private', {
+        'token': 'ehs_' + 'z' * 43, 'expires_at': time.time() + 120, 'installation_id': installation})
+    class Response(io.BytesIO):
+        status = 200
+        headers = Message()
+        headers['Content-Type'] = 'text/event-stream'
+    class Opener:
+        def open(self, request, timeout):
+            return Response(b'event: attention-check\ndata: SECRET-UNTRUSTED\n\n')
+    monkeypatch.setattr(client, 'build_opener', lambda *args: Opener())
+    with pytest.raises(client.ClientError, match='invalid_server_response'):
+        client.main(['--profile-dir', str(tmp_path), 'listen-attention', '--session', 'first',
+                     '--project', 'engineering-hub', '--generation', '1'])
+    assert 'SECRET-UNTRUSTED' not in capsys.readouterr().out

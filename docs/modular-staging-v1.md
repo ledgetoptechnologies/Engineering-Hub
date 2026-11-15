@@ -36,9 +36,11 @@ type Resource = {
 };
 ```
 
-All timestamps are UTC ISO8601; IDs are canonical UUIDs. Source commit is
-declared provenance until verified against a source provider; the submitted ZIP
-SHA256 is independently verified. Resource IDs and canonical ownership are
+All timestamps are UTC ISO8601; IDs are canonical UUIDs. New Hub submissions
+must supply a Git commit object and an independently approved exact task revision.
+Hub and worker verify the archive against the commit tree. This establishes
+object/tree consistency, not repository membership, authorship or a signature;
+Git SHA-1 collision resistance is a limitation. Resource IDs and canonical ownership are
 issued by EH, not supplied by a browser or inferred from Docker discovery.
 Unknown size stays null. A project record alone grants no execution or read access.
 
@@ -50,8 +52,8 @@ paths are canonical ASCII, with no query strings or SPA fallback routing yet.
 Use the [committed-source packager](staging-source-package.md) to prepare a
 development ref without including working-tree changes or fetching missing Git
 objects. It records the archive digest and exact dependency/cache-label inputs.
-This is local source verification only: worker commit provenance remains
-declared, and a matching reviewed CI cache/profile must still be enrolled before
+The package contains the separate commit-object proof; worker acceptance is a
+separate step, and a matching reviewed CI cache/profile must still be enrolled before
 repository tests can run. Packaging neither submits work nor grants access.
 
 ### EH API
@@ -65,6 +67,21 @@ repository tests can run. Packaging neither submits work nor grants access.
 - `GET /api/hub/v1/staging/resources?project=&kind=&state=&after=&limit=`:
   `{items: Resource[], next_after: string | null}`; limit 1–100.
 - `GET /api/hub/v1/staging/resources/{id}`: one Resource.
+- `POST /api/hub/v1/staging/jobs` requires `review_task_id`,
+  `review_task_revision`, `source_commit_object_base64`, exact source commit,
+  archive digest and archive bytes. The review must belong to the submitter,
+  name the same commit and be independently approved. The queue rechecks it at
+  submission, claim and durable dispatch intent; active work fences edits.
+  Legacy unreviewed queued rows remain blocked and need explicit reconciliation;
+  they are never upgraded or replayed automatically.
+  A legacy attempt without a complete matching source binding is reported as
+  `phase=held`, `hold_reason=source_binding_unavailable`, and is not polled or
+  reposted automatically. An unclaimed queued row remains queued in the
+  canonical queue without a fabricated machine reservation. A claimed or held
+  attempt retains its existing reservation. A pre-existing durable no-effect
+  proof remains recoverable, and historical terminal results are not rewritten.
+  Restoring a field or adding a later no-effect marker alone never clears the
+  sticky manual hold.
 - `POST /api/hub/v1/staging/resources/{id}/keep`:
   `{mode:'until'|'pinned'|'none', until?:string, reason:string,
   expected_revision:number}` → Resource. Human mutation requires existing CSRF.
@@ -91,6 +108,16 @@ EH's existing WorkQueue remains the authoritative machine reservation and
 production-first ordering source. A staged build/test action is a sandbox job,
 not production deployment or evidence that arbitrary code was independently
 reviewed. Existing deployment/review/held-work gates remain unchanged.
+The `staging-service.` action-key prefix is reserved for this module; queue
+admission fails closed if its staging submission table or binding is absent.
+Configured and shared compositions now use that same canonical key. Previously
+configured `modular.<64 lowercase hex>` work remains in the existing ledger;
+open legacy rows cannot be claimed or automatically reconciled, polled, replayed,
+or released, including rows with an earlier no-effect proof or worker receipt.
+An operator must review the original reservation and evidence through a separately
+trusted recovery process. Do not re-enroll or resubmit to bypass it. Terminal
+history remains readable. Unrelated generic `modular.*` actions are unchanged
+unless bound to a staging submission.
 
 Worker core API: `submit(payload)`, `status(job_id)`, `metadata(resource_id)`,
 `file(resource_id, relative_path)` and `cleanup(payload)`. HTTP equivalents:
@@ -122,6 +149,12 @@ Cleanup plans expire after10 minutes and bind actor, IDs, revisions and digest.
 Apply rechecks permission, expiry, job state, protection and revision in a
 transaction before marking items deleting. Worker deletion is confined to
 registered owned resource paths/containers and rechecks ownership and liveness.
+For a human cleanup apply, the exact browser session is checked in the same
+ledger writer immediately before both the initial cleanup commit and the
+dispatching journal commit. Logout is serialized with those commits; expiry is
+checked just before commit, not continuously through commit. Once the exact
+dispatch intent is committed, a later logout does not cancel that already
+admitted operation. Its original outcome is reconciled without another POST.
 EH records confirmed deletion only after a matching worker receipt; timeouts
 stay uncertain for inspection. No Docker prune, global directory sweep or
 automatic history deletion. Compact tombstones and job summaries remain.
@@ -161,3 +194,13 @@ offline TEST filesystem remain intact. No permanent service activation, secret
 rotation or public route change follows merely from a test passing. Publish
 tested code, make required operator steps concrete in EH, and distinguish local
 integration from the actual NAS-connected pilot/rollback/reboot acceptance.
+
+Failure-protection maintenance uses an index on the Hub audit ledger to verify
+committed terminal ordering before removing an older failure's protection. The
+index is created if absent when the staging resource store starts. On a large
+existing ledger its first creation takes a SQLite writer lock and may delay
+startup; plan the migration in an appropriate maintenance window and retain the
+normal backup. If creation fails, staging initialization fails closed rather
+than dropping history.
+A failure after some independently validated older protections were removed
+leaves the remaining protections intact and reports a maintenance warning.

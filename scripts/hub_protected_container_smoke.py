@@ -145,7 +145,7 @@ print(json.dumps({'unmounted_default_and_v1':'refused','phantom_ledger':False}))
 
 def _artifact(image, commit):
     if not isinstance(image,str) or not re.fullmatch(
-        r'ghcr\.io/ledgetoptechnologies/engineering-hub-control:(?:build-)[a-z0-9-]+|'
+        r'sha256:[a-f0-9]{64}|ghcr\.io/ledgetoptechnologies/engineering-hub-control:(?:build-)[a-z0-9-]+|'
         r'ghcr\.io/ledgetoptechnologies/engineering-hub-control@sha256:[a-f0-9]{64}',image):
         raise ValueError('Expected explicit release artifact')
     if not isinstance(commit,str) or not re.fullmatch('[a-f0-9]{40}',commit):

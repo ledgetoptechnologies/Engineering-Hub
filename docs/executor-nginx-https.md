@@ -44,6 +44,11 @@ Only these exact methods and original URI forms are forwarded:
 | POST | `/v1/container-pilot/current-observation` | Exact nonce-only JSON, ≤256 bytes; unchanged signed envelope ≤8192 bytes |
 | GET | `/v1/container-pilot/commands/<canonical-lowercase-UUID>` | Empty |
 | POST | `/v1/container-pilot/commands/<canonical-lowercase-UUID>/reconcile` | Empty |
+| GET | `/v2/container-pilot/capability` | Empty |
+| POST | `/v2/container-pilot/commands` | Existing closed request JSON, ≤8192 bytes |
+| GET | `/v2/container-pilot/commands/<canonical-lowercase-UUID>` | Empty |
+| POST | `/v2/container-pilot/commands/<canonical-lowercase-UUID>/reconcile` | Empty |
+| POST | `/v2/container-pilot/commands/<canonical-lowercase-UUID>/acknowledge` | Exact request and outcome digest JSON, ≤8192 bytes |
 
 Query strings, aliases, encoded path spellings, trailing slashes and other
 methods/routes are rejected. The executor still validates bearer identity,

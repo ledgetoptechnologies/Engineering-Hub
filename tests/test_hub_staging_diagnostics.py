@@ -28,7 +28,7 @@ async def diagnostic_env(controller_env,config):
             'scope':'original_engine_owned_writers_exporters_volumes_absent'}
         return receipt
     worker.submit=submitted
-    accepted=await controller.submit('codex',payload());finished=await controller.run_once()
+    accepted=await controller.submit('codex',payload(repo));finished=await controller.run_once()
     assert finished['job']['state']=='failed'
     identity=accepted['resource_ids']['test_run'];requests=[];behavior={}
     async def response(request):

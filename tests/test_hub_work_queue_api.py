@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from agent_message_bus.auth import AuthSettings
 from engineering_hub.auth import AuthConfig, SessionStore, require_human
 from engineering_hub.repository import AGENTS, HubError, HubRepository
+from tests.work_queue_review_faults import corrupt_review_after_active_work
 from engineering_hub.work_queue import WorkAction, WorkQueue
 from engineering_hub.work_queue_api import attach_work_queue_routes
 
@@ -115,6 +116,20 @@ def test_reads_require_identity_and_all_agents_can_read(rig):
             assert client.get(BASE + path, headers=bearer(name)).status_code == 200
 
 
+def test_holder_identity_is_only_exposed_after_existing_authentication(rig):
+    client, _, _, _, _, submission, _, _ = rig
+    first = client.post(BASE + '/jobs', headers=bearer(), json=submission()).json()
+    claim = client.post(BASE + '/claim', headers=bearer(), json={'instance_id': str(uuid4())})
+    assert claim.status_code == 200 and claim.json()['job']['id'] == first['id']
+    waiting = client.post(BASE + '/jobs', headers=bearer(), json=submission()).json()
+    assert client.get(BASE + '/status').status_code == 401
+    assert client.get(BASE + '/status', headers={'Authorization': 'Bearer invalid'}).status_code == 401
+    response = client.get(BASE + '/status', headers=bearer())
+    assert response.status_code == 200
+    jobs = {row['id']: row for row in response.json()['jobs']}
+    assert jobs[waiting['id']]['reservation_holder_job_id'] == first['id']
+
+
 def test_unconfigured_returns423_after_auth_for_all_routes(rig):
     _, _, _, build, _, submission, *_ = rig
     with build(None) as client:
@@ -177,7 +192,7 @@ def test_submit_binds_owned_reviewed_task_and_registered_project(rig, case):
     assert client.get(BASE + '/jobs', headers=bearer()).json()['items'] == []
 
 
-def test_production_priority_is_not_approval_and_claim_rechecks_review(rig):
+def test_production_priority_is_not_approval_and_active_review_is_frozen(rig):
     client, repo, _, _, _, submission, *_ = rig
     prod = submission(environment='production', approval_id='not-real-approval')
     assert client.post(BASE + '/jobs', headers=bearer(), json=prod).status_code == 201
@@ -185,7 +200,10 @@ def test_production_priority_is_not_approval_and_claim_rechecks_review(rig):
     staging = submission()
     assert client.post(BASE + '/jobs', headers=bearer(), json=staging).status_code == 201
     current = repo.get_task(staging['target']['task_id'])
-    repo.set_candidate('codex', current['id'], current['revision'], 'c' * 40)
+    with pytest.raises(HubError, match='active_work_job'):
+        repo.set_candidate('codex', current['id'], current['revision'], 'c' * 40)
+    assert repo.get_task(current['id'])['candidate_commit'] == COMMIT
+    corrupt_review_after_active_work(repo, staging['target']['task_id'])
     assert client.post(BASE + '/claim', headers=bearer(), json={'instance_id': str(uuid4())}).json()['job'] is None
 
 

@@ -408,3 +408,71 @@ def test_actual_process_crash_after_durable_intent_never_replays_or_deletes_arti
         assert before_artifacts == (set(rig.root.iterdir()), set(rig.reservations.iterdir()))
         assert intent.read_bytes() == intent_bytes and incomplete_generation.is_dir()
     assert before_baselines == (rig.frozen.read_bytes(), rig.live.read_bytes())
+
+
+def test_inspect_reservation_returns_guarded_actual_completion_and_reopens(rig):
+    operation, run = str(uuid4()), str(uuid4())
+    with rig.build() as store:
+        deadline = time.monotonic() + 10
+        assert store.inspect_reservation(operation, deadline_monotonic=deadline) is None
+        state = prepare(store, rig, operation=operation, run=run)
+        observed = store.inspect_reservation(operation, deadline_monotonic=deadline)
+        assert (observed.operation_id, observed.run_id, observed.role, observed.generation_id, observed.complete) == (
+            operation, run, 'candidate', state.generation_id, True)
+        info = (rig.root / state.generation_id).stat()
+        assert observed.generation_inode == (info.st_dev, info.st_ino)
+    with rig.build(create=False) as store:
+        assert store.inspect_reservation(operation, deadline_monotonic=time.monotonic()+10) == observed
+
+
+def test_inspection_reports_pending_without_inferring_no_effect(rig, monkeypatch):
+    operation, run = str(uuid4()), str(uuid4())
+    with rig.build() as store:
+        def fail(*args, **kwargs): raise OSError('synthetic copy failure')
+        monkeypatch.setattr(provider_module, 'copy_sqlite_generation', fail)
+        with pytest.raises(StateProvisionError): prepare(store, rig, operation=operation, run=run)
+        observed = store.inspect_reservation(operation, deadline_monotonic=time.monotonic()+10)
+        assert observed.run_id == run and observed.role == 'candidate'
+        assert observed.complete is False and observed.generation_inode is None
+        with pytest.raises(StateProvisionError): prepare(store, rig, operation=operation, run=run)
+
+
+@pytest.mark.parametrize('change', ['completion_inode', 'missing_database', 'bad_deadline'])
+def test_inspection_fails_closed_when_completion_cannot_be_bound(rig, change):
+    import json
+    operation, run = str(uuid4()), str(uuid4())
+    with rig.build() as store:
+        state = prepare(store, rig, operation=operation, run=run)
+        if change == 'completion_inode':
+            marker = rig.reservations / (operation + '.complete')
+            data = json.loads(marker.read_bytes()); data['inode'][1] += 1
+            marker.write_text(json.dumps(data, sort_keys=True, separators=(',', ':')))
+        elif change == 'missing_database':
+            (rig.root / state.generation_id / 'hub.sqlite3').unlink()
+        deadline = float('nan') if change == 'bad_deadline' else time.monotonic()+10
+        with pytest.raises(StateProvisionError): store.inspect_reservation(operation, deadline_monotonic=deadline)
+
+
+def test_post_marker_failure_leaves_completion_but_is_not_success(rig, monkeypatch):
+    operation, run = str(uuid4()), str(uuid4())
+    with rig.build() as store:
+        real = store._inventory_usage
+        calls = 0
+        def fail_after_marker(deadline):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise StateProvisionError('injected final inventory failure')
+            return real(deadline)
+        monkeypatch.setattr(store, '_inventory_usage', fail_after_marker)
+        with pytest.raises(StateProvisionError):
+            prepare(store, rig, operation=operation, run=run)
+        assert (rig.reservations / (operation + '.complete')).is_file()
+        # A completion marker alone cannot authorize a phase: no successful
+        # state-copy receipt was returned after the final checks failed.
+        # The owned generation is removed by failure cleanup, so inspection
+        # rejects the surviving marker instead of treating it as completion.
+        with pytest.raises(StateProvisionError):
+            store.inspect_reservation(operation, deadline_monotonic=time.monotonic()+10)
+        with pytest.raises(StateProvisionError):
+            prepare(store, rig, operation=operation, run=run)

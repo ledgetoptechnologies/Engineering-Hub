@@ -13,6 +13,31 @@ to `PilotASGI` and `HostAdapter`. The host owns its private command/operation
 ledger, pinned Engine binding, approved build records, baseline and state.
 `OwnedPilotService` supplies control-side ownership, workflow and recovery.
 
+Custom legacy adapters passed to `PilotASGI` must explicitly provide
+`_single_pilot_protocol = False` as a boolean. Missing or non-boolean mode is
+rejected on versioned command routes before the request body is read or the
+adapter is called. The mode declares protocol compatibility; it does not prove
+daemon identity or exclusive ownership.
+
+The unified HTTPS selector retains v1 by default. Its closed profile schema
+`engineering-hub.unified-pilot.v2` requires the exact boolean
+`single_pilot_protocol: true` and passes that mode to both the client and the
+owned workflow. The inert executor NGINX template lists the corresponding v2
+routes; adding source support does not install a proxy, grant access, or prove
+remote reachability. Both ends must independently use matching modes.
+
+The colocated coordinator's `serve` selector requires `--session-config` on a
+read-only mount, with a protected current-UID file and parent. This is an
+operator-authored, independently reviewed session report: its retained source,
+freshness, inventory reconciliation, writer exclusion and unresolved-effect
+claims must come from actual operator evidence, not from the executor's signed
+identity response. The session remains pending until the named operator accepts
+the challenge; expired reports cannot authorize a new observation or effect.
+The observation relay uses the same private executor socket and dedicated bearer
+as commands. That bearer has command authority and must be protected accordingly;
+it is not an observation-only credential. No configured session or signed
+identity establishes baseline health, installed acceptance or production release.
+
 `WorkQueue` separately supplies production-first eligible ordering and physical
 machine reservations. Its default claim admission is closed. Production priority
 does not grant production deployment authority; the first executor remains

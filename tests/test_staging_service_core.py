@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -25,7 +26,7 @@ def profile():
             'cpus': 1, 'pids': 32, 'output_bytes': 1048576, 'log_bytes': 65536}
 
 
-def zipped(name='index.html', data=b'<h1>hello</h1>', mode=None):
+def zipped(name='index.html', data=b'<h1>hello</h1>', mode=0o100644):
     output = io.BytesIO()
     with zipfile.ZipFile(output, 'w') as bundle:
         item = zipfile.ZipInfo(name)
@@ -55,6 +56,14 @@ class Backend:
 
 class CoreTests(unittest.TestCase):
     def setUp(self):
+        from unittest.mock import patch
+        from hub_staging_service import core
+        self.gate = patch.object(core, '_PROFILE_PROTOCOL_READY', True)
+        self.gate.start()
+        self.addCleanup(self.gate.stop)
+        self.attempt_gate = patch.object(core, '_SOURCE_ATTEMPT_ENABLED', True)
+        self.attempt_gate.start()
+        self.addCleanup(self.attempt_gate.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.service = Service(self.temp.name, {'demo': profile()}, Backend())
 
@@ -62,12 +71,225 @@ class CoreTests(unittest.TestCase):
         self.service.close()
         self.temp.cleanup()
 
+    def bind_reviewed_profile(self, payload, binding):
+        from unittest.mock import patch
+        from hub_staging_service import core
+        from engineering_hub.modular_staging_profile import from_worker_recipe, profile_digest
+        gate = patch.object(core, '_PROFILE_PROTOCOL_READY', True)
+        gate.start()
+        self.addCleanup(gate.stop)
+        effective = self.service.projects['demo']['default']
+        payload.update(require_source_binding=True, expected_source_binding=binding,
+                       reviewed_profile={'project':'demo', 'recipe':'default', 'generation':1,
+                           'digest':profile_digest(from_worker_recipe(effective))})
+
+    def prepare_reviewed_job(self, payload=None, source=None):
+        from hub_staging_service.source_provenance import _archive_tree, _object_id
+        payload = payload or job()
+        raw = base64.b64decode(payload['source_zip_base64'])
+        tree = _archive_tree(raw)[0]
+        obj = (f'tree {tree}\nauthor Test <test@example.invalid> 1 +0000\n'
+               f'committer Test <test@example.invalid> 1 +0000\n\nfixture\n').encode()
+        commit = _object_id(b'commit', obj)
+        if source is None:
+            source = {'profile_protocol':'hub-staging-profile.v2', 'source_id':uid(),
+                'project':'demo', 'source_digest':payload['source_digest'],
+                'source_zip_base64':payload['source_zip_base64'], 'source_commit':commit,
+                'source_commit_object_base64':base64.b64encode(obj).decode()}
+            receipt = self.service.put_source(source)
+        else:
+            # A second job references the original deposit without replaying it.
+            self.service._source(source['source_id'], source['project'], source['source_digest'])
+            receipt = {'source_binding': self.service._source_binding(source['source_id'], source['project'], source['source_digest'])}
+        del payload['source_zip_base64']
+        payload.update(source_id=source['source_id'], source_commit=commit)
+        self.bind_reviewed_profile(payload, receipt['source_binding'])
+        return payload, source
+
+    @unittest.skipUnless(os.name == 'posix', 'Executable file modes require POSIX')
+    def test_bound_git_modes_reach_the_executed_workspace(self):
+        from hub_staging_service.source_provenance import _archive_tree, _object_id
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, 'w') as bundle:
+            for name, mode, data in [('build.sh', 0o100755, b'#!/bin/sh\nexit 0\n'),
+                                     ('data.txt', 0o100644, b'data')]:
+                item = zipfile.ZipInfo(name)
+                item.create_system = 3
+                item.external_attr = mode << 16
+                bundle.writestr(item, data)
+        raw = output.getvalue()
+        tree = _archive_tree(raw)[0]
+        obj = (f'tree {tree}\nauthor Test <test@example.invalid> 1 +0000\n'
+               f'committer Test <test@example.invalid> 1 +0000\n\nfixture\n').encode()
+        commit = _object_id(b'commit', obj)
+        payload = job(raw)
+        source_id = uid()
+        receipt = self.service.put_source({'profile_protocol':'hub-staging-profile.v2', 'source_id': source_id, 'project': 'demo',
+            'source_digest': payload['source_digest'], 'source_zip_base64': payload.pop('source_zip_base64'),
+            'source_commit': commit, 'source_commit_object_base64': base64.b64encode(obj).decode()})
+        from unittest.mock import patch
+        from engineering_hub.modular_staging_profile import from_worker_recipe, profile_digest
+        from hub_staging_service import core
+        gate = patch.object(core, '_PROFILE_PROTOCOL_READY', True)
+        gate.start()
+        self.addCleanup(gate.stop)
+        effective = self.service.projects['demo']['default']
+        reviewed = {'project': 'demo', 'recipe': 'default', 'generation': 1,
+                    'digest': profile_digest(from_worker_recipe(effective))}
+        payload.update(source_id=source_id, source_commit=commit, require_source_binding=True,
+                       expected_source_binding=receipt['source_binding'], reviewed_profile=reviewed)
+
+        class ExecutingBackend(Backend):
+            def run(self, paths, profile, command_id):
+                script = paths['workspace'] / 'build.sh'
+                assert stat.S_IMODE(script.stat().st_mode) == 0o755
+                assert stat.S_IMODE((paths['workspace'] / 'data.txt').stat().st_mode) == 0o644
+                subprocess.run([str(script)], check=True, timeout=5)
+                return super().run(paths, profile, command_id)
+
+        self.service.backend = ExecutingBackend()
+        self.service.submit(payload)
+        self.service.wait()
+        self.assertEqual(self.service.status(payload['job_id'])['state'], 'succeeded')
+
+        # Legacy, unbound sources retain their existing non-executable policy.
+        legacy = Path(self.temp.name) / 'legacy-check'
+        legacy.mkdir()
+        extract(raw, legacy)
+        make_job_readable(legacy, 1024)
+        self.assertEqual(stat.S_IMODE((legacy / 'build.sh').stat().st_mode), 0o644)
+
+    def test_unverified_modes_cannot_change_permissions(self):
+        from unittest.mock import patch
+        from hub_staging_service.source_provenance import (
+            _archive_tree, _object_id, verify, verified_executable_paths, SourceProvenanceError)
+        valid = zipped(mode=0o100644)
+        tree = _archive_tree(valid)[0]
+        obj = (f'tree {tree}\nauthor Test <test@example.invalid> 1 +0000\n'
+               f'committer Test <test@example.invalid> 1 +0000\n\nfixture\n').encode()
+        binding = verify(valid, base64.b64encode(obj).decode(), _object_id(b'commit', obj))
+        with patch('hub_staging_service.core.Path.chmod') as chmod:
+            with self.assertRaises(SourceProvenanceError):
+                verified_executable_paths(zipped(mode=0o100777), binding)
+            chmod.assert_not_called()
+        invalid = zipped(mode=0o100777)
+        with patch('hub_staging_service.core.Path.chmod') as chmod, \
+             patch.object(self.service.backend, 'run') as run:
+            with self.assertRaises(Rejected):
+                self.service.put_source({'profile_protocol':'hub-staging-profile.v2', 'source_id': uid(), 'project': 'demo',
+                    'source_digest': hashlib.sha256(invalid).hexdigest(),
+                    'source_zip_base64': base64.b64encode(invalid).decode(),
+                    'source_commit': binding['commit_oid'],
+                    'source_commit_object_base64': base64.b64encode(obj).decode()})
+            chmod.assert_not_called()
+            run.assert_not_called()
+        self.assertEqual(self.service.db.execute('SELECT COUNT(*) FROM sources').fetchone()[0], 0)
+
+    def test_verified_source_rejects_different_commit_at_job_admission(self):
+        from hub_staging_service.source_provenance import _archive_tree, _object_id
+        raw = zipped(mode=0o100644)
+        tree = _archive_tree(raw)[0]
+        commit_object = (f'tree {tree}\nauthor Test <test@example.invalid> 1 +0000\n'
+                         f'committer Test <test@example.invalid> 1 +0000\n\nfixture\n').encode()
+        commit = _object_id(b'commit', commit_object)
+        payload = job(raw)
+        source_id = uid()
+        for invalid in (None, 7):
+            with self.assertRaises(Rejected):
+                self.service.put_source({'profile_protocol':'hub-staging-profile.v2', 'source_id': uid(), 'project': 'demo',
+                    'source_digest': payload['source_digest'], 'source_zip_base64': payload['source_zip_base64'],
+                    'source_commit': invalid, 'source_commit_object_base64': base64.b64encode(commit_object).decode()})
+        receipt = self.service.put_source({'profile_protocol':'hub-staging-profile.v2', 'source_id': source_id, 'project': 'demo',
+            'source_digest': payload['source_digest'], 'source_zip_base64': payload.pop('source_zip_base64'),
+            'source_commit': commit, 'source_commit_object_base64': base64.b64encode(commit_object).decode()})
+        self.assertEqual(receipt['source_binding']['commit_oid'], commit)
+        payload['source_id'] = source_id
+        self.bind_reviewed_profile(payload, receipt['source_binding'])
+        with self.assertRaises(Rejected) as caught:
+            self.service.submit(payload)
+        self.assertEqual(caught.exception.code, 'source_binding_mismatch')
+        payload['source_commit'] = commit
+        payload.update(require_source_binding=True, expected_source_binding=receipt['source_binding'])
+        self.service.submit(payload); self.service.wait()
+        status = self.service.status(payload['job_id'])
+        self.assertEqual(status['result']['source_commit_verification'], 'git-sha1-tree-v1')
+        self.assertEqual(status['result']['source_binding'], receipt['source_binding'])
+        self.assertEqual(self.service.submit(payload), status)
+        self.service.close()
+        self.service = Service(self.temp.name, {'demo': profile()}, Backend())
+        self.assertEqual(self.service.submit(payload), status)
+
+    def test_required_binding_denies_missing_or_changed_proof_before_execution(self):
+        from hub_staging_service.source_provenance import _archive_tree, _object_id
+        raw = zipped(mode=0o100644)
+        tree = _archive_tree(raw)[0]
+        obj = (f'tree {tree}\nauthor Test <test@example.invalid> 1 +0000\n'
+               f'committer Test <test@example.invalid> 1 +0000\n\nfixture\n').encode()
+        commit = _object_id(b'commit', obj)
+        payload = job(raw)
+        source_id = uid()
+        receipt = self.service.put_source({'profile_protocol':'hub-staging-profile.v2', 'source_id': source_id, 'project': 'demo',
+            'source_digest': payload['source_digest'], 'source_zip_base64': payload.pop('source_zip_base64'),
+            'source_commit': commit, 'source_commit_object_base64': base64.b64encode(obj).decode()})
+        payload.update(source_id=source_id, source_commit=commit)
+        self.bind_reviewed_profile(payload, receipt['source_binding'])
+        binding = dict(receipt['source_binding'], entries=True)
+        self.service.db.execute('UPDATE source_bindings SET binding=? WHERE source_id=?',
+                                (json.dumps(binding), source_id))
+        self.service.db.commit()
+        with self.assertRaises(Rejected) as caught:
+            self.service.submit(payload)
+        self.assertEqual(caught.exception.code, 'source_binding_required')
+        binding = dict(receipt['source_binding'], commit_object_sha256='0' * 64)
+        self.service.db.execute('UPDATE source_bindings SET binding=? WHERE source_id=?',
+                                (json.dumps(binding), source_id))
+        self.service.db.commit()
+        with self.assertRaises(Rejected) as caught:
+            self.service.submit(payload)
+        self.assertEqual(caught.exception.code, 'source_binding_required')
+        self.service.db.execute('DELETE FROM source_bindings WHERE source_id=?', (source_id,))
+        self.service.db.commit()
+        with self.assertRaises(Rejected) as caught:
+            self.service.submit(payload)
+        self.assertEqual(caught.exception.code, 'source_binding_required')
+        self.assertIsNone(self.service.active)
+        self.assertIsNone(self.service.thread)
+        self.assertEqual(self.service.db.execute('SELECT COUNT(*) FROM operations').fetchone()[0], 0)
+        self.assertEqual(self.service.db.execute('SELECT COUNT(*) FROM resources').fetchone()[0], 0)
+
+    def test_failed_verified_job_preserves_binding_across_replay_and_restart(self):
+        from hub_staging_service.source_provenance import _archive_tree, _object_id
+        raw = zipped(mode=0o100644)
+        tree = _archive_tree(raw)[0]
+        obj = (f'tree {tree}\nauthor Test <test@example.invalid> 1 +0000\n'
+               f'committer Test <test@example.invalid> 1 +0000\n\nfixture\n').encode()
+        commit = _object_id(b'commit', obj)
+        payload = job(raw)
+        source_id = uid()
+        receipt = self.service.put_source({'profile_protocol':'hub-staging-profile.v2', 'source_id': source_id, 'project': 'demo',
+            'source_digest': payload['source_digest'], 'source_zip_base64': payload.pop('source_zip_base64'),
+            'source_commit': commit, 'source_commit_object_base64': base64.b64encode(obj).decode()})
+        payload.update(source_id=source_id, source_commit=commit)
+        self.bind_reviewed_profile(payload, receipt['source_binding'])
+        class FailingBackend:
+            def run(self, *args):
+                raise Rejected('stage_test_failed')
+        self.service.backend = FailingBackend()
+        self.service.submit(payload); self.service.wait()
+        status = self.service.status(payload['job_id'])
+        self.assertEqual(status['state'], 'failed')
+        self.assertEqual(status['result']['source_binding'], receipt['source_binding'])
+        self.assertEqual(self.service.submit(payload), status)
+        self.service.close()
+        self.service = Service(self.temp.name, {'demo': profile()}, Backend())
+        self.assertEqual(self.service.submit(payload), status)
+
     def test_real_archive_build_registry_and_immutable_file(self):
-        payload = job()
+        payload, _ = self.prepare_reviewed_job()
         self.service.submit(payload); self.service.wait()
         status = self.service.status(payload['job_id'])
         self.assertEqual(status['state'], 'succeeded')
-        self.assertEqual(status['result']['source_commit_verification'], 'declared')
+        self.assertEqual(status['result']['source_commit_verification'], 'git-sha1-tree-v1')
         resource = payload['resource_ids']['preview']
         self.assertEqual(self.service.file(resource, 'index.html'), b'<h1>built</h1>')
         (self.service.resources / resource / 'index.html').write_text('changed')
@@ -75,7 +297,7 @@ class CoreTests(unittest.TestCase):
             self.service.file(resource, 'index.html')
 
     def test_repeated_identity_does_not_execute_twice_and_changed_payload_conflicts(self):
-        payload = job()
+        payload, _ = self.prepare_reviewed_job()
         self.service.submit(payload); self.service.wait()
         original = self.service.status(payload['job_id'])
         self.assertEqual(self.service.submit(payload), original)
@@ -86,15 +308,20 @@ class CoreTests(unittest.TestCase):
 
     def test_inline_archive_is_not_persisted_but_full_payload_identity_and_receipts_survive(self):
         from unittest.mock import patch
-        payload = job(zipped('index.html', b'unique inline archive fixture'))
+        inline = job(zipped('index.html', b'unique inline archive fixture'))
+        with self.assertRaises(Rejected) as denied:
+            self.service._submit_v2(inline)
+        self.assertEqual(denied.exception.code, 'job_schema')
+        payload, source = self.prepare_reviewed_job(inline)
+        encoded = source['source_zip_base64']
         with patch.object(self.service.backend, 'run', wraps=self.service.backend.run) as execute:
             self.service.submit(payload); self.service.wait()
             original = self.service.status(payload['job_id'])
             stored = self.service.db.execute('SELECT * FROM operations WHERE command_id=?',
                                              (payload['command_id'],)).fetchone()
             compact = json.loads(stored['payload'])
-            assert compact == {key: value for key, value in payload.items() if key != 'source_zip_base64'}
-            assert payload['source_zip_base64'] not in stored['payload']
+            assert compact == dict(payload, source_binding=payload['expected_source_binding'])
+            assert encoded not in stored['payload']
             full_identity = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
             assert stored['identity'] == full_identity
             assert self.service.submit(payload) == original
@@ -102,7 +329,7 @@ class CoreTests(unittest.TestCase):
             assert self.service.submit(payload) == original
             assert self.service.cleanup(command) == cleanup
             assert execute.call_count == 1
-            changed = dict(payload, source_zip_base64=base64.b64encode(zipped('index.html', b'changed archive')).decode())
+            changed = dict(payload, source_commit='c' * 40)
             with self.assertRaises(Rejected) as error:
                 self.service.submit(changed)
             assert error.exception.code == 'idempotency_conflict'
@@ -119,10 +346,12 @@ class CoreTests(unittest.TestCase):
                 entered.set(); release.wait(3)
                 return super().run(*args)
         self.service.backend = Blocked()
-        self.service.submit(job()); self.assertTrue(entered.wait(2))
+        first, _ = self.prepare_reviewed_job()
+        second, _ = self.prepare_reviewed_job()
+        self.service.submit(first); self.assertTrue(entered.wait(2))
         try:
             with self.assertRaises(Rejected) as caught:
-                self.service.submit(job())
+                self.service.submit(second)
             self.assertEqual(caught.exception.status, 409)
         finally:
             release.set(); self.service.wait()
@@ -138,22 +367,68 @@ class CoreTests(unittest.TestCase):
             self.service.submit(job())
 
     def test_deposit_idempotency_project_binding_and_job_without_blob(self):
-        payload = job()
-        source = {'source_id': uid(), 'project': 'demo', 'source_digest': payload['source_digest'],
-                  'source_zip_base64': payload.pop('source_zip_base64')}
-        first = self.service.put_source(source)
-        self.assertEqual(self.service.put_source(source), first)
-        payload['source_id'] = source['source_id']
+        payload, source = self.prepare_reviewed_job()
+        # Preserve legacy idempotency while v2 explicitly refuses POST replay.
+        legacy = dict(source, source_id=uid())
+        del legacy['profile_protocol']
+        first = self.service.put_source(legacy)
+        self.assertEqual(self.service.put_source(legacy), first)
+        with self.assertRaises(Rejected) as error:
+            self.service.put_source(source)
+        self.assertEqual(error.exception.code, 'source_attempt_unknown')
         self.service.submit(payload); self.service.wait()
         self.assertEqual(self.service.status(payload['job_id'])['state'], 'succeeded')
         self.service.cleanup_sources(now=10**12)
         self.assertTrue((self.service.sources / (source['source_id'] + '.zip')).exists())
 
+    def test_v2_job_cannot_use_legacy_source_without_original_attempt(self):
+        payload, source = self.prepare_reviewed_job()
+        legacy = dict(source, source_id=uid())
+        del legacy['profile_protocol']
+        self.service.put_source(legacy)
+        payload['source_id'] = legacy['source_id']
+        with self.assertRaises(Rejected) as error:
+            self.service.submit(payload)
+        self.assertEqual(error.exception.code, 'source_attempt_required')
+        self.assertEqual(self.service.db.execute('SELECT count(*) FROM operations').fetchone()[0], 0)
+
+    def test_legacy_job_cannot_use_v2_reserved_source(self):
+        payload, _ = self.prepare_reviewed_job()
+        del payload['reviewed_profile']
+        with self.assertRaises(Rejected) as error:
+            self.service.submit(payload)
+        self.assertEqual(error.exception.code, 'source_attempt_reserved')
+        self.assertEqual(self.service.db.execute('SELECT count(*) FROM operations').fetchone()[0], 0)
+
+    def test_v2_job_rejects_changed_observed_source_incarnation(self):
+        payload, source = self.prepare_reviewed_job()
+        self.service.db.execute('UPDATE source_attempts SET source_inode=source_inode+1 WHERE source_id=?', (source['source_id'],))
+        self.service.db.commit()
+        with self.assertRaises(Rejected) as error:
+            self.service.submit(payload)
+        self.assertEqual(error.exception.code, 'source_attempt_required')
+        self.assertEqual(self.service.db.execute('SELECT count(*) FROM operations').fetchone()[0], 0)
+
+    def test_stale_reserved_binding_cannot_be_deleted_by_v1_or_v2_job(self):
+        payload, source = self.prepare_reviewed_job()
+        self.service.db.execute('UPDATE source_bindings SET source_inode=source_inode+1 WHERE source_id=?', (source['source_id'],))
+        self.service.db.commit()
+        before = tuple(self.service.db.execute('SELECT * FROM source_bindings WHERE source_id=?', (source['source_id'],)).fetchone())
+        changes = self.service.db.total_changes
+        with self.assertRaises(Rejected) as v2_error:
+            self.service.submit(payload)
+        self.assertEqual(v2_error.exception.code, 'source_binding_corrupt')
+        legacy = dict(payload)
+        del legacy['reviewed_profile']
+        with self.assertRaises(Rejected) as v1_error:
+            self.service.submit(legacy)
+        self.assertEqual(v1_error.exception.code, 'source_attempt_reserved')
+        self.assertEqual(tuple(self.service.db.execute('SELECT * FROM source_bindings WHERE source_id=?', (source['source_id'],)).fetchone()), before)
+        self.assertEqual(self.service.db.total_changes, changes)
+        self.assertEqual(self.service.db.execute('SELECT count(*) FROM operations').fetchone()[0], 0)
+
     def test_expired_unreferenced_deposit_collected_unknown_files_untouched(self):
-        payload = job()
-        source = {'source_id': uid(), 'project': 'demo', 'source_digest': payload['source_digest'],
-                  'source_zip_base64': payload['source_zip_base64']}
-        self.service.put_source(source)
+        payload, source = self.prepare_reviewed_job()
         unknown = self.service.sources / 'unknown'
         unknown.write_text('preserve')
         self.service.cleanup_sources(now=10**12)
@@ -161,12 +436,7 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(unknown.exists())
 
     def deposited_job(self, source=None):
-        payload = job()
-        source = source or {'source_id': uid(), 'project': 'demo', 'source_digest': payload['source_digest'],
-                            'source_zip_base64': payload['source_zip_base64']}
-        self.service.put_source(source)
-        del payload['source_zip_base64']
-        payload['source_id'] = source['source_id']
+        payload, source = self.prepare_reviewed_job(source=source)
         self.service.submit(payload); self.service.wait()
         return payload, source
 
@@ -235,10 +505,7 @@ class CoreTests(unittest.TestCase):
         assert not (self.service.sources / (source['source_id'] + '.zip')).exists()
 
     def test_expired_source_identity_drift_does_not_delete_replacement(self):
-        payload = job()
-        source = {'source_id': uid(), 'project': 'demo', 'source_digest': payload['source_digest'],
-                  'source_zip_base64': payload['source_zip_base64']}
-        self.service.put_source(source)
+        payload, source = self.prepare_reviewed_job()
         path = self.service.sources / (source['source_id'] + '.zip')
         # Preserve original inode at another path so replacement cannot reuse it.
         path.rename(path.with_suffix('.saved'))
@@ -265,7 +532,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.service.db.execute('SELECT COUNT(*) FROM operations').fetchone()[0], 0)
 
     def test_cleanup_tombstone_idempotency_and_revision_scope(self):
-        payload = job()
+        payload, _ = self.prepare_reviewed_job()
         self.service.submit(payload); self.service.wait()
         resource = payload['resource_ids']['preview']
         cleanup = {'command_id': uid(), 'idempotency_key': uid(),
@@ -281,7 +548,7 @@ class CoreTests(unittest.TestCase):
 
     def test_original_cleanup_receipt_can_be_read_after_lost_ack_and_restart(self):
         from unittest.mock import patch
-        payload = job()
+        payload, _ = self.prepare_reviewed_job()
         self.service.submit(payload); self.service.wait()
         resource = payload['resource_ids']['preview']
         cleanup = {'command_id': uid(), 'idempotency_key': uid(),
@@ -300,7 +567,7 @@ class CoreTests(unittest.TestCase):
         assert error.exception.status == 404
         with self.assertRaises(Rejected):
             self.service.operation('../not-a-command')
-        payload = job()
+        payload, _ = self.prepare_reviewed_job()
         self.service.submit(payload); self.service.wait()
         with self.assertRaises(Rejected) as error:
             self.service.operation(payload['command_id'])
@@ -312,7 +579,7 @@ class CoreTests(unittest.TestCase):
                    'resources': [{'resource_id': uid(), 'expected_revision': 1}]}
         with self.assertRaises(Rejected):
             self.service.cleanup(cleanup)
-        payload = job(); self.service.submit(payload); self.service.wait()
+        payload, _ = self.prepare_reviewed_job(); self.service.submit(payload); self.service.wait()
         resource = payload['resource_ids']['preview']
         self.service.db.execute('UPDATE resources SET refs=? WHERE id=?', ('["held_campaign"]', resource))
         self.service.db.commit()
@@ -322,7 +589,7 @@ class CoreTests(unittest.TestCase):
 
     def test_partial_cleanup_failure_is_held_not_retried(self):
         from unittest.mock import patch
-        payload = job(); self.service.submit(payload); self.service.wait()
+        payload, _ = self.prepare_reviewed_job(); self.service.submit(payload); self.service.wait()
         resource = payload['resource_ids']['preview']
         cleanup = {'command_id': uid(), 'idempotency_key': uid(),
                    'resources': [{'resource_id': resource, 'expected_revision': 1}]}
@@ -337,7 +604,7 @@ class CoreTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == 'posix', 'POSIX symlink semantics')
     def test_cleanup_symlink_cannot_reach_foreign_file(self):
-        payload = job(); self.service.submit(payload); self.service.wait()
+        payload, _ = self.prepare_reviewed_job(); self.service.submit(payload); self.service.wait()
         resource = payload['resource_ids']['preview']
         foreign = Path(self.temp.name) / 'keep.txt'
         foreign.write_text('keep')

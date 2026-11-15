@@ -5,10 +5,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
 import mimetypes
+import os
 from pathlib import Path
 import stat
 import threading
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .core import Rejected, Service, ensure, storage_limits
 from .docker import DockerBackend
@@ -45,14 +46,106 @@ def unique_object(pairs):
 
 
 def credentials(path):
-    item = Path(path)
-    ensure(item.is_absolute() and not item.is_symlink(), 'credential_reference_required')
-    info = item.stat()
-    ensure(stat.S_ISREG(info.st_mode) and info.st_size <= 4096 and
-           not stat.S_IMODE(info.st_mode) & 0o077, 'credential_file_protection')
-    token = item.read_text().strip()
-    ensure(16 <= len(token) <= 4096 and '\n' not in token and '\r' not in token, 'credential_file_invalid')
-    return token
+    """Read one protected POSIX credential without reopening a checked path.
+
+    This does not protect against same-UID/root attackers or establish an
+    effective Windows ACL. Parent directories must be controlled; a root-owned
+    sticky directory is allowed only for a root/current-user-owned child.
+    """
+    ensure(os.name == 'posix' and all(hasattr(os, name) for name in
+           ('O_NOFOLLOW', 'O_DIRECTORY', 'O_NONBLOCK')), 'credential_protection_unavailable', 503)
+    try:
+        item = Path(path)
+    except (TypeError, ValueError):
+        raise Rejected('credential_reference_required') from None
+    ensure(item.is_absolute() and 2 <= len(item.parts) <= 128 and '..' not in item.parts,
+           'credential_reference_required')
+    try:
+        ensure(len(os.fsencode(item)) <= 4096, 'credential_reference_required')
+    except UnicodeError:
+        raise Rejected('credential_reference_required') from None
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)
+    fds, edges = [], []
+    def identity(info): return info.st_dev, info.st_ino
+    def trusted_directory(info):
+        mode = stat.S_IMODE(info.st_mode)
+        sticky_root = info.st_uid == 0 and bool(mode & stat.S_ISVTX)
+        ensure(stat.S_ISDIR(info.st_mode) and info.st_uid in (0, os.geteuid())
+               and (not mode & 0o022 or sticky_root), 'credential_directory_protection')
+        return sticky_root
+    try:
+        parent = os.open('/', flags)
+        fds.append(parent)
+        root_identity = identity(os.fstat(parent))
+        for name in item.parts[1:-1]:
+            sticky = trusted_directory(os.fstat(parent))
+            before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            ensure(stat.S_ISDIR(before.st_mode) and (not sticky or before.st_uid in (0, os.geteuid())),
+                   'credential_directory_protection')
+            child = os.open(name, flags, dir_fd=parent)
+            fds.append(child)
+            ensure(identity(before) == identity(os.fstat(child)), 'credential_directory_changed')
+            edges.append((parent, name, child, identity(before)))
+            parent = child
+        sticky = trusted_directory(os.fstat(parent))
+        name = item.name
+        before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        ensure(stat.S_ISREG(before.st_mode) and before.st_uid in (0, os.geteuid())
+               and (not sticky or before.st_uid in (0, os.geteuid())) and before.st_nlink == 1
+               and not stat.S_IMODE(before.st_mode) & 0o077 and 0 < before.st_size <= 4096,
+               'credential_file_protection')
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0), dir_fd=parent)
+        fds.append(fd)
+        opened = os.fstat(fd)
+        def version(info):
+            return (info.st_dev, info.st_ino, info.st_size, info.st_mode, info.st_uid,
+                    info.st_nlink, info.st_mtime_ns, info.st_ctime_ns)
+        ensure(version(opened) == version(before), 'credential_file_changed')
+        raw = bytearray()
+        while len(raw) <= 4096:
+            chunk = os.read(fd, 4097 - len(raw))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        ensure(len(raw) == before.st_size and len(raw) <= 4096, 'credential_file_changed')
+        os.lseek(fd, 0, os.SEEK_SET)
+        check = bytearray()
+        while len(check) <= 4096:
+            chunk = os.read(fd, 4097 - len(check))
+            if not chunk:
+                break
+            check.extend(chunk)
+        ensure(hmac.compare_digest(bytes(raw), bytes(check)), 'credential_file_changed')
+        ensure(version(os.fstat(fd)) == version(before) and
+               version(os.stat(name, dir_fd=parent, follow_symlinks=False)) == version(before),
+               'credential_file_changed')
+        ensure(identity(os.stat('/', follow_symlinks=False)) == root_identity, 'credential_directory_changed')
+        trusted_directory(os.fstat(fds[0]))
+        trusted_directory(os.fstat(parent))
+        for ancestor, edge, child, expected in edges:
+            ensure(identity(os.fstat(child)) == expected == identity(os.stat(edge, dir_fd=ancestor, follow_symlinks=False)),
+                   'credential_directory_changed')
+            trusted_directory(os.fstat(child))
+        try:
+            token = bytes(raw).decode('ascii')
+        except UnicodeError:
+            raise Rejected('credential_file_invalid') from None
+        if token.endswith('\n'):
+            token = token[:-1]
+        ensure(16 <= len(token) <= 4096 and all(0x21 <= ord(char) <= 0x7e for char in token),
+               'credential_file_invalid')
+        return token
+    except (OSError, TypeError, ValueError, NotImplementedError):
+        raise Rejected('credential_file_invalid') from None
+    finally:
+        close_failed = False
+        for fd in reversed(fds):
+            try:
+                os.close(fd)
+            except OSError:
+                close_failed = True
+        if close_failed:
+            raise Rejected('credential_file_invalid') from None
 
 
 def handler(service, token, peers, *, host_snapshot=None):
@@ -89,12 +182,29 @@ def handler(service, token, peers, *, host_snapshot=None):
                 path = unquote(urlsplit(self.path).path)
                 parts = path.strip('/').split('/')
                 if self.command == 'GET':
+                    if len(parts) == 3 and parts[:2] == ['v2', 'source-attempts']:
+                        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True, strict_parsing=True)
+                        ensure(set(query) == {'project'} and len(query['project']) == 1, 'source_attempt_query')
+                        return self.respond(200, service.source_attempt(parts[2], query['project'][0]))
+                    if len(parts) == 3 and parts[:2] == ['v2', 'source-evidence']:
+                        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True, strict_parsing=True)
+                        ensure(set(query) == {'project', 'digest', 'binding'} and all(len(values) == 1 for values in query.values())
+                               and len(query['binding'][0]) <= 1024,
+                               'source_evidence_query')
+                        binding = json.loads(query['binding'][0], object_pairs_hook=unique_object)
+                        return self.respond(200, service.source_evidence(parts[2], query['project'][0], query['digest'][0], binding))
                     if parts == ['v1', 'runtime']:
                         from .runtime_inventory import collect_runtime
                         return self.respond(200, collect_runtime(service.backend, host_snapshot))
                     if parts == ['v1', 'status']:
                         return self.respond(200, {'schema': 'hub-staging.v1', 'active_command_id': service.active,
-                                                  'projects': {name: sorted(recipes) for name, recipes in service.projects.items()}})
+                            'projects': {name: sorted(recipes) for name, recipes in service.projects.items()}})
+                    if parts == ['v2', 'status']:
+                        from . import core
+                        return self.respond(200, {'schema': 'hub-staging.v2', 'active_command_id': service.active,
+                            'profile_protocol': core.PROFILE_PROTOCOL,
+                            'profile_protocol_ready': core._PROFILE_PROTOCOL_READY and core._SOURCE_ATTEMPT_ENABLED,
+                            'projects': {name: sorted(recipes) for name, recipes in service.projects.items()}})
                     if len(parts) == 3 and parts[:2] == ['v1', 'jobs']:
                         return self.respond(200, service.status(parts[2]))
                     if len(parts) == 3 and parts[:2] == ['v1', 'operations']:
@@ -113,10 +223,16 @@ def handler(service, token, peers, *, host_snapshot=None):
                     data = self.rfile.read(int(sizes[0]))
                     ensure(len(data) == int(sizes[0]), 'incomplete_request')
                     payload = json.loads(data, object_pairs_hook=unique_object)
+                    if parts == ['v2', 'source-attempts']:
+                        return self.respond(200, service.put_source_attempt(payload))
                     if parts == ['v1', 'jobs']:
-                        return self.respond(202, service.submit(payload))
+                        return self.respond(202, service._legacy_submit(payload))
                     if parts == ['v1', 'sources']:
-                        return self.respond(200, service.put_source(payload))
+                        return self.respond(200, service._legacy_put_source(payload))
+                    if parts == ['v2', 'jobs']:
+                        return self.respond(202, service._submit_v2(payload))
+                    if parts == ['v2', 'sources']:
+                        return self.respond(200, service._put_source_v2(payload))
                     if parts == ['v1', 'cleanup']:
                         return self.respond(200, service.cleanup(payload))
                 self.respond(404, {'error': 'not_found'})

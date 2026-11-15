@@ -26,6 +26,89 @@ TOKEN = 'synthetic-private-worker-token-never-real'
 KINDS = ('workspace', 'build', 'test_run', 'preview')
 
 
+@pytest.mark.parametrize('details', [
+    {},
+    {'error': 'execution_uncertain'},
+    {'error': 'scratch_cleanup_unproven'},
+    {'error': 'scratch_cleanup_uncertain'},
+    {'error': 'cleanup_uncertain'},
+    {'error': 'unknown_future_reason'},
+    {'error': 'stage_test_failed', 'preview_ready': True},
+    {'error': 'stage_test_failed', 'preview_ready': False},
+    {'error': 'stage_test_failed', 'stages': {
+        'build': {'exit_code': 0, 'log_bytes': 0}, 'test': {'exit_code': 0, 'log_bytes': 0}}},
+    {'error': 'stage_build_failed', 'stages': {
+        'build': {'exit_code': 0, 'log_bytes': 0}, 'test': {'exit_code': 1, 'log_bytes': 0}}},
+    {'error': 'stage_test_failed', 'stages': {
+        'build': {'exit_code': 1, 'log_bytes': 0}, 'test': {'exit_code': 1, 'log_bytes': 0}}},
+    {'error': 'stage_test_failed', 'extra': 'not_worker_contract'},
+])
+def test_operation_rejects_contradictory_failed_receipt(details):
+    with pytest.raises(StagingClientError):
+        StagingClient._operation({'command_id': str(uuid4()), 'job_id': str(uuid4()),
+                                  'state': 'failed', 'result': details})
+
+
+@pytest.mark.asyncio
+async def test_job_read_rejects_contradictory_failure_over_http(config):
+    job = str(uuid4())
+    receipt = {'command_id': str(uuid4()), 'job_id': job, 'state': 'failed',
+               'result': {'error': 'stage_test_failed', 'preview_ready': True}}
+    client = StagingClient(config, test_transport=httpx.MockTransport(lambda _: httpx.Response(200, json=receipt)))
+    try:
+        with pytest.raises(StagingClientError):
+            await client.job(job)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.parametrize('reason', ['stage_build_failed', 'stage_test_failed', 'invalid_archive', 'output_size_limit'])
+def test_operation_accepts_legitimate_failed_receipt(reason):
+    receipt = {'command_id': str(uuid4()), 'job_id': str(uuid4()),
+               'state': 'failed', 'result': {'error': reason}}
+    assert StagingClient._operation(receipt) == receipt
+
+
+def test_operation_rejects_success_with_failure_reason():
+    with pytest.raises(StagingClientError):
+        StagingClient._operation({'command_id': str(uuid4()), 'job_id': str(uuid4()),
+                                  'state': 'succeeded', 'result': {'error': 'stage_test_failed'}})
+
+
+@pytest.mark.asyncio
+async def test_job_read_rejects_contradictory_success_over_http(config):
+    job = str(uuid4())
+    receipt = {'command_id': str(uuid4()), 'job_id': job, 'state': 'succeeded',
+               'result': {'error': 'stage_test_failed'}}
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, json=receipt))
+    client = StagingClient(config, test_transport=transport)
+    try:
+        with pytest.raises(StagingClientError):
+            await client.job(job)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.parametrize('mutation', ['missing', 'declared', 'commit', 'digest'])
+def test_operation_rejects_contradictory_source_proof(mutation):
+    binding = {'scheme': 'git-sha1-tree-v1', 'commit_oid': 'a' * 40, 'tree_oid': 'b' * 40,
+               'archive_sha256': 'c' * 64, 'commit_object_sha256': 'd' * 64,
+               'expanded_bytes': 1, 'entries': 1}
+    details = {'source_commit': 'a' * 40, 'source_digest': 'c' * 64,
+               'source_commit_verification': 'git-sha1-tree-v1', 'source_binding': binding}
+    if mutation == 'missing':
+        del details['source_binding']
+    elif mutation == 'declared':
+        details['source_commit_verification'] = 'declared'
+    elif mutation == 'commit':
+        details['source_commit'] = 'e' * 40
+    else:
+        details['source_digest'] = 'e' * 64
+    with pytest.raises(StagingClientError):
+        StagingClient._operation({'command_id': str(uuid4()), 'job_id': str(uuid4()),
+                                  'state': 'succeeded', 'result': details})
+
+
 @pytest.fixture
 def config(tmp_path):
     secret = tmp_path / 'worker-token'
@@ -254,13 +337,16 @@ async def test_accepted_held_operation_receipt_never_becomes_not_accepted(config
 def source():
     raw = b'Synthetic bytes; archive validation belongs to worker'
     return dict(source_id=str(uuid4()), project='demo', source_digest=hashlib.sha256(raw).hexdigest(),
-                source_zip_base64=base64.b64encode(raw).decode())
+                source_zip_base64=base64.b64encode(raw).decode(), profile_protocol='hub-staging-profile.v2',
+                source_commit='a'*40, source_commit_object_base64=base64.b64encode(b'proof').decode())
 
 
 def job():
     return dict(job_id=str(uuid4()), command_id=str(uuid4()), idempotency_key='fixture-submit',
         project='demo', recipe='static', source_commit='a' * 40, source_digest='b' * 64,
-        source_id=str(uuid4()), resource_ids={kind: str(uuid4()) for kind in KINDS})
+        source_id=str(uuid4()), resource_ids={kind: str(uuid4()) for kind in KINDS},
+        require_source_binding=True, expected_source_binding={},
+        reviewed_profile={'project':'demo', 'recipe':'static', 'generation':1, 'digest':'sha256:'+'c'*64})
 
 
 @pytest.mark.parametrize('origin', ['http://192.168.50.90:8780', 'https://8.8.8.8',
@@ -390,10 +476,13 @@ async def test_source_submit_job_metadata_file_cleanup_match_fixed_worker_contra
     def handle(request):
         seen.append((request.method, request.url.path))
         body = json.loads(request.content) if request.content else None
-        if request.url.path == '/v1/sources':
+        if request.url.path == '/v2/sources':
             assert body == source_payload and request.extensions['timeout']['write'] == 30
-            return httpx.Response(200, json={key: source_payload[key] for key in ('source_id', 'source_digest', 'project')} | {'size_bytes': 53})
-        if request.url.path == '/v1/jobs':
+            return httpx.Response(200, json={key: source_payload[key] for key in ('source_id', 'source_digest', 'project')} | {'size_bytes': 53, 'state':'historical_observation', 'authority':'observation_only',
+                'source_binding':{'scheme':'git-sha1-tree-v1','commit_oid':'a'*40,'tree_oid':'b'*40,
+                    'archive_sha256':source_payload['source_digest'], 'commit_object_sha256':hashlib.sha256(b'proof').hexdigest(),
+                    'expanded_bytes':1, 'entries':1}})
+        if request.url.path == '/v2/jobs':
             assert body == payload
             return httpx.Response(202, json=operation(payload['job_id'], payload['command_id'], state='accepted'))
         if request.url.path == '/v1/jobs/' + payload['job_id']:

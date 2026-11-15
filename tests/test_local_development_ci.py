@@ -27,6 +27,119 @@ bootstrap = module('local_ci_container')
 IMAGE = 'sha256:' + 'a' * 64
 
 
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX mode and umask semantics')
+def test_input_directory_ignores_restrictive_umask_but_parent_stays_private(tmp_path):
+    parent = tmp_path / 'private'
+    parent.mkdir(mode=0o700)
+    previous = os.umask(0o077)
+    try:
+        runner.prepare_input_directory(parent / 'input')
+    finally:
+        os.umask(previous)
+    assert (parent.stat().st_mode & 0o777) == 0o700
+    assert ((parent / 'input').stat().st_mode & 0o777) == 0o755
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX atomic link and mode semantics')
+def test_admission_is_complete_and_read_only_before_name_is_visible(tmp_path, monkeypatch):
+    inputs = tmp_path / 'input'
+    runner.prepare_input_directory(inputs)
+    original_link = os.link
+    observed = []
+    def inspect_before_publish(src, dst, **kwargs):
+        assert not (inputs / 'admit.json').exists()
+        candidate = inputs / src
+        observed.append(((candidate.stat().st_mode & 0o777), json.loads(candidate.read_text())))
+        return original_link(src, dst, **kwargs)
+    monkeypatch.setattr(runner.os, 'link', inspect_before_publish)
+    previous = os.umask(0o077)
+    try:
+        runner.publish_admission(inputs, 'a' * 32)
+    finally:
+        os.umask(previous)
+    assert observed == [(0o444, {'intent': 'a' * 32})]
+    assert json.loads((inputs / 'admit.json').read_text()) == {'intent': 'a' * 32}
+    monkeypatch.setattr(runner.os, 'link', original_link)
+    with pytest.raises(FileExistsError):
+        runner.publish_admission(inputs, 'b' * 32)
+    assert json.loads((inputs / 'admit.json').read_text()) == {'intent': 'a' * 32}
+    assert sorted(p.name for p in inputs.iterdir()) == ['admit.json']
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX directory descriptor semantics')
+def test_admission_cleanup_closes_directory_and_preserves_primary_error(tmp_path, monkeypatch):
+    inputs = tmp_path / 'input'
+    runner.prepare_input_directory(inputs)
+    original_open = os.open
+    opened_directories = []
+
+    def track_open(path, flags, *args, **kwargs):
+        fd = original_open(path, flags, *args, **kwargs)
+        if Path(path) == inputs:
+            opened_directories.append(fd)
+        return fd
+
+    def fail_link(*args, **kwargs):
+        raise RuntimeError('primary publication failure')
+
+    def fail_unlink(*args, **kwargs):
+        raise PermissionError('cleanup failure')
+
+    monkeypatch.setattr(runner.os, 'open', track_open)
+    monkeypatch.setattr(runner.os, 'link', fail_link)
+    monkeypatch.setattr(runner.os, 'unlink', fail_unlink)
+    with pytest.raises(RuntimeError, match='primary publication failure'):
+        runner.publish_admission(inputs, 'a' * 32)
+    assert len(opened_directories) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened_directories[0])
+    assert not (inputs / 'admit.json').exists()
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX directory synchronization semantics')
+def test_admission_directory_sync_failure_can_follow_visible_gate(tmp_path, monkeypatch):
+    inputs = tmp_path / 'input'
+    runner.prepare_input_directory(inputs)
+    original_fsync = os.fsync
+    def fail_directory_fsync(fd):
+        if os.path.samestat(os.fstat(fd), inputs.stat()):
+            raise OSError('synthetic directory sync failure')
+        return original_fsync(fd)
+    monkeypatch.setattr(runner.os, 'fsync', fail_directory_fsync)
+    with pytest.raises(OSError, match='directory sync'):
+        runner.publish_admission(inputs, 'c' * 32)
+    # Once linked, the consumer may have observed admission even though later
+    # directory durability failed. Never claim that this exception undid it.
+    assert json.loads((inputs / 'admit.json').read_text()) == {'intent': 'c' * 32}
+    assert sorted(p.name for p in inputs.iterdir()) == ['admit.json']
+
+
+def test_failed_retention_releases_passed_tmpdir_during_run_and_keeps_call_failure(tmp_path):
+    suite = tmp_path / 'synthetic_suite.py'
+    suite.write_text('''
+def test_pass(tmp_path):
+    (tmp_path / "payload").write_bytes(b"x" * 1024)
+    (tmp_path.parent / "passed-path").write_text(str(tmp_path))
+
+def test_next_sees_passed_directory_removed(tmp_path):
+    from pathlib import Path
+    assert not Path((tmp_path.parent / "passed-path").read_text()).exists()
+
+def test_call_failure(tmp_path):
+    (tmp_path / "failure-evidence").write_text("inspect me")
+    assert False
+''')
+    env = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD='1')
+    base = tmp_path / 'child-basetemp'
+    result = subprocess.run([sys.executable, '-m', 'pytest', '-q', str(suite),
+                             '--basetemp', str(base), '-o', 'tmp_path_retention_policy=failed'],
+                            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, timeout=30)
+    assert result.returncode == 1, result.stdout
+    evidence = [p for p in base.glob('test_call_failure*/failure-evidence') if not p.parent.is_symlink()]
+    assert len(evidence) == 1, result.stdout
+
+
 @pytest.mark.parametrize('value', [1, 300, 900])
 def test_ci_wait_accepts_only_positive_bounded_seconds(value):
     assert runner.validate_timeout(value) == value
@@ -179,6 +292,8 @@ def test_image_owned_cached_profiles_are_fixed_and_preserve_npm_links(cached_pro
     bootstrap.run_profile(profile, intent)
     assert len(commands) == count
     assert all(options['check'] is True for _, options in commands)
+    if profile in {'python', 'all'}:
+        assert 'tmp_path_retention_policy=failed' in commands[0][0]
     if profile in {'ui', 'all'}:
         assert commands[-2][0] == ['npm', 'test']
         assert commands[-1][0] == ['npm', 'run', 'build']
@@ -586,6 +701,26 @@ def test_private_guard_phases_and_detached_observer_precede_fd_close(hooked_cont
     assert result['kernel_limits']['path']!='mutated private observer copy'
     assert rig.state.closed and rig.state.pin.fd is None
     assert not (rig.engine/'HELD.json').exists() and not (rig.output/'HELD.json').exists()
+
+
+@pytest.mark.skipif(sys.platform!='linux',reason='Real Linux controller lock and kernel FD fixture')
+def test_visible_gate_followed_by_sync_failure_stops_and_records_failed(hooked_controller, monkeypatch):
+    rig = hooked_controller
+    observed = []
+    original = runner.publish_admission
+    def publish_then_fail(inputs, intent):
+        original(inputs, intent)
+        raise OSError('simulated failure after gate publication')
+    monkeypatch.setattr(runner, 'publish_admission', publish_then_fail)
+    with pytest.raises(runner.CIError):
+        runner.run(rig.args, expected_commit='c'*40, admission_guard=lambda: None,
+                   terminal_observer=observed.append)
+    assert rig.events == ['create', 'start', 'stop']
+    assert json.loads((rig.state.inputs/'admit.json').read_text())['intent'] == rig.state.intent
+    assert len(observed) == 1 and observed[0]['failed'] is True
+    assert observed[0]['terminal_verified'] is True
+    assert observed[0]['cgroup_terminal']['descendants_empty'] is True
+    assert rig.state.closed
 
 
 @pytest.mark.skipif(sys.platform!='linux',reason='Real Linux controller lock and kernel FD fixture')

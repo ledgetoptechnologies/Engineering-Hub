@@ -356,7 +356,7 @@ def test_project_archive_waits_for_component_commit_then_blocks_followup(
     before_denied_write = component_counts(env, created['id'])
     with pytest.raises(HubError) as denied:
         update_component(env, session, created, 1, name='must not commit')
-    assert getattr(denied.value, 'code', None) == 'project_archived'
+    assert getattr(denied.value, 'code', None) == 'hub_component_unavailable'
     assert component_counts(env, created['id']) == before_denied_write
 
 

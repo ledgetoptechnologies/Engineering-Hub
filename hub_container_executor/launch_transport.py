@@ -190,11 +190,18 @@ class UnixCurrentObservationTransport:
             raise RuntimeIdentityError('Current launch issuer exchange unavailable') from None
 
     def observe_current_launch(self, *, nonce, timeout_ms):
+        return self._observe_request(nonce=nonce, timeout_ms=timeout_ms, container_id=None)
+
+    def observe_app_cgroup(self, *, nonce, container_id, timeout_ms):
+        return self._observe_request(nonce=nonce, timeout_ms=timeout_ms, container_id=container_id)
+
+    def _observe_request(self, *, nonce, timeout_ms, container_id):
         admitted = False
         try:
             _require(os.getpid() == self._pid)
             _require(type(nonce) is str and _NONCE.fullmatch(nonce)
-                     and type(timeout_ms) is int and 1 <= timeout_ms <= 10000)
+                     and type(timeout_ms) is int and 1 <= timeout_ms <= 10000
+                     and (container_id is None or type(container_id) is str and _NONCE.fullmatch(container_id)))
             started = time.monotonic()
             _require(type(started) in (int, float) and math.isfinite(started))
             deadline = started + timeout_ms / 1000
@@ -205,7 +212,11 @@ class UnixCurrentObservationTransport:
                 self._busy = admitted = True
             finally:
                 self._lock.release()
-            request = _canonical({'protocol': CURRENT_REQUEST_PROTOCOL, 'nonce': nonce})
+            if container_id is None:
+                request = _canonical({'protocol': CURRENT_REQUEST_PROTOCOL, 'nonce': nonce})
+            else:
+                request = _canonical({'protocol': 'engineering-hub.app-cgroup-observation-request.v1',
+                                      'nonce': nonce, 'container_id': container_id})
             _require(0 < len(request) <= MAX_REQUEST_BYTES)
             identity = _socket_leaf(self._path)
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:

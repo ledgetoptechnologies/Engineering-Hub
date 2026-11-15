@@ -4,6 +4,7 @@ AST-loading the actual methods avoids Linux-only package imports on Windows.
 No key, Engine, journal, native process or signing primitive is constructed.
 """
 import ast
+import math
 import os
 from pathlib import Path
 import threading
@@ -43,7 +44,10 @@ def fixture(plan=(), *, expires=200.):
     namespace = {'os': os, 'time': SimpleNamespace(monotonic=lambda: clock.now),
                  'socket': SimpleNamespace(socket=Listener), '_require': require,
                  '_remaining': remaining, 'LaunchSupervisorError': RuntimeError}
-    body = ast.Module(body=[ast.ClassDef(name='Native', bases=[], keywords=[],
+    poll_ready = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                      and node.name == '_poll_ready')
+    namespace['math'] = math
+    body = ast.Module(body=[poll_ready, ast.ClassDef(name='Native', bases=[], keywords=[],
         body=methods, decorator_list=[])], type_ignores=[])
     exec(compile(ast.fix_missing_locations(body), str(source), 'exec'), namespace)
     authority = namespace['Native']()
@@ -70,16 +74,24 @@ def fixture(plan=(), *, expires=200.):
     authority._guard = forbidden_guard
     actions = iter(plan)
 
-    def select(read, write, error, timeout):
-        assert read == [authority._listener, 17] and write == error == []
-        clock.selects.append(timeout)
-        clock.now += timeout
-        action = next(actions, None)
-        if isinstance(action, BaseException):
-            raise action
-        return ([authority._listener] if action == 'ready' else [17] if action == 'exit' else []), [], []
+    class Poll:
+        def __init__(self):
+            self.registered = []
 
-    namespace['select'] = SimpleNamespace(select=select)
+        def register(self, fd, events):
+            self.registered.append((fd, events))
+
+        def poll(self, timeout_ms):
+            assert self.registered == [(12, 7), (17, 7)]
+            timeout = timeout_ms / 1000
+            clock.selects.append(timeout)
+            clock.now += timeout
+            action = next(actions, None)
+            if isinstance(action, BaseException):
+                raise action
+            return [(12, 1)] if action == 'ready' else [(17, 1)] if action == 'exit' else []
+
+    namespace['select'] = SimpleNamespace(poll=Poll, POLLIN=1, POLLHUP=2, POLLERR=4, POLLNVAL=8)
     return authority, clock
 
 
@@ -104,7 +116,9 @@ def test_absolute_startup_timeout_or_receipt_expiry_does_not_reset(timeout, expi
     authority, clock = fixture(expires=expires)
     with pytest.raises(RuntimeError):
         authority.wait_for_receipt_request(timeout_ms=timeout)
-    assert clock.now == pytest.approx(end)
+    # poll() rounds the final fractional millisecond up, without resetting the
+    # absolute deadline; allow only that single-millisecond rounding.
+    assert end <= clock.now <= end + .001001
     assert authority._held and not authority._issuance_open
 
 

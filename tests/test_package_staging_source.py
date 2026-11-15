@@ -62,8 +62,50 @@ def test_exact_commit_dirty_tree_and_dependency_binding(repo):
     assert meta["source_commit"] == expected
     assert meta["source_digest"] == hashlib.sha256(second).hexdigest()
     assert not meta["provenance"]["server_commit_verified"]
-    assert meta["provenance"]["worker_source_commit_verification"] == "declared"
+    assert meta["provenance"]["worker_source_commit_verification"] == "proof_available"
     assert not meta["cache_image_verified"]
+
+
+def test_package_proof_binds_exact_commit_and_tree(repo):
+    from hub_staging_service.source_provenance import verify, SourceProvenanceError
+
+    payload, meta = pack.build_package(repo, "HEAD")
+    proof = meta["source_proof"]["commit_object_base64"]
+    binding = verify(payload, proof, meta["source_commit"])
+    assert binding["archive_sha256"] == meta["source_digest"]
+    assert binding["entries"] == meta["entries"]
+    with pytest.raises(SourceProvenanceError):
+        verify(payload, proof, "0" * 40)
+    changed = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(payload)) as original, zipfile.ZipFile(changed, "w") as altered:
+        for info in original.infolist():
+            altered.writestr(info, b"changed" if info.filename == "main.py" else original.read(info.filename))
+    with pytest.raises(SourceProvenanceError):
+        verify(changed.getvalue(), proof, meta["source_commit"])
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='requires case-sensitive filesystem')
+def test_packager_rejects_case_colliding_directory_prefixes(repo):
+    for name in ("A/x", "a/y"):
+        path = repo / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(name)
+    commit(repo)
+    with pytest.raises(pack.PackageError, match="case_colliding_paths"):
+        pack.build_package(repo, "HEAD")
+
+
+def test_proof_rejects_unbounded_compression():
+    from hub_staging_service.source_provenance import _archive_tree, SourceProvenanceError
+    data = io.BytesIO()
+    with zipfile.ZipFile(data, "w", compression=zipfile.ZIP_BZIP2) as archive:
+        info = zipfile.ZipInfo("file")
+        info.create_system = 3
+        info.external_attr = 0o100644 << 16
+        info.compress_type = zipfile.ZIP_BZIP2
+        archive.writestr(info, b"data")
+    with pytest.raises(SourceProvenanceError):
+        _archive_tree(data.getvalue())
 
 
 def test_attributes_do_not_omit_or_substitute_committed_bytes(repo):

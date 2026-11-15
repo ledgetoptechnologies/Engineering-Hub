@@ -136,6 +136,14 @@ async def test_http_and_registered_mcp_tool_return_same_envelope(setup):
     attach_infrastructure_routes(app, service, lambda req: OWNER, metrics=reader, metrics_identity=metrics_identity)
     with TestClient(app) as client:
         response = client.get('/api/hub/v1/infrastructure/metrics', headers={'X-Fixture-Human': OWNER})
+        history = '/api/hub/v1/infrastructure/metrics/history'
+        owner = {'X-Fixture-Human': OWNER}
+        key = 'host:' + 'a' * 64
+        assert client.get(history, params={'host': key, 'range': '1h'}, headers=owner).json()['source'] == {'status': 'not_configured'}
+        assert client.get(history, params={'host': key, 'range': '1h'}, headers={'X-Fixture-Human': 'human:other'}).status_code == 403
+        for extra in ({'host': key}, {'host': key, 'range': '1h', 'query': 'up'}):
+            with pytest.raises(HubError, match='invalid_infrastructure_filter'):
+                client.get(history, params=extra, headers=owner)
     assert response.status_code == 200
     mcp = FastMCP('synthetic-metrics')
     register_metrics_tool(mcp, reader)
@@ -143,6 +151,6 @@ async def test_http_and_registered_mcp_tool_return_same_envelope(setup):
     context = SimpleNamespace(request_context=SimpleNamespace(request=request([('Authorization', 'Bearer synthetic-codex')])))
     payload = await tool.fn(context)
     assert payload['source'] == response.json()['source'] and payload['devices'] == response.json()['devices']
-    assert payload['schema_version'] == response.json()['schema_version'] == 2
+    assert payload['schema_version'] == response.json()['schema_version'] == 3
     with pytest.raises(ToolError, match='forbidden'):
         await tool.fn(SimpleNamespace(request_context=SimpleNamespace(request=request([('Authorization', 'Bearer wrong')]))))

@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 import re
 import time
+import threading
+from uuid import UUID
 
 from .container_pilot_manifest import Platform
 from .container_pilot import ContainerPilotTarget
@@ -22,8 +24,10 @@ from .queued_session_acceptance import attach_queued_session_acceptance
 from .session_acceptance_audit import OwnedSessionAcceptanceAudit
 from .startup_reconciliation import (ExecutorSessionIdentity, OperatorReconciliation,
     StartupReconciliation)
+from .session_acceptance import MAX_ACCEPTANCE_EVIDENCE_BYTES
 
 SCHEMA = 'engineering-hub.manual-staging-session.v1'
+SCHEMA_SCOPED = 'engineering-hub.manual-staging-session.v2'
 MAX_ENROLLMENT_BYTES = 32 * 1024
 MAX_REPORT_LIFETIME_MS = 600_000
 MAX_REPORT_AGE_MS = 300_000
@@ -70,6 +74,8 @@ class ManualSessionEnrollment:
     inventory_reconciled: bool
     writers_excluded: bool
     unresolved_effects_absent: bool
+    actors: tuple[str, ...] = ()
+    task_ids: tuple[str, ...] = ()
 
 
 def parse_enrollment(raw):
@@ -85,8 +91,22 @@ def parse_enrollment(raw):
         def reject(_):
             raise TrustedSessionError()
         data = json.loads(raw, object_pairs_hook=unique, parse_float=reject, parse_constant=reject)
-        _object(data, {'schema', 'release', 'launch', 'operator_actor', 'report'})
-        _require(data['schema'] == SCHEMA)
+        _require(type(data) is dict and data.get('schema') in {SCHEMA, SCHEMA_SCOPED})
+        scoped = data['schema'] == SCHEMA_SCOPED
+        _object(data, {'schema', 'release', 'launch', 'operator_actor', 'report'}
+                | ({'scope'} if scoped else set()))
+        actors, tasks = (), ()
+        if scoped:
+            from .repository import AGENTS
+            scope = _object(data['scope'], {'actors', 'task_ids'})
+            actors, tasks = scope['actors'], scope['task_ids']
+            _require(type(actors) is list and 1 <= len(actors) <= 3
+                     and all(type(x) is str and x in AGENTS for x in actors)
+                     and actors == sorted(set(actors)))
+            _require(type(tasks) is list and 1 <= len(tasks) <= 32
+                     and all(type(x) is str and str(UUID(x)) == x for x in tasks)
+                     and tasks == sorted(set(tasks)))
+            actors, tasks = tuple(actors), tuple(tasks)
         release = dict(_object(data['release'],
             (set(CurrentExecutorReleasePins.__dataclass_fields__) - {'public_key'}) | {'public_key_hex'}))
         key = release.pop('public_key_hex')
@@ -119,9 +139,42 @@ def parse_enrollment(raw):
         _require(all(value is True for value in claims.values()))
         return ManualSessionEnrollment(release, launch, actor, report['target_id'],
             report['manifest_digest'], report['machine_id'], report['source'], observed, expiry,
-            evidence, **claims)
+            evidence, **claims, actors=actors, task_ids=tasks)
     except Exception:
         raise TrustedSessionError() from None
+
+
+def _session_evidence(e):
+    """Assemble the exact displayed report and enforce the broker's byte bound."""
+    evidence = (f'Operator-attested source: {e.source}\n'
+        f'Original observed_at_ms: {e.observed_at_ms}\nExpires_at_ms: {e.expires_at_ms}\n'
+        f'Target: {e.target_id}\nManifest: {e.manifest_digest}\n'
+        'Session scope: ' + json.dumps({'actors': e.actors, 'task_ids': e.task_ids},
+            sort_keys=True, separators=(',', ':')) + '\n'
+        'Retained report executor: ' + json.dumps(_report_executor(e.release, e.launch),
+            sort_keys=True, separators=(',', ':')) + '\n'
+        'Current signed identity is not inventory/writer-exclusion proof.\n\n' + e.evidence)
+    _require(0 < len(evidence.encode('utf-8')) <= MAX_ACCEPTANCE_EVIDENCE_BYTES)
+    return evidence
+
+
+def validate_unified_session(profile, enrollment):
+    """Validate static scope and freshness without opening credentials or transport."""
+    from .unified_pilot_startup import PilotProfile
+    _require(type(profile) is PilotProfile and type(enrollment) is ManualSessionEnrollment)
+    e = parse_enrollment(enrollment_bytes(enrollment))
+    _session_evidence(e)
+    _require(profile.manifest.digest() == e.manifest_digest
+             and profile.manifest.target_id == e.target_id and profile.machine_id == e.machine_id
+             and profile.manifest.driver.implementation_commit == e.release.implementation_commit
+             and profile.manifest.runner_binding.platform == e.release.platform
+             and profile.manifest.runner_binding.daemon_identity == e.launch.engine_id
+             and bool(e.actors) and bool(e.task_ids)
+             and set(e.actors) <= profile.actors and set(e.task_ids) <= profile.task_ids)
+    mono, wall = _clock()
+    _require(0 <= wall - e.observed_at_ms <= MAX_REPORT_AGE_MS
+             and wall < e.expires_at_ms <= e.launch.approval_expires_at_ms)
+    return e, mono, wall
 
 
 class TrustedQueuedSessionComposition:
@@ -133,26 +186,17 @@ class TrustedQueuedSessionComposition:
     """
     def __init__(self, *, profile, database, enrollment, ca_pem, credential):
         self._pid, self._closed = os.getpid(), False
+        self._clock_lock = threading.Lock()
         self._observer = self._audit = self._gate = self._broker = self._owner = self._target = None
         try:
-            from .unified_pilot_startup import PilotProfile
-            _require(type(profile) is PilotProfile and type(enrollment) is ManualSessionEnrollment)
             # Reparse a retained typed enrollment to prevent bypass via direct
             # dataclass construction with malformed/false attestation fields.
-            self._enrollment = parse_enrollment(enrollment_bytes(enrollment))
+            self._enrollment, mono, wall = validate_unified_session(profile, enrollment)
             e = self._enrollment
-            _require(profile.manifest.digest() == e.manifest_digest
-                     and profile.manifest.target_id == e.target_id and profile.machine_id == e.machine_id
-                     and profile.manifest.driver.implementation_commit == e.release.implementation_commit
-                     and profile.manifest.runner_binding.platform == e.release.platform
-                     and profile.manifest.runner_binding.daemon_identity == e.launch.engine_id)
             self._database = Path(database)
             _require(self._database.is_absolute())
             self._manifest = e.manifest_digest
             self._identity = ExecutorSessionIdentity(e.launch.launch_id, e.release.image_config_id)
-            mono, wall = _clock()
-            _require(0 <= wall - e.observed_at_ms <= MAX_REPORT_AGE_MS
-                     and wall < e.expires_at_ms <= e.launch.approval_expires_at_ms)
             self._last_mono, self._last_wall = mono, wall
             self._deadline = mono + (e.expires_at_ms - wall) / 1000
             transport = CurrentExecutorHTTPSTransport.from_captured_material(profile.origin,
@@ -166,14 +210,19 @@ class TrustedQueuedSessionComposition:
             raise
 
     def _fresh(self):
+        # Never acquire an inherited lock after fork: it may belong to a thread
+        # that does not exist in this process. Serialize the clock read and
+        # watermark update across the observer and queue's worker threads.
         _require(os.getpid() == self._pid and not self._closed)
-        mono, wall = _clock()
-        e = self._enrollment
-        _require(self._last_mono <= mono < self._deadline
-                 and self._last_wall <= wall < e.expires_at_ms
-                 and 0 <= wall - e.observed_at_ms <= MAX_REPORT_LIFETIME_MS)
-        self._last_mono, self._last_wall = mono, wall
-        return mono
+        with self._clock_lock:
+            _require(os.getpid() == self._pid and not self._closed)
+            mono, wall = _clock()
+            e = self._enrollment
+            _require(self._last_mono <= mono < self._deadline
+                     and self._last_wall <= wall < e.expires_at_ms
+                     and 0 <= wall - e.observed_at_ms <= MAX_REPORT_LIFETIME_MS)
+            self._last_mono, self._last_wall = mono, wall
+            return mono
 
     def _current_verified(self):
         self._fresh()
@@ -223,12 +272,7 @@ class TrustedQueuedSessionComposition:
             e = self._enrollment
             # Original source time is preserved and shown; fresh challenge/epoch
             # binding is NOT a new observation of inventory or writer exclusion.
-            evidence = (f'Operator-attested source: {e.source}\n'
-                f'Original observed_at_ms: {e.observed_at_ms}\nExpires_at_ms: {e.expires_at_ms}\n'
-                f'Target: {e.target_id}\nManifest: {e.manifest_digest}\n'
-                'Retained report executor: ' + json.dumps(_report_executor(e.release, e.launch),
-                    sort_keys=True, separators=(',', ':')) + '\n'
-                'Current signed identity is not inventory/writer-exclusion proof.\n\n' + e.evidence)
+            evidence = _session_evidence(e)
             report = OperatorReconciliation(gate.challenge, owner.epoch, target.target_id,
                 self._manifest, self._identity, 'sha256:' + hashlib.sha256(evidence.encode()).hexdigest(),
                 e.inventory_reconciled, e.writers_excluded, e.unresolved_effects_absent)
@@ -243,6 +287,15 @@ class TrustedQueuedSessionComposition:
             if isinstance(error, Exception):
                 raise TrustedSessionError() from None
             raise
+
+    def scope_allows(self, actor, task_id):
+        """Additional session ceiling; reconciliation is not execution approval."""
+        try:
+            self._fresh()
+            return (type(actor) is str and actor in self._enrollment.actors
+                    and type(task_id) is str and task_id in self._enrollment.task_ids)
+        except Exception:
+            return False
 
     def close(self):
         self._closed = True
@@ -265,7 +318,8 @@ def enrollment_bytes(enrollment):
     release = {name: getattr(e.release, name) for name in CurrentExecutorReleasePins.__dataclass_fields__
                if name not in {'public_key', 'platform'}}
     release.update(public_key_hex=e.release.public_key.hex(), platform=e.release.platform.model_dump(mode='json'))
-    value = {'schema': SCHEMA, 'release': release,
+    scoped = bool(e.actors or e.task_ids)
+    value = {'schema': SCHEMA_SCOPED if scoped else SCHEMA, 'release': release,
         'launch': {name: getattr(e.launch, name) for name in CurrentLaunchPins.__dataclass_fields__},
         'operator_actor': e.operator_actor, 'report': {
             'target_id': e.target_id, 'manifest_digest': e.manifest_digest, 'machine_id': e.machine_id,
@@ -274,6 +328,8 @@ def enrollment_bytes(enrollment):
             'evidence': e.evidence, 'evidence_sha256': 'sha256:' + hashlib.sha256(e.evidence.encode()).hexdigest(),
             'attestations': {name: getattr(e, name) for name in (
                 'inventory_reconciled', 'writers_excluded', 'unresolved_effects_absent')}}}
+    if scoped:
+        value['scope'] = {'actors': list(e.actors), 'task_ids': list(e.task_ids)}
     return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
 
 

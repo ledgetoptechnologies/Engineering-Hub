@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import stat
 import sys
+import uuid
 from types import MappingProxyType
 
 from agent_message_bus.auth import AuthSettings
@@ -33,6 +34,9 @@ from engineering_hub.work_queue import WorkTarget
 from .local_providers import ImmutableTestSecretResolver
 
 SCHEMA = 'engineering-hub.installed-coordinator.v1'
+SCHEMA_SINGLE_PILOT = 'engineering-hub.installed-coordinator.v2'
+SCHEMA_TASK_SCOPED = 'engineering-hub.installed-coordinator.v3'
+MAX_ALLOWED_TASKS = 64
 ACTION = 'engineering-hub:container-pilot'
 MAX_CONFIG_BYTES = 256 * 1024
 _ERROR = 'Installed pilot coordinator unavailable'
@@ -84,6 +88,14 @@ def _process():
              and os.getgid() == os.getegid() == 10001 and os.getpid() == 1)
 
 
+def _task_scope_valid(task_ids):
+    try:
+        return (type(task_ids) is frozenset and 1 <= len(task_ids) <= MAX_ALLOWED_TASKS
+                and all(type(item) is str and str(uuid.UUID(item)) == item for item in task_ids))
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
 @dataclass(frozen=True)
 class CoordinatorConfiguration:
     manifest: PilotManifest
@@ -98,6 +110,8 @@ class CoordinatorConfiguration:
     roles: object
     stop_grace: int
     process_id: int
+    single_pilot_protocol: bool = False
+    allowed_task_ids: frozenset[str] = frozenset()
 
 
 def parse_configuration(raw):
@@ -117,8 +131,21 @@ def parse_configuration(raw):
 
         value = json.loads(raw, object_pairs_hook=unique, parse_float=reject,
                            parse_constant=reject)
-        _object(value, _FIELDS)
-        _require(value['schema'] == SCHEMA and _canonical(value) == raw)
+        _require(type(value) is dict and value.get('schema') in {SCHEMA, SCHEMA_SINGLE_PILOT, SCHEMA_TASK_SCOPED})
+        extra = ({'single_pilot_protocol'} if value['schema'] == SCHEMA_SINGLE_PILOT else
+                 {'single_pilot_protocol', 'allowed_task_ids'} if value['schema'] == SCHEMA_TASK_SCOPED else set())
+        _object(value, _FIELDS | extra)
+        _require(_canonical(value) == raw)
+        if value['schema'] == SCHEMA_SINGLE_PILOT:
+            _require(value['single_pilot_protocol'] is True)
+        if value['schema'] == SCHEMA_TASK_SCOPED:
+            _require(type(value['single_pilot_protocol']) is bool)
+            task_ids = value['allowed_task_ids']
+            _require(type(task_ids) is list and 1 <= len(task_ids) <= MAX_ALLOWED_TASKS
+                     and all(type(task_id) is str and str(uuid.UUID(task_id)) == task_id for task_id in task_ids)
+                     and len(set(task_ids)) == len(task_ids))
+        else:
+            task_ids = []
         manifest = PilotManifest.from_bytes(_canonical(value['manifest']))
         _require(manifest.target_id == 'engineering-hub:staging'
                  and value['machine_id'] == 'staging-pc' and value['action_key'] == ACTION)
@@ -162,7 +189,9 @@ def parse_configuration(raw):
         return CoordinatorConfiguration(manifest, *paths[:3], port, frozenset(actors), auth,
             paths[3], tuple(bindings), MappingProxyType(roles),
             _integer(value['supervisor_stop_grace_seconds'],
-                     REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS, 2**31 - 1), os.getpid())
+                     REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS, 2**31 - 1), os.getpid(),
+            value['schema'] == SCHEMA_SINGLE_PILOT or
+                (value['schema'] == SCHEMA_TASK_SCOPED and value['single_pilot_protocol']), frozenset(task_ids))
     except Exception:
         raise InstalledCoordinatorError() from None
 
@@ -208,30 +237,45 @@ def target_allowed(config, actor, action_key, environment, target):
     """Additional veto only; repository task ownership/review remain mandatory."""
     return (type(config) is CoordinatorConfiguration and type(actor) is str and actor in config.actors
         and action_key == ACTION and environment == 'staging' and type(target) is WorkTarget
+        and _task_scope_valid(config.allowed_task_ids) and target.task_id in config.allowed_task_ids
         and target.source_commit == config.manifest.candidate.source_commit
         and target.artifact_digest == config.manifest.candidate.image_config_id)
 
 
 async def run_installed_coordinator(config, *, reconciliation_factory=None,
-                                     session_acceptance_factory=None):
+                                     session_acceptance_factory=None, session_enrollment=None):
+    composition = None
     try:
         _process()
-        _require(type(config) is CoordinatorConfiguration and config.process_id == os.getpid())
+        _require(type(config) is CoordinatorConfiguration and config.process_id == os.getpid()
+                 and _task_scope_valid(config.allowed_task_ids))
         from engineering_hub.queued_pilot_service import _synchronous
         # Fixed JSON/CLI input cannot impersonate the missing trusted operator
         # channel. An explicit Python composition must supply that dependency.
-        _require(_synchronous(reconciliation_factory))
-        _require(session_acceptance_factory is None or _synchronous(session_acceptance_factory))
+        if session_enrollment is None:
+            _require(_synchronous(reconciliation_factory))
+            _require(session_acceptance_factory is None or _synchronous(session_acceptance_factory))
+        else:
+            _require(reconciliation_factory is None and session_acceptance_factory is None)
         # The optional wheel can coexist with an older core having the same
         # distribution version. Deny that unsupported composition before even
         # reading TEST secrets. API presence is compatibility, not attestation
         # or permission to substitute an unapproved core artifact.
         _require(callable(getattr(ContainerPilotClient, 'for_private_unix', None)))
+        if session_enrollment is not None:
+            from .colocated_session import validate_colocated_session
+            validate_colocated_session(config, session_enrollment)
         with ImmutableTestSecretResolver(config.secret_root, bindings=config.bindings) as secrets:
             tokens = {name: secrets.resolve_test_secret(*slot) for name, slot in config.roles.items()}
         _require(len(set(tokens.values())) == 4 and all(
             type(token) is str and token and all(33 <= ord(char) <= 126 for char in token)
             for token in tokens.values()))
+        if session_enrollment is not None:
+            from .colocated_session import ColocatedTrustedSession
+            composition = ColocatedTrustedSession(config=config, enrollment=session_enrollment,
+                                                   credential=tokens['executor'])
+            reconciliation_factory = composition.reconciliation_factory
+            session_acceptance_factory = composition.session_acceptance_factory
         settings = Settings(Path(config.database), AuthSettings(
             hermes_token=tokens['hermes'], codex_token=tokens['codex'], claude_token=tokens['claude'],
             allowed_ips=frozenset({'127.0.0.1'})), config.auth, work_queue_enabled=True,
@@ -239,19 +283,25 @@ async def run_installed_coordinator(config, *, reconciliation_factory=None,
             agent_allowed_hosts=('127.0.0.1', f'127.0.0.1:{config.port}'))
 
         def fresh_client():
-            return ContainerPilotClient.for_private_unix(config.executor_socket, tokens['executor'])
+            return ContainerPilotClient.for_private_unix(config.executor_socket, tokens['executor'],
+                **({'single_pilot_protocol':True} if config.single_pilot_protocol else {}))
 
         def policy(actor, action_key, environment, target):
-            return target_allowed(config, actor, action_key, environment, target)
+            return (target_allowed(config, actor, action_key, environment, target)
+                    and (composition is None or composition.scope_allows(actor, target.task_id)))
 
         await serve_owned_queued_pilot(settings, config.manifest, fresh_client,
             action_key=ACTION, machine_id='staging-pc', target_verifier=policy,
             reconciliation_factory=reconciliation_factory,
             session_acceptance_factory=session_acceptance_factory,
             socket_path=config.coordinator_socket, supervisor_stop_grace_seconds=config.stop_grace,
-            agent_host='127.0.0.1', agent_port=config.port)
+            agent_host='127.0.0.1', agent_port=config.port,
+            **({'single_pilot_protocol':True} if config.single_pilot_protocol else {}))
     except Exception:
         raise InstalledCoordinatorError() from None
+    finally:
+        if composition is not None:
+            composition.close()
 
 
 class _Parser(argparse.ArgumentParser):
@@ -264,11 +314,27 @@ def main(argv=None):
         parser = _Parser(description='Explicit colocated TEST pilot coordinator', allow_abbrev=False)
         parser.add_argument('operation', choices=('validate', 'serve'))
         parser.add_argument('--config', required=True, action='append')
+        parser.add_argument('--session-config', action='append')
         args = parser.parse_args(argv)
         _require(len(args.config) == 1)
+        _require(args.session_config is None or len(args.session_config) == 1)
         config = load_configuration(args.config[0])
+        # Legacy files remain readable, but cannot be treated as activation-ready.
+        _require(_task_scope_valid(config.allowed_task_ids))
+        if args.session_config is not None:
+            from engineering_hub.unified_pilot_startup import read_protected_file
+            from engineering_hub.trusted_queued_session import parse_enrollment, MAX_ENROLLMENT_BYTES
+            from .colocated_session import require_core_compatibility
+            require_core_compatibility()
+            session_path = _path(args.session_config[0])
+            enrollment = parse_enrollment(read_protected_file(Path(session_path), maximum_bytes=MAX_ENROLLMENT_BYTES,
+                                                               require_readonly=True))
         if args.operation == 'serve':
-            asyncio.run(run_installed_coordinator(config))
+            _require(args.session_config is not None)
+            asyncio.run(run_installed_coordinator(config, session_enrollment=enrollment))
+        elif args.session_config is not None:
+            from .colocated_session import validate_colocated_session
+            validate_colocated_session(config, enrollment)
         return 0
     except KeyboardInterrupt:
         return 130

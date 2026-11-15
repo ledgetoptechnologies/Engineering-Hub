@@ -20,7 +20,7 @@ describe("who's on what", () => {
       task({ owner: "claude", status: "claimed", state_since: ago(3) }),
     ], now);
     expect(rows.map(row => row.key)).toEqual(["codex", "claude"]);
-    expect(rows[0]).toMatchObject({ working: 1, inReview: 1, notStarted: 1, open: 3, oldestOpenSince: ago(5) });
+    expect(rows[0]).toMatchObject({ claimed: 1, inReview: 1, assigned: 1, open: 3, oldestOpenSince: ago(5) });
   });
   it("keeps a paired installation apart from its family", () => {
     const rows = ownershipRows([
@@ -61,6 +61,15 @@ describe("who's on what", () => {
     expect(open(CLOCK_SKEW_MS + 1).oldestOpenSince).toBeNull();
     expect(passed(CLOCK_SKEW_MS)[0].passedRecently).toBe(1);
     expect(passed(CLOCK_SKEW_MS + 1)).toEqual([]);
+  });
+  it("reports incomplete state-time coverage without inventing an oldest item", () => {
+    const rows = ownershipRows([
+      task({ owner: "codex", status: "claimed", state_since: ago(3) }),
+      task({ owner: "codex", status: "claimed", state_since: null }),
+      task({ owner: "codex", status: "in_review", state_since: "invalid" }),
+      task({ owner: "codex", status: "assigned", state_since: ago(-1) }),
+    ], now);
+    expect(rows[0]).toMatchObject({ oldestOpenSince: ago(3), unknownOpenTimes: 3, claimed: 2, inReview: 1, assigned: 1 });
   });
   it("never takes a future time as the oldest open item", () => {
     expect(ownershipRows([task({ owner: "codex", status: "claimed", state_since: ago(-1) })], now)[0].oldestOpenSince).toBeNull();

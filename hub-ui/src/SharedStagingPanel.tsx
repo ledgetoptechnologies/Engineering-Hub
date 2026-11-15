@@ -82,8 +82,6 @@ export function SharedStagingPanel({ mode, csrf, writable, stale, onUnauthorized
         <button className="secondary" type="button" disabled={load === "loading" || retrying} onClick={() => setAttempt(value => value + 1)}>
           {load === "loading" ? "Reading…" : "Refresh"}</button>
       </span></div>
-    <p className="panel-description">Staging builds and app deployments share one queue and take the staging PC one job at a time.
-      This shows whether that queue is admitting new jobs. It doesn't approve any job or deployment.</p>
     {mode === "demo" && <p role="status">Demo: an illustrative state only. Nothing is read from the Hub's staging queue.</p>}
     {load === "loading" && !status && <p role="status">Reading the shared staging queue…</p>}
     {notice && <p className="notice error" role="alert">{notice}{status && " What's shown below may be out of date."}</p>}

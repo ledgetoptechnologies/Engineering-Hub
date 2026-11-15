@@ -37,7 +37,7 @@ const ok = (state: string, reason: string | null = null) => ({ status: 200, body
 
 test("before the session check, it says what's needed and offers nothing to press but Refresh", async ({ page }) => {
   const state = await fixture(page, [ok("pending", "operator_acceptance_required")]);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   await expect(panel(page)).toContainText("Waiting for the session check");
   await expect(panel(page)).toContainText("Nothing new is admitted until you accept the staging session check.");
   await expect(panel(page)).toContainText("“Review staging session” on this page");
@@ -50,16 +50,15 @@ test("before the session check, it says what's needed and offers nothing to pres
 
 test("an open queue is never worded as deployed or approved", async ({ page }) => {
   await fixture(page, [ok("active")]);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   await expect(panel(page)).toContainText("Open");
   await expect(panel(page)).toContainText("New staging jobs can be admitted. That doesn't mean they run on their own");
   await expect(panel(page)).toContainText("nothing here means an app is deployed or healthy");
-  await expect(panel(page)).toContainText("It doesn't approve any job or deployment.");
 });
 
 test("retries the check of earlier work only when asked, with CSRF, and shows the result", async ({ page }) => {
   const state = await fixture(page, [ok("recovery_required", "original_operations_unverified")], [ok("active")]);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   await expect(panel(page)).toContainText("Earlier work not confirmed");
   await expect(panel(page)).toContainText("it never starts it again");
   expect(state.posts).toBe(0);
@@ -73,7 +72,7 @@ test("retries the check of earlier work only when asked, with CSRF, and shows th
 
 test("a retry with no answer says it may still be running, never that it failed", async ({ page }) => {
   const state = await fixture(page, [ok("recovery_required", "original_operations_unverified"), ok("recovering", "original_operations_pending")], ["abort"]);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   await panel(page).getByRole("button", { name: "Retry checking earlier work" }).click();
   await expect(panel(page).getByRole("alert")).toContainText("No answer yet. Recovery may still be running on the Hub.");
   await expect(panel(page).getByRole("alert")).not.toContainText("failed");
@@ -93,7 +92,7 @@ test("after a refused retry, only a successful Refresh allows another, and a fai
   const state = await fixture(page, [ok("recovery_required", "original_operations_unverified"),
     { status: 502, body: { detail: { code: "bad_gateway" } } }, ok("recovery_required", "original_operations_unverified")],
     [{ status: 409, body: { detail: { code: "shared_staging_recovery_required" } } }]);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   const retry = panel(page).getByRole("button", { name: "Retry checking earlier work" });
   await retry.click();
   await expect(panel(page).getByRole("alert")).toContainText("Recovery didn't confirm all the earlier work.");
@@ -109,7 +108,7 @@ test("after a refused retry, only a successful Refresh allows another, and a fai
 
 test("a failed first read never offers a retry on what it can't see", async ({ page }) => {
   await fixture(page, [{ status: 502, body: { detail: { code: "bad_gateway" } } }]);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   await expect(panel(page).getByRole("alert")).toContainText("couldn't be read");
   await expect(panel(page).getByRole("button", { name: "Retry checking earlier work" })).toHaveCount(0);
 });
@@ -117,7 +116,7 @@ test("a failed first read never offers a retry on what it can't see", async ({ p
 test("a retry the Hub refuses says to refresh and keeps the earlier state marked", async ({ page }) => {
   await fixture(page, [ok("recovery_required", "original_operations_unverified")],
     [{ status: 409, body: { detail: { code: "shared_staging_lifecycle_changed" } } }]);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   await panel(page).getByRole("button", { name: "Retry checking earlier work" }).click();
   await expect(panel(page).getByRole("alert")).toContainText("setup changed or is stopping. Use Refresh to see the current state; don't assume how far the check got.");
   await expect(panel(page).getByRole("alert")).not.toContainText("nothing was");
@@ -131,22 +130,22 @@ test("steps aside where shared staging isn't set up, for non-owners and on older
     { status: 403, body: { detail: { code: "gateway_route_forbidden" } } }]) {
     await page.unrouteAll();
     await fixture(page, [reply]);
-    await page.goto("/#/staging");
-    await expect(page.getByRole("region", { name: "Staging resources" })).toBeVisible();
+    await page.goto("/#/staging/queues");
+    await expect(page.getByRole("region", { name: "Software validation queue" })).toBeVisible();
     await expect(panel(page)).toHaveCount(0);
   }
 });
 
 test("a lost sign-in clears the panel along with the workspace", async ({ page }) => {
   await fixture(page, [{ status: 401, body: { detail: { code: "human_session_required" } } }]);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   await expect(page.getByText("Sign in to Engineering Hub.")).toBeVisible();
   await expect(panel(page)).toHaveCount(0);
 });
 
 test("an unexpected answer is refused rather than shown", async ({ page }) => {
   await fixture(page, [{ status: 200, body: { state: "active", reason: null, execution_authorized: true } }]);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   await expect(panel(page).getByRole("alert")).toHaveText("The shared staging queue's state couldn't be read. Use Refresh to try again.");
   await expect(panel(page)).not.toContainText("Open");
 });
@@ -154,7 +153,7 @@ test("an unexpected answer is refused rather than shown", async ({ page }) => {
 test("demo mode reads nothing and offers no retry", async ({ page }) => {
   let reads = 0;
   await page.route("**/api/hub/v1/staging/shared/**", (route) => { reads++; return route.abort(); });
-  await page.goto("/?demo=1#/staging");
+  await page.goto("/?demo=1#/staging/queues");
   await expect(panel(page)).toContainText("Demo: an illustrative state only.");
   await expect(panel(page).getByRole("button", { name: "Retry checking earlier work" })).toHaveCount(0);
   expect(reads).toBe(0);
@@ -163,7 +162,7 @@ test("demo mode reads nothing and offers no retry", async ({ page }) => {
 test("fits a phone screen", async ({ page }) => {
   await fixture(page, [ok("recovery_required", "original_operations_unverified")]);
   await page.setViewportSize({ width: 375, height: 812 });
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   await expect(panel(page).getByRole("button", { name: "Retry checking earlier work" })).toBeVisible();
   const box = (await panel(page).boundingBox())!;
   expect(box.x + box.width).toBeLessThanOrEqual(375);

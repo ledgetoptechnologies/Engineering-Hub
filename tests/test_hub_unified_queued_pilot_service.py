@@ -135,6 +135,15 @@ async def start(rig, **changes):
     return stop, task, addresses
 
 
+@pytest.mark.asyncio
+async def test_v2_unified_rejects_legacy_client_before_command(rig):
+    with pytest.raises(service.QueuedPilotServiceError):
+        await service.serve_owned_unified_queued_pilot(
+            rig.settings, rig.manifest, rig.client_factory,
+            **options(rig, single_pilot_protocol=True))
+    assert rig.requests == []
+
+
 def url(address):
     return 'http://' + address[0] + ':' + str(address[1])
 
@@ -435,3 +444,61 @@ async def test_invalid_preconditions_leave_caller_owner_untouched(rig, change):
             factory, **options(rig, **kwargs))
     assert rig.owner.close_count == 0 and not rig.clients
     rig.owner.assert_active(rig.settings.database)
+
+
+@pytest.mark.asyncio
+async def test_owned_queued_bound_login_and_denial_without_effects(rig, monkeypatch):
+    from dataclasses import replace
+    from urllib.parse import parse_qs, urlsplit
+    from engineering_hub.auth import GitHubIdentityProvider
+    from engineering_hub.bound_oauth_draft import enroll_owned_bound_schema
+    repo=HubRepository(rig.settings.database,pilot_owner=rig.owner)
+    enroll_owned_bound_schema(repo,writers_stopped=True,backup_verified=True)
+    rig.settings=replace(rig.settings,auth_config=replace(rig.settings.auth_config,
+        human_auth_mode='github_cloudflare',github_client_id='fixture',github_client_secret='fixture',
+        beau_github_id=123,bound_access_subject='synthetic-human'))
+    async def exchange(self, code, verifier):
+        assert code=='fixture-code' and verifier
+        return 123
+    monkeypatch.setattr(GitHubIdentityProvider,'exchange',exchange)
+    stop,task,addresses=await start(rig)
+    try:
+        async with httpx.AsyncClient(base_url=url(addresses[1]),trust_env=False,follow_redirects=False,
+                                     headers={'Host':'hub.example'}) as human:
+            assert (await human.get(BASE+'/auth/login')).status_code==401
+            headers={'CF-Access-Jwt-Assertion':rig.assertion}
+            login=await human.get(BASE+'/auth/login',headers=headers)
+            assert login.status_code==302
+            state=parse_qs(urlsplit(login.headers['location']).query)['state'][0]
+            state_cookie=human.cookies.get('hub_session_oauth')
+            callback=await human.get(BASE+'/auth/callback',params={'state':state,'code':'fixture-code'},
+                                     headers={**headers,'Cookie':'hub_session_oauth='+state_cookie})
+            assert callback.status_code==303
+            cookie=human.cookies.get('hub_session')
+            me=await human.get(BASE+'/auth/me',headers={**headers,'Cookie':'hub_session='+cookie})
+            assert me.json()['authenticated'] and me.json()['actor'].startswith('human:cf:')
+            assert (await human.get(BASE+'/auth/me',headers={'Cookie':'hub_session='+cookie})).status_code==401
+        assert rig.requests == []
+    finally:
+        stop.set()
+        await asyncio.wait_for(task,8)
+
+
+@pytest.mark.asyncio
+async def test_owned_queued_subject_drift_denies_login_and_never_calls_executor(rig):
+    from dataclasses import replace
+    from engineering_hub.bound_oauth_draft import enroll_owned_bound_schema
+    repo=HubRepository(rig.settings.database,pilot_owner=rig.owner)
+    enroll_owned_bound_schema(repo,writers_stopped=True,backup_verified=True)
+    rig.settings=replace(rig.settings,auth_config=replace(rig.settings.auth_config,
+        human_auth_mode='github_cloudflare',github_client_id='fixture',github_client_secret='fixture',
+        beau_github_id=123,bound_access_subject='other-subject'))
+    stop,task,addresses=await start(rig)
+    try:
+        async with httpx.AsyncClient(base_url=url(addresses[1]),trust_env=False,
+                headers={'Host':'hub.example','CF-Access-Jwt-Assertion':rig.assertion}) as human:
+            assert (await human.get(BASE+'/auth/login')).status_code==401
+        assert rig.requests == []
+    finally:
+        stop.set()
+        await asyncio.wait_for(task,8)

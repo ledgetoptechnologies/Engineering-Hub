@@ -220,25 +220,50 @@ def submit(queue, task, key='job'):
 WORKER = WorkWorker('codex', str(uuid.uuid5(uuid.NAMESPACE_DNS, 'one')))
 
 
+def reviewed_proposal(repo):
+    task = proposal(repo, agent='codex')
+    task = repo.claim_task('codex', task['id'], task['revision'])
+    task = repo.set_candidate('codex', task['id'], task['revision'], COMMIT)
+    return repo.review_task('claude', task['id'], task['revision'], COMMIT, 'approve')
+
+
 @pytest.mark.parametrize('state', ['queued', 'claimed', 'held'])
 def test_task_with_open_queue_work_cannot_be_withdrawn_and_the_job_is_untouched(repo, queue, state):
-    task = proposal(repo, agent='codex')
+    task = reviewed_proposal(repo)
     job = submit(queue, task)
     if state != 'queued':
         job = queue.claim(worker=WORKER)
         if state == 'held':
             queue.complete(job_id=job['id'], worker=WORKER, fence=job['fence'], outcome='held')
+    before_job = queue.get_job(job['id'])
+    assert before_job['state'] == state
+    # Both ordinary withdrawal and context invalidation are blocked while
+    # reviewed work is open. Neither transition may alter the queue.
     with pytest.raises(HubError, match='task_in_progress'):
         repo.withdraw('codex', 'task', task['id'], task['revision'], 'Moved')
-    assert repo.get_task(task['id'])['status'] == 'assigned'
-    assert queue.get_job(job['id'])['state'] == state
+    with pytest.raises(HubError, match='active_work_job'):
+        repo.update_context(HUMAN, 'task', task['id'], task['revision'], 'Changed', None)
+    assert repo.get_task(task['id']) == task and queue.get_job(job['id']) == before_job
+
+    # Independently exercise the queue guard against a legacy/corrupt
+    # withdrawable task row: ordinary APIs cannot create this state now.
+    with repo._transaction() as db:
+        stale = repo._get(db, task['id'], 'task')
+        stale.update(status='claimed', candidate_commit=None, review=None)
+        stale = repo._save(db, HUMAN, 'task.context_invalidated', 'task', stale)
+    with pytest.raises(HubError, match='task_in_progress'):
+        repo.withdraw('codex', 'task', stale['id'], stale['revision'], 'Moved')
+    assert repo.get_task(task['id']) == stale and queue.get_job(job['id']) == before_job
 
 
 def test_finished_queue_work_does_not_block_withdrawal(repo, queue):
-    task = proposal(repo, agent='codex')
+    task = reviewed_proposal(repo)
     submit(queue, task)
     job = queue.claim(worker=WORKER)
     queue.complete(job_id=job['id'], worker=WORKER, fence=job['fence'], outcome='succeeded')
+    # A completed queue job allows the human to invalidate the old review;
+    # withdrawal itself still requires a withdrawable task state.
+    task = repo.update_context(HUMAN, 'task', task['id'], task['revision'], 'Done elsewhere', None)
     assert repo.withdraw('codex', 'task', task['id'], task['revision'], 'Done elsewhere')['status'] == 'withdrawn'
 
 

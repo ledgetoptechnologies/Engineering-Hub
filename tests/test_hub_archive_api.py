@@ -87,6 +87,16 @@ def headers(agent='codex'):
     return {'Authorization': 'Bearer test-' + agent}
 
 
+def test_explicitly_mounted_archive_contract_exposes_pagination(disabled):
+    client = disabled[0]
+    params = {item['name']: item for item in client.app.openapi()['paths'][BASE]['get']['parameters']}
+    assert set(params) == {'limit', 'after_id'}
+    assert all(item['in'] == 'query' and not item['required'] for item in params.values())
+    assert params['limit']['schema'] == {'type': 'integer', 'minimum': 1, 'maximum': 50, 'default': 50}
+    assert params['after_id']['schema'] == {'type': 'string', 'minLength': 36, 'maxLength': 36,
+        'pattern': r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'}
+
+
 @pytest.mark.parametrize('agent,expected', [('codex', [IDS[0], IDS[1], IDS[3]]),
                                          ('hermes', [IDS[0], IDS[2]]), ('claude', [IDS[1], IDS[2], IDS[3]])])
 def test_actual_reader_visibility_is_sender_or_recipient_only(archive, agent, expected):

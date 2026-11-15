@@ -13,6 +13,7 @@ from starlette.responses import Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .openapi_body import request_body
 from .repository import AGENTS, HubError, HubRepository
 
 
@@ -32,11 +33,14 @@ class ClosedInput(BaseModel):
 
 class StagingSubmission(ClosedInput):
     request_id: str = Field(pattern=r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$')
+    review_task_id: str = Field(pattern=r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$')
+    review_task_revision: int = Field(ge=1)
     project: Project
     recipe: str = Field(pattern=r'^[a-z0-9][a-z0-9_-]{0,63}$')
     source_commit: str = Field(pattern=r'^[a-f0-9]{40}$')
     source_digest: str = Field(pattern=r'^[a-f0-9]{64}$')
     source_zip_base64: str = Field(min_length=1, max_length=MAX_SOURCE_BASE64)
+    source_commit_object_base64: str = Field(min_length=1, max_length=87384)
     topic: str | None = Field(default=None, pattern=r'^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$')
 
 
@@ -60,6 +64,11 @@ class StagingCleanupApply(ClosedInput):
 class StagingPolicy(ClosedInput):
     expected_revision: int = Field(ge=0)
     grants: dict[str, Annotated[list[Action], Field(max_length=6)]] = Field(max_length=1000)
+
+
+class StagingProfileEnrollment(ClosedInput):
+    expected_generation: int = Field(ge=0, lt=2**31 - 1)
+    profile: dict = Field(max_length=16)
 
 
 def _unique_object(pairs):
@@ -97,7 +106,8 @@ async def _payload(request, model, *, maximum=65536):
 
 
 def attach_staging_routes(app, controller, actor, human, preview_broker=None, preview_session=None,
-                          module_status=None, diagnostic_session=None, observer=None):
+                          module_status=None, diagnostic_session=None, observer=None,
+                          human_admission=None, human_read_admission=None):
     """Compose existing authenticated callbacks; attaching starts no work."""
     def configured():
         if controller is None:
@@ -111,6 +121,17 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         principal = (human if human_only else actor)(request, mutation=True) if mutation else (human if human_only else actor)(request)
         HubRepository._actor(principal, human=human_only)
         return principal
+
+    def revalidate(request, principal, *, human_only=False):
+        if authenticated(request, mutation=True, human_only=human_only) != principal:
+            raise HubError('staging_identity_changed', 403)
+
+    def admission(request, principal):
+        if not principal.startswith('human:'):
+            return None
+        if not callable(human_admission):
+            raise HubError('staging_human_admission_unavailable', 503)
+        return human_admission(request, principal)
 
     @app.get('/api/hub/v1/staging/status')
     async def status(request: Request):
@@ -150,6 +171,15 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
             except ValueError:
                 raise HubError('staging_runtime_unavailable', 503) from None
         return {key: result[key] for key in ('configured', 'state', 'snapshot')}
+
+    @app.get('/api/hub/v1/staging/source-intent-handoffs')
+    def source_intent_handoffs(request: Request, after: str | None = Query(default=None),
+                               limit: int = Query(default=50, ge=1, le=100)):
+        principal = authenticated(request, human_only=True)
+        if not callable(human_read_admission):
+            raise HubError('staging_human_admission_unavailable', 503)
+        return configured().source_intent_handoffs(
+            principal, after=after, limit=limit, admission_guard=human_read_admission(request, principal))
 
     @app.get('/api/hub/v1/staging/resources')
     def resources(request: Request, project: Project | None = None,
@@ -192,34 +222,46 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         return await diagnostic_download(service.resources, service.client, principal, resource_id,
                                          relative_path, session_alive=alive)
 
-    @app.post('/api/hub/v1/staging/resources/{resource_id}/keep')
+    @app.post('/api/hub/v1/staging/resources/{resource_id}/keep', openapi_extra=request_body(StagingKeep))
     async def keep(resource_id: Identity, request: Request):
         principal = authenticated(request, mutation=True)
         service = configured()
         payload = await _payload(request, StagingKeep)
-        return service.resources.set_keep(principal, resource_id, **payload.model_dump())
+        revalidate(request, principal)
+        return service.resources.set_keep(principal, resource_id, **payload.model_dump(),
+                                          admission_guard=admission(request, principal))
 
-    @app.post('/api/hub/v1/staging/cleanup/plan')
+    @app.post('/api/hub/v1/staging/cleanup/plan', openapi_extra=request_body(StagingCleanupPlan))
     async def cleanup_plan(request: Request):
         principal = authenticated(request, mutation=True)
         service = configured()
         payload = await _payload(request, StagingCleanupPlan)
-        return service.resources.cleanup_plan(principal, **payload.model_dump())
+        revalidate(request, principal)
+        return service.resources.cleanup_plan(principal, **payload.model_dump(),
+                                              admission_guard=admission(request, principal))
 
-    @app.post('/api/hub/v1/staging/cleanup/apply')
+    @app.post('/api/hub/v1/staging/cleanup/apply', openapi_extra=request_body(StagingCleanupApply))
     async def cleanup_apply(request: Request):
         principal = authenticated(request, mutation=True)
         service = configured()
         payload = await _payload(request, StagingCleanupApply)
+        revalidate(request, principal)
+        if principal.startswith('human:'):
+            if not callable(human_admission):
+                raise HubError('staging_human_admission_unavailable', 503)
+            guard = human_admission(request, principal)
+            return await service.cleanup_apply(principal, payload.plan_id, payload.digest,
+                                               admission_guard=guard)
         return await service.cleanup_apply(principal, payload.plan_id, payload.digest)
 
-    @app.post('/api/hub/v1/staging/jobs', status_code=202)
+    @app.post('/api/hub/v1/staging/jobs', status_code=202, openapi_extra=request_body(StagingSubmission))
     async def submit(request: Request):
         principal = authenticated(request, mutation=True)
         if principal not in AGENTS:
             raise HubError('staging_agent_required', 403)
         service = configured()
         payload = await _payload(request, StagingSubmission, maximum=12 * 1024 * 1024)
+        revalidate(request, principal)
         return await service.submit(principal, payload.model_dump())
 
     @app.get('/api/hub/v1/staging/jobs/{job_id}')
@@ -227,26 +269,49 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         principal = authenticated(request)
         return configured().get_job(principal, job_id)
 
-    @app.post('/api/hub/v1/staging/jobs/{job_id}/reconcile')
+    @app.post('/api/hub/v1/staging/jobs/{job_id}/reconcile', openapi_extra=request_body(ClosedInput))
     async def reconcile(job_id: Identity, request: Request):
         principal = authenticated(request, mutation=True, human_only=True)
         service = configured()
         await _payload(request, ClosedInput)
-        return await service.reconcile_for(principal, job_id)
+        revalidate(request, principal, human_only=True)
+        return await service.reconcile_for(principal, job_id, admission_guard=admission(request, principal))
 
     @app.get('/api/hub/v1/staging/projects/{project}/policy')
     def get_policy(project: Project, request: Request):
         principal = authenticated(request, human_only=True)
         return configured().resources.get_policy(principal, project)
 
-    @app.put('/api/hub/v1/staging/projects/{project}/policy')
+    @app.get('/api/hub/v1/staging/projects/{project}/profiles/{recipe}')
+    def get_profile(project: Project, recipe: Annotated[str, Path(pattern=r'^[a-z0-9][a-z0-9_-]{0,63}$')],
+                    request: Request, generation: int | None = Query(default=None, ge=1, lt=2**31)):
+        principal = authenticated(request)
+        guard = None
+        if principal.startswith('human:'):
+            if not callable(human_read_admission):
+                raise HubError('staging_human_admission_unavailable', 503)
+            guard = human_read_admission(request, principal)
+        return configured().resources.get_profile(principal, project, recipe, generation, admission_guard=guard)
+
+    @app.put('/api/hub/v1/staging/projects/{project}/profiles/{recipe}', openapi_extra=request_body(StagingProfileEnrollment))
+    async def enroll_profile(project: Project, recipe: Annotated[str, Path(pattern=r'^[a-z0-9][a-z0-9_-]{0,63}$')], request: Request):
+        principal = authenticated(request, mutation=True, human_only=True)
+        service = configured()
+        payload = await _payload(request, StagingProfileEnrollment)
+        revalidate(request, principal, human_only=True)
+        return service.resources.enroll_profile(principal, project, recipe, **payload.model_dump(),
+                                                admission_guard=admission(request, principal))
+
+    @app.put('/api/hub/v1/staging/projects/{project}/policy', openapi_extra=request_body(StagingPolicy))
     async def set_policy(project: Project, request: Request):
         principal = authenticated(request, mutation=True, human_only=True)
         service = configured()
         payload = await _payload(request, StagingPolicy)
-        return service.resources.set_policy(principal, project, **payload.model_dump())
+        revalidate(request, principal, human_only=True)
+        return service.resources.set_policy(principal, project, **payload.model_dump(),
+                                            admission_guard=admission(request, principal))
 
-    @app.post('/api/hub/v1/staging/resources/{resource_id}/preview-session')
+    @app.post('/api/hub/v1/staging/resources/{resource_id}/preview-session', openapi_extra=request_body(ClosedInput))
     async def preview(resource_id: Identity, request: Request):
         principal = authenticated(request, mutation=True, human_only=True)
         configured()
@@ -256,5 +321,6 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         session = preview_session(request)
         if inspect.isawaitable(session):
             session = await session
+        revalidate(request, principal, human_only=True)
         result = preview_broker.issue(principal, resource_id, *session)
         return {'url': result['preview_url'], 'expires_at': result['expires_at']}

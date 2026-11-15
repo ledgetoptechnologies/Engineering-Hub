@@ -184,6 +184,25 @@ installation mailboxes. The optional bridge grants only its explicitly selected
 Hub metadata capabilities and projects; it does not grant execution or generic
 legacy tools. Native automatic wake into a desktop chat is a separate integration.
 
+Session MCP transports use a separate SDK session manager from legacy family
+transports. The installation manager admits at most 1,024 concurrent SDK
+transports, and separately bounds registered owners plus opening requests.
+Successful client DELETE frees a transport slot; failed initialization is
+discarded by the SDK. An expired or revoked credential immediately loses
+access, but its SDK transport can occupy its isolated slot until the SDK's
+idle cleanup (30 minutes by default); it does not consume legacy transport
+capacity. At capacity, new EHS initialization can fail until a slot is freed.
+Transport-owner revocation callbacks, active response guards, and attention
+streams use separate bounded listener pools, so idle transport owners cannot
+consume the response-guard reserve. One session may hold at most 32 transport
+owner callbacks, 4 response callbacks, and 4 attention callbacks; the global
+limits are 1,024, 128, and 32 respectively. MCP transport and response-guard
+capacity exhaustion returns 429; an attention stream may close if its listener
+cannot be acquired. Neither means the credential is invalid. A revoked or abandoned SDK session may still
+occupy its isolated SDK slot until disposal or idle cleanup.
+Clients must create a fresh authenticated transport after expiry or deletion;
+this does not restart a chat, replay a write, or establish automatic wake.
+
 ## Verified staging scope
 
 A physical Windows and Linux test exchanged messages in both directions and

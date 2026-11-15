@@ -38,6 +38,8 @@ _DDL = {
     'sqlite_sequence': 'CREATE TABLE sqlite_sequence(name,seq)',
     'auth_sessions': 'CREATE TABLE auth_sessions (token_hash TEXT PRIMARY KEY, github_id INTEGER NOT NULL, csrf_token TEXT NOT NULL, expires REAL NOT NULL)',
     'auth_states': 'CREATE TABLE auth_states (state_hash TEXT PRIMARY KEY, verifier TEXT NOT NULL, expires REAL NOT NULL)',
+    'auth_bound_oauth_states': 'CREATE TABLE auth_bound_oauth_states (state_hash TEXT PRIMARY KEY, verifier TEXT NOT NULL, binding TEXT NOT NULL, expires REAL NOT NULL)',
+    'auth_bound_oauth_sessions': 'CREATE TABLE auth_bound_oauth_sessions (token_hash TEXT PRIMARY KEY, binding TEXT NOT NULL, github_id INTEGER NOT NULL, csrf_token TEXT NOT NULL, expires REAL NOT NULL)',
     'auth_access_sessions': 'CREATE TABLE auth_access_sessions (token_hash TEXT PRIMARY KEY, binding TEXT NOT NULL, actor TEXT NOT NULL, csrf_token TEXT NOT NULL, expires REAL NOT NULL)',
     'auth_access_identities': 'CREATE TABLE auth_access_identities (identity_key TEXT PRIMARY KEY, binding TEXT NOT NULL, actor TEXT NOT NULL)',
     'hub_work_jobs': 'CREATE TABLE hub_work_jobs (sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, actor TEXT NOT NULL, request_id TEXT NOT NULL, fingerprint TEXT NOT NULL, action_key TEXT NOT NULL, environment TEXT NOT NULL, machine_id TEXT NOT NULL, project TEXT NOT NULL, approval_id TEXT, target TEXT NOT NULL, requires_execution_proof INTEGER NOT NULL, state TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0, worker TEXT, fence INTEGER, lease_until REAL, created_at REAL NOT NULL, UNIQUE(actor,request_id))',
@@ -59,6 +61,8 @@ _DDL = {
     'hub_interactive_review_requests': 'CREATE TABLE hub_interactive_review_requests (actor TEXT NOT NULL,key TEXT NOT NULL,fingerprint TEXT NOT NULL,review_id TEXT NOT NULL,PRIMARY KEY(actor,key))',
     'hub_interactive_review_answer_events': 'CREATE TABLE hub_interactive_review_answer_events (review_id TEXT NOT NULL,revision INTEGER NOT NULL,item_id TEXT NOT NULL,actor TEXT NOT NULL,value TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(review_id,revision,item_id))',
     'hub_interactive_asset_bindings': 'CREATE TABLE hub_interactive_asset_bindings (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL)',
+    'hub_decision_requests': 'CREATE TABLE hub_decision_requests (actor TEXT NOT NULL, project TEXT NOT NULL, key TEXT NOT NULL, fingerprint TEXT NOT NULL, receipt TEXT NOT NULL, PRIMARY KEY(actor,project,key))',
+    'hub_staging_task_profiles': 'CREATE TABLE hub_staging_task_profiles (task_id TEXT NOT NULL, candidate_revision INTEGER NOT NULL, project TEXT NOT NULL, recipe TEXT NOT NULL, generation INTEGER NOT NULL, digest TEXT NOT NULL, commit_oid TEXT NOT NULL, review_revision INTEGER, reviewer TEXT, PRIMARY KEY(task_id,candidate_revision))',
 }
 # Exact current native-module indexes only; this is not generic index admission.
 _INDEX_DDL = {
@@ -68,6 +72,7 @@ _INDEX_DDL = {
 _CORE = frozenset(list(_DDL)[:9])
 _GROUPS = (
     frozenset({'auth_sessions', 'auth_states'}),
+    frozenset({'auth_bound_oauth_states', 'auth_bound_oauth_sessions'}),
     frozenset({'auth_access_sessions', 'auth_access_identities'}),
     frozenset({'hub_work_jobs', 'hub_work_machines', 'hub_work_policy'}),
     frozenset({'hub_delivery_namespace', 'hub_delivery_receipts', 'hub_delivery_sender'}),
@@ -238,6 +243,10 @@ def _snapshot(db, *, enrolled=False):
         else:
             raise EnrollmentError()
     # No controller ownership or incomplete external effects may be adopted.
+    # A staging-resource entity can represent an external effect even when its
+    # companion tables are absent. Missing metadata is not proof of cleanup.
+    if db.execute("SELECT 1 FROM hub_entities WHERE kind='staging_resource' LIMIT 1").fetchone():
+        raise EnrollmentError()
     for (raw,) in db.execute("SELECT data FROM hub_entities WHERE kind='run'"):
         run = json.loads(raw)
         if type(run) is not dict or run.get('status') not in {'succeeded', 'rolled_back'}:

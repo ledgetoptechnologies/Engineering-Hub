@@ -4,6 +4,7 @@ import json
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import replace
 
 import pytest
@@ -11,7 +12,7 @@ import pytest
 import hub_container_executor.adapter as adapter_module
 from engineering_hub.container_pilot_client import ContainerPilotRequest
 from engineering_hub.container_pilot_manifest import PilotManifest
-from hub_container_executor.adapter import HostAdapter, KnownTerminalFailure
+from hub_container_executor.adapter import HostAdapter, KnownTerminalFailure, TrustedEffectContextGuard
 from hub_container_executor.backend import (
     ActualImageSelection,
     BaselineIdentity,
@@ -258,6 +259,77 @@ def command(manifest, action, *, run_id=None, fence=1):
         candidate_commit=manifest.candidate.source_commit,
         policy_revision=manifest.policy_revision, fencing_generation=fence,
     )
+
+
+def test_explicit_effect_context_carries_original_admitted_run_and_fence(tmp_path):
+    adapter, backend, state, manifest = make_fixture(tmp_path)
+    request = command(manifest, 'deploy_container', fence=7)
+    seen, entered = [], []
+    def verify(context):
+        assert context.request is request
+        assert context.request.run_id == request.run_id and context.request.fencing_generation == 7
+        seen.append((context.operation_id, context.kind))
+        return True
+    @contextmanager
+    def scope(context):
+        entered.append(context.operation_id)
+        yield
+    adapter.effect_context_guard = TrustedEffectContextGuard(verify, scope)
+    try:
+        response = adapter.submit(request)
+        assert response.state == 'succeeded'
+        assert len(seen) >= 2 and entered == [operation for operation, _ in seen]
+        assert len({operation for operation, _ in seen}) == len(seen)
+    finally:
+        adapter.close()
+
+
+def test_explicit_effect_context_denial_holds_without_any_effect(tmp_path):
+    adapter, backend, state, manifest = make_fixture(tmp_path)
+    @contextmanager
+    def forbidden_scope(context):
+        pytest.fail('denied context reached scope')
+        yield
+    adapter.effect_context_guard = TrustedEffectContextGuard(lambda context: False, forbidden_scope)
+    try:
+        response = adapter.submit(command(manifest, 'deploy_container'))
+        assert response.state == 'held' and response.reason == 'inspect_required'
+        assert state.calls == []
+        assert not any(event in {'create', 'start', 'probe'} for event in backend.events)
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize('slow_stage', ['verify', 'scope'])
+def test_effect_context_delay_exhausts_deadline_before_callback(tmp_path, monkeypatch, slow_stage):
+    adapter, backend, state, manifest = make_fixture(tmp_path)
+    request = command(manifest, 'deploy_container')
+    status = {'expired': False, 'callbacks': 0, 'begun': 0}
+    def begin(*args):
+        status['begun'] += 1
+        return str(uuid.uuid4())
+    def timeout(*args):
+        if status['expired']:
+            raise adapter_module._Held('inspect_required')
+        return 100
+    def verify(context):
+        if slow_stage == 'verify': status['expired'] = True
+        return True
+    @contextmanager
+    def scope(context):
+        if slow_stage == 'scope': status['expired'] = True
+        yield
+    def effect(*args):
+        status['callbacks'] += 1
+    monkeypatch.setattr(adapter.ledger, 'begin_operation', begin)
+    monkeypatch.setattr(adapter, '_timeout', timeout)
+    adapter.effect_context_guard = TrustedEffectContextGuard(verify, scope)
+    try:
+        with pytest.raises(adapter_module._Held):
+            adapter._effect(request, 'create_candidate', effect, 100, 1.0, lambda value: {})
+        assert status['begun'] == 1 and status['callbacks'] == 0
+    finally:
+        adapter.close()
 
 
 def test_default_missing_trusted_verifier_fails_before_any_effect(tmp_path):
@@ -518,3 +590,188 @@ def test_reentrant_close_from_effect_callback_is_deferred_until_result_commit(tm
     replacement = HostAdapter(adapter.ledger.path, manifest)
     assert replacement.get(request.command_id).state == "succeeded"
     replacement.close()
+
+
+def test_single_pilot_get_and_reconcile_never_surface_unverified_terminal(tmp_path):
+    adapter, backend, _state, manifest = make_fixture(tmp_path)
+    cmd = command(manifest, 'deploy_container')
+    try:
+        adapter.ledger.enable_single_pilot_protocol()
+        adapter.ledger.arm_single_pilot(cmd)
+        assert adapter.ledger.admit(cmd).accepted
+        adapter.ledger.finish(cmd.command_id, state='succeeded', reason=None,
+                              evidence=adapter._evidence('c'*64, manifest.candidate.image_config_id, 'unknown', True))
+        assert adapter.get(cmd.command_id).state == 'held'
+        before = list(backend.events)
+        assert adapter.reconcile(cmd.command_id).state == 'held'
+        assert backend.events == before
+    finally:
+        adapter.close()
+
+
+def test_single_pilot_submit_does_not_surface_unverified_success(tmp_path):
+    adapter, backend, _state, manifest = make_fixture(tmp_path)
+    cmd = command(manifest, 'deploy_container')
+    try:
+        adapter.ledger.enable_single_pilot_protocol()
+        adapter.ledger.arm_single_pilot(cmd)
+        response = adapter.submit(cmd)
+        assert response.state == 'held' and response.reason == 'recovery_required'
+        assert 'create' in backend.events and 'start' in backend.events
+        assert adapter.get(cmd.command_id).state == 'held'
+    finally:
+        adapter.close()
+
+
+def test_single_pilot_lost_denial_replays_after_adapter_reopen(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import hub_container_executor.single_pilot_evidence as pilot_evidence
+    adapter, backend, state, manifest = make_fixture(tmp_path)
+    # Only no-effect admission is under test; no Docker or state operation runs.
+    monkeypatch.setattr(pilot_evidence, 'require_resources', lambda *_: None)
+    backend.operation_journal = SimpleNamespace(require_no_pending=lambda: None)
+    state.require_complete_reservations = lambda **_: None
+    adapter.ledger.enable_single_pilot_protocol()
+    adapter._single_pilot_protocol = True
+    denied = command(manifest, 'smoke_container')
+    path = adapter.ledger.path
+    try:
+        lost = adapter.submit(denied)
+        assert lost.state == 'held' and lost.reason == 'identity_conflict'
+        assert backend.events == [] and state.calls == []
+    finally:
+        adapter.close()
+    reopened = HostAdapter(path, manifest, backend=backend, state_provisioner=state,
+                           single_pilot_protocol=True)
+    try:
+        assert reopened.get(denied.command_id).reason == 'identity_conflict'
+        replay = reopened.submit(denied)
+        assert replay.replayed and replay.reason == 'identity_conflict'
+        other = command(manifest, 'deploy_container')
+        reopened.ledger.arm_single_pilot(other)
+        changed = denied.model_copy(update={'fencing_generation': denied.fencing_generation + 1})
+        conflict = reopened.submit(changed)
+        assert conflict.reason == 'identity_conflict' and conflict.replayed is False
+        assert conflict.command_id == changed.command_id
+        assert conflict.fencing_generation == changed.fencing_generation
+        assert reopened.ledger.inspect_single_pilot()['request']['command_id'] == other.command_id
+        assert backend.events == [] and state.calls == []
+    finally:
+        reopened.close()
+
+
+def test_single_pilot_preflight_failure_retry_does_not_admit(tmp_path):
+    from types import SimpleNamespace
+    adapter, backend, state, manifest = make_fixture(tmp_path)
+    def preflight_failure():
+        raise RuntimeError('synthetic pending journal')
+    backend.operation_journal = SimpleNamespace(require_no_pending=preflight_failure)
+    adapter.ledger.enable_single_pilot_protocol()
+    adapter._single_pilot_protocol = True
+    cmd = command(manifest, 'deploy_container')
+    try:
+        first = adapter.submit(cmd)
+        assert first.state == 'held' and first.reason == 'inspect_required'
+        assert adapter.ledger.get(cmd.command_id) is None
+        gate = adapter.ledger.inspect_single_pilot()
+        retry = adapter.submit(cmd)
+        assert retry.state == 'held' and retry.reason == 'recovery_required'
+        assert adapter.ledger.get(cmd.command_id) is None
+        assert adapter.ledger.inspect_single_pilot() == gate
+        assert backend.events == [] and state.calls == []
+    finally:
+        adapter.close()
+
+
+def test_single_pilot_state_preflight_failure_reopen_concurrent_retries_stay_held(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    import hub_container_executor.single_pilot_evidence as pilot_evidence
+
+    adapter, backend, state, manifest = make_fixture(tmp_path)
+    monkeypatch.setattr(pilot_evidence, 'require_resources', lambda *_: None)
+    checks = []
+    backend.operation_journal = SimpleNamespace(require_no_pending=lambda: checks.append('journal'))
+    def reject_reservation(**_):
+        checks.append('reservation')
+        raise RuntimeError('synthetic incomplete reservation')
+    state.require_complete_reservations = reject_reservation
+    adapter.ledger.enable_single_pilot_protocol()
+    adapter._single_pilot_protocol = True
+    cmd = command(manifest, 'deploy_container')
+    path = adapter.ledger.path
+    try:
+        first = adapter.submit(cmd)
+        assert (first.state, first.reason) == ('held', 'inspect_required')
+        gate = adapter.ledger.inspect_single_pilot()
+        assert gate == {'state': 'effect_held', 'request': cmd.model_dump(mode='json')}
+        assert checks == ['journal', 'reservation']
+        assert adapter.ledger.get(cmd.command_id) is None
+    finally:
+        adapter.close()
+
+    reopened = HostAdapter(path, manifest, backend=backend, state_provisioner=state,
+                           single_pilot_protocol=True)
+    try:
+        for inspect in (reopened.get, reopened.reconcile):
+            held = inspect(cmd.command_id)
+            assert (held.state, held.reason, held.replayed) == ('held', 'recovery_required', False)
+            assert held.command_id == cmd.command_id
+            assert inspect('00000000-0000-4000-8000-000000000000') is None
+        start = threading.Barrier(4)
+        def retry():
+            start.wait(timeout=5)
+            return reopened.submit(cmd)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            responses = list(pool.map(lambda _: retry(), range(4)))
+        assert all((r.state, r.reason, r.replayed) == ('held', 'recovery_required', False)
+                   for r in responses)
+        assert reopened.ledger.get(cmd.command_id) is None
+        assert reopened.ledger.operation_rows(cmd.command_id) == ()
+        assert reopened.ledger.inspect_single_pilot() == gate
+        assert checks == ['journal', 'reservation']
+        assert backend.events == [] and state.calls == []
+    finally:
+        reopened.close()
+
+@pytest.mark.parametrize('invalid', [None, 'baseline', 'run', 'fence', 'image', 'generation'])
+def test_opt_in_candidate_stop_checks_exact_target_before_effect(invalid):
+    """Synthetic boundaries: mismatch must issue no stop; baseline is never stopped."""
+    from types import SimpleNamespace
+    from hub_container_executor.app_cgroup_observation import AppCgroupObserver
+    from hub_container_executor.effect_response_recorder import DurableEffectResponseRecorder
+    adapter = object.__new__(HostAdapter)
+    adapter._single_pilot_protocol = True
+    adapter.effect_context_guard = TrustedEffectContextGuard(lambda _: True, lambda _: None)
+    calls = []
+    adapter.backend = SimpleNamespace(app_cgroup_observer=object.__new__(AppCgroupObserver),
+        effect_response_recorder=object.__new__(DurableEffectResponseRecorder),
+        stop_container=lambda cid, op, timeout: calls.append(('stop', cid)))
+    adapter.manifest = SimpleNamespace(candidate=SimpleNamespace(image_config_id='image'),
+                                       timeouts=SimpleNamespace(stop_ms=1000))
+    target = dict(current_run_id='run', fence=3, image_config_id='image',
+                  container_id='d'*64, generation_id='candidate')
+    baseline = SimpleNamespace(container_id='c'*64, state_generation_id='baseline')
+    if invalid == 'baseline': target['container_id'] = baseline.container_id
+    if invalid == 'run': target['current_run_id'] = 'wrong'
+    if invalid == 'fence': target['fence'] = 4
+    if invalid == 'image': target['image_config_id'] = 'wrong'
+    if invalid == 'generation': target['generation_id'] = 'baseline'
+    adapter.ledger = SimpleNamespace(target_snapshot=lambda _: target)
+    adapter._verified_image = lambda _: 'verified'
+    adapter._image_defaults = lambda *_: 'defaults'
+    adapter._profile = lambda *_: 'profile'
+    adapter._inspect_container = lambda *args: calls.append(('inspect', args[0]))
+    def effect(request, kind, callback, limit, deadline, receipt):
+        calls.append(('admit', kind))
+        assert receipt(None) == {'container_id':'d'*64, 'generation_id':'candidate', 'stopped':True}
+        callback('op', limit)
+    adapter._effect = effect
+    req = SimpleNamespace(target_id='target', run_id='run', fencing_generation=3)
+    if invalid is None:
+        adapter._stop_same_run_candidate(req, baseline, {}, 10)
+        assert calls == [('inspect','d'*64),('admit','stop'),('stop','d'*64)]
+    else:
+        with pytest.raises(adapter_module._Held):
+            adapter._stop_same_run_candidate(req, baseline, {}, 10)
+        assert calls == []

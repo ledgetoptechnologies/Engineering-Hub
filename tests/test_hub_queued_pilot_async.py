@@ -112,15 +112,24 @@ async def test_success_and_healthy_rollback_each_use_fresh_phase_and_release(cas
 async def test_changed_review_during_claim_observation_cannot_claim_another_job(case):
     await accept(case)
     task, original = submit(case)
-    submit(case, 'next')
+    _, next_job = submit(case, 'next')
     case.observation.block_at = 2
     running = asyncio.create_task(case.bridge.run_once())
     await entered(case)
     current = case.repo.get_task(task['id'])
-    case.repo.set_candidate('codex', task['id'], current['revision'], 'f' * 40)
+    # Current public transitions prevent a review change while work is open.
+    # Verify that guard first, then inject a storage-level fault to exercise
+    # the separate claim-time defense against unexpectedly changed history.
+    with pytest.raises(HubError, match='active_work_job'):
+        case.repo.set_candidate('codex', task['id'], current['revision'], 'f' * 40)
+    with case.repo._transaction() as db:
+        changed = case.repo._get(db, task['id'], 'task')
+        changed.update(candidate_commit='f' * 40, review=None, status='in_review')
+        case.repo._save(db, 'codex', 'task.candidate', 'task', changed)
     case.observation.release.set()
     assert await running is None
     assert case.queue.get_job(original['id'])['state'] == 'queued'
+    assert case.queue.get_job(next_job['id'])['state'] == 'queued'
     assert not case.client.submissions and machine_job(case) is None
 
 

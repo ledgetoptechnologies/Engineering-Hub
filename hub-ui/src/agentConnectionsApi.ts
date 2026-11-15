@@ -292,7 +292,7 @@ export function demoAgentConnections(now = Date.now()): { installations: Install
         reason: "owner_revoked", approved_at: iso(-90_000_000), approved_by: "Demo owner", revoked_at: iso(-7_200_000), revoked_by: "Demo owner", revision: 3 }),
     ],
     sessions: { "demo-claude-laptop": [
-      { id: "demo-session-1", installation_id: "demo-claude-laptop", label: "main chat", issued_at: iso(-300_000), expires_at: iso(600_000),
+      { id: "demo-session-1", installation_id: "demo-claude-laptop", label: "hub session", issued_at: iso(-300_000), expires_at: iso(600_000),
         last_used_at: iso(-20_000), state: "active", revision: 1 },
       { id: "demo-session-0", installation_id: "demo-claude-laptop", label: "", issued_at: iso(-2_000_000), expires_at: iso(-1_100_000),
         last_used_at: iso(-1_200_000), state: "expired", revision: 1 },

@@ -97,14 +97,14 @@ const panelOf = (page: Page) => page.getByRole("region", { name: "Installations"
 
 test("the panel stays hidden when this Hub has no agent-connection service", async ({ page }) => {
   await fixture(page, { capability: "missing" });
-  await page.goto("/#/agents");
-  await expect(page.getByRole("region", { name: "Hub stream observations" })).toBeVisible();
+  await page.goto("/#/agents/installations");
+  await expect(page.getByRole("heading", { level: 1, name: "Installations" })).toBeVisible();
   await expect(panelOf(page)).toHaveCount(0);
 });
 
 test("the owner sees installations by agent, a staging badge and the pairing check, never a credential", async ({ page }) => {
   await fixture(page);
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const panel = panelOf(page);
   await expect(panel.getByText("STAGING", { exact: true })).toBeVisible();
   const claude = panel.getByRole("region", { name: "Claude installations" });
@@ -112,13 +112,12 @@ test("the owner sees installations by agent, a staging badge and the pairing che
   await expect(claude.getByLabel("Pairing check")).toContainText("482913");
   await expect(claude.getByLabel("Pairing check")).toContainText("a1b2c3d4e5f60718");
   await expect(panel.getByRole("region", { name: "Hermes installations" })).toContainText("No Hermes installations yet.");
-  await expect(panel).toContainText("doesn't prove the agent is listening");
   await expect(panel).not.toContainText(/eh[is]_/);
 });
 
 test("approving needs an explicit match check and shows only what the server confirmed", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const panel = panelOf(page);
   await panel.getByRole("button", { name: "Check and approve…" }).click();
   const dialog = page.getByRole("dialog", { name: "Approve Claude on the desk PC?" });
@@ -137,7 +136,7 @@ test("approving needs an explicit match check and shows only what the server con
 test("a conflict keeps the dialog open and changes nothing", async ({ page }) => {
   const state = await fixture(page);
   state.writeStatus = 409; state.writeCode = "revision_conflict";
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   await panelOf(page).getByRole("button", { name: "Check and approve…" }).click();
   const dialog = page.getByRole("dialog", { name: /Approve/ });
   await dialog.getByLabel("I checked that computer and both match").check();
@@ -148,7 +147,7 @@ test("a conflict keeps the dialog open and changes nothing", async ({ page }) =>
 
 test("an existing timed approval changes only after explicit owner confirmation", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const row = panelOf(page).locator(".installation-row", { hasText: "Claude on the laptop" });
   await row.getByRole("button", { name: "Keep approved…", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Keep Claude on the laptop approved?" });
@@ -165,7 +164,7 @@ test("an existing timed approval changes only after explicit owner confirmation"
 
 test("disconnecting an installation needs its name, waits for the server and leaves other installations working", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const panel = panelOf(page);
   const laptop = panel.locator(".installation-row", { hasText: "Claude on the laptop" });
   await laptop.getByRole("button", { name: "Disconnect this installation…" }).click();
@@ -192,7 +191,7 @@ test("disconnecting an installation needs its name, waits for the server and lea
 
 test("ending one session keeps the installation and its other session, and never disconnects the installation", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const laptop = panelOf(page).locator(".installation-row", { hasText: "Claude on the laptop" });
   await laptop.getByRole("button", { name: "Show sessions" }).click();
   const table = laptop.getByRole("table", { name: "Sessions for Claude on the laptop" });
@@ -209,7 +208,7 @@ test("ending one session keeps the installation and its other session, and never
 
 test("someone who isn't the configured Hub owner sees no installations", async ({ page }) => {
   const state = await fixture(page, { owner: false });
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   await expect(panelOf(page)).toContainText("Only the configured Hub owner can see and manage agent installations.");
   await expect(panelOf(page).locator(".installation-row")).toHaveCount(0);
   expect(state.reads).toEqual(["GET /capabilities"]);
@@ -218,7 +217,7 @@ test("someone who isn't the configured Hub owner sees no installations", async (
 test("a lost sign-in clears the workspace", async ({ page }) => {
   const state = await fixture(page);
   state.listStatus = 401;
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   await expect(page.getByRole("link", { name: /Sign in securely/ })).toBeVisible();
   await expect(panelOf(page)).toHaveCount(0);
 });
@@ -227,7 +226,7 @@ test("a pending request runs out by this browser's clock without reading again",
   await page.clock.install({ time: new Date() });
   const state = await fixture(page);
   state.installations[1].expires_at = iso(45_000);
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const row = panelOf(page).locator(".installation-row", { hasText: "desk PC" });
   await expect(row.getByRole("button", { name: "Check and approve…" })).toBeVisible();
   const reads = state.reads.length;
@@ -239,7 +238,7 @@ test("a pending request runs out by this browser's clock without reading again",
 
 test("a pending request can be declined without approving anything", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const row = panelOf(page).locator(".installation-row", { hasText: "desk PC" });
   await row.getByRole("button", { name: "Decline…" }).click();
   const dialog = page.getByRole("dialog", { name: "Decline Claude on the desk PC?" });
@@ -253,15 +252,15 @@ test("an unsupported capability environment keeps the panel hidden instead of sh
   await fixture(page);
   await page.route("**/api/hub/v1/agent-connections/capabilities", route =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ enabled: true, environment: "preview", owner: true }) }));
-  await page.goto("/#/agents");
-  await expect(page.getByRole("region", { name: "Hub stream observations" })).toBeVisible();
+  await page.goto("/#/agents/installations");
+  await expect(page.getByRole("heading", { level: 1, name: "Installations" })).toBeVisible();
   await expect(panelOf(page)).toHaveCount(0);
   await expect(page.locator("#agents").getByRole("alert")).toHaveCount(0);
 });
 
 test("production capability keeps the owner installation panel available and identifies the environment", async ({ page }) => {
   await fixture(page, { environment: "production" });
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const panel = panelOf(page);
   await expect(panel.getByText("PRODUCTION", { exact: true })).toBeVisible();
   await expect(panel.locator(".installation-row")).toHaveCount(3);
@@ -269,7 +268,7 @@ test("production capability keeps the owner installation panel available and ide
 
 test("an older session read that answers late never replaces a newer one", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const laptop = panelOf(page).locator(".installation-row", { hasText: "Claude on the laptop" });
   state.holdSessions = true;
   await laptop.getByRole("button", { name: "Show sessions" }).click();
@@ -288,7 +287,7 @@ test("an older session read that answers late never replaces a newer one", async
 
 test("losing the right to change things disables an already-open form and sends nothing", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   // Found by its computer, since the name becomes an input while renaming.
   const row = panelOf(page).locator(".installation-row", { hasText: "beau-laptop" });
   await row.getByRole("button", { name: "Rename" }).click();
@@ -306,7 +305,7 @@ test("losing the right to change things disables an already-open form and sends 
 test("a long Unicode name that the backend accepts is shown and can be saved", async ({ page }) => {
   const state = await fixture(page);
   state.installations[0].name = "🌲".repeat(60);
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   await expect(panelOf(page)).toContainText("🌲".repeat(60));
   const laptop = panelOf(page).locator(".installation-row", { hasText: "beau-laptop" });
   await laptop.getByRole("button", { name: "Rename" }).click();
@@ -319,7 +318,7 @@ test("a long Unicode name that the backend accepts is shown and can be saved", a
 
 test("when a different person signs in on the open page, the previous owner's installations and late answers are gone", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const laptop = panelOf(page).locator(".installation-row", { hasText: "beau-laptop" });
   state.holdSessions = true;
   await laptop.getByRole("button", { name: "Show sessions" }).click();
@@ -338,7 +337,7 @@ test("when a different person signs in on the open page, the previous owner's in
 
 test("the disconnect confirmation states the live-session count only when sessions have loaded", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const laptop = panelOf(page).locator(".installation-row", { hasText: "beau-laptop" });
   // Not loaded yet: no count is claimed.
   await laptop.getByRole("button", { name: "Disconnect this installation…" }).click();
@@ -358,7 +357,7 @@ test("the disconnect confirmation states the live-session count only when sessio
 test("a session list that couldn't be read never turns into a count", async ({ page }) => {
   const state = await fixture(page);
   state.failSessions = true;
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const laptop = panelOf(page).locator(".installation-row", { hasText: "beau-laptop" });
   await laptop.getByRole("button", { name: "Show sessions" }).click();
   await expect(laptop.getByRole("alert")).toContainText("Sessions couldn't be read");
@@ -369,7 +368,7 @@ test("a session list that couldn't be read never turns into a count", async ({ p
 
 test("session and installation actions have distinct names and places", async ({ page }) => {
   await fixture(page);
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const laptop = panelOf(page).locator(".installation-row", { hasText: "beau-laptop" });
   await laptop.getByRole("button", { name: "Show sessions" }).click();
   await expect(laptop.getByRole("button", { name: "End session…" })).toHaveCount(2);
@@ -385,7 +384,7 @@ test("session and installation actions have distinct names and places", async ({
 test("pairing guidance points at this Hub's own helper downloads and opens when nothing is paired", async ({ page }) => {
   const state = await fixture(page);
   state.emptyInstallations = true;
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const guide = panelOf(page).locator("details.pairing-guide");
   await expect(guide).toHaveAttribute("open", "");
   await expect(guide.getByRole("link", { name: "helper" })).toHaveAttribute("href", "/api/agent-sessions/v1/client/agent_session_client.py");
@@ -397,7 +396,7 @@ test("pairing guidance points at this Hub's own helper downloads and opens when 
 test("production pairing guidance uses private VPN paths without browser-origin download links", async ({ page }) => {
   const state = await fixture(page, { environment: "production" });
   state.emptyInstallations = true;
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const guide = panelOf(page).locator("details.pairing-guide");
   await expect(guide).toHaveAttribute("open", "");
   await expect(guide.getByRole("link", { name: "helper" })).toHaveCount(0);
@@ -416,7 +415,7 @@ test("a read that never answers is cancelled at the deadline and reported, witho
   state.stallInstallations = true;
   const cancelled: string[] = [];
   page.on("requestfailed", request => { if (request.url().endsWith("/agent-connections/installations")) cancelled.push(request.url()); });
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   await expect(panelOf(page).getByRole("status")).toContainText("Reading installations…");
   const reads = state.reads.filter(read => read === "GET /installations").length;
   await page.clock.runFor(16_000);
@@ -430,7 +429,7 @@ test("leaving the page cancels a read that is still open", async ({ page }) => {
   state.stallInstallations = true;
   const cancelled: string[] = [];
   page.on("requestfailed", request => { if (request.url().endsWith("/agent-connections/installations")) cancelled.push(request.url()); });
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   await expect(panelOf(page).getByRole("status")).toContainText("Reading installations…");
   // In-app navigation unmounts the panel without reloading the page.
   await page.getByRole("navigation", { name: "Workspace" }).getByRole("link", { name: /^Work/ }).click();
@@ -448,7 +447,7 @@ test("when one of the paired reads fails early, the other one that is still open
   const state = await fixture(page);
   state.failInstallations = true; state.stallAudit = true;
   const audit = cancelledReads(page, "/agent-connections/audit");
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   await expect(panelOf(page).getByRole("alert")).toContainText("Agent connections couldn't be read");
   await expect.poll(() => audit.length).toBe(1);
 });
@@ -457,7 +456,7 @@ test("a newer refresh cancels the previous Hub-access catalog check", async ({ p
   const state = await fixture(page);
   state.stallCatalog = true;
   const catalog = cancelledReads(page, "/agent-connections/hub-capabilities");
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   await expect(panelOf(page).locator(".installation-row")).toHaveCount(3);
   expect(catalog).toHaveLength(0);
   await panelOf(page).getByRole("button", { name: "Refresh", exact: true }).click();
@@ -468,7 +467,7 @@ test("leaving the page cancels a session list that is still loading", async ({ p
   const state = await fixture(page);
   state.stallSessions = true;
   const sessions = cancelledReads(page, "/sessions");
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const laptop = panelOf(page).locator(".installation-row", { hasText: "beau-laptop" });
   await laptop.getByRole("button", { name: "Show sessions" }).click();
   await expect(laptop.getByRole("status")).toContainText("Reading sessions…");
@@ -479,7 +478,7 @@ test("leaving the page cancels a session list that is still loading", async ({ p
 
 test("someone without the owner's Hub sign-in gets a way to sign in, without promising ownership", async ({ page }) => {
   await fixture(page, { owner: false });
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const link = panelOf(page).getByRole("link", { name: "sign in to this Hub" });
   await expect(link).toHaveAttribute("href", "/api/hub/v1/auth/login");
   await expect(panelOf(page)).toContainText("Managing installations needs the configured owner's own Hub sign-in on this Hub.");
@@ -490,7 +489,7 @@ test("someone without the owner's Hub sign-in gets a way to sign in, without pro
 for (const variant of ["hangs", "fails"] as const) test(`a Refresh that ${variant} cancels an open session read, and its late answer or 401 never lands`, async ({ page }) => {
   const state = await fixture(page);
   const sessions = cancelledReads(page, "/sessions");
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const laptop = panelOf(page).locator(".installation-row", { hasText: "beau-laptop" });
   state.holdSessions = true;
   await laptop.getByRole("button", { name: "Show sessions" }).click();

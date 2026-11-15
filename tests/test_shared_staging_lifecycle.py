@@ -101,7 +101,7 @@ async def test_auto_run_starts_modular_after_both_ready_and_shared_open(tmp_path
     async with lifecycle_case(tmp_path, auto_run=True) as case:
         await pending(case)
         await case.lifecycle.recover_and_open()
-        submitted = await case.modular.submit('codex', payload())
+        submitted = await case.modular.submit('codex', payload(case.repo))
         await until(lambda: case.queue.get_job(submitted['job']['id'])['state'] == 'succeeded')
         assert case.modular_client.posts == 1 and case.runtime.status['running']
 
@@ -141,7 +141,7 @@ async def test_application_guard_rejects_forged_or_foreign_context(tmp_path):
 async def create_held(path):
     with joint_case(path) as initial:
         initial.modular_client.lost_ack = True
-        submitted = await initial.modular.submit('codex', payload())
+        submitted = await initial.modular.submit('codex', payload(initial.repo))
         assert (await initial.modular.run_once())['job']['state'] == 'held'
         clients = initial.client, initial.modular_client
         identity = submitted['job']['id']
@@ -198,6 +198,74 @@ async def test_cancelled_caller_does_not_abandon_accepted_recovery(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('unexpected', [False, True])
+@pytest.mark.parametrize('async_mode', [False, True])
+async def test_shutdown_distinguishes_pilot_preclaim_veto_from_failure(tmp_path, monkeypatch, unexpected, async_mode):
+    async with lifecycle_case(tmp_path) as case:
+        entered, release = asyncio.Event(), asyncio.Event()
+        case.releases.append(release)
+        original = case.bridge.run_once
+
+        async def delayed_preclaim():
+            entered.set()
+            await release.wait()
+            if unexpected:
+                raise HubError('execution_policy_admission_closed', 409)
+            return await original()
+
+        monkeypatch.setattr(case.bridge, 'run_once', delayed_preclaim)
+        await pending(case)
+        await case.lifecycle.recover_and_open()
+        await asyncio.wait_for(entered.wait(), 5)
+        closing = asyncio.create_task(case.lifecycle.close())
+        await until(lambda: case.runtime._claims_suspended)
+        assert not closing.done() and not case.policies._open
+        if async_mode:
+            # Select the async entry point only after shutdown has vetoed
+            # admission; its first guard must run before any observation.
+            monkeypatch.setattr(type(case.bridge), 'async_admission_required', property(lambda _: True))
+        release.set()
+        if unexpected:
+            with pytest.raises(HubError, match='shared_staging_shutdown_failed'):
+                await closing
+            assert case.lifecycle.status['state'] == 'shutdown_failed'
+        else:
+            await closing
+            assert case.lifecycle.status['state'] == 'stopped'
+        assert case.lifecycle.is_drained and case.client.submissions == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_reports_same_code_failure_after_pilot_claim(tmp_path, monkeypatch):
+    async with lifecycle_case(tmp_path) as case:
+        entered, release = asyncio.Event(), asyncio.Event()
+        case.releases.append(release)
+
+        async def failing_advance(_run_id):
+            entered.set()
+            await release.wait()
+            raise RuntimeError('simulated accepted work failure')
+
+        def failing_hold(_job):
+            raise HubError('execution_policy_admission_closed', 409)
+
+        monkeypatch.setattr(case.bridge.workflow, 'advance', failing_advance)
+        monkeypatch.setattr(case.bridge, '_hold', failing_hold)
+        await pending(case)
+        await case.lifecycle.recover_and_open()
+        _, job = submit(case)
+        await asyncio.wait_for(entered.wait(), 5)
+        assert case.queue.get_job(job['id'])['state'] == 'claimed'
+        closing = asyncio.create_task(case.lifecycle.close())
+        await until(lambda: case.runtime._claims_suspended)
+        release.set()
+        with pytest.raises(HubError, match='shared_staging_shutdown_failed'):
+            await closing
+        assert case.lifecycle.status['state'] == 'shutdown_failed'
+        assert case.lifecycle.is_drained
+
+
+@pytest.mark.asyncio
 async def test_shutdown_drains_accepted_modular_before_client_or_owner_close(tmp_path):
     async with lifecycle_case(tmp_path) as case:
         await pending(case); await case.lifecycle.recover_and_open()
@@ -206,7 +274,7 @@ async def test_shutdown_drains_accepted_modular_before_client_or_owner_close(tmp
         async def blocked(request):
             entered.set(); await release.wait(); return await original(request)
         case.modular_client.submit = blocked
-        await case.modular.submit('codex', payload())
+        await case.modular.submit('codex', payload(case.repo))
         running = asyncio.create_task(case.modular.run_once())
         await entered.wait()
         caller = asyncio.create_task(case.lifecycle.close())
@@ -224,7 +292,7 @@ async def test_shutdown_drains_accepted_modular_before_client_or_owner_close(tmp
 @pytest.mark.asyncio
 async def test_other_live_worker_lease_is_not_inspected_adopted_or_expired(tmp_path):
     with joint_case(tmp_path) as initial:
-        submitted = await initial.modular.submit('codex', payload())
+        submitted = await initial.modular.submit('codex', payload(initial.repo))
         claim = initial.queue.claim(worker=initial.modular.worker,
             action_keys=tuple(initial.modular.actions.values()), lease_seconds=600)
         identity = submitted['job']['id']
@@ -265,7 +333,7 @@ async def test_shutdown_retains_actual_work_after_identity_drift_and_closes_orig
         async def blocked(request):
             entered.set(); await release.wait(); return await original(request)
         case.modular_client.submit = blocked
-        await case.modular.submit('codex', payload())
+        await case.modular.submit('codex', payload(case.repo))
         running = asyncio.create_task(case.modular.run_once())
         await entered.wait()
         if drift == 'runtime-feed': case.runtime.feed = object()
@@ -299,7 +367,7 @@ async def test_listener_veto_never_closes_client_before_external_http_upload_dra
         case.modular_client.put_source = upload
         # This direct upload represents an accepted HTTP request not contained
         # in controller.inflight. Actual server request drain is tested elsewhere.
-        request = asyncio.create_task(case.modular.submit('codex', payload()))
+        request = asyncio.create_task(case.modular.submit('codex', payload(case.repo)))
         await entered.wait()
         assert not case.modular.inflight
         assert case.lifecycle.close_admission() is None

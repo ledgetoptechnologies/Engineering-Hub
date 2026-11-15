@@ -333,6 +333,17 @@ def browser(case, tmp_path, monkeypatch):
         yield client, login, case
 
 
+def test_optional_session_acceptance_openapi_body(browser):
+    client, _, _ = browser
+    operation = client.app.openapi()['paths'][BASE]['post']
+    body = operation['requestBody']
+    assert body['required'] is True
+    schema = body['content']['application/json']['schema']
+    assert set(schema['required']) == {'request_id', 'expected_revision', 'action'}
+    assert schema['additionalProperties'] is False
+    assert schema['properties']['action']['enum'] == ['accept', 'decline']
+
+
 def test_actual_cloudflare_human_csrf_and_separately_pinned_operator(browser):
     client, login, c = browser
     assert client.get(BASE).status_code == 401

@@ -14,7 +14,21 @@ import time
 import uuid
 import zipfile
 
+# Independent development interlock for direct worker POSTs. Existing status
+# and recovery reads remain available. Do not enable before protocol review.
+_PROFILE_PROTOCOL_READY = False
+PROFILE_PROTOCOL = 'hub-staging-profile.v2'
+
 MAX_ARCHIVE = 8 * 1024 * 1024
+# This observation is not an authenticated ledger epoch or authority to retry.
+_SOURCE_EVIDENCE_ENABLED = False
+# Experimental receiver record only; does not confer worker or epoch authority.
+_SOURCE_ATTEMPT_ENABLED = False
+_SOURCE_ATTEMPT_LIMIT = 4096
+_SOURCE_ATTEMPT_INTERNAL = object()  # Same-process routing, not a security capability.
+_SOURCE_ATTEMPT_DDL = ("CREATE TABLE source_attempts (source_id TEXT PRIMARY KEY, "
+                       "project TEXT NOT NULL, digest TEXT NOT NULL, binding TEXT NOT NULL, "
+                       "state TEXT NOT NULL, source_inode INTEGER, source_created REAL)")
 MAX_EXPANDED = 64 * 1024 * 1024
 KINDS = ('workspace', 'build', 'test_run', 'preview')
 TERMINAL = ('succeeded', 'failed')
@@ -157,18 +171,21 @@ def tree_manifest(path, limit):
     return result, total
 
 
-def make_job_readable(path, limit):
+def make_job_readable(path, limit, *, executable_paths=frozenset()):
     """Validate an owned immutable tree before exposing it via a read-only bind.
 
     Rootless Docker maps the host owner to container root; the configured job
     UID therefore needs read/traverse bits. Only this resource tree changes;
     its private worker/resource ancestors remain inaccessible to other hosts.
     """
-    tree_manifest(path, limit)
+    manifest, _ = tree_manifest(path, limit)
+    ensure(type(executable_paths) is frozenset and executable_paths <= manifest.keys(),
+           'invalid_source_executable_paths')
     for directory, dirs, files in os.walk(path, followlinks=False):
         Path(directory).chmod(0o755)
         for name in files:
-            (Path(directory) / name).chmod(0o644)
+            item = Path(directory) / name
+            item.chmod(0o755 if item.relative_to(path).as_posix() in executable_paths else 0o644)
 
 
 def terminal_receipt_config(value, worker_root):
@@ -244,6 +261,9 @@ class Service:
             CREATE TABLE IF NOT EXISTS sources (
                 id TEXT PRIMARY KEY, project TEXT NOT NULL, digest TEXT NOT NULL,
                 bytes INTEGER NOT NULL, inode INTEGER NOT NULL, created REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS source_bindings (
+                source_id TEXT PRIMARY KEY, source_inode INTEGER NOT NULL,
+                source_created REAL NOT NULL, binding TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS terminal_receipts (
                 command_id TEXT PRIMARY KEY, slot_id TEXT NOT NULL UNIQUE,
                 root TEXT NOT NULL, capture TEXT NOT NULL, binding TEXT NOT NULL);
@@ -479,33 +499,349 @@ class Service:
         ensure(used + extra <= self.capacity_bytes and shutil.disk_usage(self.root).free >= extra + self.free_floor_bytes,
                'worker_storage_capacity', 409)
 
-    def put_source(self, payload):
-        ensure(isinstance(payload, dict) and set(payload) == {'source_id', 'project', 'source_digest', 'source_zip_base64'},
-               'source_schema')
+    def _legacy_put_source(self, payload, *, _attempt_owner=None):
+        fields = {'source_id', 'project', 'source_digest', 'source_zip_base64'}
+        ensure(isinstance(payload, dict) and set(payload) in
+               (fields, fields | {'source_commit', 'source_commit_object_base64'}), 'source_schema')
         source_id = identifier(payload['source_id'])
         ensure(payload['project'] in self.projects, 'project_not_allowed', 403)
         raw = archive(payload['source_zip_base64'])
         digest = hashlib.sha256(raw).hexdigest()
         ensure(payload['source_digest'] == digest, 'source_digest_mismatch')
         extract(raw)  # Includes complete CRC/readback and expansion checks before deposit.
+        binding = None
+        if 'source_commit' in payload:
+            from .source_provenance import verify
+            try:
+                binding = verify(raw, payload['source_commit_object_base64'], payload['source_commit'])
+            except ValueError:
+                raise Rejected('source_binding_invalid') from None
+        binding_json = json.dumps(binding, sort_keys=True, separators=(',', ':')) if binding is not None else None
         with self.lock:
             row = self.db.execute('SELECT * FROM sources WHERE id=?', (source_id,)).fetchone()
             if row:
-                ensure(row['project'] == payload['project'] and row['digest'] == digest, 'source_identity_conflict', 409)
-                self._source(source_id, payload['project'], digest)
+                # Keep the original legacy retry path when the experimental
+                # table does not exist. A separate process introducing tables
+                # concurrently is outside the single-owner worker contract.
+                attempt_schema = self.db.execute("SELECT 1 FROM sqlite_master WHERE name='source_attempts'").fetchone()
+                if attempt_schema is None and _attempt_owner is None:
+                    ensure(row['project'] == payload['project'] and row['digest'] == digest
+                           and self._source_binding(source_id, payload['project'], digest) == binding,
+                           'source_identity_conflict', 409)
+                    self._source(source_id, payload['project'], digest)
+                else:
+                    self.db.execute('BEGIN IMMEDIATE')
+                    try:
+                        self._guard_source_attempt(source_id, payload['project'], digest, binding_json, _attempt_owner)
+                        ensure(_attempt_owner is None, 'source_attempt_conflict', 409)
+                        row = self.db.execute('SELECT * FROM sources WHERE id=?', (source_id,)).fetchone()
+                        ensure(row is not None and row['project'] == payload['project'] and row['digest'] == digest,
+                               'source_identity_conflict', 409)
+                        prior = self.db.execute('SELECT source_inode,source_created FROM source_bindings WHERE source_id=?',
+                                                (source_id,)).fetchone()
+                        # _source_binding deletes and commits a stale binding.
+                        # Never let it end the attempt guard's writer early.
+                        ensure(prior is None or (prior['source_inode'] == row['inode'] and prior['source_created'] == row['created']),
+                               'source_identity_conflict', 409)
+                        ensure(self._source_binding(source_id, payload['project'], digest) == binding,
+                               'source_identity_conflict', 409)
+                        self._source(source_id, payload['project'], digest)
+                        self.db.commit()
+                    except Exception:
+                        self.db.rollback()
+                        raise
             else:
                 ensure(self._receipt_fault is None, 'terminal_receipt_recovery_required', 409)
+                # Check before cleanup as well as at the effect transaction:
+                # a reserved ID must not cause unrelated source collection.
+                self.db.execute('BEGIN IMMEDIATE')
+                try:
+                    self._guard_source_attempt(source_id, payload['project'], digest, binding_json, _attempt_owner)
+                    self.db.commit()
+                except Exception:
+                    self.db.rollback()
+                    raise
                 self.cleanup_sources()
                 self._capacity(len(raw))
                 path = self.sources / (source_id + '.zip')
                 ensure(not path.exists() and not path.is_symlink(), 'source_path_conflict', 409)
-                with path.open('xb') as stream:
-                    stream.write(raw); stream.flush(); os.fsync(stream.fileno())
-                path.chmod(0o600)
-                self.db.execute('INSERT INTO sources VALUES (?,?,?,?,?,?)',
-                    (source_id, payload['project'], digest, len(raw), path.stat().st_ino, time.time()))
+                created_inode = None
+                self.db.execute('BEGIN IMMEDIATE')
+                try:
+                    self._guard_source_attempt(source_id, payload['project'], digest, binding_json, _attempt_owner)
+                    if _attempt_owner is _SOURCE_ATTEMPT_INTERNAL:
+                        ensure(self.db.execute('SELECT 1 FROM source_bindings WHERE source_id=?', (source_id,)).fetchone() is None,
+                               'source_attempt_conflict', 409)
+                    # A previous worker does not enable SQLite foreign keys,
+                    # so its exact legacy DELETE may leave this one orphan.
+                    # Absence of the source row makes this binding stale.
+                    self.db.execute('DELETE FROM source_bindings WHERE source_id=?', (source_id,))
+                    with path.open('xb') as stream:
+                        created_inode = os.fstat(stream.fileno()).st_ino
+                        stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+                    path.chmod(0o600)
+                    created_at = time.time()
+                    self.db.execute('INSERT INTO sources VALUES (?,?,?,?,?,?)',
+                        (source_id, payload['project'], digest, len(raw), created_inode, created_at))
+                    if binding_json is not None:
+                        self.db.execute('INSERT INTO source_bindings '
+                            '(source_id,source_inode,source_created,binding) VALUES (?,?,?,?)',
+                            (source_id, created_inode, created_at, binding_json))
+                    self.db.commit()
+                except Exception:
+                    self.db.rollback()
+                    if (created_inode is not None and not path.is_symlink() and path.exists()
+                            and path.stat().st_ino == created_inode):
+                        path.unlink()
+                    raise
+            result = {'source_id': source_id, 'source_digest': digest, 'size_bytes': len(raw),
+                      'project': payload['project']}
+            if binding is not None:
+                result['source_binding'] = binding
+            return result
+
+
+    def put_source(self, payload):
+        if isinstance(payload, dict) and 'profile_protocol' in payload:
+            return self._put_source_v2(payload)
+        return self._legacy_put_source(payload)
+
+    def _put_source_v2(self, payload):
+        ensure(_PROFILE_PROTOCOL_READY, 'profile_protocol_unavailable', 503)
+        fields = {'source_id', 'project', 'source_digest', 'source_zip_base64',
+                  'source_commit', 'source_commit_object_base64', 'profile_protocol'}
+        ensure(type(payload) is dict and set(payload) == fields
+               and payload['profile_protocol'] == PROFILE_PROTOCOL, 'source_schema')
+        with self.lock:
+            ensure(_PROFILE_PROTOCOL_READY, 'profile_protocol_unavailable', 503)
+            return self.put_source_attempt({key: value for key, value in payload.items() if key != 'profile_protocol'})
+
+    def _source_attempt_schema(self):
+        """Validate the experimental journal before trusting its contents."""
+        row = self.db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='source_attempts'").fetchone()
+        if row is None:
+            self.db.execute(_SOURCE_ATTEMPT_DDL)
+            row = self.db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='source_attempts'").fetchone()
+        ensure(row is not None and row['sql'] == _SOURCE_ATTEMPT_DDL, 'source_attempt_journal_invalid', 503)
+        extras = self.db.execute("SELECT type FROM sqlite_master WHERE tbl_name='source_attempts' "
+                                 "AND type IN ('trigger','index') AND name NOT LIKE 'sqlite_autoindex_%'").fetchall()
+        ensure(not extras, 'source_attempt_journal_invalid', 503)
+
+    def _guard_source_attempt(self, source_id, project, digest, binding_json, owner):
+        """Called under the effect writer transaction; v1 cannot adopt v2 IDs."""
+        objects = self.db.execute("SELECT type FROM sqlite_master WHERE name='source_attempts'").fetchall()
+        if not objects:
+            ensure(owner is None, 'source_attempt_journal_invalid', 503)
+            return False
+        ensure(len(objects) == 1 and objects[0]['type'] == 'table', 'source_attempt_journal_invalid', 503)
+        self._source_attempt_schema()
+        row = self.db.execute('SELECT * FROM source_attempts WHERE source_id=?', (source_id,)).fetchone()
+        if owner is None:
+            ensure(row is None, 'source_attempt_reserved', 409)
+        else:
+            ensure(owner is _SOURCE_ATTEMPT_INTERNAL and row is not None and
+                   (row['project'], row['digest'], row['binding'], row['state']) ==
+                   (project, digest, binding_json, 'uncertain'), 'source_attempt_journal_invalid', 503)
+        return True
+
+    def _require_observed_source_attempt(self, payload):
+        """Admission check only; does not prove peer epoch or host fencing."""
+        objects = self.db.execute("SELECT type FROM sqlite_master WHERE name='source_attempts'").fetchall()
+        ensure(len(objects) == 1 and objects[0]['type'] == 'table', 'source_attempt_required', 409)
+        self._source_attempt_schema()
+        attempt = self.db.execute('SELECT * FROM source_attempts WHERE source_id=?', (payload['source_id'],)).fetchone()
+        source = self.db.execute('SELECT * FROM sources WHERE id=?', (payload['source_id'],)).fetchone()
+        binding = self.db.execute('SELECT * FROM source_bindings WHERE source_id=?', (payload['source_id'],)).fetchone()
+        canonical = json.dumps(payload['expected_source_binding'], sort_keys=True, separators=(',', ':'))
+        ensure(attempt is not None and source is not None and binding is not None
+               and (attempt['project'], attempt['digest'], attempt['binding'], attempt['state']) ==
+                   (payload['project'], payload['source_digest'], canonical, 'historical_observation')
+               and (source['project'], source['digest'], source['inode'], source['created']) ==
+                   (payload['project'], payload['source_digest'], attempt['source_inode'], attempt['source_created'])
+               and (binding['binding'], binding['source_inode'], binding['source_created']) ==
+                   (canonical, source['inode'], source['created']), 'source_attempt_required', 409)
+
+    def put_source_attempt(self, payload):
+        """Record an original attempt before an experimental deposit; never replay it.
+
+        The persistent record is evidence only. It does not authenticate this
+        process, exclude other writers, authorize a hold release or prove that
+        an absent attempt had no effect. Unknown states are retained indefinitely.
+        """
+        ensure(_SOURCE_ATTEMPT_ENABLED and _PROFILE_PROTOCOL_READY, 'source_attempt_unavailable', 503)
+        fields = {'source_id', 'project', 'source_digest', 'source_zip_base64',
+                  'source_commit', 'source_commit_object_base64'}
+        ensure(type(payload) is dict and set(payload) == fields, 'source_attempt_schema')
+        source_id = identifier(payload['source_id'])
+        ensure(type(payload['project']) is str and payload['project'] in self.projects, 'project_not_allowed', 403)
+        raw = archive(payload['source_zip_base64'])
+        digest = hashlib.sha256(raw).hexdigest()
+        ensure(payload['source_digest'] == digest, 'source_digest_mismatch')
+        extract(raw)
+        from .source_provenance import verify
+        try:
+            binding = verify(raw, payload['source_commit_object_base64'], payload['source_commit'])
+        except ValueError:
+            raise Rejected('source_binding_invalid') from None
+        canonical = json.dumps(binding, sort_keys=True, separators=(',', ':'))
+        with self.lock:
+            ensure(_SOURCE_ATTEMPT_ENABLED and _PROFILE_PROTOCOL_READY, 'source_attempt_unavailable', 503)
+            # Existing terminal-receipt uncertainty is a veto on every new
+            # mutation, including the pre-effect attempt record itself.
+            ensure(self._receipt_fault is None, 'terminal_receipt_recovery_required', 409)
+            self.db.execute('BEGIN IMMEDIATE')
+            try:
+                self._source_attempt_schema()
+                previous = self.db.execute('SELECT * FROM source_attempts WHERE source_id=?', (source_id,)).fetchone()
+                if previous is not None:
+                    ensure((previous['project'], previous['digest'], previous['binding']) ==
+                           (payload['project'], digest, canonical), 'source_attempt_conflict', 409)
+                    # Even a completed response is not replayed or presented as
+                    # live worker authority. Recovery must inspect the original.
+                    raise Rejected('source_attempt_unknown', 409)
+                ensure(self.db.execute('SELECT COUNT(*) FROM source_attempts').fetchone()[0] < _SOURCE_ATTEMPT_LIMIT,
+                       'source_attempt_capacity', 409)
+                ensure(self.db.execute('SELECT 1 FROM sources WHERE id=?', (source_id,)).fetchone() is None
+                       and self.db.execute('SELECT 1 FROM source_bindings WHERE source_id=?', (source_id,)).fetchone() is None
+                       and not (self.sources / (source_id + '.zip')).exists()
+                       and not (self.sources / (source_id + '.zip')).is_symlink(), 'source_attempt_conflict', 409)
+                self.db.execute('INSERT INTO source_attempts VALUES(?,?,?,?,?,?,?)',
+                                (source_id, payload['project'], digest, canonical, 'uncertain', None, None))
+                stored = self.db.execute('SELECT * FROM source_attempts WHERE source_id=?', (source_id,)).fetchone()
+                ensure(stored is not None and tuple(stored) == (source_id, payload['project'], digest, canonical, 'uncertain', None, None),
+                       'source_attempt_journal_invalid', 503)
                 self.db.commit()
-            return {'source_id': source_id, 'source_digest': digest, 'size_bytes': len(raw), 'project': payload['project']}
+            except Exception:
+                self.db.rollback()
+                raise
+            # Recheck even while holding the worker's process-local lock. A
+            # separate DB writer is outside this prototype's trust boundary.
+            ensure(self.db.execute('SELECT 1 FROM source_bindings WHERE source_id=?', (source_id,)).fetchone() is None,
+                   'source_attempt_conflict', 409)
+            receipt = self._legacy_put_source(payload, _attempt_owner=_SOURCE_ATTEMPT_INTERNAL)
+            # Confirming the local effect is not proof of process identity or
+            # external quiescence. Failure here leaves the original uncertain.
+            self.db.execute('BEGIN IMMEDIATE')
+            try:
+                self._source_attempt_schema()
+                source = self.db.execute('SELECT * FROM sources WHERE id=?', (source_id,)).fetchone()
+                source_binding = self.db.execute('SELECT * FROM source_bindings WHERE source_id=?', (source_id,)).fetchone()
+                ensure(source is not None and source_binding is not None and source['project'] == payload['project']
+                       and source['digest'] == digest and source_binding['binding'] == canonical
+                       and source_binding['source_inode'] == source['inode'] and source_binding['source_created'] == source['created'],
+                       'source_attempt_conflict', 409)
+                changed = self.db.execute("UPDATE source_attempts SET state='historical_observation',source_inode=?,source_created=? WHERE source_id=? "
+                    "AND project=? AND digest=? AND binding=? AND state='uncertain'",
+                    (source['inode'], source['created'], source_id, payload['project'], digest, canonical)).rowcount
+                ensure(changed == 1, 'source_attempt_journal_invalid', 503)
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+            return {'authority': 'observation_only', 'state': 'historical_observation', **receipt}
+
+    def source_attempt(self, source_id, project):
+        """Read retained local attempt metadata without authorizing any action."""
+        ensure(_SOURCE_ATTEMPT_ENABLED, 'source_attempt_unavailable', 503)
+        identifier(source_id)
+        ensure(type(project) is str and project in self.projects, 'project_not_allowed', 403)
+        with self.lock:
+            # Read-only GET does not create a schema for a never-used feature.
+            row = self.db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='source_attempts'").fetchone()
+            if row is None:
+                return {'state': 'unknown', 'authority': 'observation_only'}
+            self._source_attempt_schema()
+            row = self.db.execute('SELECT * FROM source_attempts WHERE source_id=?', (source_id,)).fetchone()
+            if row is None or row['project'] != project or row['state'] not in ('uncertain', 'historical_observation'):
+                return {'state': 'unknown', 'authority': 'observation_only'}
+            return {'state': row['state'], 'authority': 'observation_only', 'source_id': source_id,
+                    'project': project, 'source_digest': row['digest'], 'source_binding': json.loads(row['binding'])}
+
+    def source_evidence(self, source_id, project, digest, expected_binding):
+        """Read one source observation; absence never proves a POST had no effect.
+
+        A present observation does not identify a worker incarnation or grant
+        permission to release a hold. No journal, files, or bindings are changed.
+        """
+        ensure(_SOURCE_EVIDENCE_ENABLED, 'source_evidence_unavailable', 503)
+        identifier(source_id)
+        ensure(type(project) is str and project in self.projects, 'project_not_allowed', 403)
+        ensure(type(digest) is str and re.fullmatch(r'[0-9a-f]{64}', digest), 'invalid_source_digest')
+        ensure(type(expected_binding) is dict and set(expected_binding) == {'scheme', 'commit_oid', 'tree_oid',
+               'archive_sha256', 'commit_object_sha256', 'expanded_bytes', 'entries'}
+               and expected_binding.get('scheme') == 'git-sha1-tree-v1'
+               and all(type(expected_binding.get(key)) is str and re.fullmatch(r'[0-9a-f]{40}', expected_binding[key])
+                       for key in ('commit_oid', 'tree_oid'))
+               and all(type(expected_binding.get(key)) is str and re.fullmatch(r'[0-9a-f]{64}', expected_binding[key])
+                       for key in ('archive_sha256', 'commit_object_sha256'))
+               and expected_binding['archive_sha256'] == digest
+               and type(expected_binding['expanded_bytes']) is int and 0 <= expected_binding['expanded_bytes'] <= MAX_EXPANDED
+               and type(expected_binding['entries']) is int and 1 <= expected_binding['entries'] <= 5000,
+               'invalid_source_binding')
+        unknown = {'state': 'unknown', 'authority': 'observation_only'}
+        with self.lock:
+            try:
+                row = self.db.execute('SELECT * FROM sources WHERE id=?', (source_id,)).fetchone()
+                if row is None:
+                    return unknown
+                if row['project'] != project or row['digest'] != digest:
+                    return {'state': 'conflict', 'authority': 'observation_only'}
+                binding_row = self.db.execute('SELECT * FROM source_bindings WHERE source_id=?', (source_id,)).fetchone()
+                if (binding_row is None or binding_row['source_inode'] != row['inode']
+                        or binding_row['source_created'] != row['created']
+                        or type(row['bytes']) is not int or not 0 < row['bytes'] <= MAX_ARCHIVE):
+                    return unknown
+                def unique(pairs):
+                    result = {}
+                    for key, value in pairs:
+                        if key in result:
+                            raise ValueError('duplicate binding key')
+                        result[key] = value
+                    return result
+                binding = json.loads(binding_row['binding'], object_pairs_hook=unique)
+                if (type(binding) is not dict or set(binding) != {'scheme', 'commit_oid', 'tree_oid',
+                        'archive_sha256', 'commit_object_sha256', 'expanded_bytes', 'entries'}
+                        or binding.get('scheme') != 'git-sha1-tree-v1'
+                        or any(type(binding.get(key)) is not str or re.fullmatch(r'[0-9a-f]{40}', binding[key]) is None
+                               for key in ('commit_oid', 'tree_oid'))
+                        or any(type(binding.get(key)) is not str or re.fullmatch(r'[0-9a-f]{64}', binding[key]) is None
+                               for key in ('archive_sha256', 'commit_object_sha256'))
+                        or binding['archive_sha256'] != digest
+                        or type(binding['expanded_bytes']) is not int or not 0 <= binding['expanded_bytes'] <= MAX_EXPANDED
+                        or type(binding['entries']) is not int or not 1 <= binding['entries'] <= 5000):
+                    return unknown
+                if binding != expected_binding:
+                    return {'state': 'conflict', 'authority': 'observation_only'}
+                if not all(hasattr(os, name) for name in ('O_NOFOLLOW', 'O_DIRECTORY', 'O_NONBLOCK')):
+                    return unknown
+                directory = os.open(self.sources, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    fd = os.open(source_id + '.zip', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+                    try:
+                        before = os.fstat(fd)
+                        if not stat.S_ISREG(before.st_mode) or before.st_ino != row['inode'] or before.st_size != row['bytes']:
+                            return unknown
+                        with os.fdopen(fd, 'rb', closefd=False) as stream:
+                            raw = stream.read(MAX_ARCHIVE + 1)
+                        after = os.fstat(fd)
+                        linked = os.stat(source_id + '.zip', dir_fd=directory, follow_symlinks=False)
+                        if (len(raw) != row['bytes'] or hashlib.sha256(raw).hexdigest() != digest
+                                or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                                or (linked.st_dev, linked.st_ino) != (after.st_dev, after.st_ino)):
+                            return unknown
+                    finally:
+                        os.close(fd)
+                finally:
+                    os.close(directory)
+                from .source_provenance import verify_tree_binding
+                verify_tree_binding(raw, binding)
+                return {'state': 'present', 'authority': 'observation_only',
+                        'binding_assurance': 'journal_match_tree_checked', 'source_id': source_id,
+                        'project': project, 'source_digest': digest, 'size_bytes': len(raw),
+                        'source_binding': binding}
+            except (OSError, ValueError, TypeError, KeyError, sqlite3.Error):
+                return unknown
 
     def _source(self, source_id, project, digest):
         identifier(source_id)
@@ -517,6 +853,47 @@ class Service:
         raw = path.read_bytes()
         ensure(hashlib.sha256(raw).hexdigest() == digest, 'source_identity_drift', 409)
         return raw
+
+    def _source_binding(self, source_id, project, digest):
+        row = self.db.execute('SELECT * FROM sources WHERE id=?', (identifier(source_id),)).fetchone()
+        ensure(row is not None and row['project'] == project and row['digest'] == digest,
+               'source_not_registered', 404)
+        binding_row = self.db.execute('SELECT source_inode,source_created,binding FROM source_bindings WHERE source_id=?',
+                                      (source_id,)).fetchone()
+        if binding_row is None:
+            return None
+        if (binding_row['source_inode'] != row['inode']
+                or binding_row['source_created'] != row['created']):
+            # The older worker can delete and recreate a source with the same
+            # UUID without knowing this side table. The file-incarnation facts
+            # prevent attaching the previous proof to that new unverified row.
+            self.db.execute('DELETE FROM source_bindings WHERE source_id=?', (source_id,))
+            self.db.commit()
+            return None
+        try:
+            value = json.loads(binding_row['binding'])
+        except (ValueError, TypeError):
+            raise Rejected('source_binding_corrupt', 409) from None
+        ensure(type(value) is dict, 'source_binding_corrupt', 409)
+        return value
+
+    def _source_binding_readonly(self, source_id, project, digest):
+        """Read a binding without deleting or committing stale state."""
+        row = self.db.execute('SELECT * FROM sources WHERE id=?', (identifier(source_id),)).fetchone()
+        ensure(row is not None and row['project'] == project and row['digest'] == digest,
+               'source_not_registered', 404)
+        bound = self.db.execute('SELECT source_inode,source_created,binding FROM source_bindings WHERE source_id=?',
+                                (source_id,)).fetchone()
+        if bound is None:
+            return None
+        ensure(bound['source_inode'] == row['inode'] and bound['source_created'] == row['created'],
+               'source_binding_corrupt', 409)
+        try:
+            value = json.loads(bound['binding'])
+        except (ValueError, TypeError):
+            raise Rejected('source_binding_corrupt', 409) from None
+        ensure(type(value) is dict, 'source_binding_corrupt', 409)
+        return value
 
     def cleanup_sources(self, now=None):
         """Collect expired owned deposits after every referencing job is retired.
@@ -541,6 +918,7 @@ class Service:
                 ensure(not path.is_symlink() and path.is_file() and path.stat().st_ino == row['inode'], 'source_cleanup_identity_drift', 409)
                 path.unlink()
                 self.db.execute('DELETE FROM sources WHERE id=?', (row['id'],))
+                self.db.execute('DELETE FROM source_bindings WHERE source_id=?', (row['id'],))
                 self.db.commit()
 
     def _source_job_retired(self, source, operation, payload):
@@ -578,9 +956,14 @@ class Service:
         return {'command_id': row['command_id'], 'job_id': row['job_id'], 'state': row['state'],
                 'result': json.loads(row['result'])}
 
-    def submit(self, payload):
+    def _legacy_submit(self, payload):
         fields = {'job_id', 'command_id', 'idempotency_key', 'project', 'recipe', 'source_commit', 'source_digest', 'resource_ids'}
-        ensure(isinstance(payload, dict) and set(payload) in (fields | {'source_id'}, fields | {'source_zip_base64'}), 'job_schema')
+        legacy = (fields | {'source_id'}, fields | {'source_zip_base64'})
+        bound = fields | {'source_id', 'require_source_binding', 'expected_source_binding'}
+        ensure(isinstance(payload, dict) and set(payload) in (*legacy, bound), 'job_schema')
+        if 'require_source_binding' in payload:
+            ensure(payload['require_source_binding'] is True and type(payload['expected_source_binding']) is dict,
+                   'job_schema')
         identifier(payload['job_id']); identifier(payload['command_id'])
         ensure(isinstance(payload['idempotency_key'], str) and 0 < len(payload['idempotency_key']) <= 128,
                'invalid_idempotency_key')
@@ -596,8 +979,34 @@ class Service:
             identity, existing = self._operation(payload['command_id'], payload)
             if existing:
                 return existing
+            attempt_schema = False
+            if ('source_id' in payload and self.db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='source_attempts'").fetchone() is not None):
+                self.db.execute('BEGIN IMMEDIATE')
+                try:
+                    attempt_schema = self._guard_source_attempt(payload['source_id'], payload['project'], payload['source_digest'], None, None)
+                    self.db.commit()
+                except Exception:
+                    self.db.rollback()
+                    raise
             raw = self._source(payload['source_id'], payload['project'], payload['source_digest']) if 'source_id' in payload else archive(payload['source_zip_base64'])
             ensure(hashlib.sha256(raw).hexdigest() == payload['source_digest'], 'source_digest_mismatch')
+            binding_reader = self._source_binding_readonly if attempt_schema else self._source_binding
+            binding = (binding_reader(payload['source_id'], payload['project'], payload['source_digest'])
+                       if 'source_id' in payload else None)
+            if payload.get('require_source_binding') is True:
+                ensure(binding is not None and
+                       json.dumps(binding, sort_keys=True, separators=(',', ':')) ==
+                       json.dumps(payload['expected_source_binding'], sort_keys=True, separators=(',', ':')),
+                       'source_binding_required', 409)
+            if binding is not None:
+                from .source_provenance import verify_tree_binding
+                try:
+                    verify_tree_binding(raw, binding)
+                except ValueError:
+                    raise Rejected('source_binding_invalid', 409) from None
+                ensure(binding['commit_oid'] == payload['source_commit'], 'source_binding_mismatch', 409)
+                payload = dict(payload, source_binding=binding)
             extract(raw)
             ensure(self.active is None and not self.db.execute("SELECT 1 FROM operations WHERE state IN ('held','running','accepted')").fetchone(),
                    'worker_busy_or_held', 409)
@@ -615,8 +1024,14 @@ class Service:
             # The full incoming payload is already bound by `identity`. Retain
             # compact provenance/idempotency facts, not an inline archive forever.
             persisted = {key: value for key, value in payload.items() if key != 'source_zip_base64'}
+            self.db.execute('BEGIN IMMEDIATE')
             try:
-                self.db.execute('BEGIN IMMEDIATE')
+                if 'source_id' in payload:
+                    self._guard_source_attempt(payload['source_id'], payload['project'], payload['source_digest'], None, None)
+            except Exception:
+                self.db.rollback()
+                raise
+            try:
                 ensure(not self.db.execute("SELECT 1 FROM scratch_leases WHERE state!='released'").fetchone(),
                        'scratch_occupied', 409)
                 if self.scratch_slot is not None:
@@ -646,16 +1061,130 @@ class Service:
                 raise Rejected('worker_start_failed', 503) from None
             return self.status(payload['job_id'])
 
-    def _execute(self, payload, raw):
+
+    def submit(self, payload):
+        if isinstance(payload, dict) and 'reviewed_profile' in payload:
+            return self._submit_v2(payload)
+        return self._legacy_submit(payload)
+
+    def _submit_v2(self, payload):
+        ensure(_PROFILE_PROTOCOL_READY, 'profile_protocol_unavailable', 503)
+        fields = {'job_id', 'command_id', 'idempotency_key', 'project', 'recipe', 'source_commit', 'source_digest', 'resource_ids'}
+        bound = fields | {'source_id', 'require_source_binding', 'expected_source_binding'}
+        reviewed = bound | {'reviewed_profile'}
+        # Old accepted operations remain queryable/held. No new name-only or
+        # source-only operation may enter the worker after this protocol change.
+        ensure(type(payload) is dict and set(payload) == reviewed, 'job_schema')
         try:
-            self._execute_operation(payload, raw)
+            payload = json.loads(json.dumps(payload, allow_nan=False))
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            raise Rejected('job_schema') from None
+        if 'require_source_binding' in payload:
+            ensure(payload['require_source_binding'] is True and type(payload['expected_source_binding']) is dict,
+                   'job_schema')
+        identifier(payload['job_id']); identifier(payload['command_id'])
+        ensure(isinstance(payload['idempotency_key'], str) and 0 < len(payload['idempotency_key']) <= 128,
+               'invalid_idempotency_key')
+        ensure(payload['project'] in self.projects, 'project_not_allowed', 403)
+        ensure(payload['recipe'] in self.projects[payload['project']], 'recipe_not_allowed', 403)
+        profile = self.projects[payload['project']][payload['recipe']]
+        from .profile_binding import checked_recipe_snapshot
+        try:
+            profile = checked_recipe_snapshot(payload['project'], payload['recipe'],
+                                              payload['reviewed_profile'], profile)
+        except ValueError:
+            raise Rejected('reviewed_profile_mismatch', 409) from None
+        ensure(re.fullmatch(r'[0-9a-f]{40}', payload.get('source_commit', '')) is not None, 'invalid_commit')
+        ensure(re.fullmatch(r'[0-9a-f]{64}', payload.get('source_digest', '')) is not None, 'invalid_source_digest')
+        ensure(isinstance(payload['resource_ids'], dict) and set(payload['resource_ids']) == set(KINDS), 'resource_schema')
+        ids = [identifier(payload['resource_ids'][kind]) for kind in KINDS]
+        ensure(len(set(ids)) == len(ids), 'duplicate_resource_id')
+        with self.lock:
+            ensure(_PROFILE_PROTOCOL_READY, 'profile_protocol_unavailable', 503)
+            identity, existing = self._operation(payload['command_id'], payload)
+            if existing:
+                return existing
+            raw = self._source(payload['source_id'], payload['project'], payload['source_digest']) if 'source_id' in payload else archive(payload['source_zip_base64'])
+            ensure(hashlib.sha256(raw).hexdigest() == payload['source_digest'], 'source_digest_mismatch')
+            binding = (self._source_binding_readonly(payload['source_id'], payload['project'], payload['source_digest'])
+                       if 'source_id' in payload else None)
+            if payload.get('require_source_binding') is True:
+                ensure(binding is not None and
+                       json.dumps(binding, sort_keys=True, separators=(',', ':')) ==
+                       json.dumps(payload['expected_source_binding'], sort_keys=True, separators=(',', ':')),
+                       'source_binding_required', 409)
+            if binding is not None:
+                from .source_provenance import verify_tree_binding
+                try:
+                    verify_tree_binding(raw, binding)
+                except ValueError:
+                    raise Rejected('source_binding_invalid', 409) from None
+                ensure(binding['commit_oid'] == payload['source_commit'], 'source_binding_mismatch', 409)
+                payload = dict(payload, source_binding=binding)
+            extract(raw)
+            ensure(self.active is None and not self.db.execute("SELECT 1 FROM operations WHERE state IN ('held','running','accepted')").fetchone(),
+                   'worker_busy_or_held', 409)
+            self._receipt_inventory()
+            ensure(self._receipt_fault is None, 'terminal_receipt_recovery_required', 409)
+            ensure(not self.db.execute('SELECT 1 FROM operations WHERE job_id=?', (payload['job_id'],)).fetchone(), 'job_conflict', 409)
+            for resource_id in ids:
+                ensure(not self.db.execute('SELECT 1 FROM resources WHERE id=?', (resource_id,)).fetchone()
+                       and not (self.resources / resource_id).exists(), 'resource_conflict', 409)
+            reservation = MAX_EXPANDED + 3 * profile['output_bytes'] + len(raw)
+            if self._receipt_config is not None:
+                from .terminal_receipt import SLOT_BYTES
+                reservation += SLOT_BYTES
+            self._capacity(reservation)
+            # The full incoming payload is already bound by `identity`. Retain
+            # compact provenance/idempotency facts, not an inline archive forever.
+            persisted = {key: value for key, value in payload.items() if key != 'source_zip_base64'}
+            self.db.execute('BEGIN IMMEDIATE')
+            try:
+                ensure(_SOURCE_ATTEMPT_ENABLED, 'source_attempt_unavailable', 503)
+                self._require_observed_source_attempt(payload)
+            except Exception:
+                self.db.rollback()
+                raise
+            try:
+                ensure(not self.db.execute("SELECT 1 FROM scratch_leases WHERE state!='released'").fetchone(),
+                       'scratch_occupied', 409)
+                if self.scratch_slot is not None:
+                    self.scratch_slot.reserve(self.db, payload['command_id'], payload['job_id'], payload['resource_ids'])
+                self._prepare_receipt(payload, identity)
+                self.db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?)',
+                                (payload['command_id'], identity, payload['job_id'], 'accepted', json.dumps(persisted), '{}'))
+                self.db.commit()
+            except Exception:
+                if self._receipt_config is not None:
+                    self._receipt_fault = 'terminal_receipt_persistence_failed'
+                self.db.rollback()
+                raise
+            self.active = payload['command_id']
+            self.thread = threading.Thread(target=self._execute, args=(payload, raw, profile), daemon=False)
+            try:
+                self.thread.start()
+            except Exception:
+                if self._receipt_config is not None:
+                    self._receipt_fault = 'terminal_receipt_recovery_required'
+                try:
+                    self.db.execute("UPDATE operations SET state='held' WHERE command_id=?", (self.active,))
+                    self.db.commit()
+                finally:
+                    self.active = None
+                    self.thread = None
+                raise Rejected('worker_start_failed', 503) from None
+            return self.status(payload['job_id'])
+
+    def _execute(self, payload, raw, profile=None):
+        try:
+            self._execute_operation(payload, raw, profile)
         except Exception:
             # Preserve the original reservation even if SQLite cannot record
             # failure. The sticky veto and startup accepted/running->held gate
             # prevent another job; private receipt remains evidence only.
-            if self._receipt_config is not None:
-                self._receipt_fault = 'terminal_receipt_persistence_failed'
             with self.lock:
+                if self._receipt_config is not None:
+                    self._receipt_fault = 'terminal_receipt_persistence_failed'
                 try:
                     self.db.rollback()
                     self.db.execute("UPDATE operations SET state='held' WHERE command_id=?", (payload['command_id'],))
@@ -667,9 +1196,13 @@ class Service:
             with self.lock:
                 self.active = None
 
-    def _execute_operation(self, payload, raw):
+    def _execute_operation(self, payload, raw, profile=None):
         lease = None
         try:
+            executable_paths = frozenset()
+            if payload.get('source_binding') is not None:
+                from .source_provenance import verified_executable_paths
+                executable_paths = verified_executable_paths(raw, payload['source_binding'])
             with self.lock:
                 self.db.execute("UPDATE operations SET state='running' WHERE command_id=?", (payload['command_id'],))
                 self.db.commit()
@@ -686,8 +1219,9 @@ class Service:
                         (resource_id, payload['job_id'], kind, 1, 'building', path.stat().st_ino, '{}', 0, '[]'))
                     self.db.commit()
             extract(raw, paths['workspace'])
-            make_job_readable(paths['workspace'], MAX_EXPANDED)
-            profile = self.projects[payload['project']][payload['recipe']]
+            make_job_readable(paths['workspace'], MAX_EXPANDED, executable_paths=executable_paths)
+            if profile is None:
+                profile = self.projects[payload['project']][payload['recipe']]
             if lease is None:
                 result = self.backend.run(paths, profile, payload['command_id'])
             else:
@@ -700,8 +1234,11 @@ class Service:
                     self.db.execute("UPDATE resources SET state='ready',manifest=?,bytes=? WHERE id=?",
                                     (json.dumps(manifest), size, payload['resource_ids'][kind]))
                     self.db.commit()
-            result.update(source_commit=payload['source_commit'], source_commit_verification='declared',
+            result.update(source_commit=payload['source_commit'], source_commit_verification=(
+                              'git-sha1-tree-v1' if payload.get('source_binding') else 'declared'),
                           source_digest=payload['source_digest'], resource_ids=payload['resource_ids'])
+            if payload.get('source_binding') is not None:
+                result['source_binding'] = payload['source_binding']
             state = 'succeeded'
         except Exception as exc:
             from .docker import DockerBackend, FrozenDiagnosticFailure
@@ -731,10 +1268,16 @@ class Service:
                 result = {'error': exc.code if isinstance(exc, Rejected) else 'execution_uncertain'}
                 state = 'held' if result['error'] == 'execution_uncertain' else 'failed'
             if self._receipt_config is not None and isinstance(exc, (sqlite3.Error, OSError)):
-                self._receipt_fault = 'terminal_receipt_persistence_failed'
+                with self.lock:
+                    self._receipt_fault = 'terminal_receipt_persistence_failed'
         if self.scratch_slot is not None and (lease is None or not lease.backend_absent):
             state = 'held'
             result = {'error': 'scratch_cleanup_unproven'}
+        if state in TERMINAL and 'reviewed_profile' in payload:
+            result['profile_digest'] = payload['reviewed_profile']['digest']
+        if state in TERMINAL and payload.get('source_binding') is not None:
+            result.update(source_commit=payload['source_commit'], source_digest=payload['source_digest'],
+                          source_commit_verification='git-sha1-tree-v1', source_binding=payload['source_binding'])
         with self.lock:
             self._terminal_receipt(payload['command_id'], state, result)
             if lease is not None and lease.backend_absent:

@@ -6,6 +6,7 @@ build approval are synthetic; no Docker socket, host mount, real signing key,
 service, image or permission change outside disposable fixtures is used.
 """
 import asyncio
+import base64
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict
@@ -324,6 +325,36 @@ def current_pins(authority):
     return release, launch_pin
 
 
+def test_signed_proposal_is_available_to_separate_operator_process(synthetic_issuer, short_root):
+    """Real receipt/owner file + separate reader; host/Engine attestation is synthetic."""
+    authority, path, _ = synthetic_issuer
+    thread, result = serve_fixture(authority)
+    transport = UnixLaunchReceiptTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                           expected_issuer_gid=os.getgid())
+    try:
+        verifier = LaunchReceiptIdentityVerifier(enrollment=authority.release, issuer_transport=transport,
+            max_receipt_lifetime_seconds=30, exchange_timeout_ms=1000)
+        receipt = verifier.accepted_launch_receipt()
+        verifier.close()
+    finally:
+        transport.close()
+        thread.join(5)
+    assert not thread.is_alive() and result == [receipt[0]]
+    proposal = short_root / 'operator-proposal.json'
+    authority.write_approval_proposal(str(proposal), timeout_ms=1000)
+    assert stat.S_IMODE(proposal.stat().st_mode) == 0o600
+    child = '''import json,sys\nfrom engineering_hub.current_executor_observation import CurrentExecutorReleasePins\nfrom engineering_hub.container_pilot_manifest import Platform\nfrom hub_container_executor.postlaunch_approval import verify_launch_proposal\nv=json.loads(sys.stdin.read());v["public_key"]=bytes.fromhex(v["public_key"]);v["platform"]=Platform(**v["platform"])\nr=verify_launch_proposal(open(sys.argv[1],"rb").read(),release=CurrentExecutorReleasePins(**v),expected_engine_id="synthetic-engine")\nprint(r.receipt_id)\n'''
+    public = {name: getattr(authority.release, name) for name in authority.release.__dataclass_fields__}
+    public['public_key'] = public['public_key'].hex()
+    public['platform'] = authority.release.platform.model_dump(mode='json')
+    result = subprocess.run([sys.executable, '-c', child, str(proposal)], input=json.dumps(public),
+                            text=True, capture_output=True, timeout=5, check=True)
+    assert result.stdout.strip() == receipt[0]
+    original = proposal.read_bytes()
+    with pytest.raises(FileExistsError): authority.write_approval_proposal(str(proposal), timeout_ms=1000)
+    assert proposal.read_bytes() == original
+
+
 def current_exchange(path, *, nonce, timeout_ms):
     """Test-only direct UDS client; the production relay is tested separately."""
     with socket.socket(socket.AF_UNIX) as peer:
@@ -547,18 +578,18 @@ def test_owned_wait_request_handoff_keeps_absolute_deadline(synthetic_issuer, mo
     now = [origin]
     deadlines = []
     serve = authority._serve_current_peer_until
-    select_ready = launch.select.select
-    def delayed_ready(read, write, errors, timeout):
+    poll_ready = launch._poll_ready
+    def delayed_ready(read, timeout):
         if authority._listener not in read:
-            return select_ready(read, write, errors, timeout)
+            return poll_ready(read, timeout)
         now[0] = origin + .1  # Scheduling consumes the original 50 ms window.
-        return [authority._listener], [], []
+        return [authority._listener]
     def capture(deadline):
         deadlines.append(deadline)
         return serve(deadline)  # Must decline before socket admission.
     with monkeypatch.context() as patch:
         patch.setattr(launch.time, 'monotonic', lambda: now[0])
-        patch.setattr(launch.select, 'select', delayed_ready)
+        patch.setattr(launch, '_poll_ready', delayed_ready)
         patch.setattr(authority, '_serve_current_peer_until', capture)
         assert authority.wait_for_stop_with_observations(
             timeout_ms=50, stop_requested=lambda: False) is False
@@ -861,6 +892,7 @@ def synthetic_launcher(journal, *, failure=None, image_kind='config'):
             original = authority._create_body()
             host = deepcopy(original.pop('HostConfig'))
             if failure == 'privileged-inspect': host['Privileged'] = True
+            if failure == 'wrong-cgroup-parent': host['CgroupParent'] = 'other.slice'
             if failure == 'wrong-tmpfs': host['Tmpfs']['/tmp'] = 'rw,size=1024'
             if failure == 'tag-config': original['Image'] = 'unapproved:latest'
             mounts = [{'Type': 'bind', 'Source': item.source, 'Destination': item.target,
@@ -1364,3 +1396,647 @@ def test_graceful_stop_exact_sigterm_quiescence_or_timeout_never_forces_cleanup(
             child.terminate()  # Fixture teardown, NOT supervisor timeout escalation.
             child.wait(timeout=3)
         authority.close()
+
+
+def test_root_requested_proposal_refresh_retains_launch_and_ceiling(synthetic_issuer, short_root, monkeypatch):
+    """Real socket/peer and fresh signed evidence; Engine observation is synthetic."""
+    from hub_container_executor import postlaunch_approval
+    authority, path, _ = synthetic_issuer
+    thread, result = serve_fixture(authority)
+    transport = UnixLaunchReceiptTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                           expected_issuer_gid=os.getgid())
+    verifier = LaunchReceiptIdentityVerifier(enrollment=authority.release, issuer_transport=transport,
+        max_receipt_lifetime_seconds=30, exchange_timeout_ms=1000)
+    receipt = verifier.accepted_launch_receipt()
+    transport.close()
+    thread.join(5)
+    assert not thread.is_alive() and result == [receipt[0]]
+    first = authority.approval_proposal(timeout_ms=1000)
+    release, pin = current_pins(authority)
+    first_verified = postlaunch_approval.verify_launch_proposal(first, release=release,
+                                                               expected_engine_id='synthetic-engine')
+    original_clock = postlaunch_approval.time
+    monkeypatch.setattr(postlaunch_approval, 'time', SimpleNamespace(time=lambda: original_clock.time() + 6))
+    with pytest.raises(Exception):
+        postlaunch_approval.verify_launch_proposal(first, release=release, expected_engine_id='synthetic-engine')
+    monkeypatch.setattr(postlaunch_approval, 'time', original_clock)
+    socket_path = short_root / 'proposal.sock'
+    stop = threading.Event()
+    served = []
+    worker = threading.Thread(target=lambda: served.append(authority.wait_for_stop_with_observations(
+        timeout_ms=5000, stop_requested=stop.is_set, proposal_socket=str(socket_path))))
+    worker.start()
+    try:
+        until = time.monotonic() + 3
+        while not socket_path.exists() and time.monotonic() < until:
+            time.sleep(.01)
+        assert socket_path.exists()
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run([sys.executable, '-m', 'hub_container_executor.proposal_request',
+                                 '--socket', str(socket_path), '--launch-id', authority._launch_id],
+                                env=env, text=True, capture_output=True, timeout=4, check=True)
+        output = Path(result.stdout.strip())
+    finally:
+        stop.set()
+        worker.join(5)
+    assert not worker.is_alive() and served == [True]
+    assert not socket_path.exists()
+    assert output.parent == short_root and output.name.startswith('proposal-')
+    fresh = postlaunch_approval.verify_launch_proposal(output.read_bytes(), release=release,
+                                                       expected_engine_id='synthetic-engine')
+    assert fresh.receipt_id == first_verified.receipt_id == receipt[0]
+    assert fresh.launch == first_verified.launch == pin
+    assert fresh.launch.approval_expires_at_ms == pin.approval_expires_at_ms
+    approver = Ed25519PrivateKey.generate()
+    approved = {'schema': 'engineering-hub.independent-launch-approval.v1',
+                'approval_id': str(uuid4()), 'receipt_id': fresh.receipt_id,
+                'launch': asdict(fresh.launch), 'approved_at_ms': int(time.time() * 1000),
+                'expires_at_ms': min(receipt[7], fresh.launch.approval_expires_at_ms)}
+    signature = base64.urlsafe_b64encode(approver.sign(
+        postlaunch_approval.DOMAIN + launch._canonical(approved))).rstrip(b'=').decode()
+    raw_approval = launch._canonical({'payload': approved, 'signature': signature})
+    approver_public = approver.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    accepted = postlaunch_approval.verify_postlaunch_approval(raw_approval, verifier=verifier,
+        release=release, approver_public_key=approver_public, expected_engine_id='synthetic-engine')
+    assert accepted.launch == pin
+    with pytest.raises(postlaunch_approval.PostLaunchApprovalError):
+        postlaunch_approval.verify_postlaunch_approval(raw_approval, verifier=verifier,
+            release=release, approver_public_key=release.public_key, expected_engine_id='synthetic-engine')
+    verifier.close()
+    with pytest.raises(FileExistsError):
+        authority.write_approval_proposal(str(output), timeout_ms=1000)
+
+
+def test_proposal_request_denies_nonroot_peer_before_read(synthetic_issuer):
+    authority, _, _ = synthetic_issuer
+    class Peer:
+        def getsockopt(self, *args): return struct.pack('=iII', 42, 1234, 1234)
+        def close(self): pass
+    class Listener:
+        def settimeout(self, value): pass
+        def accept(self): return Peer(), None
+    assert authority._serve_proposal_request(Listener(), time.monotonic() + 1) is False
+
+
+def test_separate_operator_signer_publishes_reviewed_launch(synthetic_issuer, short_root):
+    """Kernel socket + separate signer process, synthetic Engine; no mounted-runner claim."""
+    from hub_container_executor.postlaunch_approval import verify_launch_proposal, verify_postlaunch_approval
+    authority, path, _ = synthetic_issuer
+    thread, served = serve_fixture(authority)
+    transport = UnixLaunchReceiptTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                           expected_issuer_gid=os.getgid())
+    verifier = LaunchReceiptIdentityVerifier(enrollment=authority.release, issuer_transport=transport,
+        max_receipt_lifetime_seconds=30, exchange_timeout_ms=1000)
+    receipt = verifier.accepted_launch_receipt()
+    thread.join(5)
+    assert not thread.is_alive() and served == [receipt[0]]
+    release, pin = current_pins(authority)
+    proposal_file = short_root / 'proposal.json'
+    authority.write_approval_proposal(str(proposal_file), timeout_ms=1000)
+    proposal = verify_launch_proposal(proposal_file.read_bytes(), release=release,
+                                      expected_engine_id='synthetic-engine')
+    assert proposal.receipt_expires_at_ms == receipt[7]
+    altered = json.loads(proposal_file.read_bytes())
+    altered['payload']['receipt_expires_at_ms'] += 1
+    with pytest.raises(Exception):
+        verify_launch_proposal(launch._canonical(altered), release=release,
+                               expected_engine_id='synthetic-engine')
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    key_file = short_root / 'approver.key'
+    key_file.write_bytes(key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                                            serialization.NoEncryption()))
+    key_file.chmod(0o600)
+    destination = short_root / 'delivery'
+    destination.mkdir(mode=0o700)
+    os.chown(destination, 12345, 12345)
+    release_data = {name: getattr(release, name) for name in release.__dataclass_fields__}
+    release_data['public_key'] = release.public_key.hex()
+    release_data['platform'] = release.platform.model_dump(mode='json')
+    policy = {'schema': 'engineering-hub.operator-approval-policy.v1', 'release': release_data,
+              'expected_engine_id': 'synthetic-engine', 'approver_public_key': public.hex(),
+              'receipt_id': proposal.receipt_id, 'receipt_sha256': proposal.receipt_sha256,
+              'launch_sha256': hashlib.sha256(launch._canonical(asdict(pin))).hexdigest(),
+              'receipt_expires_at_ms': proposal.receipt_expires_at_ms,
+              'approval_expires_at_ms': proposal.receipt_expires_at_ms,
+              'output_path': str(destination / 'approval.json'), 'output_uid': 12345, 'output_gid': 12345}
+    policy_file = short_root / 'policy.json'
+    policy_file.write_bytes(launch._canonical(policy))
+    policy_file.chmod(0o600)
+    from hub_container_executor.operator_approval import publish, OperatorApprovalError
+    bad_policy = dict(policy, launch_sha256='f' * 64)
+    policy_file.write_bytes(launch._canonical(bad_policy))
+    with pytest.raises(OperatorApprovalError):
+        publish(policy_file=str(policy_file), proposal_file=str(proposal_file), signing_key_file=str(key_file))
+    assert not (destination / 'approval.json').exists()
+    bad_policy = dict(policy, receipt_expires_at_ms=proposal.receipt_expires_at_ms + 1)
+    policy_file.write_bytes(launch._canonical(bad_policy))
+    with pytest.raises(OperatorApprovalError):
+        publish(policy_file=str(policy_file), proposal_file=str(proposal_file), signing_key_file=str(key_file))
+    assert not (destination / 'approval.json').exists()
+    bad_policy = dict(policy, approval_expires_at_ms=int(time.time() * 1000) - 1)
+    policy_file.write_bytes(launch._canonical(bad_policy))
+    with pytest.raises(OperatorApprovalError):
+        publish(policy_file=str(policy_file), proposal_file=str(proposal_file), signing_key_file=str(key_file))
+    assert not (destination / 'approval.json').exists()
+    bad_policy = dict(policy, approver_public_key=release.public_key.hex())
+    policy_file.write_bytes(launch._canonical(bad_policy))
+    with pytest.raises(OperatorApprovalError):
+        publish(policy_file=str(policy_file), proposal_file=str(proposal_file), signing_key_file=str(key_file))
+    assert not (destination / 'approval.json').exists()
+    policy_file.write_bytes(launch._canonical(policy))
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+    cmd = [sys.executable, '-m', 'hub_container_executor.operator_approval', '--execute',
+           '--policy', str(policy_file), '--proposal', str(proposal_file), '--signing-key', str(key_file)]
+    result = subprocess.run(cmd, text=True, capture_output=True, env=env, timeout=8)
+    assert result.returncode == 0, result.stderr
+    output = destination / 'approval.json'
+    info = output.stat()
+    assert (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) == (12345, 12345, 0o600)
+    raw = output.read_bytes()
+    approval = verify_postlaunch_approval(raw, verifier=verifier, release=release,
+        approver_public_key=public, expected_engine_id='synthetic-engine')
+    assert approval.launch == pin and approval.expires_at_ms <= receipt[7]
+    assert subprocess.run(cmd, text=True, capture_output=True, env=env, timeout=8).returncode == 2
+    assert output.read_bytes() == raw
+    verifier.close()
+    transport.close()
+
+
+def test_separate_consumer_receives_supervisor_proposal_and_operator_approval(synthetic_issuer, short_root):
+    """Separate receipt consumer and signer with kernel peer checks, synthetic Engine."""
+    authority, path, _ = synthetic_issuer
+    signer = Ed25519PrivateKey.generate()
+    public = signer.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    key_file = short_root / 'approver.key'
+    key_file.write_bytes(signer.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                                               serialization.NoEncryption()))
+    key_file.chmod(0o600)
+    delivery = short_root / 'delivery'
+    delivery.mkdir(mode=0o700)
+    os.chown(delivery, 12345, 12345)
+    release = {name: getattr(authority.release, name) for name in authority.release.__dataclass_fields__}
+    release['public_key'] = release['public_key'].hex()
+    release['platform'] = authority.release.platform.model_dump(mode='json')
+    script = '''import json,sys\nfrom hub_container_executor.launch_transport import UnixLaunchReceiptTransport\nfrom hub_container_executor.runtime_identity import ExecutorReleaseEnrollment,LaunchReceiptIdentityVerifier\nfrom hub_container_executor.postlaunch_approval import verify_postlaunch_approval\nfrom engineering_hub.current_executor_observation import CurrentExecutorReleasePins\nfrom engineering_hub.container_pilot_manifest import Platform\nv=json.loads(input()); r=v['release']; r['public_key']=bytes.fromhex(r['public_key']); r['platform']=Platform(**r['platform']); e=ExecutorReleaseEnrollment(**r)\nprint('ready',flush=True); input()\nt=UnixLaunchReceiptTransport(socket_path=v['socket'],expected_issuer_uid=0,expected_issuer_gid=0)\nx=LaunchReceiptIdentityVerifier(enrollment=e,issuer_transport=t,max_receipt_lifetime_seconds=30,exchange_timeout_ms=1000); receipt=x.accepted_launch_receipt(); print(json.dumps(receipt[0]),flush=True)\npath=input(); p=CurrentExecutorReleasePins(**{n:getattr(e,n) for n in CurrentExecutorReleasePins.__dataclass_fields__}); a=verify_postlaunch_approval(open(path,'rb').read(),verifier=x,release=p,approver_public_key=bytes.fromhex(v['approver']),expected_engine_id='synthetic-engine'); print(a.launch.launch_id,flush=True); x.close(); t.close()\n'''
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+    child = subprocess.Popen([sys.executable, '-u', '-c', script], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    try:
+        child.stdin.write(json.dumps({'release': release, 'socket': str(path), 'approver': public.hex()}) + '\n')
+        child.stdin.flush()
+        assert child.stdout.readline().strip() == 'ready'
+        authority._consumer.close()
+        authority._consumer = launch._Process(child.pid)
+        thread, served = serve_fixture(authority)
+        child.stdin.write('go\n')
+        child.stdin.flush()
+        receipt_id = json.loads(child.stdout.readline())
+        thread.join(5)
+        assert not thread.is_alive() and served == [receipt_id]
+        proposal_file = short_root / 'proposal2.json'
+        authority.write_approval_proposal(str(proposal_file), timeout_ms=1000)
+        release_pin, _ = current_pins(authority)
+        from hub_container_executor.postlaunch_approval import verify_launch_proposal
+        proposal = verify_launch_proposal(proposal_file.read_bytes(), release=release_pin,
+                                           expected_engine_id='synthetic-engine')
+        policy = {'schema': 'engineering-hub.operator-approval-policy.v1', 'release': release,
+                  'expected_engine_id': 'synthetic-engine', 'approver_public_key': public.hex(),
+                  'receipt_id': proposal.receipt_id, 'receipt_sha256': proposal.receipt_sha256,
+                  'launch_sha256': hashlib.sha256(launch._canonical(asdict(proposal.launch))).hexdigest(),
+                  'receipt_expires_at_ms': proposal.receipt_expires_at_ms,
+                  'approval_expires_at_ms': proposal.receipt_expires_at_ms,
+                  'output_path': str(delivery / 'approval.json'), 'output_uid': 12345, 'output_gid': 12345}
+        policy_file = short_root / 'policy2.json'
+        policy_file.write_bytes(launch._canonical(policy))
+        policy_file.chmod(0o600)
+        cmd = [sys.executable, '-m', 'hub_container_executor.operator_approval', '--execute',
+               '--policy', str(policy_file), '--proposal', str(proposal_file), '--signing-key', str(key_file)]
+        result = subprocess.run(cmd, text=True, capture_output=True, env=env, timeout=8)
+        assert result.returncode == 0, result.stderr
+        child.stdin.write(str(delivery / 'approval.json') + '\n')
+        child.stdin.flush()
+        assert child.stdout.readline().strip() == authority._launch_id
+        assert child.wait(timeout=5) == 0, child.stderr.read()
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            child.wait(timeout=5)
+        child.stdin.close()
+        child.stdout.close()
+        child.stderr.close()
+
+
+@pytest.mark.parametrize('postcheck_failure', [False, True])
+def test_supervisor_records_empty_daemon_scope_without_claiming_effect_outcome(
+        synthetic_issuer, monkeypatch, postcheck_failure):
+    """Synthetic cgroup/Engine; real owned pidfds and real journal transaction."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from hub_container_executor import cgroup_scope_evidence as cgroups
+    authority, _, _ = synthetic_issuer
+    root = authority._socket_path.parent
+    fake_root = root / 'cgroup'
+    fake_root.mkdir(mode=0o700)
+    scope_path = fake_root / 'daemon'
+    scope_path.mkdir(mode=0o700)
+    for base, names in ((fake_root, {'cgroup.procs': '', 'cgroup.threads': ''}),
+        (scope_path, {'cgroup.max.depth': '0\n', 'cgroup.max.descendants': '0\n',
+                      'cgroup.procs': '', 'cgroup.threads': '', 'cgroup.subtree_control': '',
+                      'cgroup.events': 'populated 1\nfrozen 0\n'})):
+        for name, value in names.items():
+            (base / name).write_text(value)
+            (base / name).chmod(0o600)
+    monkeypatch.setattr(cgroups, '_CGROUP_ROOT', fake_root)
+    monkeypatch.setattr(cgroups, '_filesystem', lambda fd: None)
+    monkeypatch.setattr(cgroups, '_mount_root', lambda: None)
+    monkeypatch.setattr(cgroups, '_membership', lambda process, expected: None)
+    daemon = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    consumer = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    scope = None
+    daemon_process = launch._Process(daemon.pid)
+    try:
+        authority._consumer.close()
+        authority._consumer = launch._Process(consumer.pid)
+        authority._daemon_pin = replace(authority._daemon_pin, pid=daemon.pid, start_ticks=daemon_process.start)
+        authority._engine = SimpleNamespace(process=daemon_process, close=lambda: None)
+        (scope_path / 'cgroup.procs').write_text(str(daemon.pid) + '\n')
+        scope = authority.enroll_daemon_scope('daemon', timeout_ms=1000)
+        with pytest.raises(launch.LaunchSupervisorError):
+            authority.record_daemon_scope_emptiness(scope)  # consumer not drained
+        consumer.terminate()
+        consumer.wait(timeout=3)
+        authority._journal.state(authority._launch_id, 'stopped', authority._record())
+        with pytest.raises(launch.LaunchSupervisorError):
+            authority.record_daemon_scope_emptiness(scope)  # daemon still alive
+        with authority._journal.transaction() as db:
+            assert 'daemon_scope_observation' not in json.loads(db.execute('SELECT data FROM launch').fetchone()[0])
+        daemon.terminate()
+        daemon.wait(timeout=3)
+        (scope_path / 'cgroup.procs').write_text('')
+        (scope_path / 'cgroup.events').write_text('populated 0\nfrozen 0\n')
+        if postcheck_failure:
+            original_observe = scope.observe_empty
+            calls = []
+            def fail_second():
+                calls.append(True)
+                if len(calls) == 2:
+                    raise cgroups.ScopeEvidenceError('synthetic postcheck failure')
+                return original_observe()
+            monkeypatch.setattr(scope, 'observe_empty', fail_second)
+            with pytest.raises(launch.LaunchSupervisorError):
+                authority.record_daemon_scope_emptiness(scope)
+        else:
+            observed = authority.record_daemon_scope_emptiness(scope)
+            assert observed.effect_outcome_proven is False
+        with authority._journal.transaction() as db:
+            state, raw = db.execute('SELECT state,data FROM launch').fetchone()
+        record = json.loads(raw)['daemon_scope_observation']
+        assert state == 'stopped' and record['effect_outcome_proven'] is False
+        assert record['verification'] == ('provisional' if postcheck_failure else 'postcheck_complete')
+        assert record['original_members'] == [[daemon.pid, daemon_process.start]]
+        with pytest.raises(launch.LaunchSupervisorError):
+            authority.record_daemon_scope_emptiness(scope)  # no overwrite or replay
+        authority._hold()
+        with authority._journal.transaction() as db:
+            state, raw = db.execute('SELECT state,data FROM launch').fetchone()
+        assert state == 'held' and json.loads(raw)['daemon_scope_observation'] == record
+    finally:
+        if scope is not None: scope.close()
+        daemon_process.close()
+        for child in (consumer, daemon):
+            if child.poll() is None:
+                child.terminate()
+                try: child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=2)
+
+
+def test_scope_evidence_upgrades_version_atomically_and_blocks_legacy_writer(root_journal, monkeypatch):
+    """v1 binaries check the same user_version while holding the exclusive owner lock."""
+    from contextlib import contextmanager
+    journal = root_journal
+    identity = str(uuid4())
+    journal.reserve(identity, {'expected': 'original'})
+    journal.state(identity, 'stopped', {'expected': 'original'})
+    observation = {'verification': 'provisional', 'effect_outcome_proven': False}
+    original_transaction = journal.transaction
+    @contextmanager
+    def failing_transaction():
+        with original_transaction() as db:
+            yield db
+            raise RuntimeError('synthetic rollback before commit')
+    monkeypatch.setattr(journal, 'transaction', failing_transaction)
+    with pytest.raises(RuntimeError):
+        journal.record_empty_daemon_scope(identity, {'expected': 'original'}, observation)
+    monkeypatch.setattr(journal, 'transaction', original_transaction)
+    with journal.transaction() as db:
+        assert db.execute('PRAGMA user_version').fetchone() == (1,)
+        assert 'daemon_scope_observation' not in json.loads(db.execute('SELECT data FROM launch').fetchone()[0])
+    journal.record_empty_daemon_scope(identity, {'expected': 'original'}, observation)
+    path = str(journal.path)
+    with journal.transaction() as db:
+        assert db.execute('PRAGMA user_version').fetchone() == (2,)
+        before = db.execute('SELECT state,data FROM launch').fetchone()
+    with pytest.raises(Exception):
+        launch._Journal(path, create=False)  # no old or new concurrent owner
+    journal.close()
+    # This is the actual, unmodified v1 _Journal class captured from the
+    # previous commit, run after releasing the current writer's owner lock.
+    from tests.legacy_launch_journal_v1 import _Journal as LegacyJournal
+    with pytest.raises(launch.LaunchSupervisorError):
+        LegacyJournal(path, create=False)
+    import sqlite3
+    with sqlite3.connect(path) as legacy:
+        assert legacy.execute('PRAGMA user_version').fetchone() == (2,)
+        assert legacy.execute('SELECT state,data FROM launch').fetchone() == before
+    reopened = launch._Journal(path, create=False)
+    try:
+        reopened.state(identity, 'held', {'expected': 'original'})
+        with reopened.transaction() as db:
+            state, raw = db.execute('SELECT state,data FROM launch').fetchone()
+        assert state == 'held' and json.loads(raw)['daemon_scope_observation'] == observation
+    finally:
+        reopened.close()
+
+
+def test_legacy_version_with_unprotected_scope_evidence_requires_review(root_journal):
+    journal = root_journal
+    identity = str(uuid4())
+    journal.reserve(identity, {'expected': 'original'})
+    # Reproduce the earlier candidate's v1 evidence without promoting it.
+    data = {'expected': 'original', 'daemon_scope_observation': {'verification': 'provisional'}}
+    with journal.transaction() as db:
+        db.execute('UPDATE launch SET data=? WHERE id=?', (launch._canonical(data).decode(), identity))
+        assert db.execute('PRAGMA user_version').fetchone() == (1,)
+    path = str(journal.path)
+    journal.close()
+    with pytest.raises(launch.LaunchSupervisorError):
+        launch._Journal(path, create=False)
+    import sqlite3
+    with sqlite3.connect(path) as db:
+        assert db.execute('PRAGMA user_version').fetchone() == (1,)
+        assert json.loads(db.execute('SELECT data FROM launch').fetchone()[0]) == data
+
+
+def test_launcher_scope_preflight_failure_never_calls_fake_engine(root_journal, short_root, monkeypatch):
+    """Real launcher/supervisor preflight; no fake Engine POST on invalid scope."""
+    from dataclasses import replace
+    from hub_container_executor import launcher_cli, cgroup_scope_evidence as cgroups
+    authority, _ = synthetic_launcher(root_journal)
+    engine, journal_path = authority._engine, str(root_journal.path)
+    daemon = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    daemon_process = launch._Process(daemon.pid)
+    try:
+        authority._daemon_pin = launch._DaemonPin('/synthetic/daemon.sock', daemon.pid,
+            daemon_process.start, 10001, 10001, 'synthetic-engine', '1.45')
+        authority._engine.process = daemon_process
+        fake_root = short_root / 'cgroup-preflight'
+        fake_root.mkdir(mode=0o700)
+        for name in ('cgroup.procs', 'cgroup.threads'):
+            (fake_root / name).write_text('')
+            (fake_root / name).chmod(0o600)
+        monkeypatch.setattr(cgroups, '_CGROUP_ROOT', fake_root)
+        monkeypatch.setattr(cgroups, '_filesystem', lambda fd: None)
+        monkeypatch.setattr(cgroups, '_mount_root', lambda: None)
+        class Policy:
+            scope = 'missing-scope'
+            def check(self, supervisor, scope=None): pass
+        monkeypatch.setattr(launcher_cli, '_load_daemon_scope_policy', lambda path: Policy())
+        monkeypatch.setattr(launcher_cli, '_load_supervisor', lambda: lambda **kwargs: authority)
+        monkeypatch.setattr(launcher_cli, '_install_handlers', lambda stop: [])
+        monkeypatch.setattr(launcher_cli, '_restore_handlers', lambda previous: None)
+        options = SimpleNamespace(enrollment_file='/fake/enrollment', signing_key_file='/fake/key',
+            journal_file='/fake/journal', daemon_scope_policy='/fake/scope', approval_proposal_file=None,
+            proposal_refresh_socket=None, wait_seconds=5)
+        code, phase = launcher_cli._execute(options)
+        assert (code, phase) == (2, 'unavailable_preserve_evidence')
+        assert engine.effect_calls == []
+        import sqlite3
+        with sqlite3.connect(journal_path) as db:
+            assert db.execute('SELECT COUNT(*) FROM launch').fetchone() == (0,)
+    finally:
+        daemon_process.close()
+        if daemon.poll() is None:
+            daemon.terminate()
+            try: daemon.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                daemon.kill()
+                daemon.wait(timeout=2)
+
+
+def test_launcher_cgroup_parent_is_enrolled_and_bound_to_profile(root_journal):
+    """Synthetic profile readback only; no real Docker containment is claimed."""
+    legacy = profile_data()
+    profile = launch.ExecutorLaunchProfile.model_validate(legacy)
+    assert profile.digest() == 'sha256:' + hashlib.sha256(launch._canonical(legacy)).hexdigest()
+    configured = dict(legacy, cgroup_parent='ehcontaintrial.slice',
+                      cgroup_host_parent='/user.slice/user-10001.slice/ehcontaintrial.slice',
+                      cgroup_host_ns_device=1, cgroup_host_ns_inode=2)
+    pinned = launch.ExecutorLaunchProfile.model_validate(configured)
+    assert pinned.digest() != profile.digest()
+    assert pinned.digest() == 'sha256:' + hashlib.sha256(launch._canonical(configured)).hexdigest()
+    authority, _ = synthetic_launcher(root_journal)
+    try:
+        authority.profile = pinned
+        assert authority._create_body()['HostConfig']['CgroupParent'] == 'ehcontaintrial.slice'
+    finally:
+        authority.close()
+
+
+@pytest.mark.parametrize('parent, host', [
+    ('ehcontaintrial.slice', None), (None, '/user.slice/ehcontaintrial.slice'),
+    ('other.slice', '/user.slice/ehcontaintrial.slice'),
+    ('../escape.slice', '/user.slice/escape.slice'),
+    ('ehcontaintrial.slice', '/user.slice/../ehcontaintrial.slice')])
+def test_launcher_rejects_partial_or_mismatched_cgroup_enrollment(parent, host):
+    with pytest.raises(Exception):
+        launch.ExecutorLaunchProfile.model_validate(dict(profile_data(), cgroup_parent=parent,
+                                                       cgroup_host_parent=host))
+
+
+def test_launcher_checks_kernel_membership_against_exact_pinned_parent(root_journal, short_root, monkeypatch):
+    """Synthetic paths exercise comparison; real kernel attestation is separate."""
+    root = short_root / 'cgroupfs'
+    root.mkdir()
+    parent = root / 'parent.slice'
+    parent.mkdir()
+    child = parent / 'runner.scope'
+    child.mkdir()
+    outside = root / 'other.scope'
+    outside.mkdir()
+    monkeypatch.setattr(launch, '_CGROUPFS_ROOT', root)
+    authority, _ = synthetic_launcher(root_journal)
+    try:
+        from hub_container_executor import cgroup_scope_evidence as cgroups
+        monkeypatch.setattr(cgroups, '_mount_root', lambda: None)
+        monkeypatch.setattr(cgroups, '_filesystem', lambda fd: None)
+        namespace = launch._identity(os.stat('/proc/self/ns/cgroup'))
+        authority._daemon_pin = SimpleNamespace(pid=os.getpid())
+        authority.profile = launch.ExecutorLaunchProfile.model_validate(dict(profile_data(),
+            cgroup_parent='parent.slice', cgroup_host_parent='/parent.slice',
+            cgroup_host_ns_device=namespace[0], cgroup_host_ns_inode=namespace[1]))
+        authority._pin_cgroup_parent()
+        retained_fd = authority._cgroup_parent_fd
+        assert os.fstat(retained_fd).st_ino == parent.stat().st_ino
+        authority._check_cgroup_parent_membership('/parent.slice/runner.scope')
+        with pytest.raises(launch.LaunchSupervisorError):
+            authority._check_cgroup_parent_membership('/other.scope')
+        parent.rename(root / 'moved.slice')
+        parent.mkdir()
+        (parent / 'runner.scope').mkdir()
+        with pytest.raises(launch.LaunchSupervisorError):
+            authority._check_cgroup_parent_membership('/parent.slice/runner.scope')
+        assert os.fstat(retained_fd).st_ino != parent.stat().st_ino
+    finally:
+        authority.close()
+    with pytest.raises(OSError):
+        os.fstat(retained_fd)
+
+
+
+def test_launcher_wrong_cgroup_parent_readback_holds_before_start(root_journal):
+    """Engine readback is checked, but is not claimed as kernel membership proof."""
+    authority, _ = synthetic_launcher(root_journal, failure='wrong-cgroup-parent')
+    try:
+        authority.profile = launch.ExecutorLaunchProfile.model_validate(dict(profile_data(),
+            cgroup_parent='parent.slice', cgroup_host_parent='/user.slice/parent.slice',
+            cgroup_host_ns_device=1, cgroup_host_ns_inode=2))
+        authority._pin_cgroup_parent = lambda: None  # no real cgroup in this fixture
+        with pytest.raises(launch.LaunchSupervisorError):
+            authority.launch()
+        calls = authority._engine.effect_calls
+        assert any(method == 'POST' and '/containers/create?' in route for method, route in calls)
+        assert not any(method == 'POST' and route.endswith('/start') for method, route in calls)
+        with root_journal.transaction() as db:
+            assert db.execute('SELECT state FROM launch').fetchone() == ('held',)
+    finally:
+        authority.close()
+
+
+def test_launcher_rejects_unenrolled_cgroup_namespace_before_engine_post(root_journal, monkeypatch):
+    from hub_container_executor import cgroup_scope_evidence as cgroups
+    authority, _ = synthetic_launcher(root_journal)
+    try:
+        namespace = launch._identity(os.stat('/proc/self/ns/cgroup'))
+        authority._daemon_pin = SimpleNamespace(pid=os.getpid())
+        authority.profile = launch.ExecutorLaunchProfile.model_validate(dict(profile_data(),
+            cgroup_parent='parent.slice', cgroup_host_parent='/user.slice/parent.slice',
+            cgroup_host_ns_device=namespace[0], cgroup_host_ns_inode=namespace[1] + 1))
+        monkeypatch.setattr(cgroups, '_mount_root', lambda: None)
+        with pytest.raises(launch.LaunchSupervisorError): authority.launch()
+        assert authority._engine.effect_calls == []
+    finally:
+        authority.close()
+
+
+def test_authenticated_app_cgroup_observation_round_trip(synthetic_issuer):
+    """Real issuer UDS/signature/pidfd; Engine and parent containment are synthetic."""
+    from hub_container_executor.app_cgroup_observation import AppCgroupPins, AppCgroupObserver
+    from hub_container_executor.launch_transport import UnixCurrentObservationTransport
+    authority, path, _ = synthetic_issuer
+    current_ready(authority)
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    authority.profile = SimpleNamespace(cgroup_parent='parent.slice',
+        cgroup_host_ns_device=3, cgroup_host_ns_inode=4)
+    authority._cgroup_parent_identity = (1, 2)
+    authority._check_cgroup_parent_membership = lambda relative: None  # explicitly synthetic
+    authority._engine = SimpleNamespace(namespace=launch._identity(os.stat('/proc/self/ns/pid')),
+        json=lambda method, route, deadline: (200, {'Id':'a'*64, 'HostConfig':{'CgroupParent':'parent.slice'},
+                                                   'State':{'Running':True,'Pid':child.pid}}),
+        close=lambda: None)
+    release, pin = current_pins(authority)
+    transport = UnixCurrentObservationTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                                expected_issuer_gid=os.getgid())
+    observer = AppCgroupObserver(transport=transport, release=release, launch=pin,
+                                 pins=AppCgroupPins('parent.slice',1,2,3,4), timeout_ms=2000)
+    results = []
+    worker = threading.Thread(target=lambda: results.append(authority.serve_one_current_observation(timeout_ms=3000)))
+    try:
+        worker.start()
+        observed = observer.verify('a'*64, deadline=time.monotonic()+3)
+        assert observed.container_id == 'a'*64
+        worker.join(4)
+        assert not worker.is_alive() and results == [True]
+    finally:
+        transport.close()
+        if child.poll() is None:
+            child.terminate()
+            try: child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                child.kill(); child.wait(timeout=2)
+        worker.join(4)
+
+
+def test_supervisor_worker_scope_requires_exact_prelaunch_process_inventory(root_journal, short_root, monkeypatch):
+    """Real pidfds, synthetic cgroup files and no fake Engine POST."""
+    from hub_container_executor import cgroup_scope_evidence as cgroups
+    authority, _ = synthetic_launcher(root_journal)
+    engine = authority._engine
+    fake_root = short_root / 'worker-cgroup'
+    fake_root.mkdir(mode=0o700)
+    scope_dir = fake_root / 'worker'
+    scope_dir.mkdir(mode=0o700)
+    nested = scope_dir / 'delegated'
+    nested.mkdir(mode=0o700)
+    for base, names in ((fake_root, {'cgroup.procs':'', 'cgroup.threads':''}),
+        (scope_dir, {'cgroup.max.depth':'2\n', 'cgroup.max.descendants':'8\n',
+                     'cgroup.procs':'', 'cgroup.threads':'', 'cgroup.subtree_control':'',
+                     'cgroup.events':'populated 1\nfrozen 0\n'}),
+        (nested, {'cgroup.procs':''})):
+        for name, value in names.items():
+            (base/name).write_text(value)
+            (base/name).chmod(0o600)
+    monkeypatch.setattr(cgroups, '_CGROUP_ROOT', fake_root)
+    monkeypatch.setattr(cgroups, '_filesystem', lambda fd: None)
+    monkeypatch.setattr(cgroups, '_mount_root', lambda: None)
+    monkeypatch.setattr(cgroups, '_membership', lambda process, expected, **kwargs: None)
+    children = [subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for _ in range(2)]
+    processes = tuple(launch._Process(child.pid) for child in children)
+    scope = None
+    try:
+        authority._daemon_pin = launch._DaemonPin('/synthetic/daemon.sock', processes[0].pid,
+            processes[0].start, 10001, 10001, 'synthetic-engine', '1.45')
+        engine.process = processes[0]
+        (scope_dir/'cgroup.procs').write_text(str(children[0].pid)+'\n')
+        (nested/'cgroup.procs').write_text(str(children[1].pid)+'\n')
+        scope = authority.preflight_worker_scope('worker', processes=processes, timeout_ms=1000)
+        scope.assert_enrolled_live()
+        (nested/'cgroup.procs').write_text(str(children[1].pid)+'\n999999\n')
+        with pytest.raises(cgroups.ScopeEvidenceError): scope.assert_enrolled_live()
+        assert engine.effect_calls == []
+    finally:
+        if scope is not None: scope.close()
+        for process in processes: process.close()
+        for child in children:
+            if child.poll() is None:
+                child.terminate()
+                try: child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    child.kill(); child.wait(timeout=2)
+        authority.close()
+
+
+def test_invalid_polled_descriptor_fails_closed():
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    try:
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch._poll_ready([read_fd], 0)
+    finally:
+        os.close(write_fd)
+
+
+@pytest.mark.parametrize('ready_flag', ['POLLIN', 'POLLHUP'])
+def test_supervisor_mixed_poll_error_is_rejected(monkeypatch, ready_flag):
+    class Poll:
+        def register(self,fd,mask): pass
+        def poll(self,timeout): return [(10,launch.select.POLLERR | getattr(launch.select,ready_flag))]
+    monkeypatch.setattr(launch.select, 'poll', Poll)
+    with pytest.raises(launch.LaunchSupervisorError): launch._poll_ready([10],0)

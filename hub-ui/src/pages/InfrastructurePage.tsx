@@ -10,12 +10,13 @@ import type { Hub } from "../hub";
 import { httpInfrastructure, writeFailureText, type DeviceDraft, type InfrastructureClient } from "../infrastructureApi";
 import { demoInfrastructure } from "../infrastructureDemo";
 import {
-  actorLabel, ago, inNetwork, ipFamily, isHostname, isIpAddress, isNetwork, isSlug, maintenanceView, needsAttention, observationView,
+  actorLabel, ago, inNetwork, ipFamily, isHostname, isIpAddress, isNetwork, isSlug, maintenanceView, METRICS_HOST_PATTERN, needsAttention, observationView,
   TEXT_MAX, type Device, type DeviceDetail, type DeviceList, type Maintenance,
 } from "../infrastructureModel";
 import { href, navigate, registerRouteLeaveGuard } from "../router";
 import { Badge, PageHeader, PanelTitle } from "../ui";
-import { MachineHealth } from "./MachineHealth";
+import { MachineHealth, MachineStrip, machinesByDevice, useMachineMetrics } from "./MachineHealth";
+import type { MachineGroup } from "../infrastructureMetrics";
 
 type Load<T> = { state: "loading" } | { state: "loaded"; value: T } | { state: "failed"; message: string } | { state: "unavailable" };
 type Filter = "all" | "attention" | "maintenance";
@@ -73,12 +74,14 @@ function Unavailable({ actions, children }: { actions: React.ReactNode; children
 function DeviceListPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const client = useClient(hub);
   const now = useNow();
+  const reading = useMachineMetrics(hub);
+  const machines = machinesByDevice(reading);
   const [retired, setRetired] = useState(false);
   const [filter, setFilter] = useState<Filter>("all");
   const [creating, setCreating] = useState(false);
   const [load, refresh] = useRead<DeviceList>(hub, signal => client.list(signal, retired), [client, retired, hub.data]);
   // Machine health has its own admission: someone refused the device list may still read metrics, and it hides itself otherwise.
-  if (load.state === "unavailable") return <Unavailable actions={actions}><MachineHealth hub={hub} /></Unavailable>;
+  if (load.state === "unavailable") return <Unavailable actions={actions}><MachineHealth hub={hub} reading={reading} /></Unavailable>;
   const list = load.state === "loaded" ? load.value : null;
   const shown = (list?.items ?? []).filter(device => filter === "all" ? true
     : filter === "maintenance" ? device.open_maintenance !== null : needsAttention(device, now));
@@ -86,8 +89,7 @@ function DeviceListPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }
     kind === "maintenance" ? device.open_maintenance !== null : needsAttention(device, now)).length;
   const canEdit = Boolean(list?.capabilities.device_write) && hub.writable && !hub.stale && !hub.demo;
   return <>
-    <PageHeader eyebrow="INFRASTRUCTURE" title="Infrastructure"
-      subtitle="The devices the Hub knows about, what its checks last saw, and any maintenance in progress. Nothing here powers or changes a device.">
+    <PageHeader eyebrow="INFRASTRUCTURE" title="Infrastructure">
       {actions}
     </PageHeader>
     <section className="panel infra" aria-label="Devices">
@@ -113,14 +115,14 @@ function DeviceListPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }
       {list && list.items.length === 0 && <p className="infra-empty">No devices are recorded yet.</p>}
       {list && list.items.length > 0 && shown.length === 0 && <p className="infra-empty">No devices match this filter.</p>}
       {shown.length > 0 && <ul className="infra-list">
-        {shown.map(device => <DeviceRow key={device.id} device={device} now={now} self={hub.session?.actor ?? null} />)}
+        {shown.map(device => <DeviceRow key={device.id} device={device} now={now} self={hub.session?.actor ?? null} machine={machines.get(device.id)} />)}
       </ul>}
     </section>
-    <MachineHealth hub={hub} />
+    <MachineHealth hub={hub} reading={reading} shownDevices={new Set((list?.items ?? []).map(device => device.id))} />
   </>;
 }
 
-function DeviceRow({ device, now, self }: { device: Device; now: Date; self: string | null }) {
+function DeviceRow({ device, now, self, machine }: { device: Device; now: Date; self: string | null; machine?: MachineGroup }) {
   const maintenance = device.open_maintenance ? maintenanceView(device.open_maintenance, now, self) : null;
   return <li className={device.retired ? "infra-row retired" : "infra-row"}>
     <a className="infra-row-main" href={href({ page: "device", id: device.id })}>
@@ -137,12 +139,14 @@ function DeviceRow({ device, now, self }: { device: Device; now: Date; self: str
         return <Badge key={item.probe_id} tone={view.tone}>{view.label}: {view.line}</Badge>; })}
       {maintenance && <span className={maintenance.overdue ? "infra-maintenance overdue" : "infra-maintenance"}>Maintenance: {maintenance.line}</span>}
     </div>
+    {machine && <MachineStrip group={machine} deviceId={device.id} now={now} />}
   </li>;
 }
 
 function DevicePage({ hub, actions, id }: { hub: Hub; actions: React.ReactNode; id: string }) {
   const client = useClient(hub);
   const now = useNow();
+  const reading = useMachineMetrics(hub);
   const self = hub.session?.actor ?? null;
   const [editing, setEditing] = useState(false);
   const [load, refresh] = useRead<DeviceDetail>(hub, signal => client.detail(id, signal), [client, id, hub.data]);
@@ -163,11 +167,11 @@ function DevicePage({ hub, actions, id }: { hub: Hub; actions: React.ReactNode; 
           {detail.capabilities.device_write && writable && !editing && <button type="button" className="secondary" onClick={() => setEditing(true)}>Edit</button>}
           <button type="button" className="secondary" disabled={load.state === "loading"} onClick={refresh}>Refresh</button>
         </PanelTitle>
-        <p className="panel-description">What's been recorded about this device. Recorded details aren't checked against the device itself.</p>
         {device.retired && <p className="notice" role="status">This device is retired. Its history is kept.</p>}
         {editing ? <DeviceEditor client={client} csrf={csrf} device={device} onDone={saved => { setEditing(false); if (saved) refresh(); }} />
           : <dl className="infra-facts">
             <dt>Hostname</dt><dd>{device.hostname ?? "Not recorded"}</dd>
+            {device.metrics_host && <><dt>Prometheus host</dt><dd><code>{device.metrics_host}</code></dd></>}
             <dt>Addresses</dt><dd>{device.addresses.length ? device.addresses.map(item => <code key={item}>{item}</code>) : "Not recorded"}</dd>
             <dt>Network</dt><dd>{device.network ?? "Not recorded"}</dd>
             <dt>VLAN</dt><dd>{device.vlan ?? "Not recorded"}</dd>
@@ -178,13 +182,12 @@ function DevicePage({ hub, actions, id }: { hub: Hub; actions: React.ReactNode; 
       </section>
       <section className="panel" aria-label="Checks">
         <PanelTitle title="Checks" />
-        <p className="panel-description">A passed check means only that the check succeeded. It doesn't prove the device is powered on or that agents can use it.</p>
         {device.observations.length === 0 ? <p className="infra-empty">No checks are set up for this device, so its state is unknown.</p>
           : <ul className="infra-checks">{device.observations.map(item => { const view = observationView(item, now);
             return <li key={item.probe_id}><div><strong>{view.label}</strong><small><code>{item.probe_id}</code></small></div>
               <Badge tone={view.tone}>{view.line}</Badge></li>; })}</ul>}
       </section>
-      <MachineHealth hub={hub} deviceId={device.id} />
+      <MachineHealth hub={hub} device={{ id: device.id, name: device.metrics_host ?? device.hostname }} reading={reading} />
       <MaintenanceSection client={client} csrf={csrf} detail={detail} now={now} self={self}
         canWrite={detail.capabilities.maintenance_write && writable && !device.retired} onChanged={refresh} />
     </div>}
@@ -210,7 +213,6 @@ function MaintenanceSection({ client, csrf, detail, now, self, canWrite, onChang
   const open = detail.device.open_maintenance;
   return <section className="panel" aria-label="Maintenance">
     <PanelTitle title="Maintenance" />
-    <p className="panel-description">Notes on planned or ongoing work, so an outage has a reason attached. A note records intent; it isn't proof the work happened.</p>
     {open ? <OpenMaintenance client={client} csrf={csrf} entry={open} now={now} self={self} canWrite={canWrite} onChanged={onChanged} />
       : canWrite ? <MaintenanceForm client={client} csrf={csrf} deviceId={detail.device.id} onChanged={onChanged} />
         : <p className="infra-empty">No maintenance is open.</p>}
@@ -307,7 +309,7 @@ function MaintenanceForm({ client, csrf, deviceId, onChanged }: { client: Infras
   </form>;
 }
 
-interface EditorDraft { id: string; name: string; hostname: string; addresses: string; network: string; vlan: string; role: string }
+interface EditorDraft { id: string; name: string; hostname: string; metricsHost: string; addresses: string; network: string; vlan: string; role: string }
 function editorProblems(draft: EditorDraft, creating: boolean): string[] {
   const problems: string[] = [];
   const addresses = draft.addresses.split(/\s+/).filter(Boolean);
@@ -315,6 +317,8 @@ function editorProblems(draft: EditorDraft, creating: boolean): string[] {
   if (!draft.name.trim()) problems.push("Give the device a name.");
   if (!draft.role.trim()) problems.push("Say what the device is for.");
   if (draft.hostname && !isHostname(draft.hostname)) problems.push("The hostname isn't valid.");
+  if (draft.metricsHost.trim() && !METRICS_HOST_PATTERN.test(draft.metricsHost.trim()))
+    problems.push("The Prometheus host can use letters, numbers, dots, dashes and underscores, up to 64 characters.");
   if (addresses.length > 16) problems.push("At most 16 addresses.");
   const bad = addresses.filter(item => !isIpAddress(item));
   if (bad.length) problems.push(`Not an IP address: ${bad.join(", ")}.`);
@@ -331,13 +335,14 @@ function editorProblems(draft: EditorDraft, creating: boolean): string[] {
   return problems;
 }
 function toDraft(draft: EditorDraft, retired: boolean): DeviceDraft {
-  return { id: draft.id, name: draft.name.trim(), hostname: draft.hostname.trim() || null, addresses: draft.addresses.split(/\s+/).filter(Boolean),
+  return { id: draft.id, name: draft.name.trim(), hostname: draft.hostname.trim() || null, metrics_host: draft.metricsHost.trim() || null,
+    addresses: draft.addresses.split(/\s+/).filter(Boolean),
     network: draft.network.trim() || null, vlan: draft.vlan ? Number(draft.vlan) : null, role: draft.role.trim(), retired };
 }
 
 function DeviceEditor({ client, csrf, device, onDone }: { client: InfrastructureClient; csrf: string; device: Device | null; onDone: (saved: Device | null) => void }) {
   const creating = device === null;
-  const initial: EditorDraft = { id: device?.id ?? "", name: device?.name ?? "", hostname: device?.hostname ?? "",
+  const initial: EditorDraft = { id: device?.id ?? "", name: device?.name ?? "", hostname: device?.hostname ?? "", metricsHost: device?.metrics_host ?? "",
     addresses: (device?.addresses ?? []).join("\n"), network: device?.network ?? "", vlan: device?.vlan?.toString() ?? "", role: device?.role ?? "" };
   const [draft, setDraft] = useState(initial);
   const [busy, setBusy] = useState(false);
@@ -366,6 +371,9 @@ function DeviceEditor({ client, csrf, device, onDone }: { client: Infrastructure
     <label className="field"><span className="field-label">Name</span><input required maxLength={100} value={draft.name} onChange={set("name")} /></label>
     <label className="field"><span className="field-label">Role</span><input required maxLength={100} value={draft.role} onChange={set("role")} placeholder="e.g. Staging builds" /></label>
     <label className="field"><span className="field-label">Hostname (optional)</span><input maxLength={253} value={draft.hostname} onChange={set("hostname")} /></label>
+    <label className="field"><span className="field-label">Prometheus host (optional)</span>
+      <input maxLength={64} value={draft.metricsHost} onChange={set("metricsHost")} placeholder="e.g. BEAST" />
+      <small>Only if Prometheus reports this machine under a different name than its hostname. It must match exactly, including capitals.</small></label>
     <label className="field"><span className="field-label">IP addresses (optional, one per line)</span>
       <textarea value={draft.addresses} onChange={set("addresses")} /></label>
     <div className="infra-form-row">

@@ -56,6 +56,8 @@ async def test_correctable_local_validation_error_does_not_strand_current_claim(
 class RecoveryClient(FakeClient):
     def response(self, command):
         response = super().response(command)
+        if command.action == 'deploy_container' and response.state == 'failed':
+            return response
         container = ('d' if command.action in ACTIONS[2:] else 'e') * 64
         return response.model_copy(update={'evidence': response.evidence.model_copy(update={'container_id': container})})
 
@@ -90,12 +92,13 @@ def rig(tmp_path):
     owners = []
     target = ContainerPilotTarget.from_manifest(pilot_manifest())
 
-    def restart(client=None):
+    def restart(client=None, *, single_pilot_protocol=False):
         owner = PilotOwner(path, allow_ephemeral_test_storage=True)
         owners.append(owner)
         repo = HubRepository(path, execution_principal=PRINCIPAL, pilot_owner=owner)
         client = client or RecoveryClient()
-        workflow = ContainerPilotWorkflow(repo, client, [target], pilot_owner=owner)
+        workflow = ContainerPilotWorkflow(repo, client, [target], pilot_owner=owner,
+                                          single_pilot_protocol=single_pilot_protocol)
         return SimpleNamespace(owner=owner, repo=repo, client=client, workflow=workflow,
                                recovery=PilotRecovery(workflow))
 
@@ -275,15 +278,30 @@ async def test_multiple_idle_restarts_preserve_original_epoch_recoverability(rig
 
 
 @pytest.mark.asyncio
-async def test_candidate_failure_recovery_counts_once_then_rollback(rig):
+async def test_deploy_failure_recovery_does_not_assume_prior_effects_absent(rig):
     _, run, _ = await rig.crash()
     current = rig.restart(RecoveryClient({'deploy_container': 'failed'}))
     result = await current.recovery.recover(run['id'])
-    assert result['run']['status'] == 'failed'
-    assert current.repo.get_task(run['task_id'])['repair_count'] == 1
-    assert (await current.workflow.advance(run['id']))['status'] == 'rolled_back'
-    assert current.repo.get_task(run['task_id'])['repair_count'] == 1
-    assert [item.action for item in current.client.submissions] == list(ACTIONS[2:])
+    assert result['recovery'] == 'held'
+    assert result['run']['status'] == 'held'
+    assert current.client.submissions == []
+    assert len(reservations(current.repo, run['id'])[0]) == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_holds_contradictory_deploy_failure_without_rollback(rig):
+    _, run, _ = await rig.crash()
+    class Contradictory(RecoveryClient):
+        def response(self, command):
+            result = super().response(command)
+            return result.model_copy(update={'reason': 'paused'})
+
+    current = rig.restart(Contradictory({'deploy_container': 'failed'}))
+    result = await current.recovery.recover(run['id'])
+    assert result['recovery'] == 'held'
+    assert result['run']['status'] == 'held'
+    assert current.client.submissions == []
+    assert len(reservations(current.repo, run['id'])[0]) == 1
 
 
 @pytest.mark.asyncio
@@ -361,3 +379,179 @@ async def test_changed_original_request_is_not_reconstructed_or_queried(rig):
     assert result['recovery'] == 'held'
     assert current.client.inspections == current.client.submissions == []
     assert reservations(current.repo, run['id'])[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('lost', ['submit', 'ack', 'held'])
+async def test_single_pilot_public_recovery_retries_only_ack_after_restart(rig, lost):
+    from engineering_hub.container_pilot_client import single_pilot_outcome_digest
+    class AckRecoveryClient(RecoveryClient):
+        single_pilot_protocol = True
+        def __init__(self):
+            super().__init__(); self.acks=[]; self.lose_submit=lost=='submit'; self.lose_ack=lost=='ack'; self.held=lost=='held'
+        async def submit_command(self, command):
+            response=await super().submit_command(command)
+            if self.lose_submit:
+                self.lose_submit=False
+                raise TimeoutError('synthetic lost original response')
+            if self.held:
+                self.held=False
+                return response.model_copy(update={'state':'held','reason':'inspect_required'})
+            return response
+        async def acknowledge_command(self, command, digest):
+            self.acks.append((command,digest))
+            if self.lose_ack:
+                self.lose_ack=False
+                raise TimeoutError('synthetic lost ack response')
+            response=self.response(command).model_copy(update={'replayed':True})
+            assert single_pilot_outcome_digest(response)==digest
+            return response
+    client=AckRecoveryClient()
+    initial=rig.restart(client, single_pilot_protocol=True)
+    workflow=initial.workflow
+    task=reviewed_task(initial.repo)
+    run=workflow.create_run('codex',task['id'],task['revision'],IMAGE,rig.target.target_id)
+    held=await workflow.advance(run['id'])
+    assert held['status']=='held' and len(client.submissions)==1
+    initial.owner.close()
+    owner=PilotOwner(rig.path,allow_ephemeral_test_storage=True)
+    try:
+        repo=HubRepository(rig.path,execution_principal=PRINCIPAL,pilot_owner=owner)
+        resumed=ContainerPilotWorkflow(repo,client,[rig.target],pilot_owner=owner,single_pilot_protocol=True)
+        recovery=PilotRecovery(resumed)
+        result=await recovery.recover(run['id'])
+        assert result['recovery']=='recovered' and result['run']['status']=='running'
+        assert len(client.submissions)==1  # recovery never repeats deployment
+        assert len(client.acks)==(2 if lost=='ack' else 1)
+        second=await recovery.recover(run['id'])
+        assert second['recovery']=='recovered' and len(client.submissions)==1
+        completed=await resumed.advance(run['id'])
+        assert completed['status']=='succeeded'
+        assert [x.action for x in client.submissions]==['deploy_container','smoke_container']
+    finally:
+        owner.close()
+
+
+@pytest.mark.asyncio
+async def test_single_pilot_recovery_never_finalizes_uncertain_ack(rig):
+    class AckUnavailable(RecoveryClient):
+        single_pilot_protocol = True
+        async def acknowledge_command(self, command, digest):
+            raise TimeoutError('synthetic acknowledgement unavailable')
+    client=AckUnavailable()
+    initial=rig.restart(client, single_pilot_protocol=True)
+    workflow=initial.workflow
+    task=reviewed_task(initial.repo)
+    run=workflow.create_run('codex',task['id'],task['revision'],IMAGE,rig.target.target_id)
+    assert (await workflow.advance(run['id']))['status']=='held'
+    initial.owner.close()
+    owner=PilotOwner(rig.path,allow_ephemeral_test_storage=True)
+    try:
+        repo=HubRepository(rig.path,execution_principal=PRINCIPAL,pilot_owner=owner)
+        resumed=ContainerPilotWorkflow(repo,client,[rig.target],pilot_owner=owner,single_pilot_protocol=True)
+        result=await PilotRecovery(resumed).recover(run['id'])
+        assert result['recovery']=='held' and result['run']['status']=='held'
+        assert len(client.submissions)==1
+        with repo._connection() as db:
+            assert db.execute('SELECT state FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
+                              (run['id'],'deploy_container')).fetchone()['state']=='ack_pending'
+            assert db.execute('SELECT 1 FROM hub_single_pilot_ack_receipts WHERE run_id=?',(run['id'],)).fetchone() is None
+    finally:
+        owner.close()
+
+
+@pytest.mark.asyncio
+async def test_single_pilot_pause_arriving_during_ack_keeps_local_pending_until_unpaused(rig):
+    class PauseClient(RecoveryClient):
+        single_pilot_protocol=True
+        def __init__(self):
+            super().__init__(); self.first=True; self.pause_repo=None; self.acks=0
+        async def acknowledge_command(self, command, digest):
+            self.acks+=1
+            if self.first:
+                self.first=False
+                raise TimeoutError('synthetic initial lost ack')
+            if self.pause_repo is not None:
+                self.pause_repo.set_pause('human:1234',True); self.pause_repo=None
+            return self.response(command)
+    client=PauseClient(); initial=rig.restart(client,single_pilot_protocol=True)
+    task=reviewed_task(initial.repo)
+    run=initial.workflow.create_run('codex',task['id'],task['revision'],IMAGE,rig.target.target_id)
+    assert (await initial.workflow.advance(run['id']))['status']=='held'
+    initial.owner.close()
+    owner=PilotOwner(rig.path,allow_ephemeral_test_storage=True)
+    try:
+        repo=HubRepository(rig.path,execution_principal=PRINCIPAL,pilot_owner=owner)
+        resumed=ContainerPilotWorkflow(repo,client,[rig.target],pilot_owner=owner,single_pilot_protocol=True)
+        recovery=PilotRecovery(resumed); client.pause_repo=repo
+        result=await recovery.recover(run['id'])
+        assert result['recovery']=='paused' and result['run']['status']=='held'
+        with repo._connection() as db:
+            assert db.execute('SELECT state FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
+                              (run['id'],'deploy_container')).fetchone()['state']=='ack_pending'
+            assert db.execute('SELECT 1 FROM hub_single_pilot_ack_receipts WHERE run_id=?',(run['id'],)).fetchone() is None
+        repo.set_pause('human:1234',False)
+        result=await recovery.recover(run['id'])
+        assert result['recovery']=='recovered' and result['run']['status']=='running'
+        assert len(client.submissions)==1 and client.acks==3
+    finally:
+        owner.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_during_original_ack_stops_next_effect_and_survives_restart(rig):
+    import asyncio
+    from engineering_hub.container_pilot_client import single_pilot_outcome_digest
+
+    class PausedAckClient(RecoveryClient):
+        single_pilot_protocol = True
+
+        def __init__(self):
+            super().__init__()
+            self.ack_started = asyncio.Event()
+            self.release_ack = asyncio.Event()
+            self.acknowledged = []
+
+        async def acknowledge_command(self, command, digest):
+            self.ack_started.set()
+            await self.release_ack.wait()
+            result = self.response(command)
+            assert single_pilot_outcome_digest(result) == digest
+            self.acknowledged.append((command, digest))
+            return result
+
+    client = PausedAckClient()
+    initial = rig.restart(client, single_pilot_protocol=True)
+    task = reviewed_task(initial.repo)
+    run = initial.workflow.create_run('codex', task['id'], task['revision'], IMAGE, rig.target.target_id)
+    advance = asyncio.create_task(initial.workflow.advance(run['id']))
+    await asyncio.wait_for(client.ack_started.wait(), timeout=5)
+    initial.repo.set_pause('human:1234', True)
+    client.release_ack.set()
+    with pytest.raises(HubError, match='paused'):
+        await advance
+    assert [item.action for item in client.submissions] == ['deploy_container']
+    assert len(client.acknowledged) == 1
+    assert initial.repo.get_run(run['id'])['status'] == 'running'
+    with initial.repo._connection() as db:
+        assert db.execute('SELECT state FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
+                          (run['id'], 'deploy_container')).fetchone()['state'] == 'succeeded'
+        assert db.execute('SELECT 1 FROM hub_single_pilot_ack_receipts WHERE run_id=? AND action=?',
+                          (run['id'], 'deploy_container')).fetchone() is not None
+    initial.owner.close()
+    owner = PilotOwner(rig.path, allow_ephemeral_test_storage=True)
+    try:
+        repo = HubRepository(rig.path, execution_principal=PRINCIPAL, pilot_owner=owner)
+        resumed = ContainerPilotWorkflow(repo, client, [rig.target], pilot_owner=owner, single_pilot_protocol=True)
+        paused = await PilotRecovery(resumed).recover(run['id'])
+        assert paused['recovery'] == 'paused'
+        assert [item.action for item in client.submissions] == ['deploy_container']
+        repo.set_pause('human:1234', False)
+        recovered = await PilotRecovery(resumed).recover(run['id'])
+        assert recovered['recovery'] == 'recovered' and recovered['run']['status'] == 'running'
+        assert [item.action for item in client.submissions] == ['deploy_container']
+        final = await resumed.advance(run['id'])
+        assert final['status'] == 'succeeded'
+        assert [item.action for item in client.submissions] == ['deploy_container', 'smoke_container']
+    finally:
+        owner.close()

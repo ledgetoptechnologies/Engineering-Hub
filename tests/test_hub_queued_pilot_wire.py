@@ -20,6 +20,7 @@ from tests.test_hub_queued_pilot import rig, submit
 
 
 class SyntheticHost:
+    _single_pilot_protocol = False
     """Deliberate fake; typed health assertions are not observed Engine evidence."""
     def __init__(self):
         self.commands, self.inspected = {}, []

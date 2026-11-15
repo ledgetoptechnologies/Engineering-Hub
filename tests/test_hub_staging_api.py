@@ -49,7 +49,7 @@ class Controller:
         self.resources.authorize(actor, PROJECT, 'read')
         return {'job_id': job_id, 'state': 'queued'}
 
-    async def reconcile_for(self, actor, job_id):
+    async def reconcile_for(self, actor, job_id, *, admission_guard=None):
         if actor not in self.resources.admin_actors:
             raise HubError('staging_admin_required', 403)
         self.resources.authorize(actor, PROJECT, 'read')
@@ -115,7 +115,8 @@ def application(controller, *, broker=None, session=None, observer=None):
         HubRepository._actor(principal, human=True)
         return principal
 
-    attach_staging_routes(app, controller, actor, human, broker, session, observer=observer)
+    attach_staging_routes(app, controller, actor, human, broker, session, observer=observer,
+                          human_admission=lambda request, principal: lambda db: None)
     return TestClient(app), calls
 
 
@@ -137,8 +138,9 @@ def resource(env, *, kind='build', expired=False):
 
 def submission():
     return {'request_id': '33762456-e740-4f80-bda9-776f8dbcf753', 'project': PROJECT, 'recipe': 'static',
+            'review_task_id': '33762456-e740-4f80-bda9-776f8dbcf754', 'review_task_revision': 4,
             'source_commit': COMMIT, 'source_digest': 'c' * 64,
-            'source_zip_base64': 'eA==', 'topic': 'topic'}
+            'source_zip_base64': 'eA==', 'source_commit_object_base64': 'eA==', 'topic': 'topic'}
 
 
 def test_disabled_status_is_authenticated_and_actions_closed():
@@ -276,6 +278,27 @@ def test_policy_owner_only_cas_and_human_csrf(env):
     assert client.put(path, headers=headers(ADMIN), json=payload).status_code == 403
     assert client.put(path, headers=headers(ADMIN, csrf=True), json=payload).status_code == 200
     assert client.put(path, headers=headers(ADMIN, csrf=True), json=payload).status_code == 409
+
+
+def test_profile_owner_cas_and_project_scoped_reads(env):
+    client, _ = application(env[3])
+    path = PREFIX + '/projects/' + PROJECT + '/profiles/static'
+    profile = {'schema': 'modular-staging-profile-v1', 'image_id': 'sha256:' + 'a' * 64,
+               'build_argv': ['npm', 'run', 'build'], 'test_argv': ['npm', 'test'],
+               'timeout_seconds': 30, 'memory_mb': 128, 'pids': 32, 'output_bytes': 4096,
+               'log_bytes': 1024, 'workspace_bytes': 65536, 'cpu_millis': 250}
+    payload = {'expected_generation': 0, 'profile': profile}
+    assert client.put(path, headers=headers('codex'), json=payload).status_code == 403
+    assert client.put(path, headers={**headers('codex'), 'Content-Type': 'application/json'}, content='{bad').status_code == 403
+    assert client.put(path, headers=headers(ADMIN), json=payload).status_code == 403
+    assert client.put(path, headers=headers('human:2', csrf=True), json=payload).status_code == 403
+    response = client.put(path, headers=headers(ADMIN, csrf=True), json=payload)
+    assert response.status_code == 200 and response.json()['generation'] == 1
+    assert response.json()['execution_authorization'] is False
+    assert client.put(path, headers=headers(ADMIN, csrf=True), json=payload).status_code == 409
+    assert client.get(path, headers=headers('codex')).json()['profile'] == profile
+    assert client.get(path, headers=headers('claude')).status_code == 403
+    assert client.get(path + '?generation=2', headers=headers('codex')).status_code == 404
 
 
 def test_preview_uses_real_broker_human_csrf_and_normalizes_url(env):

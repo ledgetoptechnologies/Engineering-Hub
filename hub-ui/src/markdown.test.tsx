@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import { Markdown } from "./markdown";
+import { internalHref, Markdown } from "./markdown";
 import { groupByFolder } from "./NotesPanel";
 import { isMissingRoute } from "./api";
 import { listTopics, parseTopicList } from "./topicsApi";
@@ -31,11 +31,22 @@ describe("safe markdown", () => {
 
   it("links only https and Hub paths", () => {
     expect(html("[ok](https://example.com/a)")).toContain('href="https://example.com/a"');
-    expect(html("[hub](/projects/treedar)")).toContain('href="/projects/treedar"');
+    expect(html("[hub](/projects/treedar)")).toContain('href="#/projects/treedar"');
+    expect(html("[file](/api/hub/v1/attachments/x)")).toContain('href="/api/hub/v1/attachments/x"');
+    expect(html("[tab](/projects/treedar?tab=work)")).toContain('href="#/projects/treedar?tab=work"');
+    expect(html("[part](/notes#later)")).toContain('href="#/notes#later"');
+    expect(html("[file](/api/hub/v1/attachments/x?download=1)")).toContain('href="/api/hub/v1/attachments/x?download=1"');
     for (const bad of ["javascript:alert(1)", "http://example.com", "data:text/html,x", "//evil.example"]) {
       const out = html(`[x](${bad})`);
       expect(out).not.toContain("href=");
     }
+  });
+
+  it("preserves queries and fragments with an existing path-mode demo query", () => {
+    const pathMode = (path: string) => `${path}?demo=1`;
+    expect(internalHref('/projects/treedar?tab=work#detail', pathMode))
+      .toBe('/projects/treedar?demo=1&tab=work#detail');
+    expect(internalHref('/notes#later', pathMode)).toBe('/notes?demo=1#later');
   });
 });
 

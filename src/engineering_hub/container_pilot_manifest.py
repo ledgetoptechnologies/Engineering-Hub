@@ -317,6 +317,24 @@ class PilotManifest(_Closed):
     timeouts: Timeouts
     failure_policy: FailurePolicy
     retention: Retention
+    # Explicit reviewed staging-only opt in. Omission retains the exact v1
+    # canonical representation and digest of existing manifests.
+    disposable_final_cleanup: Literal[True] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def explicit_cleanup_opt_in(cls, value):
+        if isinstance(value, dict) and 'disposable_final_cleanup' in value:
+            if value['disposable_final_cleanup'] is not True:
+                raise ValueError('disposable cleanup requires explicit true')
+        return value
+
+    @model_serializer(mode="wrap")
+    def serialize_cleanup(self, handler):
+        result = handler(self)
+        if self.disposable_final_cleanup is None:
+            result.pop('disposable_final_cleanup', None)
+        return result
 
     @field_validator("campaign_id")
     @classmethod

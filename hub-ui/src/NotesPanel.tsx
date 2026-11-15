@@ -352,8 +352,6 @@ ${latest.path}`;
           onClick={() => { setListRevision(value => value + 1); if (selected !== null) setDocRevision(value => value + 1); }}>Refresh</button>
         {canWrite && <button className="primary" type="button" onClick={startNew}>New note</button>}
       </span></div>
-    <p className="panel-description">Durable project notes shared with the agents. Notes are context only. They do not approve
-      tasks, answer decisions or authorize runs.</p>
     <div className="notes-controls">
       {!scoped && <div className="notes-project">
         <label htmlFor="notes-project">Project</label>

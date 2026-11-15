@@ -9,6 +9,7 @@ import uuid
 import pytest
 
 from engineering_hub.repository import HubError, HubRepository
+from tests.work_queue_review_faults import corrupt_review_after_active_work
 from engineering_hub.work_queue import WorkAction, WorkQueue, WorkTarget, WorkWorker
 
 
@@ -114,9 +115,7 @@ def test_ineligible_production_does_not_starve_same_machine_staging(priority_que
     if invalidated == 'revoked-approval':
         state.approvals['approved-production'] = False
     elif invalidated == 'revoked-review':
-        task = state.repo.get_task(production['target']['task_id'])
-        state.repo.set_candidate('codex', task['id'], task['revision'], 'c' * 40)
-        assert state.repo.get_task(task['id'])['review'] is None
+        corrupt_review_after_active_work(state.repo, production['target']['task_id'])
     elif invalidated == 'revoked-target':
         state.revoked_targets.add(production['target']['task_id'])
     elif invalidated == 'removed-action':
@@ -238,8 +237,7 @@ def test_readiness_true_cannot_grant_missing_approval_or_current_independent_rev
     production = submit(state, 'production', PRODUCTION,
         approval=None if missing == 'approval' else 'approved-production')
     if missing == 'review':
-        task = state.repo.get_task(production['target']['task_id'])
-        state.repo.set_candidate('codex', task['id'], task['revision'], 'c' * 40)
+        corrupt_review_after_active_work(state.repo, production['target']['task_id'])
     readiness(state, lambda *_: True)
     assert state.queue.claim(worker=worker('hermes'), action_keys=(PRODUCTION,)) is None
     assert state.queue.claim(worker=worker(), action_keys=(STAGING,))['id'] == staging['id']

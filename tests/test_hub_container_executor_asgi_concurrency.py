@@ -26,6 +26,7 @@ def command():
 
 
 class BlockingAdapter:
+    _single_pilot_protocol = False
     def __init__(self):
         self.release, self.started, self.finished = threading.Event(), threading.Event(), threading.Event()
         self.block = True

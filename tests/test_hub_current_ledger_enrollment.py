@@ -44,6 +44,14 @@ def test_current_composed_app_cold_copy_initial_enrollment_preserves_native_stat
     project = projects.create_project('human:42', 'client-notes', 'Client notes', 'project-request')
     links = [{'label': 'Reference', 'url': 'https://example.invalid/reference'}]
     task = repo.create_task('human:42', project['id'], 'Keep context', 'context-request', details='Full context', links=links)
+    # Preserve a retained profile-binding receipt as data, not as execution
+    # approval. This fixture deliberately does not enroll a worker or profile.
+    with repo._transaction() as db:
+        db.execute('INSERT INTO hub_staging_task_profiles VALUES (?,?,?,?,?,?,?,?,?)',
+            (task['id'], 2, project['id'], 'static', 1, 'sha256:' + 'd' * 64,
+             'e' * 40, 3, 'claude'))
+        expected_profile_rows = [tuple(row) for row in db.execute(
+            'SELECT * FROM hub_staging_task_profiles ORDER BY task_id,candidate_revision')]
     question = repo.create_decision('claude', project['id'], 'Explain?', ['Yes', 'No'],
                                      details='Reasoning', links=links, allow_text=True)
     output = BytesIO()
@@ -115,6 +123,8 @@ def test_current_composed_app_cold_copy_initial_enrollment_preserves_native_stat
             authorize=lambda *args: True, asset_authorize=assets.asset_authorize)
         assert owned_reviews.get_review('human:42', review['id']) == completed_review
         with owned._connection() as db:
+            assert [tuple(row) for row in db.execute(
+                'SELECT * FROM hub_staging_task_profiles ORDER BY task_id,candidate_revision')] == expected_profile_rows
             assert [tuple(row) for row in db.execute('SELECT * FROM hub_interactive_asset_bindings ORDER BY id')] == expected_asset_bindings
             assert [tuple(row) for row in db.execute('SELECT * FROM hub_interactive_review_answer_events ORDER BY revision,item_id')] == expected_answer_events
         with closing(sqlite3.connect(copied)) as db:
@@ -129,12 +139,17 @@ def test_current_composed_app_cold_copy_initial_enrollment_preserves_native_stat
     'partial-project', 'partial-label', 'project-shape', 'image-shape',
     'unknown-index', 'index-wrong-columns', 'missing-native-index', 'native-trigger',
     'partial-component', 'partial-review', 'review-shape', 'asset-binding-shape', 'unknown-review-index',
+    'task-profile-shape', 'task-profile-trigger',
 ])
 def test_current_optional_schema_admission_remains_exact_and_read_only(ledger, hazard):
     path, repo, *_ = ledger
     compose(path, repo)
     with closing(sqlite3.connect(path)) as db, db:
-        if hazard == 'partial-project':
+        if hazard == 'task-profile-shape':
+            db.execute('ALTER TABLE hub_staging_task_profiles ADD COLUMN extra TEXT')
+        elif hazard == 'task-profile-trigger':
+            db.execute('CREATE TRIGGER extra_profile_trigger AFTER INSERT ON hub_staging_task_profiles BEGIN SELECT 1; END')
+        elif hazard == 'partial-project':
             db.execute('DROP TABLE hub_project_requests')
         elif hazard == 'partial-label':
             db.execute('DROP TABLE hub_label_items')

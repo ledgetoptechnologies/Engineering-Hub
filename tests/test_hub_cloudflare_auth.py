@@ -379,6 +379,16 @@ def test_environment_selects_exact_provider_and_allowlist(monkeypatch, tmp_path)
     assert config.cloudflare_config.allowed_emails == EMAILS
 
 
+def test_bound_mode_environment_only_reports_version_3_requirement(monkeypatch, tmp_path):
+    monkeypatch.setenv("HUB_DB", str(tmp_path / "hub.sqlite"))
+    monkeypatch.setenv("HUB_HUMAN_AUTH_MODE", "github_cloudflare")
+    for name, value in (("HERMES_TOKEN", "h"), ("CODEX_TOKEN", "c"), ("CLAUDE_TOKEN", "cl")):
+        monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match="requires an explicit version 3 deployment configuration"):
+        Settings.from_env()
+    assert not (tmp_path / "hub.sqlite").exists()
+
+
 def test_access_requires_secure_origin_and_explicit_mode():
     with pytest.raises(ValueError):
         AuthConfig("http://localhost", human_auth_mode="cloudflare_access")

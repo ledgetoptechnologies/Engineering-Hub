@@ -70,7 +70,7 @@ class HubFrontends:
             raise ValueError("Hub frontends require one existing FastAPI Hub core")
         settings = getattr(core.state, "settings", None)
         if (not isinstance(settings, Settings) or settings.ingress_mode != "combined"
-                or settings.auth_config.human_auth_mode != "cloudflare_access"
+                or settings.auth_config.human_auth_mode not in {"cloudflare_access", "github_cloudflare"}
                 or settings.auth_config.cloudflare_config is None):
             raise ValueError("Shared Hub core requires combined ingress and configured Cloudflare Access")
         if getattr(core.state, "hub_frontends", None) is not None:

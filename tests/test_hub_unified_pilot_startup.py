@@ -316,11 +316,16 @@ def test_secret_file_guards_and_no_token_echo(installed, monkeypatch, kind):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('layout', ['external', 'private-hub-child'])
 @pytest.mark.parametrize('with_acceptance', [False, True])
-async def test_selector_preserves_settings_scope_tls_and_closes_pretransfer_owner(installed, monkeypatch, layout, with_acceptance):
+@pytest.mark.parametrize('single_mode', [False, True])
+async def test_selector_preserves_settings_scope_tls_and_closes_pretransfer_owner(installed, monkeypatch, layout, with_acceptance, single_mode):
     from engineering_hub import unified_queued_pilot_service as serving
     from engineering_hub.work_queue import WorkTarget
     owner = PilotOwner(installed['database'], allow_ephemeral_test_storage=True)
     owner.close()
+    if single_mode:
+        installed['document']['schema'] = startup.SCHEMA_SINGLE_PILOT
+        installed['document']['single_pilot_protocol'] = True
+        installed['profile'].write_bytes(encode(installed['document']))
     if layout == 'private-hub-child':
         secret_root = installed['database'].parent / 'executor-secrets'
         secret_root.mkdir(mode=0o700)
@@ -340,6 +345,7 @@ async def test_selector_preserves_settings_scope_tls_and_closes_pretransfer_owne
         pytest.fail('selector must forward, not invoke, trusted acceptance factory')
     acceptance_factory = acceptance if with_acceptance else None
     async def fake_serve(settings, manifest, factory, **kwargs):
+        assert kwargs.get('single_pilot_protocol', False) is single_mode
         assert kwargs['session_acceptance_factory'] is acceptance_factory
         assert kwargs['reconciliation_factory'] is synthetic_reconciliation
         assert settings.database == installed['database']
@@ -359,6 +365,7 @@ async def test_selector_preserves_settings_scope_tls_and_closes_pretransfer_owne
         client = factory()
         try:
             assert type(client) is ContainerPilotClient
+            assert client.single_pilot_protocol is single_mode
         finally:
             await client.aclose()
         raise RuntimeError('Synthetic early bind failure')
@@ -368,6 +375,15 @@ async def test_selector_preserves_settings_scope_tls_and_closes_pretransfer_owne
             reconciliation_factory=synthetic_reconciliation, session_acceptance_factory=acceptance_factory)
     assert len(opened) == 1
     with pytest.raises(PilotOwnershipError): opened[0].assert_active(installed['database'])
+
+
+@pytest.mark.parametrize('mode', [False, 0, 1, None, 'true'])
+def test_v2_profile_requires_explicit_exact_true(mode):
+    value = profile_document()
+    value['schema'] = startup.SCHEMA_SINGLE_PILOT
+    value['single_pilot_protocol'] = mode
+    with pytest.raises(startup.UnifiedPilotStartupError):
+        startup.parse_profile(encode(value))
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import io
 import json
@@ -94,7 +95,7 @@ def safe_path(raw: bytes) -> str:
     except UnicodeError:
         raise PackageError("non_utf8_path") from None
     parts = name.split("/")
-    if (not name or name.startswith("/") or "\\" in name or ":" in name
+    if (not name or len(raw) > 4096 or len(parts) > 64 or name.startswith("/") or "\\" in name or ":" in name
             or any(p in ("", ".", "..") for p in parts)
             or any(ord(c) < 32 or ord(c) == 127 for c in name)):
         raise PackageError("unsafe_path")
@@ -108,12 +109,16 @@ def build_package(repo: Path, ref: str) -> tuple[bytes, dict]:
                  ref + "^{commit}", limit=128).strip().decode("ascii")
     if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
         raise PackageError("unsupported_commit_format")
+    commit_object = git(repo, "cat-file", "commit", commit, limit=64 * 1024)
+    if not commit_object or len(commit_object) > 64 * 1024:
+        raise PackageError("commit_object_limit")
     tree = git(repo, "ls-tree", "-r", "-l", "-z", commit, limit=2 * 1024 * 1024)
     rows = tree.split(b"\x00")
     if rows[-1] != b"" or not 1 <= len(rows) - 1 <= MAX_ENTRIES:
         raise PackageError("entry_limit")
     entries = []
     seen = set()
+    prefixes = {}
     total = 0
     for row in rows[:-1]:
         head, raw_name = row.split(b"\t", 1)
@@ -121,6 +126,11 @@ def build_package(repo: Path, ref: str) -> tuple[bytes, dict]:
         if mode not in (b"100644", b"100755") or kind != b"blob":
             raise PackageError("unsupported_tree_entry")
         name = safe_path(raw_name)
+        parts = name.split("/")
+        for index in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:index])
+            if prefixes.setdefault(prefix.casefold(), prefix) != prefix:
+                raise PackageError("case_colliding_paths")
         if name.casefold() in seen:
             raise PackageError("case_colliding_paths")
         seen.add(name.casefold())
@@ -167,10 +177,12 @@ def build_package(repo: Path, ref: str) -> tuple[bytes, dict]:
         "schema": "engineering-hub.staging-source-package.v1",
         "source_commit": commit,
         "source_digest": hashlib.sha256(payload).hexdigest(),
+        "source_proof": {"schema": "git-sha1-tree-v1",
+                          "commit_object_base64": base64.b64encode(commit_object).decode("ascii")},
         "archive_bytes": len(payload), "expanded_bytes": total, "entries": len(entries),
         "provenance": {"local_git_objects_checked": True,
                        "server_commit_verified": False,
-                       "worker_source_commit_verification": "declared",
+                       "worker_source_commit_verification": "proof_available",
                        "attributes": "exact_blobs_export_ignore_and_export_subst_not_applied"},
         "dependency_sha256": dependencies,
         "required_cache_labels": {LOCK_LABELS[n]: dependencies[n] for n in LOCK_LABELS},

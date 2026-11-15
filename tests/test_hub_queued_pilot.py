@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from tests.manual_session_fixtures import synthetic_workflow_reconciliation
+from tests.work_queue_review_faults import corrupt_review_after_active_work
 
 from engineering_hub.container_pilot import ContainerPilotTarget, ContainerPilotWorkflow
 from engineering_hub.container_pilot_manifest import PilotManifest
@@ -138,10 +139,12 @@ async def test_private_worker_only_and_fence_cannot_be_forged(rig):
 
 
 @pytest.mark.asyncio
-async def test_changed_review_prevents_claim_and_any_host_submission(rig):
+async def test_open_job_freezes_reviewed_task_and_allows_its_pilot(rig):
     task, _ = submit(rig)
-    current = rig.repo.get_task(task["id"])
-    rig.repo.set_candidate("codex", task["id"], current["revision"], "f" * 40)
+    current = rig.repo.get_task(task['id'])
+    with pytest.raises(HubError, match='active_work_job'):
+        rig.repo.set_candidate('codex', task['id'], current['revision'], 'f' * 40)
+    corrupt_review_after_active_work(rig.repo, task["id"])
     assert await rig.bridge.run_once() is None
     assert rig.client.submissions == [] and rig.repo.list_runs() == []
 
@@ -344,6 +347,11 @@ async def test_original_target_authorization_revocation_between_phases_stops_pos
         assert [c.action for c in client.submissions] == ["deploy_container"]
         assert queue.get_job(job["id"])["state"] == "held"
         assert await bridge.run_once() is None
+        with pytest.raises(HubError, match='queued_pilot_review_changed'):
+            await bridge.recover(job['id'])
+        assert queue.get_job(job['id'])['state'] == 'held'
+        assert machine_job(SimpleNamespace(repo=repo)) == job['id']
+        assert client.inspections == []
         assert len(client.submissions) == 1
 
 
@@ -379,7 +387,33 @@ async def test_mismatched_typed_host_evidence_never_releases_capacity(rig, misma
     result = await rig.bridge.run_once()
     assert result["state"] == "held"
     assert machine_job(rig) == job["id"]
+    assert rig.repo.list_runs()[0]["status"] == "held"
     assert rig.repo.get_task(job["target"]["task_id"])["status"] == "verified"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mismatch', ['rollback_smoke', 'rollback_reuses_candidate'])
+async def test_mismatched_rollback_holds_run_and_machine(rig, mismatch):
+    rig.client.outcomes['smoke_container'] = 'failed'
+    original = rig.client.response
+
+    def altered(command):
+        response = original(command)
+        if ((mismatch == 'rollback_smoke' and command.action == 'smoke_container_rollback')
+                or (mismatch == 'rollback_reuses_candidate' and command.action == 'rollback_container')):
+            container = '9' * 64 if mismatch == 'rollback_smoke' else 'e' * 64
+            response = response.model_copy(update={'evidence': response.evidence.model_copy(
+                update={'container_id': container})})
+        return response
+
+    rig.client.response = altered
+    _, job = submit(rig)
+    result = await rig.bridge.run_once()
+    assert result['state'] == 'held'
+    assert machine_job(rig) == job['id']
+    assert rig.repo.list_runs()[0]['status'] == 'held'
+    if mismatch == 'rollback_reuses_candidate':
+        assert [command.action for command in rig.client.submissions] == ACTIONS[:3]
 
 
 @pytest.mark.parametrize("changed", ["machine", "manifest"])
@@ -430,3 +464,46 @@ def test_missing_inprocess_bridge_never_treats_durable_marker_as_authority(rig):
         assert rig.repo.list_runs() == [] and rig.client.submissions == []
     finally:
         rig.repo._queued_pilot = rig.bridge
+
+
+@pytest.mark.parametrize('extra', [
+    {'review_revision': 4, 'submission_id': str(uuid.uuid4())},
+    {'ci_attempt_job_id': str(uuid.uuid4())},
+    {'build_receipt_digest': 'sha256:' + 'c' * 64},
+    {'execution_release_digest': 'sha256:' + 'd' * 64},
+    {'ci_attempt_job_id': str(uuid.uuid4()), 'build_receipt_digest': 'sha256:' + 'c' * 64,
+     'execution_release_digest': 'sha256:' + 'd' * 64},
+])
+def test_unpersisted_target_bindings_are_rejected_before_queue_admission(rig, extra):
+    task = reviewed_task(rig.repo, 'unsupported-target-binding')
+    target = WorkTarget(task['id'], COMMIT, IMAGE, **extra)
+    with pytest.raises(HubError, match='work_target_not_verified'):
+        rig.queue.submit(actor='codex', request_id='unsupported-binding', action_key=ACTION,
+                         environment='staging', target=target)
+    with rig.repo._connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM hub_work_jobs').fetchone()[0] == 0
+    assert machine_job(rig) is None and rig.client.submissions == []
+
+
+@pytest.mark.asyncio
+async def test_corrupted_queued_extra_binding_is_not_claimed_or_dispatched(rig):
+    _, job = submit(rig, 'legacy-extra-binding')
+    with rig.repo._transaction() as db:
+        row = db.execute('SELECT target FROM hub_work_jobs WHERE id=?', (job['id'],)).fetchone()
+        target = json.loads(row['target'])
+        target['build_receipt_digest'] = 'sha256:' + 'c' * 64
+        db.execute('UPDATE hub_work_jobs SET target=? WHERE id=?', (json.dumps(target), job['id']))
+    assert await rig.bridge.run_once() is None
+    assert rig.queue.get_job(job['id'])['state'] == 'queued'
+    assert machine_job(rig) is None and rig.client.submissions == []
+
+@pytest.mark.asyncio
+async def test_one_open_job_per_task_does_not_deadlock_pilot(rig):
+    task, first = submit(rig)
+    assert rig.queue.submit(actor='codex', request_id='one', action_key=ACTION,
+        environment='staging', target=WorkTarget(task['id'], COMMIT, IMAGE))['id'] == first['id']
+    with pytest.raises(HubError, match='work_task_already_queued'):
+        rig.queue.submit(actor='codex', request_id='duplicate-target', action_key=ACTION,
+            environment='staging', target=WorkTarget(task['id'], COMMIT, IMAGE))
+    assert (await rig.bridge.run_once())['state'] == 'succeeded'
+    assert machine_job(rig) is None

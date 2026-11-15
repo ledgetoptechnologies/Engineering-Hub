@@ -54,6 +54,48 @@ def draft():
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='Real private SQLite/file owner composition')
+@pytest.mark.parametrize('operation', ['save', 'open', 'resolve'])
+@pytest.mark.parametrize('revocation', ['logout', 'expiry'])
+def test_mutation_rechecks_session_after_body_read(tmp_path, monkeypatch, operation, revocation):
+    from engineering_hub import infrastructure_api
+
+    config = settings(tmp_path)
+    app = create_app(config)
+    with TestClient(app, base_url=config.auth_config.origin) as client:
+        headers = login(client, app, config)
+        assert client.put(BASE + '/devices/synthetic-pc', headers=headers, json=draft()).status_code == 200
+        assert client.put(BASE + '/devices/other-pc', headers=headers, json=draft()).status_code == 200
+        opened = client.post(BASE + '/devices/synthetic-pc/maintenance', headers=headers,
+                             json={'reason': 'fixture', 'client_request_id': 'setup'}).json()
+        token = client.cookies.get(config.auth_config.cookie_name)
+        original_payload = infrastructure_api._payload
+
+        async def revoke_after_body(request, model, maximum=16384):
+            result = await original_payload(request, model, maximum)
+            if revocation == 'logout':
+                app.state.sessions.delete_session(token)
+            else:
+                prior_clock = app.state.sessions.clock
+                app.state.sessions.clock = lambda: prior_clock() + app.state.sessions.session_ttl + 1
+            return result
+
+        monkeypatch.setattr(infrastructure_api, '_payload', revoke_after_body)
+        if operation == 'save':
+            response = client.put(BASE + '/devices/third-pc', headers=headers, json=draft())
+        elif operation == 'open':
+            response = client.post(BASE + '/devices/other-pc/maintenance', headers=headers,
+                                   json={'reason': 'second fixture', 'client_request_id': 'rejected'})
+        else:
+            response = client.post(BASE + '/maintenance/' + opened['id'] + '/resolve', headers=headers,
+                                   json={'expected_revision': 1, 'resolution': 'done'})
+        assert response.status_code == 401
+        registry = app.state.infrastructure.service.registry
+        assert registry.db.execute("SELECT count(*) FROM infra_devices WHERE id='third-pc'").fetchone()[0] == 0
+        assert registry.db.execute("SELECT count(*) FROM infra_requests WHERE key='rejected'").fetchone()[0] == 0
+        assert registry.db.execute('SELECT state FROM infra_maintenance WHERE id=?', (opened['id'],)).fetchone()[0] == 'open'
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='Real private SQLite/file owner composition')
 def test_environment_default_path_uses_owner_and_respects_operator_disable(tmp_path, monkeypatch):
     monkeypatch.setenv('HUB_DB', str(tmp_path / 'hub.sqlite3'))
     monkeypatch.setenv('HUB_BASE_URL', 'https://hub.test')
@@ -148,7 +190,8 @@ def test_owner_metrics_navigation_does_not_require_inventory_read_grant(tmp_path
 
 @pytest.mark.skipif(os.name != 'posix', reason='Actual private inventory and session composition')
 def test_composed_metrics_use_owner_session_and_authenticated_internal_agents(tmp_path, monkeypatch):
-    from engineering_hub.infrastructure_metrics import MetricsReader, QUERIES
+    from engineering_hub.infrastructure_metrics import MetricsReader
+    from engineering_hub.infrastructure_discovery_metrics import ALL_QUERIES
     from engineering_hub.infrastructure_prometheus import TARGET_PATH
     from urllib.parse import parse_qs, urlsplit
 
@@ -159,7 +202,7 @@ def test_composed_metrics_use_owner_session_and_authenticated_internal_agents(tm
     config.infrastructure_config_path.write_text(json.dumps(operator))
     calls = []
     stamp = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-    by_query = {query: (kind, key) for kind, key, query in QUERIES}
+    by_query = {query: (kind, key) for kind, key, query in ALL_QUERIES}
 
     async def fetch(reader, client, path, budget):
         calls.append(path)
@@ -189,7 +232,7 @@ def test_composed_metrics_use_owner_session_and_authenticated_internal_agents(tm
         response = client.get(BASE + '/metrics')
         assert response.status_code == 200, response.text
         result = response.json()
-        assert result['schema_version'] == 2
+        assert result['schema_version'] == 3
         assert result['source'] == {'status': 'ok', 'truncated': False, 'omitted_count': 0, 'warnings': []}
         target = result['devices'][0]
         assert target['cpu_busy_ratio'] == 0.25 and target['mem_total_bytes'] == 1024

@@ -10,18 +10,21 @@ TEXT = TEMPLATE.read_text(encoding='utf-8')
 BODY = '\n'.join(line.split('#', 1)[0] for line in TEXT.splitlines())
 UUID = '00000000-0000-4000-8000-000000000001'
 ROOT = '/v1/container-pilot/commands'
+V2 = '/v2/container-pilot/commands'
 
 
 def admitted(method, uri):
     # These patterns deliberately use the common anchored PCRE/Python subset.
     # Testing the literal template avoids inventing a separate route allowlist.
     patterns = re.findall(r'"~(\^.*\$)"\s+1;', BODY)
-    assert len(patterns) == 4
+    assert len(patterns) == 9
     return any(re.fullmatch(pattern, method + ':' + uri) for pattern in patterns)
 
 
 @pytest.mark.parametrize('method,path', [('POST', ROOT), ('GET', ROOT + '/' + UUID),
-    ('POST', ROOT + '/' + UUID + '/reconcile'), ('POST', '/v1/container-pilot/current-observation')])
+    ('POST', ROOT + '/' + UUID + '/reconcile'), ('POST', '/v1/container-pilot/current-observation'),
+    ('GET', '/v2/container-pilot/capability'), ('POST', V2), ('GET', V2 + '/' + UUID),
+    ('POST', V2 + '/' + UUID + '/reconcile'), ('POST', V2 + '/' + UUID + '/acknowledge')])
 def test_only_expected_routes_admitted(method, path):
     assert admitted(method, path)
 
@@ -36,7 +39,9 @@ def test_only_expected_routes_admitted(method, path):
     ('GET', '/v1/container-pilot/current-observation'),
     ('POST', '/v1/container-pilot/current-observation/'),
     ('POST', '/v1/container-pilot/current-observation?x=1'),
-    ('POST', '/v1/container-pilot/%63urrent-observation')])
+    ('POST', '/v1/container-pilot/%63urrent-observation'), ('POST', V2 + '/' + UUID + '/acknowledge?x=1'),
+    ('GET', V2 + '/' + UUID + '/acknowledge'), ('POST', '/v2/container-pilot/%63ommands'),
+    ('GET', '/v2/container-pilot/capability/'), ('POST', V2 + '/bad/acknowledge')])
 def test_aliases_other_methods_and_query_strings_denied(method, path):
     assert not admitted(method, path)
 

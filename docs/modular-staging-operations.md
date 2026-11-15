@@ -143,6 +143,24 @@ IP SAN, with no environment proxy, default-CA or disabled-TLS fallback.
    before enabling autonomous work. A configuration parse, source test or Docker
    mock is not live-host acceptance.
 
+The staging receiver's `token_file` loader requires POSIX descriptor-relative,
+no-follow path traversal. Each ancestor must be owned by root or the receiver's
+effective UID and not group- or world-writable; a root-owned sticky directory
+is permitted only for a root- or receiver-owned child. The token file must be
+regular, owned by root or the effective UID, have exactly one link, and have no
+group or other permissions. Its token must contain at least 16 printable
+non-space ASCII characters, optionally followed by one LF; the entire file,
+including that LF, must not exceed 4096 bytes. The loader rejects changes
+observed during its bounded descriptor reads. Verify the real installed UID,
+all ancestor ownership and modes, mount behavior, and readability before a
+rollout; an existing `0600` file alone does not establish path compatibility.
+
+Non-POSIX receiver credential loading fails closed because equivalent Windows
+ACL and handle protections have not been established. This changes any prior
+Windows receiver use and does not affect the separate Hub-side credential
+loader. The checks do not establish protection against same-UID/root or mount
+administrators, live revocation, or host/ledger fencing.
+
 ## EH configuration and permissions
 
 The existing EH deployment may load the optional sibling `staging-service.json`.
@@ -228,3 +246,9 @@ and verify isolation with separate local browser-test origins only.
 No production deployment, DNS/Cloudflare change, host installation, cleanup,
 daemon activation, filesystem recovery or held-reservation release was performed
 for this document.
+
+Queue request IDs beginning with `staging:` are reserved for internal staging
+controller submissions. Public work-queue REST and MCP submissions must choose
+another prefix. Existing ambiguous jobs using that prefix cannot be cancelled
+through the generic queue operation; review their staging ownership and resources
+before taking further action; no automatic cleanup is provided.

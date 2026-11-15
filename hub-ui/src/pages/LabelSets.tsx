@@ -33,7 +33,6 @@ export function LabelSetsPanel({ hub, project }: { hub: Hub; project: string }) 
   return (
     <section className="panel label-sets" aria-label="Labeling">
       <PanelTitle title="Labeling" count={sets?.length} />
-      <p className="panel-description">Sets an agent prepared for you to label. Every choice saves as you go.</p>
       {state === "loading" && <p role="status">Reading labeling sets…</p>}
       {state === "failed" && <p role="alert">Labeling sets are unavailable right now.</p>}
       <div className="label-set-list">

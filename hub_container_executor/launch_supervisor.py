@@ -20,6 +20,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import select
 import socket
 import sqlite3
@@ -47,6 +48,11 @@ from .configuration_commitment import configuration_commitment
 _HEX = re.compile(r'[0-9a-f]{64}\Z')
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
 CURRENT_REQUEST_PROTOCOL = 'engineering-hub.executor-current-observation-request.v1'
+APP_CGROUP_REQUEST_PROTOCOL = 'engineering-hub.app-cgroup-observation-request.v1'
+APP_CGROUP_SIGNATURE_DOMAIN = b'engineering-hub-app-cgroup-observation-v1\x00'
+PROPOSAL_REQUEST_PROTOCOL = 'engineering-hub.launch-proposal-request.v1'
+_CGROUPFS_ROOT = Path('/sys/fs/cgroup')
+APPROVAL_PROPOSAL_DOMAIN = b'engineering-hub-launch-approval-proposal-v1\x00'
 _TARGETS = {
     'engine_socket': '/run/engineering-hub/docker.sock',
     'issuer_socket': '/run/engineering-hub/issuer.sock',
@@ -179,6 +185,26 @@ def _proc_start(pid):
     return ticks
 
 
+def _poll_ready(sources, timeout):
+    """Bounded descriptor readiness without select()'s descriptor limit."""
+    _require(type(sources) in (list, tuple) and sources
+             and type(timeout) in (int, float) and math.isfinite(timeout) and 0 <= timeout <= 3600)
+    mapping = {}
+    poller = select.poll()
+    for source in sources:
+        fd = source if type(source) is int else source.fileno()
+        _require(type(fd) is int and fd >= 0 and fd not in mapping)
+        mapping[fd] = source
+        poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    events = poller.poll(math.ceil(timeout * 1000))
+    ready = []
+    for fd, event in events:
+        _require(fd in mapping and not event & (select.POLLNVAL | select.POLLERR)
+                 and bool(event & (select.POLLIN | select.POLLHUP)))
+        ready.append(mapping[fd])
+    return ready
+
+
 class _Process:
     def __init__(self, pid, *, expected_start=None):
         _require(type(pid) is int and pid > 0 and hasattr(os, 'pidfd_open'))
@@ -195,7 +221,7 @@ class _Process:
             raise
 
     def check(self):
-        _require(self.fd is not None and not select.select([self.fd], [], [], 0)[0]
+        _require(self.fd is not None and not _poll_ready([self.fd], 0)
                  and _boot_id() == self.boot and _proc_start(self.pid) == self.start)
 
     def close(self):
@@ -256,6 +282,10 @@ class ExecutorLaunchProfile(_Closed):
     mounts: tuple[ExecutorLaunchMount, ...]
     runner_file: str
     runner_digest: str
+    cgroup_parent: str | None = None
+    cgroup_host_parent: str | None = None
+    cgroup_host_ns_device: int | None = None
+    cgroup_host_ns_inode: int | None = None
 
     @field_validator('supplementary_groups', 'entrypoint', 'command', 'environment', 'mounts', mode='before')
     @classmethod
@@ -285,6 +315,18 @@ class ExecutorLaunchProfile(_Closed):
                      if item.role not in {'engine_socket', 'issuer_socket'}))
         _require(all(not (left == right or left in right.parents or right in left.parents)
                      for index, left in enumerate(sources) for right in sources[index + 1:]))
+        if self.cgroup_parent is None or self.cgroup_host_parent is None:
+            _require(self.cgroup_parent is None and self.cgroup_host_parent is None
+                     and self.cgroup_host_ns_device is None and self.cgroup_host_ns_inode is None)
+        else:
+            _require(type(self.cgroup_parent) is str
+                     and re.fullmatch(r'[a-z][a-z0-9-]{0,60}\.slice', self.cgroup_parent)
+                     and type(self.cgroup_host_parent) is str and self.cgroup_host_parent.startswith('/')
+                     and os.path.normpath(self.cgroup_host_parent) == self.cgroup_host_parent
+                     and '..' not in Path(self.cgroup_host_parent).parts
+                     and Path(self.cgroup_host_parent).name == self.cgroup_parent
+                     and type(self.cgroup_host_ns_device) is int and self.cgroup_host_ns_device > 0
+                     and type(self.cgroup_host_ns_inode) is int and self.cgroup_host_ns_inode > 0)
         _path(self.runner_file)
         _require(self.runner_file.endswith('/hub_container_executor/installed_runner.py')
                  and not any(self.runner_file == item.target or Path(item.target) in Path(self.runner_file).parents
@@ -292,7 +334,13 @@ class ExecutorLaunchProfile(_Closed):
         return self
 
     def digest(self):
-        return 'sha256:' + hashlib.sha256(_canonical(self.model_dump(mode='json'))).hexdigest()
+        value = self.model_dump(mode='json')
+        if self.cgroup_parent is None:
+            del value['cgroup_parent']
+            del value['cgroup_host_parent']
+            del value['cgroup_host_ns_device']
+            del value['cgroup_host_ns_inode']
+        return 'sha256:' + hashlib.sha256(_canonical(value)).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -537,7 +585,18 @@ class _Journal:
                     db.execute('CREATE TABLE issuance (launch_id TEXT PRIMARY KEY, nonce TEXT UNIQUE NOT NULL, '
                                'state TEXT NOT NULL, receipt_digest TEXT)')
                     db.execute('PRAGMA user_version=1')
-                _require(db.execute('PRAGMA user_version').fetchone()[0] == 1)
+                version = db.execute('PRAGMA user_version').fetchone()[0]
+                _require(version in (1, 2))
+                rows = db.execute('SELECT data FROM launch').fetchall()
+                _require(len(rows) <= 1)
+                records = [_strict(row[0].encode('utf-8'), 65536) for row in rows]
+                _require(all(type(record) is dict for record in records))
+                if version == 1:
+                    _require(all('daemon_scope_observation' not in record for record in records))
+                else:
+                    _require(len(records) == 1 and type(records[0].get('daemon_scope_observation')) is dict
+                             and records[0]['daemon_scope_observation'].get('verification')
+                                 in ('provisional', 'postcheck_complete'))
                 _require({row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")} == {'launch', 'issuance'})
         except BaseException:
             self.close()
@@ -575,8 +634,47 @@ class _Journal:
 
     def state(self, identity, state, data):
         with self.transaction() as db:
-            _require(db.execute('UPDATE launch SET state=?,data=? WHERE id=?',
-                (state, _canonical(data).decode(), identity)).rowcount == 1)
+            _require(type(data) is dict and 'daemon_scope_observation' not in data)
+            row = db.execute('SELECT data FROM launch WHERE id=?', (identity,)).fetchone()
+            _require(row is not None)
+            prior = _strict(row[0].encode('utf-8'), 65536)
+            _require(type(prior) is dict)
+            version = db.execute('PRAGMA user_version').fetchone()[0]
+            _require((version == 1 and 'daemon_scope_observation' not in prior)
+                     or (version == 2 and type(prior.get('daemon_scope_observation')) is dict))
+            retained = dict(data)
+            if 'daemon_scope_observation' in prior:
+                retained['daemon_scope_observation'] = prior['daemon_scope_observation']
+            _require(db.execute('UPDATE launch SET state=?,data=? WHERE id=? AND data=?',
+                (state, _canonical(retained).decode(), identity, row[0])).rowcount == 1)
+
+    def record_empty_daemon_scope(self, identity, expected_record, observation):
+        """Retain one post-stop scope snapshot; it grants no recovery authority."""
+        with self.transaction() as db:
+            _require(db.execute('PRAGMA user_version').fetchone() == (1,))
+            row = db.execute('SELECT state,data FROM launch WHERE id=?', (identity,)).fetchone()
+            _require(row is not None and row[0] == 'stopped')
+            data = _strict(row[1].encode('utf-8'), 65536)
+            _require(type(data) is dict and data == expected_record and 'daemon_scope_observation' not in data)
+            data['daemon_scope_observation'] = observation
+            _require(db.execute('UPDATE launch SET data=? WHERE id=? AND state=? AND data=?',
+                (_canonical(data).decode(), identity, 'stopped', row[1])).rowcount == 1)
+            # Same transaction as the first observation: legacy binaries
+            # reject v2 before they can execute their destructive state update.
+            db.execute('PRAGMA user_version=2')
+
+    def confirm_empty_daemon_scope(self, identity, observation):
+        """Record that a second scope check finished, never prove effect outcome."""
+        with self.transaction() as db:
+            _require(db.execute('PRAGMA user_version').fetchone() == (2,))
+            row = db.execute('SELECT state,data FROM launch WHERE id=?', (identity,)).fetchone()
+            _require(row is not None and row[0] == 'stopped')
+            data = _strict(row[1].encode('utf-8'), 65536)
+            _require(type(data) is dict and data.get('daemon_scope_observation') == observation
+                     and observation.get('verification') == 'provisional')
+            data['daemon_scope_observation'] = dict(observation, verification='postcheck_complete')
+            _require(db.execute('UPDATE launch SET data=? WHERE id=? AND state=? AND data=?',
+                (_canonical(data).decode(), identity, 'stopped', row[1])).rowcount == 1)
 
     def reserve_issuance(self, identity, nonce):
         with self.transaction() as db:
@@ -618,9 +716,11 @@ class LaunchSupervisor:
         self._closed = False
         self._issuance_open = False
         self._receipt_served = False
+        self._receipt_id = self._receipt_digest = self._receipt_expires_at_ms = None
         self._approval_expires_at_ms = None
         self._held = False
         self._source_pins = {}
+        self._cgroup_parent_identity = self._cgroup_parent_fd = None
         try:
             _require(sys.platform == 'linux' and os.geteuid() == os.getuid() == 0
                      and hasattr(socket, 'SO_PEERCRED') and hasattr(os, 'pidfd_open'))
@@ -760,9 +860,53 @@ class LaunchSupervisor:
         os.chmod(pinned, 0o660, follow_symlinks=False)
         self._listener.listen(1)
 
+    def _check_cgroup_namespace(self):
+        from .cgroup_scope_evidence import _mount_root
+        _mount_root()
+        expected = (self.profile.cgroup_host_ns_device, self.profile.cgroup_host_ns_inode)
+        _require(_identity(os.stat('/proc/self/ns/cgroup')) == expected
+                 and _identity(os.stat(f'/proc/{self._daemon_pin.pid}/ns/cgroup')) == expected)
+
+    def _pin_cgroup_parent(self):
+        """Retain the enrolled parent inode in the enrolled cgroup namespace."""
+        if self.profile.cgroup_parent is None:
+            return
+        from .cgroup_scope_evidence import _filesystem
+        _require(getattr(self, '_cgroup_parent_fd', None) is None)
+        self._check_cgroup_namespace()
+        path = _CGROUPFS_ROOT / self.profile.cgroup_host_parent.lstrip('/')
+        _require(path.resolve(strict=True) == path and path != _CGROUPFS_ROOT)
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            _filesystem(fd)
+            info = os.fstat(fd)
+            _require(stat.S_ISDIR(info.st_mode) and _identity(info) == _identity(os.stat(path, follow_symlinks=False)))
+            self._check_cgroup_namespace()
+            self._cgroup_parent_identity = _identity(info)
+            self._cgroup_parent_fd, fd = fd, None
+        finally:
+            if fd is not None: os.close(fd)
+
+    def _check_cgroup_parent_membership(self, process_cgroup):
+        """Compare momentary kernel membership to the retained parent handle."""
+        if self.profile.cgroup_parent is None:
+            return
+        from .cgroup_scope_evidence import _filesystem
+        parent = _CGROUPFS_ROOT / self.profile.cgroup_host_parent.lstrip('/')
+        observed = _CGROUPFS_ROOT / process_cgroup.lstrip('/')
+        fd = getattr(self, '_cgroup_parent_fd', None)
+        _require(fd is not None and getattr(self, '_cgroup_parent_identity', None) is not None)
+        self._check_cgroup_namespace()
+        _filesystem(fd)
+        _require(parent.resolve(strict=True) == parent and observed.resolve(strict=True) == observed
+                 and parent in observed.parents
+                 and _identity(os.fstat(fd)) == self._cgroup_parent_identity
+                 and _identity(os.stat(parent, follow_symlinks=False)) == self._cgroup_parent_identity)
+        self._check_cgroup_namespace()
+
     def _create_body(self):
         p = self.profile
-        return {'Image': self.image.runnable_reference, 'User': p.user,
+        body = {'Image': self.image.runnable_reference, 'User': p.user,
             'Entrypoint': list(p.entrypoint), 'Cmd': list(p.command), 'Env': list(p.environment),
             'WorkingDir': '/', 'Hostname': '', 'Domainname': '', 'AttachStdin': False,
             'AttachStdout': False, 'AttachStderr': False, 'OpenStdin': False, 'Tty': False,
@@ -777,6 +921,9 @@ class LaunchSupervisor:
                             'ReadOnly': item.read_only, 'BindOptions': {'Propagation': 'rprivate'}} for item in p.mounts],
                 'RestartPolicy': {'Name': 'no', 'MaximumRetryCount': 0}, 'AutoRemove': False,
                 'Devices': [], 'DeviceRequests': [], 'ExtraHosts': [], 'Links': [], 'VolumesFrom': []}}
+        if p.cgroup_parent is not None:
+            body['HostConfig']['CgroupParent'] = p.cgroup_parent
+        return body
 
     def _inspect(self, deadline, *, running):
         _, info = self._engine.json('GET', '/containers/' + self._container_id + '/json', deadline)
@@ -851,6 +998,7 @@ class LaunchSupervisor:
                 deadline = time.monotonic() + self._launch_ms / 1000
                 self._bind_issuer()
                 self._pin_sources()
+                self._pin_cgroup_parent()
                 defaults = self._engine.image(self.image, deadline)
                 _require(not defaults.get('Volumes') and not defaults.get('Healthcheck') and not defaults.get('OnBuild')
                          and tuple(defaults.get('Entrypoint') or ()) == self.profile.entrypoint
@@ -916,6 +1064,7 @@ class LaunchSupervisor:
         _require(os.path.normpath(relative) == relative and '..' not in Path(relative).parts)
         cgroup = Path('/sys/fs/cgroup') / relative.lstrip('/')
         _require(cgroup.resolve(strict=True) == cgroup)
+        self._check_cgroup_parent_membership(relative)
         def value(name):
             raw = (cgroup / name).read_bytes()
             _require(len(raw) <= 4096)
@@ -986,8 +1135,7 @@ class LaunchSupervisor:
                         return False
                     deadline = min(deadline, self._expires)
                     _remaining(deadline)
-                    ready, _, _ = select.select([self._listener, self._consumer.fd], [], [],
-                        min(0.1, _remaining(deadline)))
+                    ready = _poll_ready([self._listener, self._consumer.fd], min(0.1, _remaining(deadline)))
                     _remaining(deadline)
                     _require(self._consumer.fd not in ready)
                     if self._listener in ready:
@@ -1048,6 +1196,9 @@ class LaunchSupervisor:
                 peer.shutdown(socket.SHUT_WR)
                 _remaining(deadline)
                 self._journal.issuance_state(self._launch_id, 'sent', hashlib.sha256(raw).hexdigest())
+                self._receipt_id = payload['receipt_id']
+                self._receipt_digest = hashlib.sha256(raw).hexdigest()
+                self._receipt_expires_at_ms = payload['expires_at_ms']
                 self._receipt_served = True
                 return payload['receipt_id']
             except BaseException:
@@ -1127,6 +1278,127 @@ class LaunchSupervisor:
             self._hold()
             raise LaunchSupervisorError() from None
 
+    def _observe_app_cgroup_locked(self, nonce, container_id, deadline):
+        """Observe exact running app membership from the root host, not Docker alone."""
+        try:
+            _require(self.profile.cgroup_parent is not None and self._receipt_served
+                     and not self._issuance_open and type(container_id) is str and _HEX.fullmatch(container_id)
+                     and type(nonce) is str and _HEX.fullmatch(nonce))
+            deadline = min(deadline, self._expires)
+            self._validate_live(deadline)
+            # Engine-reported PID is interpreted only in the same PID namespace.
+            _require(self._engine.namespace == _identity(os.stat('/proc/self/ns/pid')))
+            _, info = self._engine.json('GET', '/containers/' + container_id + '/json', deadline)
+            _require(type(info) is dict and info.get('Id') == container_id
+                     and type(info.get('HostConfig')) is dict
+                     and info['HostConfig'].get('CgroupParent') == self.profile.cgroup_parent
+                     and type(info.get('State')) is dict and info['State'].get('Running') is True
+                     and type(info['State'].get('Pid')) is int and info['State']['Pid'] > 1)
+            pid = info['State']['Pid']
+            _require(pid != self._consumer.pid and pid != self._daemon_pin.pid)
+            process = _Process(pid)
+            try:
+                rows = Path(f'/proc/{pid}/cgroup').read_text(encoding='ascii').splitlines()
+                _require(len(rows) == 1 and rows[0].startswith('0::/'))
+                relative = rows[0][3:]
+                _require(os.path.normpath(relative) == relative and '..' not in Path(relative).parts)
+                self._check_cgroup_parent_membership(relative)
+                group = _CGROUPFS_ROOT / relative.lstrip('/')
+                _require(str(pid) in (group / 'cgroup.procs').read_text(encoding='ascii').splitlines())
+                process.check()
+                now = int(time.time() * 1000)
+                expires = min(now + min(5000, int(_remaining(self._expires) * 1000)),
+                              self._approval_expires_at_ms)
+                _require(now < expires)
+                payload = {'protocol': 'engineering-hub.app-cgroup-observation.v1', 'nonce': nonce,
+                    'launch_id': self._launch_id, 'boot_id': process.boot, 'engine_id': self._daemon_pin.daemon_id,
+                    'engine_pid': self._daemon_pin.pid, 'engine_start_ticks': self._daemon_pin.start_ticks,
+                    'container_id': container_id, 'host_pid': process.pid, 'host_start_ticks': process.start,
+                    'cgroup_parent': self.profile.cgroup_parent, 'cgroup_device': self._cgroup_parent_identity[0],
+                    'cgroup_inode': self._cgroup_parent_identity[1],
+                    'namespace_device': self.profile.cgroup_host_ns_device,
+                    'namespace_inode': self.profile.cgroup_host_ns_inode,
+                    'observed_at_ms': now, 'expires_at_ms': expires}
+                signature = base64.urlsafe_b64encode(self._signer.sign(
+                    APP_CGROUP_SIGNATURE_DOMAIN + _canonical(payload))).rstrip(b'=').decode()
+                result = _canonical({'payload': payload, 'signature': signature})
+                process.check()
+                self._check_cgroup_parent_membership(relative)
+                _, final = self._engine.json('GET', '/containers/' + container_id + '/json', deadline)
+                _require(type(final) is dict and final.get('Id') == container_id
+                         and type(final.get('HostConfig')) is dict
+                         and final['HostConfig'].get('CgroupParent') == self.profile.cgroup_parent
+                         and type(final.get('State')) is dict and final['State'].get('Running') is True
+                         and type(final['State'].get('Pid')) is int and final['State']['Pid'] == pid)
+                process.check()
+                _require(Path(f'/proc/{pid}/cgroup').read_text(encoding='ascii').splitlines() == rows
+                         and str(pid) in (group / 'cgroup.procs').read_text(encoding='ascii').splitlines())
+                self._validate_live(deadline)
+                _require(int(time.time() * 1000) < expires)
+                _remaining(deadline)
+                return result
+            finally:
+                process.close()
+        except BaseException:
+            self._hold()
+            raise LaunchSupervisorError() from None
+
+    def approval_proposal(self, *, timeout_ms):
+        """Return a fresh issuer-signed proposal, never an independent approval.
+
+        The caller must deliver it through a separately protected operator
+        channel. This does not reveal bearer values or change launch authority.
+        """
+        _require(type(timeout_ms) is int and 100 <= timeout_ms <= 10000)
+        deadline = time.monotonic() + timeout_ms / 1000
+        with self._observation_mutex(deadline):
+            self._guard()
+            _require(self._receipt_served and type(self._receipt_id) is str
+                     and type(self._receipt_digest) is str and _HEX.fullmatch(self._receipt_digest)
+                     and type(self._receipt_expires_at_ms) is int and self._receipt_expires_at_ms > 0)
+            nonce = secrets.token_hex(32)
+            raw = self._observe_current_launch_locked(nonce, deadline)
+            observation = _strict(raw, current_observation.MAX_OBSERVATION_BYTES)
+            payload = {'schema': 'engineering-hub.launch-approval-proposal.v1',
+                       'receipt_id': self._receipt_id, 'receipt_sha256': self._receipt_digest,
+                       'receipt_expires_at_ms': self._receipt_expires_at_ms, 'observation': observation}
+            signature = base64.urlsafe_b64encode(self._signer.sign(
+                APPROVAL_PROPOSAL_DOMAIN + _canonical(payload))).rstrip(b'=').decode()
+            result = _canonical({'payload': payload, 'signature': signature})
+            _require(len(result) <= 16384)
+            self._validate_live(deadline)
+            _remaining(deadline)
+            return result
+
+    def write_approval_proposal(self, path, *, timeout_ms):
+        """Write one fresh signed proposal to a new root-private operator file.
+
+        Exclusive creation never replaces or removes an existing file. An I/O
+        failure leaves any partially written file for explicit reconciliation.
+        """
+        path = _path(path)
+        raw = self.approval_proposal(timeout_ms=timeout_ms)
+        parent = _root_parent(path, private=True)
+        fd = None
+        try:
+            fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         0o600, dir_fd=parent)
+            info = os.fstat(fd)
+            _require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1
+                     and stat.S_IMODE(info.st_mode) == 0o600)
+            remaining = memoryview(raw)
+            while remaining:
+                written = os.write(fd, remaining)
+                _require(written > 0)
+                remaining = remaining[written:]
+            os.fsync(fd)
+            named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            _require(_identity(named) == _identity(info) and named.st_size == len(raw))
+            os.fsync(parent)
+        finally:
+            if fd is not None: os.close(fd)
+            os.close(parent)
+
     def observe_current_launch(self, *, nonce, timeout_ms):
         """Fresh signed current identity; no create/start/stop or approval renewal.
 
@@ -1171,9 +1443,13 @@ class LaunchSupervisor:
                 size = struct.unpack('!I', self._receive(peer, 4, deadline))[0]
                 _require(0 < size <= MAX_REQUEST_BYTES)
                 request = _strict(self._receive(peer, size, deadline), MAX_REQUEST_BYTES)
-                _require(type(request) is dict and set(request) == {'protocol', 'nonce'}
-                         and request['protocol'] == CURRENT_REQUEST_PROTOCOL
-                         and type(request['nonce']) is str and _HEX.fullmatch(request['nonce']))
+                _require(type(request) is dict and type(request.get('nonce')) is str
+                         and _HEX.fullmatch(request['nonce']))
+                is_current = set(request) == {'protocol', 'nonce'} and request['protocol'] == CURRENT_REQUEST_PROTOCOL
+                is_app = (set(request) == {'protocol', 'nonce', 'container_id'}
+                          and request['protocol'] == APP_CGROUP_REQUEST_PROTOCOL
+                          and type(request['container_id']) is str and _HEX.fullmatch(request['container_id']))
+                _require(is_current or is_app)
                 peer.settimeout(_remaining(deadline))
                 _require(peer.recv(1) == b'')
             except Exception:
@@ -1185,7 +1461,8 @@ class LaunchSupervisor:
                     peer.close()
                 raise
             try:
-                raw = self._observe_current_launch_locked(request['nonce'], deadline)
+                raw = (self._observe_current_launch_locked(request['nonce'], deadline) if is_current else
+                       self._observe_app_cgroup_locked(request['nonce'], request['container_id'], deadline))
                 # A disconnected requester is not proof of a broken launch.
                 try:
                     peer.settimeout(_remaining(deadline))
@@ -1198,7 +1475,7 @@ class LaunchSupervisor:
             finally:
                 peer.close()
 
-    def wait_for_stop_with_observations(self, *, timeout_ms, stop_requested):
+    def wait_for_stop_with_observations(self, *, timeout_ms, stop_requested, proposal_socket=None):
         """Owned bounded wait, serving fresh observations after the one receipt.
 
         No new listener/thread/service. Approval expiry stops observation service,
@@ -1208,6 +1485,12 @@ class LaunchSupervisor:
         _require(type(timeout_ms) is int and 1 <= timeout_ms <= 3_600_000
                  and callable(stop_requested))
         deadline = time.monotonic() + timeout_ms / 1000
+        if proposal_socket is not None:
+            with self._proposal_listener(proposal_socket) as listener:
+                return self._wait_for_stop_with_proposals(deadline, stop_requested, listener)
+        return self._wait_for_stop_with_proposals(deadline, stop_requested, None)
+
+    def _wait_for_stop_with_proposals(self, deadline, stop_requested, proposal_listener):
         while True:
             requested = stop_requested()
             _require(type(requested) is bool)
@@ -1226,21 +1509,98 @@ class LaunchSupervisor:
                         read = [self._consumer.fd]
                         if active:
                             read.append(self._listener)
+                            if proposal_listener is not None:
+                                read.append(proposal_listener)
                         remaining = deadline - time.monotonic()
                         _require(math.isfinite(remaining))
                         if remaining <= 0:
                             return False
-                        ready, _, _ = select.select(read, [], [], min(.1, remaining))
+                        ready = _poll_ready(read, min(.1, remaining))
                         _require(self._consumer.fd not in ready)
                         pending = active and self._listener in ready
+                        proposal_pending = active and proposal_listener is not None and proposal_listener in ready
                     except BaseException:
                         self._hold()
                         raise LaunchSupervisorError() from None
             except _ObservationWaitExpired:
                 return False
+            if proposal_pending:
+                self._serve_proposal_request(proposal_listener, min(
+                    deadline, time.monotonic() + self._request_ms / 1000))
             if pending:
                 self._serve_current_until(min(
                     deadline, time.monotonic() + self._request_ms / 1000))
+
+    @contextmanager
+    def _proposal_listener(self, path):
+        """One explicit root-only request socket, removed only by identity."""
+        path = _path(path)
+        parent = _root_parent(path, private=True)
+        listener = None
+        identity = None
+        try:
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.set_inheritable(False)
+            pinned = f'/proc/self/fd/{parent}/{path.name}'
+            _require(len(pinned.encode()) <= 107)
+            listener.bind(pinned)  # Existing entries are never replaced.
+            info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            identity = _identity(info)
+            os.chmod(pinned, 0o600, follow_symlinks=False)
+            listener.listen(1)
+            self._proposal_output_parent = path.parent
+            yield listener
+        finally:
+            self._proposal_output_parent = None
+            if listener is not None:
+                listener.close()
+            try:
+                if identity is not None:
+                    info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+                    _require(_identity(info) == identity and stat.S_ISSOCK(info.st_mode)
+                             and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o600
+                             and _identity(os.stat(path.parent, follow_symlinks=False))
+                                 == _identity(os.fstat(parent)))
+                    os.unlink(path.name, dir_fd=parent)
+                    os.fsync(parent)
+            finally:
+                os.close(parent)
+
+    def _serve_proposal_request(self, listener, deadline):
+        """Accept a closed, root-authenticated request for this exact launch.
+
+        Each request names a fresh nonce-derived file in the private socket
+        directory. A proposal is not an approval and never extends authority.
+        """
+        peer = None
+        try:
+            listener.settimeout(_remaining(deadline))
+            peer, _ = listener.accept()
+            pid, uid, gid = struct.unpack('=iII', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            _require(pid > 0 and uid == 0)
+            size = struct.unpack('!I', self._receive(peer, 4, deadline))[0]
+            _require(0 < size <= MAX_REQUEST_BYTES)
+            request = _strict(self._receive(peer, size, deadline), MAX_REQUEST_BYTES)
+            _require(type(request) is dict and set(request) == {'protocol', 'launch_id', 'nonce'}
+                     and request['protocol'] == PROPOSAL_REQUEST_PROTOCOL
+                     and request['launch_id'] == self._launch_id
+                     and type(request['nonce']) is str and _HEX.fullmatch(request['nonce']))
+            peer.settimeout(_remaining(deadline))
+            _require(peer.recv(1) == b'')
+            # This path is generated by the server, never supplied by the peer.
+            _require(self._proposal_output_parent is not None)
+            output = self._proposal_output_parent / ('proposal-' + request['nonce'] + '.json')
+            remaining_ms = min(10000, int(_remaining(deadline) * 1000))
+            _require(remaining_ms >= 100)
+            self.write_approval_proposal(str(output), timeout_ms=remaining_ms)
+            _remaining(deadline)
+            peer.sendall(b'OK')
+        except Exception:
+            return False
+        finally:
+            if peer is not None:
+                peer.close()
+        return True
 
     def graceful_stop(self):
         """Explicit SIGTERM only. Timeout is held, never permission for SIGKILL."""
@@ -1254,12 +1614,155 @@ class LaunchSupervisor:
                 self._journal.state(self._launch_id, 'term_reserved', self._record())
                 self._engine.json('POST', '/containers/' + self._container_id + '/kill?signal=SIGTERM',
                                   deadline, statuses=(204,))
-                _require(bool(select.select([self._consumer.fd], [], [], _remaining(deadline))[0]))
+                _require(bool(_poll_ready([self._consumer.fd], _remaining(deadline))))
                 self._wait_stopped(deadline)
                 self._journal.state(self._launch_id, 'stopped', self._record())
                 self._remove_owned_socket()
             except BaseException:
                 self._hold()
+                raise LaunchSupervisorError() from None
+
+    def preflight_daemon_scope(self, scope_path, *, timeout_ms):
+        """Pin the exact live daemon scope before any launch Engine effect."""
+        from .cgroup_scope_evidence import EnrolledCgroupScope
+        _require(self._pid == os.getpid() and type(timeout_ms) is int and 1 <= timeout_ms <= 10000)
+        with self._mutex:
+            scope = None
+            try:
+                self._guard()
+                _require(self._launch_id is None and self._engine is not None
+                         and type(self._engine.process) is _Process
+                         and self._engine.process.pid == self._daemon_pin.pid
+                         and self._engine.process.start == self._daemon_pin.start_ticks)
+                deadline = time.monotonic() + timeout_ms / 1000
+                self._engine.process.check()
+                scope = EnrolledCgroupScope(scope_path, processes=(self._engine.process,))
+                self._engine.process.check()
+                _remaining(deadline)
+                return scope
+            except BaseException:
+                if scope is not None: scope.close()
+                raise LaunchSupervisorError() from None
+
+    def preflight_worker_scope(self, scope_path, *, processes, timeout_ms):
+        """Pin an explicitly inventoried daemon/worker tree before launch.
+
+        The caller supplies already retained live pidfds, including this exact
+        daemon handle, under independently provisioned root-controlled scope.
+        Full worker inventory and privileged process placement remain external
+        responsibilities. No effect outcome or recovery authority is inferred.
+        """
+        from .cgroup_scope_evidence import EnrolledCgroupScope
+        _require(self._pid == os.getpid() and type(timeout_ms) is int and 1 <= timeout_ms <= 10000)
+        with self._mutex:
+            scope = None
+            try:
+                self._guard()
+                _require(self._launch_id is None and self._engine is not None
+                         and type(self._engine.process) is _Process and type(processes) is tuple
+                         and any(item is self._engine.process for item in processes)
+                         and self._engine.process.pid == self._daemon_pin.pid
+                         and self._engine.process.start == self._daemon_pin.start_ticks)
+                deadline = time.monotonic() + timeout_ms / 1000
+                self._engine.process.check()
+                scope = EnrolledCgroupScope(scope_path, processes=processes, allow_descendants=True)
+                self._engine.process.check()
+                _remaining(deadline)
+                return scope
+            except BaseException:
+                if scope is not None: scope.close()
+                raise LaunchSupervisorError() from None
+
+    def verify_preflight_daemon_scope(self, scope, *, timeout_ms):
+        """Recheck the preflight scope against the actual running launch."""
+        from .cgroup_scope_evidence import EnrolledCgroupScope
+        _require(self._pid == os.getpid() and type(timeout_ms) is int and 1 <= timeout_ms <= 10000)
+        with self._mutex:
+            try:
+                self._guard()
+                _require(type(scope) is EnrolledCgroupScope and scope._pid == self._pid
+                         and self._launch_id is not None and self._consumer is not None
+                         and self._engine is not None and type(self._engine.process) is _Process
+                         and any(item is self._engine.process for item in scope._processes)
+                         and self._engine.process.pid == self._daemon_pin.pid
+                         and self._engine.process.start == self._daemon_pin.start_ticks)
+                deadline = time.monotonic() + timeout_ms / 1000
+                self._validate_live(deadline)
+                scope.assert_enrolled_live()
+                self._validate_live(deadline)
+                _remaining(deadline)
+            except Exception:
+                raise LaunchSupervisorError() from None
+
+    def enroll_daemon_scope(self, scope_path, *, timeout_ms):
+        """Retain a root-controlled daemon-only scope while its identity is live.
+
+        The caller owns the returned observation handle and must close it.
+        Enrollment and later emptiness prove no Docker operation outcome.
+        """
+        from .cgroup_scope_evidence import EnrolledCgroupScope
+        _require(self._pid == os.getpid() and type(timeout_ms) is int and 1 <= timeout_ms <= 10000)
+        with self._mutex:
+            scope = None
+            try:
+                self._guard()
+                _require(self._launch_id is not None and self._consumer is not None and self._engine is not None
+                         and type(self._engine.process) is _Process
+                         and self._engine.process.pid == self._daemon_pin.pid
+                         and self._engine.process.start == self._daemon_pin.start_ticks)
+                deadline = time.monotonic() + timeout_ms / 1000
+                self._validate_live(deadline)
+                scope = EnrolledCgroupScope(scope_path, processes=(self._engine.process,))
+                self._validate_live(deadline)
+                _remaining(deadline)
+                return scope
+            except BaseException:
+                if scope is not None: scope.close()
+                raise LaunchSupervisorError() from None
+
+    def record_daemon_scope_emptiness(self, scope):
+        """Record an already-stopped daemon scope without resolving any effect.
+
+        The scope must have been enrolled while the exact daemon was alive,
+        with the supervisor's retained daemon pidfd among its original members.
+        The caller independently stops the daemon; this method sends no signal
+        and never clears a journal/ledger hold or infers an Engine outcome.
+        """
+        from .cgroup_scope_evidence import EnrolledCgroupScope, EmptyScopeObservation
+        _require(self._pid == os.getpid())
+        with self._mutex:
+            try:
+                self._guard(allow_held=True)
+                _require(type(scope) is EnrolledCgroupScope and scope._pid == self._pid
+                         and self._launch_id is not None and self._consumer is not None
+                         and self._consumer.fd is not None
+                         and bool(_poll_ready([self._consumer.fd], 0))
+                         and self._engine is not None and type(self._engine.process) is _Process
+                         and any(item is self._engine.process for item in scope._processes)
+                         and self._engine.process.pid == self._daemon_pin.pid
+                         and self._engine.process.start == self._daemon_pin.start_ticks)
+                evidence = scope.observe_empty()
+                _require(type(evidence) is EmptyScopeObservation and evidence.effect_outcome_proven is False
+                         and evidence.boot_id == self._engine.process.boot
+                         and (self._daemon_pin.pid, self._daemon_pin.start_ticks) in evidence.original_members)
+                record = {'boot_id': evidence.boot_id,
+                    'scope_mode': 'hierarchy' if scope._allow_descendants else 'leaf',
+                    'scope_device': evidence.scope_device,
+                    'scope_inode': evidence.scope_inode, 'original_members': [list(p) for p in evidence.original_members],
+                    'observed_monotonic_ns': int(evidence.observed_monotonic * 1_000_000_000),
+                    'effect_outcome_proven': False, 'verification': 'provisional'}
+                self._journal.record_empty_daemon_scope(self._launch_id, self._record(), record)
+                # This second check detects common changes around persistence;
+                # neither check is atomic with kernel state or external effects.
+                after = scope.observe_empty()
+                _require(type(after) is EmptyScopeObservation and after.effect_outcome_proven is False
+                         and after.boot_id == evidence.boot_id and after.scope_device == evidence.scope_device
+                         and after.scope_inode == evidence.scope_inode
+                         and after.original_members == evidence.original_members
+                         and after.observed_monotonic >= evidence.observed_monotonic)
+                self._journal.confirm_empty_daemon_scope(self._launch_id, record)
+                return evidence
+            except Exception:
                 raise LaunchSupervisorError() from None
 
     def _remove_owned_socket(self):
@@ -1288,11 +1791,11 @@ class LaunchSupervisor:
         self._issuance_open = False
         self._closed = True
         failed = False
-        for name in ('_listener', '_socket_parent', '_consumer', '_engine', '_journal'):
+        for name in ('_listener', '_socket_parent', '_cgroup_parent_fd', '_consumer', '_engine', '_journal'):
             value = getattr(self, name, None)
             if value is not None:
                 try:
-                    if name == '_socket_parent':
+                    if name in ('_socket_parent', '_cgroup_parent_fd'):
                         os.close(value)
                     else:
                         value.close()

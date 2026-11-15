@@ -3,6 +3,7 @@ from fastapi import Request
 from pydantic import BaseModel, ConfigDict
 from typing import Literal
 
+from .openapi_body import request_body
 from .repository import HubError
 from .shared_staging_lifecycle import SharedStagingLifecycle
 from .staging_api import _payload
@@ -39,7 +40,7 @@ def attach_shared_staging_routes(app, shared, human):
     async def status(request: Request):
         return authorized(request).status
 
-    @app.post('/api/hub/v1/staging/shared/recover', response_model=SharedLifecycleStatus)
+    @app.post('/api/hub/v1/staging/shared/recover', response_model=SharedLifecycleStatus, openapi_extra=request_body(_Recover))
     async def recover(request: Request):
         original = authorized(request, mutation=True)
         await _payload(request, _Recover, maximum=1024)

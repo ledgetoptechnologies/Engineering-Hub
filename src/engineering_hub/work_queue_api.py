@@ -105,6 +105,8 @@ def submit_reviewed_work(repo, queue, principal, payload: WorkSubmission):
     """Shared REST/MCP submission guard; identity is authenticated, never input."""
     if queue is None:
         raise HubError('work_queue_not_configured', 423)
+    if payload.request_id.startswith('staging:'):
+        raise HubError('work_request_prefix_reserved', 409)
     task = repo.get_task(payload.target.task_id)
     review = task.get('review')
     if task.get('owner') != principal:
@@ -164,6 +166,11 @@ def attach_work_queue_routes(app, *, repo, queue, actor, agent, human):
     def submit(payload: WorkSubmission, request: Request):
         principal = identity(request, agent)
         return submit_reviewed_work(repo, configured(), principal, payload)
+
+    @app.post('/api/hub/v1/work/jobs/{job_id}/cancel')
+    def cancel_unclaimed(job_id: JobID, request: Request):
+        principal = identity(request, agent)
+        return configured().cancel_unclaimed(actor=principal, job_id=job_id)
 
     @app.post('/api/hub/v1/work/claim')
     def claim(payload: WorkClaim, request: Request):

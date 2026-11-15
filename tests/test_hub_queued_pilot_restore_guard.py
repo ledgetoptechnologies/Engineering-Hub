@@ -23,6 +23,7 @@ from tests.test_hub_container_pilot import COMMIT, IMAGE, PRINCIPAL, pilot_manif
 
 
 class SyntheticEffectsWithRealHostLedger:
+    _single_pilot_protocol = False
     def __init__(self, ledger):
         self.ledger = ledger
         self.effects = []

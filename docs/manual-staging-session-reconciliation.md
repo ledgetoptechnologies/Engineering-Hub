@@ -52,7 +52,7 @@ the Engine after inspection, cannot be made safe merely by this local component.
 Actual exclusive-writer enforcement/current-host acceptance remains mandatory.
 Do not restore a live database underneath an active owner.
 
-## Mandatory source integration; operator channel still missing
+## Mandatory source integration and operator evidence
 
 Both explicit services require a trusted synchronous
 `reconciliation_factory(owner, target)`, returning the exact bound
@@ -90,13 +90,15 @@ native-source failure closes the gate synchronously but retains/drains already
 accepted operations. Gate permission is rechecked before every next effect;
 successful checks are never reusable permit tokens.
 
-The installed coordinator and unified selector Python functions require an
-explicit trusted reconciliation factory to activate. Their existing CLI/JSON
-paths cannot supply it and refuse activation before credential resolution or
-owner construction. Validation remains non-activating. This intentional refusal
-must not be bypassed with a JSON approved bit or an allowlist-generated report.
-The real trusted operator/launcher channel is the next source-design gate; this
-patch does not make those CLI serve paths or live NAS staging usable.
+The colocated installed coordinator's `serve` selector requires an explicit
+protected `--session-config` file on a read-only mount and constructs the trusted
+composition from its contents. The report is operator-authored evidence, not
+proof merely because it parses or because the executor returned a signed identity.
+The gate begins pending and the named human must accept its challenge; a current
+signed observation and the independently established report facts remain required.
+The separate unified selector retains its own explicit manual-session flow.
+Validation remains non-activating. Neither path makes live NAS staging ready or
+permits an invented approved bit or allowlist-generated report to replace evidence.
 
 Original-command GET inspection may remain available under its existing separate
 authorization; reading receipts must not open the gate or authorize effect replay.

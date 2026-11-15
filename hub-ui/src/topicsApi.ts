@@ -23,6 +23,15 @@ export function parseTopicList(value: unknown): TopicEntry[] {
   });
 }
 
+/** Combine a trusted directory snapshot with the current device selection without mutating either. */
+export function visibleTopics(server: TopicEntry[] | null, remembered: string[], current: string): TopicEntry[] {
+  const entries: TopicEntry[] = server === null
+    ? [...new Set(remembered.filter(isTopic))].map(topic => ({ topic, last_activity_at: null, peer_count: null, source: "device" }))
+    : [...server];
+  return entries.some(entry => entry.topic === current) ? entries
+    : [{ topic: current, last_activity_at: null, peer_count: null, source: "device" }, ...entries];
+}
+
 async function unavailableCatalog(response: Response): Promise<boolean> {
   try {
     const body: unknown = await response.clone().json();

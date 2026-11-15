@@ -5,6 +5,7 @@ instead proves old code reads the coherent PRE-upgrade backup (candidate writes
 are deliberately absent). Neither mode proves protected-owner or host recovery.
 """
 import argparse
+import contextvars
 import importlib.util
 import json
 from pathlib import Path
@@ -21,6 +22,7 @@ durable = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(durable)
 _deadline = None
 _term_issued = set()
+_session = contextvars.ContextVar('rollback_docker_session', default=None)
 
 
 class PublicFailure(RuntimeError):
@@ -84,19 +86,24 @@ def _container(name, owner, *, missing_ok=False):
     return identity
 
 
-def validate(image, commit):
-    if (type(image) is not str or re.fullmatch(re.escape(PACKAGE) + r'@sha256:[a-f0-9]{64}', image) is None
+def validate(image, commit, *, local_images=False):
+    pattern = r'sha256:[a-f0-9]{64}' if local_images else re.escape(PACKAGE) + r'@sha256:[a-f0-9]{64}'
+    if (type(image) is not str or re.fullmatch(pattern, image) is None
             or type(commit) is not str or re.fullmatch('[a-f0-9]{40}', commit) is None):
         raise ValueError('Fixed Hub package digest and exact commit required')
 
 
 def _docker(args, *, check=True, timeout=30):
     """Bound public CLI output and one attempt; kill/reap only this CLI on timeout."""
+    session = _session.get()
+    if session is None:
+        raise RuntimeError('Explicit Docker session required')
+    prefix, env = session
     limit = min(time.monotonic() + timeout, _deadline or float('inf'))
     if time.monotonic() >= limit:
         raise TimeoutError('Smoke deadline expired')
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
-        child = subprocess.Popen(['docker', *args], stdout=out, stderr=err)
+        child = subprocess.Popen([*prefix, *args], env=env, stdout=out, stderr=err)
         try:
             while child.poll() is None:
                 if time.monotonic() >= limit or out.tell() + err.tell() > 256 * 1024:
@@ -116,8 +123,8 @@ def _docker(args, *, check=True, timeout=30):
             child.wait()
 
 
-def _image(ref, commit):
-    validate(ref, commit)
+def _image(ref, commit, *, local_images=False):
+    validate(ref, commit, local_images=local_images)
     template = ('{"id":{{json .Id}},"revision":{{json (index .Config.Labels '
         '"org.opencontainers.image.revision")}},"user":{{json .Config.User}},'
         '"digests":{{json .RepoDigests}}}')
@@ -125,7 +132,8 @@ def _image(ref, commit):
     if (type(value) is not dict or set(value) != {'id', 'revision', 'user', 'digests'}
             or type(value['id']) is not str or not re.fullmatch('sha256:[a-f0-9]{64}', value['id'])
             or value['revision'] != commit or value['user'] != '568:568'
-            or type(value['digests']) is not list or ref not in value['digests']):
+            or (value['id'] != ref if local_images else
+                type(value['digests']) is not list or ref not in value['digests'])):
         raise ValueError('Image identity/commit/UID/digest mismatch')
     return value['id']
 
@@ -188,14 +196,24 @@ def _probe(identity, mode, commit, task=None, *, candidate_write=False):
     return result
 
 
-def run_smoke(baseline, baseline_commit, candidate, candidate_commit, *, rollback_mode='direct'):
+def run_smoke(baseline, baseline_commit, candidate, candidate_commit, *, docker_host, rollback_mode='direct', local_images=False):
+    validate(baseline, baseline_commit, local_images=local_images)
+    validate(candidate, candidate_commit, local_images=local_images)
+    with durable.docker_session(docker_host) as session:
+        token = _session.set(session)
+        try:
+            return _run_smoke(baseline, baseline_commit, candidate, candidate_commit,
+                rollback_mode=rollback_mode, local_images=local_images)
+        finally:
+            _session.reset(token)
+
+
+def _run_smoke(baseline, baseline_commit, candidate, candidate_commit, *, rollback_mode, local_images):
     global _deadline, _term_issued
-    validate(baseline, baseline_commit); validate(candidate, candidate_commit)
     if rollback_mode not in {'direct', 'backup-restore'} or baseline == candidate or baseline_commit == candidate_commit:
         raise ValueError('Distinct baseline and candidate required')
     _deadline = time.monotonic() + 480
     _term_issued = set()
-    durable._docker = _docker
     owner = uuid.uuid4().hex
     prefix = 'hub-rollback-' + owner
     volumes = [prefix + '-state', prefix + '-restore']
@@ -227,9 +245,9 @@ def run_smoke(baseline, baseline_commit, candidate, candidate_commit, *, rollbac
         return identity
 
     try:
-        old_id = step('baseline.image', _image, baseline, baseline_commit)
+        old_id = step('baseline.image', _image, baseline, baseline_commit, local_images=local_images)
         report['baseline']['image_id'] = old_id
-        new_id = step('candidate.image', _image, candidate, candidate_commit)
+        new_id = step('candidate.image', _image, candidate, candidate_commit, local_images=local_images)
         report['candidate']['image_id'] = new_id
         if old_id == new_id:
             raise ValueError('Distinct immutable image IDs required')
@@ -313,11 +331,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for flag in ('baseline-image', 'baseline-commit', 'candidate-image', 'candidate-commit'):
         parser.add_argument('--' + flag, required=True)
+    parser.add_argument('--docker-host', required=True)
+    parser.add_argument('--local-images', action='store_true')
     parser.add_argument('--rollback-mode', choices=('direct', 'backup-restore'), default='direct')
     args = parser.parse_args()
     try:
         report = run_smoke(args.baseline_image, args.baseline_commit, args.candidate_image,
-            args.candidate_commit, rollback_mode=args.rollback_mode)
+            args.candidate_commit, docker_host=args.docker_host, rollback_mode=args.rollback_mode, local_images=args.local_images)
     except Exception as error:
         report = dict(_failure(error), state='failed', failure_phase='input.validation',
             entered_steps=['input.validation'], completed_steps=[])

@@ -1,0 +1,7 @@
+# Human staging reconciliation admissions
+
+Human-initiated reconciliation records an immutable local admission containing the actor and the admitted operation binding, plus a digest of the observed state. It does not store cookies, CSRF values, or a reusable session credential. Session authorization is checked in the admission transaction; a later logout does not undo an already admitted reconciliation. This local record does not fence the external worker or authorize a new dispatch.
+
+Admissions are append-only and capped at 100,000 distinct records. A retry of an identical admission can reuse its receipt at capacity; a different human admission fails closed with `staging_reconciliation_admission_limit` (HTTP 503). Background reconciliation does not consume these receipts and remains available. No receipt is automatically deleted or overwritten. An operator must arrange an owner-approved archival and retention procedure before capacity is reached; no archival or deletion procedure is implemented here.
+
+Initialization creates indexes over existing staging-resource data. It can hold the database writer while indexes are built. Any staging resource with malformed JSON or a missing or non-string job ID blocks all staging reconciliation, including unrelated and older unbound jobs. An unowned reference to the admitted job also blocks its reconciliation. These records are preserved and must be investigated rather than silently removed or adopted. Older partial or unbound jobs remain held where their ownership cannot be established.

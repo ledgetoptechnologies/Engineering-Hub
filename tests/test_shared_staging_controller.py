@@ -12,13 +12,17 @@ from tests.test_hub_staging_controller import Client, payload
 
 
 @pytest.fixture
-def shared(tmp_path):
+def shared(tmp_path, monkeypatch):
+    from engineering_hub import staging_controller
+    from tests.test_staging_profile_task_binding import PROFILE
+    monkeypatch.setattr(staging_controller, '_PROFILE_PROTOCOL_READY', True)
     repo = HubRepository(tmp_path / 'shared.db', execution_principal=CONTAINER_PILOT_EXECUTOR)
     now, principal = [1800000000], object()
     resources = StagingResourceStore(repo, admin_actors=frozenset({'human:1'}),
                                     control_principal=principal, clock=lambda: now[0])
     resources.set_policy('human:1', 'engineering-hub', 0,
-                         {'codex': ['read', 'build', 'test', 'cleanup', 'preview']})
+                         {'codex': ['read', 'build', 'test', 'cleanup', 'preview'], 'claude':['read']})
+    resources.enroll_profile('human:1', 'engineering-hub', 'static', 0, PROFILE)
     queue, actions = compose_queue(repo, None, {'engineering-hub': ['static']}, 'staging-pc')
     queue.actions['pilot-fixture'] = WorkAction('staging-pc', project='engineering-hub')
     policies = SharedExecutionPolicies(repo, queue)
@@ -47,7 +51,7 @@ def opened(shared):
 async def test_closed_startup_never_deposits_or_posts(shared):
     controller, policies, client, *_ = shared
     with pytest.raises(HubError, match='admission_closed'):
-        await controller.submit('codex', payload())
+        await controller.submit('codex', payload(shared[-1]))
     policies.ready('modular')
     with pytest.raises(HubError):
         policies.open()
@@ -58,7 +62,7 @@ async def test_closed_startup_never_deposits_or_posts(shared):
 async def test_shared_modular_job_preserves_principal_and_creates_no_pilot_run(shared):
     controller = opened(shared)
     repo = shared[-1]
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(shared[-1]))
     finished = await controller.run_once()
     assert finished['job']['state'] == 'succeeded', (controller._read(job_id=submitted['job']['id']), shared[2].posts)
     assert repo.execution_principal == CONTAINER_PILOT_EXECUTOR
@@ -78,7 +82,7 @@ async def test_close_during_upload_preserves_receipt_but_never_queues_or_execute
         return result
     client.put_source = upload
     with pytest.raises(HubError, match='admission_closed'):
-        await controller.submit('codex', payload())
+        await controller.submit('codex', payload(shared[-1]))
     with shared[-1]._connection() as db:
         assert db.execute('SELECT COUNT(*) FROM hub_work_jobs').fetchone()[0] == 0
     assert client.deposits == 1 and client.posts == 0
@@ -88,7 +92,7 @@ async def test_close_during_upload_preserves_receipt_but_never_queues_or_execute
 async def test_close_after_original_job_acceptance_drains_without_new_post(shared):
     controller = opened(shared)
     policies, client = shared[1:3]
-    await controller.submit('codex', payload())
+    await controller.submit('codex', payload(shared[-1]))
     original = client.submit
     async def accepted(request):
         result = await original(request)
@@ -106,7 +110,7 @@ async def test_close_after_original_job_acceptance_drains_without_new_post(share
 async def test_context_drift_after_job_post_retains_original_claim_and_reconciles_without_repost(shared):
     controller = opened(shared)
     client = shared[2]
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(shared[-1]))
     original = client.submit
     async def accepted(request):
         result = await original(request)
@@ -126,7 +130,7 @@ async def test_context_drift_after_job_post_retains_original_claim_and_reconcile
 async def test_context_drift_after_resource_read_does_not_mark_local_resource_ready(shared):
     controller = opened(shared)
     client, resources = shared[2:4]
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(shared[-1]))
     original = client.resource
     async def observed(identity):
         result = await original(identity)
@@ -148,7 +152,7 @@ async def test_context_drift_after_resource_read_does_not_mark_local_resource_re
 @pytest.mark.asyncio
 async def test_binding_drift_before_claim_never_posts(shared, change):
     controller = opened(shared)
-    await controller.submit('codex', payload())
+    await controller.submit('codex', payload(shared[-1]))
     if change == 'callback':
         controller.queue.claim_verifier = None
     elif change == 'action_map':
@@ -166,7 +170,7 @@ async def test_binding_drift_before_claim_never_posts(shared, change):
 async def test_close_during_cleanup_preflight_never_deletes(shared):
     controller = opened(shared)
     policies, client, resources, now = shared[1:5]
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(shared[-1]))
     await controller.run_once()
     now[0] += 32 * 86400
     plan = resources.cleanup_plan('codex', 'engineering-hub', kinds=['preview'])
@@ -185,7 +189,7 @@ async def test_close_during_cleanup_preflight_never_deletes(shared):
 async def test_close_after_lost_cleanup_ack_reconciles_only_original_operation(shared):
     controller = opened(shared)
     policies, client, resources, now = shared[1:5]
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(shared[-1]))
     await controller.run_once()
     now[0] += 32 * 86400
     plan = resources.cleanup_plan('codex', 'engineering-hub', kinds=['preview'])
@@ -202,7 +206,7 @@ async def test_recreated_controller_recovers_lost_ack_before_open_without_repost
     controller = opened(shared)
     old_policies, client, resources, _, repo = shared[1:]
     client.lost_ack = True
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(shared[-1]))
     held = await controller.run_once()
     assert held['job']['state'] == 'held'
     original_worker, original_fence = held['job']['worker'], held['job']['fence']

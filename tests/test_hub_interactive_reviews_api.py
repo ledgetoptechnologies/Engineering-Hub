@@ -1,3 +1,4 @@
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.responses import JSONResponse
@@ -12,7 +13,7 @@ AGENT = {'Authorization': 'Bearer codex'}
 HUMAN = {'X-Human': 'human:1', 'X-CSRF': 'verified'}
 
 
-def client(env):
+def client(env, admission=True):
     app = FastAPI()
     @app.exception_handler(HubError)
     async def handler(request, error):
@@ -30,7 +31,10 @@ def client(env):
         identity = actor(request, mutation)
         env[4]._actor(identity, human=True)
         return identity
-    attach_interactive_review_routes(app, env[0], actor, human)
+    # This isolated API fixture uses synthetic identities, not real sessions.
+    attach_interactive_review_routes(app, env[0], actor, human,
+        human_admission=(lambda request, principal: lambda db: None) if admission is True else
+                        (lambda request, principal: None) if admission == 'noncallable' else None)
     return TestClient(app)
 
 
@@ -51,6 +55,31 @@ def test_agent_creation_human_phone_choice_text_and_completion(env):
     assert done.status_code == 200 and done.json()['state'] == 'completed'
     state = api.get(path + '/state', headers=HUMAN).json()
     assert state['answered_count'] == 2 and state['answers']['note']['by'] == 'human:1'
+
+
+def test_openapi_success_schemas_match_actual_wire_responses(env):
+    from jsonschema import Draft202012Validator
+
+    api = client(env)
+    paths = api.app.openapi()['paths']
+
+    def check(path, method, response):
+        assert response.status_code in (200, 201)
+        schema = paths[path][method]['responses'][str(response.status_code)]['content']['application/json']['schema']
+        Draft202012Validator.check_schema(schema)
+        Draft202012Validator(schema).validate(response.json())
+
+    created = api.post(BASE, headers=AGENT, json=payload(env))
+    check(BASE, 'post', created)
+    identity = created.json()['id']
+    path = BASE + '/' + identity
+    check(BASE, 'get', api.get(BASE, headers=HUMAN, params={'project': PROJECT}))
+    check(BASE + '/{review_id}', 'get', api.get(path, headers=HUMAN))
+    check(BASE + '/{review_id}/state', 'get', api.get(path + '/state', headers=HUMAN))
+    answered = api.post(path + '/answers', headers=HUMAN, json={'expected_revision': 1,
+        'client_request_id': 'schema-answer', 'answers': [{'item_id': 'label', 'value': 'yes'}]})
+    check(BASE + '/{review_id}/answers', 'post', answered)
+    check(BASE + '/{review_id}/state', 'get', api.get(path + '/state', headers=HUMAN))
 
 
 def test_logout_csrf_and_agent_answer_denials(env):
@@ -89,3 +118,15 @@ def test_component_version_change_is_visible_as_conflict_not_old_answers(env):
     env[1].update_component('human:1', env[2]['id'], 1, description='new context')
     response = api.get(BASE + '/' + item['id'], headers=HUMAN)
     assert response.status_code == 409 and response.json()['code'] == 'review_component_changed'
+
+
+@pytest.mark.parametrize('admission', [False, 'noncallable'])
+def test_answer_fails_closed_without_transaction_guard(env, admission):
+    api = client(env, admission=admission)
+    item = api.post(BASE, headers=AGENT, json=payload(env)).json()
+    response = api.post(BASE + '/' + item['id'] + '/answers', headers=HUMAN,
+        json={'expected_revision': 1, 'client_request_id': 'answer',
+              'answers': [{'item_id': 'label', 'value': 'yes'}]})
+    assert response.status_code == 503
+    assert response.json()['code'] == 'interactive_review_admission_unavailable'
+    assert env[0].get_review('human:1', item['id'])['revision'] == 1

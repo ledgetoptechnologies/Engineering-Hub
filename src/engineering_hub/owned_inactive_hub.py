@@ -42,7 +42,7 @@ async def serve_owned_inactive_hub(settings, *, bus_paths,
     if (type(settings) is not Settings or settings.work_queue_enabled
             or settings.ingress_mode != 'combined'
             or type(settings.auth_config) is not AuthConfig
-            or settings.auth_config.human_auth_mode != 'cloudflare_access'
+            or settings.auth_config.human_auth_mode not in {'cloudflare_access', 'github_cloudflare'}
             or settings.auth_config.cloudflare_config is None
             or os.environ.get('HUB_BUS_STARTUP_CLEANUP', '0') != '0'):
         raise OwnedInactiveHubError()
@@ -102,11 +102,24 @@ async def serve_owned_inactive_hub(settings, *, bus_paths,
         raise OwnedInactiveHubError() from None
 
 
-async def serve_configuration(config_path):
+async def serve_configuration(config_path, *, loopback_ports=None):
+    # This explicitly selected mode is intended for a task-owned local test
+    # service behind a separately configured private router. It does not supply
+    # the router, authentication, credentials, or isolation from local users.
+    if loopback_ports is not None and (
+            type(loopback_ports) is not tuple or len(loopback_ports) != 2
+            or any(type(port) is not int or not 1 <= port <= 65535 for port in loopback_ports)
+            or loopback_ports[0] == loopback_ports[1]):
+        raise OwnedInactiveHubError()
     deployment = load_deployment_config(config_path)
     deployment.validate_ledger_boundary()
     settings = Settings.from_env(deployment)
-    await serve_owned_inactive_hub(settings, bus_paths=deployment.bus_paths)
+    if loopback_ports is None:
+        await serve_owned_inactive_hub(settings, bus_paths=deployment.bus_paths)
+    else:
+        await serve_owned_inactive_hub(settings, bus_paths=deployment.bus_paths,
+            agent_host='127.0.0.1', agent_port=loopback_ports[0],
+            browser_host='127.0.0.1', browser_port=loopback_ports[1])
 
 
 def main(argv=None):
@@ -119,9 +132,12 @@ def main(argv=None):
     parser = Parser(description=__doc__, allow_abbrev=False)
     parser.add_argument('--config', required=True,
                         help='Existing non-secret Hub deployment configuration')
+    parser.add_argument('--loopback-ports', nargs=2, type=int, metavar=('AGENT', 'BROWSER'),
+                        help='Bind both listeners to 127.0.0.1 on the selected distinct ports')
     args = parser.parse_args(argv)
     try:
-        asyncio.run(serve_configuration(args.config))
+        ports = tuple(args.loopback_ports) if args.loopback_ports is not None else None
+        asyncio.run(serve_configuration(args.config, loopback_ports=ports))
     except (Exception, KeyboardInterrupt):
         parser.exit(2, str(OwnedInactiveHubError()) + '\n')
 

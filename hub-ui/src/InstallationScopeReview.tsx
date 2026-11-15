@@ -93,8 +93,6 @@ export function InstallationScopeReview({ items, epoch, canChange, allowed, onDe
   const ours = scopes.filter(row => row.internal_effective).length;
   return <section className="installation-scopes" aria-label="Our own agents">
     <h3>Our own agents <span className="tab-count">{ours}</span></h3>
-    <p className="panel-description">Mark the installations that are yours. Your own agents can read Hub-wide information such as machine health.
-      Project-only installations keep just the project access you grant them under Hub access. This never changes approval or sessions.</p>
     {notice && <p role={notice.error ? "alert" : "status"} className={notice.error ? "notice error" : "notice"}>{notice.text}</p>}
     {load === "failed" && scopes.length === 0 ? null : <>
       <div className="filter-bar">

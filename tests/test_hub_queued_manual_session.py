@@ -58,6 +58,69 @@ def submit(s):
 
 
 @pytest.mark.asyncio
+async def test_installed_task_scope_is_an_additional_veto_through_queue(tmp_path):
+    from dataclasses import replace
+    from hub_container_executor.installed_coordinator import ACTION as installed_action, target_allowed
+    from tests.test_hub_container_executor_installed_coordinator import parse
+
+    private = tmp_path / 'private'; private.mkdir(mode=0o700)
+    with PilotOwner(private / 'hub.sqlite3', allow_ephemeral_test_storage=True) as owner:
+        repo = HubRepository(private / 'hub.sqlite3', execution_principal=PRINCIPAL, pilot_owner=owner)
+        approved = reviewed_task(repo, 'approved-scope')
+        other = reviewed_task(repo, 'other-scope')
+        held_task = reviewed_task(repo, 'held-scope')
+        unreviewed = repo.create_task('human:1234', 'engineering-hub', 'Unreviewed', 'unreviewed-scope')
+        unreviewed = repo.claim_task('codex', unreviewed['id'], unreviewed['revision'])
+        unreviewed = repo.set_candidate('codex', unreviewed['id'], unreviewed['revision'], COMMIT)
+        config = replace(parse(), manifest=pilot_manifest(),
+            allowed_task_ids=frozenset({approved['id'], held_task['id'], unreviewed['id']}))
+        current = [config]
+        policy = lambda actor, action, environment, target: target_allowed(current[0], actor, action, environment, target)
+        target = ContainerPilotTarget.from_manifest(pilot_manifest())
+        client = DistinctContainerClient()
+        workflow = ContainerPilotWorkflow(repo, client, [target], pilot_owner=owner)
+        queue = WorkQueue(repo, {installed_action: WorkAction(MACHINE, project='engineering-hub')}, target_verifier=policy)
+        identity = ExecutorSessionIdentity(str(uuid4()), 'sha256:' + 'e' * 64)
+        gate = StartupReconciliation(owner=owner, database=repo.path, target_id=target.target_id,
+            manifest_digest=target.manifest_digest, executor=identity, lifetime_seconds=3600,
+            current_executor_identity=lambda: identity)
+        bridge = QueuedContainerPilot(queue, workflow, action_key=installed_action, machine_id=MACHINE, reconciliation=gate)
+        try:
+            def create(task):
+                return queue.submit(actor='codex', request_id=str(uuid4()), action_key=installed_action,
+                    environment='staging', target=WorkTarget(task['id'], COMMIT, IMAGE))
+            # Even an allowed, reviewed task still needs manual reconciliation.
+            with pytest.raises(HubError): create(approved)
+            accept(SimpleNamespace(gate=gate, owner=owner, target=target, identity=identity))
+            # Same actor, source and image are insufficient outside approved scope.
+            with pytest.raises(HubError): create(other)
+            # Being in scope does not substitute for independent review.
+            with pytest.raises(HubError): create(unreviewed)
+            assert repo.list_runs() == [] and client.submissions == []
+            job = create(approved)
+            assert (await bridge.run_once())['state'] == 'succeeded'
+            assert queue.get_job(job['id'])['state'] == 'succeeded'
+            pending = create(held_task)
+            # Simulate a later coordinator with this task omitted from its scope.
+            current[0] = replace(config, allowed_task_ids=frozenset({approved['id']}))
+            assert queue.claim(worker=bridge.worker, lease_seconds=600, action_keys=(installed_action,)) is None
+            assert queue.get_job(pending['id'])['state'] == 'queued'
+            current[0] = config
+            client.outcomes['deploy_container'] = 'held'
+            assert (await bridge.run_once())['state'] == 'held'
+            before = list(client.submissions)
+            current[0] = replace(config, allowed_task_ids=frozenset({approved['id']}))
+            with pytest.raises(HubError):
+                await bridge.recover(pending['id'])
+            assert queue.get_job(pending['id'])['state'] == 'held'
+            assert client.submissions == before
+            with repo._connection() as db:
+                assert db.execute('SELECT job_id FROM hub_work_machines WHERE job_id=?', (pending['id'],)).fetchone()
+        finally:
+            gate.close()
+
+
+@pytest.mark.asyncio
 async def test_pending_blocks_submission_and_direct_bridge_without_poisoning_acceptance(composition):
     s = composition
     assert s.bridge.reconciliation_state == 'pending'
