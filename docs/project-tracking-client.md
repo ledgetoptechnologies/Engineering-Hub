@@ -34,6 +34,19 @@ after_task_id and unfinished are optional. Page from the beginning on later
 turns because task IDs are not chronological. Keep private content out of
 terminal transcripts and use a protected input channel in actual workflows.
 
+While a completion claim is pending, ordinary updates cannot clear or replace it.
+The claimant must withdraw its exact claim, or an independent reviewer must
+reopen it, before new progress or a replacement claim can be recorded. This
+also applies to legacy claims; their documented independent reopen path remains
+available. Exact retries of an already accepted update remain idempotent.
+Stage the exact new update in the private outbox before sending when it must
+be retained. A pending-claim conflict leaves that local record unconfirmed;
+it is not a Hub task update and does not notify the reviewer. After the claim
+is withdrawn or reopened, read the current task and reconcile the saved work.
+The saved payload has its original revision and cannot be edited in place.
+Do not blindly resend it against a changed revision or use a new request ID
+until an uncertain earlier send has been reconciled with the Hub.
+
 If work previously claimed complete is found incomplete, the exact EHS
 installation that made the latest claim may use `withdraw-claim` with task_id,
 expected_revision, expected_claim_revision, client_request_id and a nonempty

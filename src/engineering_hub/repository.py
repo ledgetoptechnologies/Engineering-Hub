@@ -715,6 +715,8 @@ class HubRepository:
             self._cas(item, expected_revision)
             if item['status'] == 'completion_verified':
                 raise HubError('tracking_reopen_required', 409)
+            if item['status'] == 'completion_claimed':
+                raise HubError('tracking_claim_pending', 409)
             self._tracking_rollover(db, item, 'updates')
             item['updates'].append(dict(actor=actor, progress=progress, evidence_links=links,
                                         completion_claim=completion_claim, actor_family=session_context.family(actor),
