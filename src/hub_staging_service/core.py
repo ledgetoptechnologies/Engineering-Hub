@@ -2003,23 +2003,16 @@ class Service:
                 return self._status_without_active() if guarded else self._legacy_idle_status()
             row = self.db.execute('SELECT job_id,payload FROM operations WHERE command_id=?', (self.active,)).fetchone()
             if row is None or row['job_id'] is None:
-                if guarded:
-                    raise Rejected('worker_status_unavailable', 503)
-                return None
+                raise Rejected('worker_status_unavailable', 503)
             try:
-                if guarded:
-                    ensure(type(json.loads(row['payload'])) is dict, 'worker_status_unavailable', 503)
+                ensure(type(json.loads(row['payload'])) is dict, 'worker_status_unavailable', 503)
                 self._legacy_job_guard(row['job_id'])
             except Rejected as exc:
                 if exc.code == 'scoped_not_found':
-                    if guarded:
-                        raise Rejected('worker_status_unavailable', 503) from None
-                    return None
-                raise
-            except (sqlite3.Error, ValueError, TypeError):
-                if guarded:
                     raise Rejected('worker_status_unavailable', 503) from None
                 raise
+            except (sqlite3.Error, ValueError, TypeError):
+                raise Rejected('worker_status_unavailable', 503) from None
             return self.active
 
     def legacy_runtime_allowed(self):

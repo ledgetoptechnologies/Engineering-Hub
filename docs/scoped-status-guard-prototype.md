@@ -76,8 +76,9 @@ The optional receiver `observer_credential` must be an object containing only
 `token_file`; it is a separate private static bearer and must differ from every
 legacy and project bearer. It permits only `GET /v2/operator/runtime` with no
 query string. The optional Hub observer config `operator_v2: true` selects this
-route and never falls back to the legacy endpoint. Absent configuration leaves
-legacy behavior unchanged. This global operator inventory can contain names and
+route and never falls back to the legacy endpoint. Without observer configuration,
+the observer continues to use the legacy route, subject to the status and runtime
+compatibility effects described above. This global operator inventory can contain names and
 images belonging to other projects; provision its credential only to authorized
 operators. It remains informational and does not prove physical idleness,
 worker fencing or live credential revocation; token rotation requires receiver
