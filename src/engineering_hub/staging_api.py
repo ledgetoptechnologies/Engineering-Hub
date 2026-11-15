@@ -172,6 +172,15 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
                 raise HubError('staging_runtime_unavailable', 503) from None
         return {key: result[key] for key in ('configured', 'state', 'snapshot')}
 
+    @app.get('/api/hub/v1/staging/source-intent-handoffs')
+    def source_intent_handoffs(request: Request, after: str | None = Query(default=None),
+                               limit: int = Query(default=50, ge=1, le=100)):
+        principal = authenticated(request, human_only=True)
+        if not callable(human_read_admission):
+            raise HubError('staging_human_admission_unavailable', 503)
+        return configured().source_intent_handoffs(
+            principal, after=after, limit=limit, admission_guard=human_read_admission(request, principal))
+
     @app.get('/api/hub/v1/staging/resources')
     def resources(request: Request, project: Project | None = None,
                   kind: Kind | None = None, state: State | None = None,

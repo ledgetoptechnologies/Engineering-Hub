@@ -490,6 +490,66 @@ class StagingController:
         self.resources.authorize(actor, item['project'], 'read')
         return self._view(item)
 
+    def source_intent_handoffs(self, actor, *, after=None, limit=50, admission_guard=None):
+        """Owner-only, bounded original-intent handoff; never inspect or affect a worker."""
+        self.repo._actor(actor, human=True)
+        _require(actor in self.resources.admin_actors, 'staging_admin_required', 403)
+        _require(callable(admission_guard), 'staging_human_admission_required', 403)
+        _require(type(limit) is int and 1 <= limit <= 100)
+        if after is not None:
+            _id(after)
+        with self.repo._transaction(before_commit=admission_guard) as db:
+            rows = db.execute('SELECT id,actor,request_id,fingerprint, '
+                              'CASE WHEN length(data)<=32768 THEN data ELSE NULL END AS data '
+                              'FROM hub_staging_submissions '
+                              'WHERE id>? ORDER BY id LIMIT ?', (after or '', limit + 1)).fetchall()
+            items = []
+            for row in rows[:limit]:
+                _id(row['id'])  # A corrupt pagination key must never be exposed as arbitrary data.
+                try:
+                    item = json.loads(row['data'])
+                    if type(item) is not dict:
+                        raise ValueError()
+                    if type(item.get('phase')) is not str:
+                        raise ValueError()
+                    if item.get('phase') != 'deposit_unknown':
+                        continue
+                    public_keys = ('request_id', 'review_task_id', 'review_task_revision', 'project', 'recipe',
+                                   'source_commit', 'source_digest', 'source_binding', 'topic', 'reviewed_profile')
+                    public = {key: item[key] for key in public_keys}
+                    profile = item['reviewed_profile']
+                    _require(item['id'] == row['id'] and item['actor'] == row['actor']
+                             and item['request_id'] == row['request_id'] and item['actor'] in AGENTS
+                             and _id(item['id']) and _id(item['request_id']) and _id(item['source_id'])
+                             and _id(item['command_id']) and _id(item['review_task_id'])
+                             and type(item['review_task_revision']) is int and item['review_task_revision'] >= 1
+                             and type(item['project']) is str and re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', item['project'])
+                             and type(item['recipe']) is str and re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', item['recipe'])
+                             and _valid_source_binding(item) and item.get('job_id') is None
+                             and item.get('resource_ids') == {}
+                             and type(profile) is dict and set(profile) == {'project', 'recipe', 'generation', 'digest'}
+                             and profile['project'] == item['project'] and profile['recipe'] == item['recipe']
+                             and type(profile['generation']) is int and 1 <= profile['generation'] < 2**31
+                             and type(profile['digest']) is str and re.fullmatch(r'sha256:[a-f0-9]{64}', profile['digest'])
+                             and hashlib.sha256(_json(public).encode()).hexdigest() == row['fingerprint'],
+                             'staging_source_handoff_unreadable', 409)
+                    items.append({'submission_id': item['id'], 'actor': item['actor'],
+                                  'request_id': item['request_id'], 'source_id': item['source_id'],
+                                  'reserved_command_id': item['command_id'], 'review_task_id': item['review_task_id'],
+                                  'review_task_revision': item['review_task_revision'], 'project': item['project'],
+                                  'recipe': item['recipe'], 'source_commit': item['source_commit'],
+                                  'source_digest': item['source_digest'], 'source_binding': item['source_binding'],
+                                  'reviewed_profile': profile, 'state': 'deposit_unknown',
+                                  'source_identity_assurance': 'journal_only',
+                                  'worker_ledger_authority': 'unverified', 'source_post_outcome': 'unknown',
+                                  'review_status': 'historical_not_current', 'execution_authorization': False,
+                                  'automatic_retry_or_release': False})
+                except (ValueError, TypeError, KeyError, HubError, RecursionError):
+                    # No arbitrary or corrupted row content is returned.
+                    items.append({'submission_id': row['id'], 'state': 'unreadable'})
+            return {'items': items, 'next_cursor': rows[limit - 1]['id'] if len(rows) > limit else None,
+                    'scope': 'original_intent_only', 'worker_authority_verified': False}
+
     def _view(self, item):
         result = {'job': self.queue.get_job(item['job_id']), 'source_id': item['source_id'],
                   'resource_ids': item['resource_ids'], 'phase': item['phase']}
