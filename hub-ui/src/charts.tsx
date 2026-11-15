@@ -7,7 +7,7 @@ import type { Task } from "./types";
 
 export const STAGES: { key: Task["status"]; label: string; color: string }[] = [
   { key: "assigned", label: "Assigned", color: "var(--chart-stage-1)" },
-  { key: "claimed", label: "In progress", color: "var(--chart-stage-2)" },
+  { key: "claimed", label: "Claimed", color: "var(--chart-stage-2)" },
   { key: "in_review", label: "In review", color: "var(--chart-stage-3)" },
   { key: "verified", label: "Review passed", color: "var(--chart-stage-4)" },
 ];

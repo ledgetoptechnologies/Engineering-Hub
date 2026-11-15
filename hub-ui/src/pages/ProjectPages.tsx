@@ -24,7 +24,7 @@ import { ProjectTrackingPanel } from "../ProjectTrackingPanel";
 
 const STATUSES: Task["status"][] = ["assigned", "claimed", "in_review", "verified"];
 const columnName: Record<Task["status"], string> = {
-  assigned: "Assigned", claimed: "In progress", in_review: "In review", verified: "Review passed", withdrawn: "Withdrawn",
+  assigned: "Assigned", claimed: "Claimed", in_review: "In review", verified: "Review passed", withdrawn: "Withdrawn",
 };
 
 export interface ProjectStats {
@@ -136,7 +136,7 @@ export function ProjectsPage({ hub, actions }: { hub: Hub; actions: React.ReactN
   );
 }
 
-function WorkBoard({ hub, tasks }: { hub: Hub; tasks: Task[] }) {
+export function WorkBoard({ hub, tasks }: { hub: Hub; tasks: Task[] }) {
   return (
     <div className="board" role="list" aria-label="Work board">
       {STATUSES.map((status) => {
