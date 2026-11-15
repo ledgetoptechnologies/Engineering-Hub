@@ -14,6 +14,7 @@ import { RunReleaseEvidence } from "../ReleaseEvidencePanel";
 import { StagingResourcesPanel } from "../StagingResourcesPanel";
 import { SessionReconciliationPanel } from "../SessionReconciliationPanel";
 import { SharedStagingPanel } from "../SharedStagingPanel";
+import { SourceIntentPanel } from "../SourceIntentPanel";
 import { StagingBadge } from "./WorkPages";
 
 function HubConnectionRow({ agent, stale }: { agent: AgentSummary; stale: boolean }) {
@@ -204,6 +205,8 @@ export function StagingPage({ hub, actions, view = "overview" }: {
         )}
         <WorkQueuePanel mode={hub.demo ? "demo" : "live"} refreshToken={data}
           stale={hub.stale} onUnauthorized={hub.clearPrivateWorkspace} />
+        {!hub.demo && hub.session?.authenticated && hub.session.csrf_token && <SourceIntentPanel
+          key={`${hub.session.actor}:${hub.session.csrf_token}`} onUnauthorized={hub.clearPrivateWorkspace} />}
       </div>
     </>
   );
