@@ -50,12 +50,13 @@ The indexes are only local query aids; they are not rollback protection,
 authentication, corruption proof or a guarantee of worker quiescence. A
 separate proof spanning the relevant effect and release remains required.
 
-The current global legacy runtime endpoint remains unavailable once scoped
-configuration/history is present. The existing admin `StagingObserver` uses
-that legacy endpoint and therefore also reports unavailable. A separately
-provisioned, read-only, independently reviewed operator-observer identity and
-endpoint may be designed later; do not grant global inventory to a scoped
-project token or silently fall back to a broader credential.
+The global legacy runtime endpoint remains unavailable once scoped
+configuration/history is present. An admin `StagingObserver` still using that
+endpoint therefore reports unavailable. The optional, separately provisioned
+operator-observer identity and endpoint described below are a source-only
+prototype requiring independent review and rollout qualification. Do not grant
+global inventory to a scoped project token or silently fall back to a broader
+credential.
 
 For a legacy-only runtime request, the scope check uses the same bounded,
 isolated read-only snapshot instead of iterating the entire history on the
