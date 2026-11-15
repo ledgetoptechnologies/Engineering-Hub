@@ -47,7 +47,7 @@ async def test_reviewed_proof_queue_claim_and_mutation_fence(env):
                          payload['source_commit_object_base64'], payload['source_commit'])
         client.binding = binding
         client.bindings[payload['source_id']] = binding
-        return {k: payload[k] for k in ('source_id', 'project', 'source_digest')} | {
+        return {k: payload[k] for k in ('source_id', 'project', 'source_digest', 'reviewed_profile')} | {
             'size_bytes': len(base64.b64decode(payload['source_zip_base64'])), 'source_binding': binding}
     client.put_source = deposit
     original_submit = client.submit
@@ -87,7 +87,7 @@ async def test_mismatched_deposit_receipt_never_enqueues(env):
         binding = verify(base64.b64decode(payload['source_zip_base64']),
                          payload['source_commit_object_base64'], payload['source_commit'])
         binding['tree_oid'] = 'f' * 40
-        return {k: payload[k] for k in ('source_id', 'project', 'source_digest')} | {
+        return {k: payload[k] for k in ('source_id', 'project', 'source_digest', 'reviewed_profile')} | {
             'size_bytes': 1, 'source_binding': binding}
     client.put_source = deposit
     with pytest.raises(HubError, match='staging_source_binding_receipt_mismatch'):
@@ -105,7 +105,7 @@ async def test_review_change_during_deposit_vetoes_queue_transaction(env):
         binding = verify(base64.b64decode(payload['source_zip_base64']),
                          payload['source_commit_object_base64'], payload['source_commit'])
         repo.set_candidate('codex', request['review_task_id'], request['review_task_revision'], 'f' * 40)
-        return {k: payload[k] for k in ('source_id', 'project', 'source_digest')} | {
+        return {k: payload[k] for k in ('source_id', 'project', 'source_digest', 'reviewed_profile')} | {
             'size_bytes': 1, 'source_binding': binding}
     client.put_source = deposit
     with pytest.raises(HubError, match='work_target_not_verified'):
@@ -122,7 +122,7 @@ async def test_legacy_unreviewed_row_is_never_claimed(env):
     async def deposit(payload):
         binding = verify(base64.b64decode(payload['source_zip_base64']),
                          payload['source_commit_object_base64'], payload['source_commit'])
-        return {k: payload[k] for k in ('source_id', 'project', 'source_digest')} | {
+        return {k: payload[k] for k in ('source_id', 'project', 'source_digest', 'reviewed_profile')} | {
             'size_bytes': 1, 'source_binding': binding}
     client.put_source = deposit
     queued = await controller.submit('codex', request)
@@ -146,7 +146,7 @@ async def test_failed_transactional_candidate_does_not_starve_other_machine(env,
     async def deposit(payload):
         binding = verify(base64.b64decode(payload['source_zip_base64']),
                          payload['source_commit_object_base64'], payload['source_commit'])
-        return {k: payload[k] for k in ('source_id', 'project', 'source_digest')} | {
+        return {k: payload[k] for k in ('source_id', 'project', 'source_digest', 'reviewed_profile')} | {
             'size_bytes': 1, 'source_binding': binding}
     client.put_source = deposit
     await controller.submit('codex', request)
@@ -172,7 +172,7 @@ async def test_revocation_after_live_claim_vetoes_dispatch_intent(env, monkeypat
     async def deposit(payload):
         binding = verify(base64.b64decode(payload['source_zip_base64']),
                          payload['source_commit_object_base64'], payload['source_commit'])
-        return {k: payload[k] for k in ('source_id', 'project', 'source_digest')} | {
+        return {k: payload[k] for k in ('source_id', 'project', 'source_digest', 'reviewed_profile')} | {
             'size_bytes': 1, 'source_binding': binding}
     client.put_source = deposit
     queued = await controller.submit('codex', request)
@@ -194,7 +194,7 @@ async def test_revocation_after_intent_lost_ack_keeps_original_held(env):
     async def deposit(payload):
         binding = verify(base64.b64decode(payload['source_zip_base64']),
                          payload['source_commit_object_base64'], payload['source_commit'])
-        return {k: payload[k] for k in ('source_id', 'project', 'source_digest')} | {
+        return {k: payload[k] for k in ('source_id', 'project', 'source_digest', 'reviewed_profile')} | {
             'size_bytes': 1, 'source_binding': binding}
     client.put_source = deposit
     async def revoke_and_lose_ack(payload):
@@ -219,7 +219,7 @@ async def test_failed_terminal_with_mismatched_binding_stays_held(env):
         binding = verify(base64.b64decode(payload['source_zip_base64']),
                          payload['source_commit_object_base64'], payload['source_commit'])
         client.bindings[payload['source_id']] = binding
-        return {k: payload[k] for k in ('source_id', 'project', 'source_digest')} | {
+        return {k: payload[k] for k in ('source_id', 'project', 'source_digest', 'reviewed_profile')} | {
             'size_bytes': 1, 'source_binding': binding}
     client.put_source = deposit
     async def failed_with_wrong_binding(payload):

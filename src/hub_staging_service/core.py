@@ -1908,14 +1908,16 @@ class Service:
             lease_index = "CREATE INDEX status_unreleased_leases ON scratch_leases(state)\n                WHERE state != 'released' OR state IS NULL"
             db = self.db if db is None else db
             row = db.execute("""SELECT CASE WHEN
+                (SELECT COUNT(*) FROM pragma_table_info('operations') WHERE name='state' AND "notnull"=1)=1 AND
+                (SELECT COUNT(*) FROM pragma_table_info('scratch_leases') WHERE name='state' AND "notnull"=1)=1 AND
                 EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='status_unsettled_operations'
                        AND tbl_name='operations' AND sql=?) AND
                 EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='status_unreleased_leases'
                        AND tbl_name='scratch_leases' AND sql=?) THEN
                 EXISTS(SELECT 1 FROM operations INDEXED BY status_unsettled_operations
-                       WHERE state NOT IN ('succeeded','failed') OR state IS NULL) OR
+                       WHERE state NOT IN ('succeeded','failed')) OR
                 EXISTS(SELECT 1 FROM scratch_leases INDEXED BY status_unreleased_leases
-                       WHERE state != 'released' OR state IS NULL)
+                       WHERE state != 'released')
                 ELSE 1 END""", (operation_index, lease_index)).fetchone()
             ensure(not row[0], 'worker_status_unavailable', 503)
         except (Rejected, sqlite3.Error):

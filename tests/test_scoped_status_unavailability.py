@@ -14,8 +14,8 @@ def service():
     s.db = sqlite3.connect(':memory:')
     s.db.row_factory = sqlite3.Row
     s.db.execute('CREATE TABLE operations (command_id TEXT, job_id TEXT, payload TEXT)')
-    s.db.execute('ALTER TABLE operations ADD COLUMN state TEXT')
-    s.db.execute('CREATE TABLE scratch_leases (state TEXT)')
+    s.db.execute('ALTER TABLE operations ADD COLUMN state TEXT NOT NULL')
+    s.db.execute('CREATE TABLE scratch_leases (state TEXT NOT NULL)')
     s.db.execute("CREATE INDEX status_unsettled_operations ON operations(state)\n                WHERE state NOT IN ('succeeded','failed') OR state IS NULL")
     s.db.execute("CREATE INDEX status_unreleased_leases ON scratch_leases(state)\n                WHERE state != 'released' OR state IS NULL")
     s._receipt_fault = None
@@ -372,9 +372,9 @@ def test_restart_of_accepted_operation_remains_unavailable(tmp_path):
 
 def test_status_queries_use_partial_indexes_and_missing_index_fails_closed(real_service):
     query = """SELECT EXISTS(SELECT 1 FROM operations INDEXED BY status_unsettled_operations
-               WHERE state NOT IN ('succeeded','failed') OR state IS NULL),
+               WHERE state NOT IN ('succeeded','failed')),
                EXISTS(SELECT 1 FROM scratch_leases INDEXED BY status_unreleased_leases
-               WHERE state != 'released' OR state IS NULL)"""
+               WHERE state != 'released')"""
     plan = ' '.join(str(tuple(row)) for row in real_service.db.execute('EXPLAIN QUERY PLAN ' + query))
     assert 'status_unsettled_operations' in plan
     assert 'status_unreleased_leases' in plan
@@ -427,3 +427,25 @@ def test_wrong_index_survives_restart_but_status_fails_closed(tmp_path):
         assert_both_unavailable(service)
     finally:
         service.close()
+
+@pytest.mark.parametrize('table', ['operations', 'scratch_leases'])
+def test_nullable_state_schema_fails_closed_even_with_expected_index(service, table):
+    if table == 'operations':
+        service.db.execute('DROP TABLE operations')
+        service.db.execute('CREATE TABLE operations (command_id TEXT, job_id TEXT, payload TEXT, state TEXT)')
+        service.db.execute("CREATE INDEX status_unsettled_operations ON operations(state)\n                WHERE state NOT IN ('succeeded','failed') OR state IS NULL")
+        service.db.execute('INSERT INTO operations VALUES (?, ?, ?, ?)', ('x', 'j', '{}', None))
+    else:
+        service.db.execute('DROP TABLE scratch_leases')
+        service.db.execute('CREATE TABLE scratch_leases (state TEXT)')
+        service.db.execute("CREATE INDEX status_unreleased_leases ON scratch_leases(state)\n                WHERE state != 'released' OR state IS NULL")
+        service.db.execute('INSERT INTO scratch_leases VALUES (NULL)')
+    unavailable(lambda: service.scoped_active('alice', {'demo'}, {'demo': {'default'}}))
+
+@pytest.mark.parametrize('state,held', [('succeeded', False), ('failed', False), ('held', True), ('unknown', True)])
+def test_indexed_operation_states_never_look_idle_when_unsettled(service, state, held):
+    service.db.execute('INSERT INTO operations VALUES (?, ?, ?, ?)', ('x', 'j', '{}', state))
+    if held:
+        unavailable(lambda: service.scoped_active('alice', {'demo'}, {'demo': {'default'}}))
+    else:
+        assert service.scoped_active('alice', {'demo'}, {'demo': {'default'}}) is None
