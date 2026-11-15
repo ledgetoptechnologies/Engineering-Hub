@@ -37,9 +37,12 @@ pytestmark = pytest.mark.skipif(os.name != 'posix', reason='Real private credent
 def experimental_profile_protocol(monkeypatch):
     from engineering_hub import staging_controller
     from hub_staging_service import core
+    from hub_staging_service import __main__ as worker_http
     monkeypatch.setattr(staging_controller, '_PROFILE_PROTOCOL_READY', True)
     monkeypatch.setattr(core, '_PROFILE_PROTOCOL_READY', True)
     monkeypatch.setattr(core, '_SOURCE_ATTEMPT_ENABLED', True)
+    monkeypatch.setattr(core, '_SOURCE_EVIDENCE_ENABLED', True)
+    monkeypatch.setattr(worker_http, '_SCOPED_LIFECYCLE_READY', True)
 
 
 HTML = b'<html>source</html>'
@@ -110,15 +113,26 @@ def private_tls(root):
 
 
 class Wire:
-    def __init__(self, root):
+    def __init__(self, root, *, scoped=False, terminal=False):
         self.root, self.now = root, [1800000000]
         self.backend = SyntheticCopyBackend()
         profile = {'image_id': 'sha256:' + 'a' * 64, 'build_argv': ['synthetic-only'],
                    'test_argv': ['synthetic-only'], 'cpus': 1, 'memory_mb': 128,
                    'pids': 32, 'timeout_seconds': 30, 'output_bytes': 1048576, 'log_bytes': 65536}
-        self.service = Service(root / 'worker', {'engineering-hub': {'recipes': {'static': profile}}},
-                               self.backend, capacity_bytes=128 * 1024**2)
+        self.worker_projects = {'engineering-hub': {'recipes': {'static': profile}}}
+        self.receipt_config = {'path': str(root / 'worker' / 'private-receipts'), 'max_slots': 16} if terminal else None
+        self.service = Service(root / 'worker', self.worker_projects, self.backend,
+                               capacity_bytes=128 * 1024**2, terminal_receipts=self.receipt_config)
+        if scoped:
+            # Test-only explicit migration; production never auto-creates these.
+            self.service.db.executescript("""CREATE INDEX status_unsettled_operations ON operations(state)
+                WHERE state NOT IN ('succeeded','failed') OR state IS NULL;
+            CREATE INDEX status_unreleased_leases ON scratch_leases(state)
+                WHERE state != 'released' OR state IS NULL;""")
         token = 'synthetic-wire-only-' + uuid.uuid4().hex
+        legacy_token = ('synthetic-legacy-' + uuid.uuid4().hex) if scoped else token
+        self.legacy_token = legacy_token
+        self.other_token = 'synthetic-foreign-' + uuid.uuid4().hex
         credential = root / 'credential'
         credential.write_text(token)
         credential.chmod(0o600)
@@ -126,14 +140,20 @@ class Wire:
         self.counts, self.received, self.guard = Counter(), [], threading.Lock()
         self.drop_jobs = self.drop_cleanup = self.drop_sources = False
         wire = self
-        production_handler = handler(self.service, token, {ipaddress.ip_address('127.0.0.1')})
+        credentials = (('alice', token, frozenset({'engineering-hub'}),
+                        {'engineering-hub': frozenset({'static'})}),
+                       ('bob', self.other_token, frozenset({'engineering-hub'}),
+                        {'engineering-hub': frozenset({'static'})})) if scoped else None
+        production_handler = handler(self.service, legacy_token, {ipaddress.ip_address('127.0.0.1')},
+                                     v2_credentials=credentials)
 
         class ObservedHandler(production_handler):
             def authorize(self):
-                super().authorize()
+                identity = super().authorize()
                 with wire.guard:
                     wire.counts[(self.command, self.path)] += 1
                     wire.received.append((self.command, self.path))
+                return identity
 
             def respond(self, status, value, content_type='application/json'):
                 # dispatch has ALREADY called real Service.submit/cleanup here.
@@ -141,11 +161,11 @@ class Wire:
                 # handler exception or client-side synthetic transport is used.
                 with wire.guard:
                     drop = (self.command == 'POST' and
-                            (self.path == '/v2/sources' and status == 200 and wire.drop_sources or
+                            (self.path in ('/v2/sources', '/v2/source-attempts') and status == 200 and wire.drop_sources or
                              self.path == '/v2/jobs' and status == 202 and wire.drop_jobs or
-                             self.path == '/v1/cleanup' and status == 200 and wire.drop_cleanup))
+                             self.path in ('/v1/cleanup', '/v2/cleanup') and status == 200 and wire.drop_cleanup))
                     if drop:
-                        if self.path == '/v2/sources':
+                        if self.path in ('/v2/sources', '/v2/source-attempts'):
                             wire.drop_sources = False
                         elif self.path == '/v2/jobs':
                             wire.drop_jobs = False
@@ -164,7 +184,8 @@ class Wire:
         self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={'poll_interval': 0.01})
         self.config = StagingConnectionConfig('https://127.0.0.1:' + str(self.server.server_port),
-            credential, ca_file=ca, enabled=True, projects=PROJECTS)
+            credential, ca_file=ca, enabled=True, projects=PROJECTS,
+            protocol_mode='scoped-v2' if scoped else 'legacy')
         self.controllers, self.repos = [], []
         try:
             self.new_controller()
@@ -236,7 +257,7 @@ PROJECTS_RECIPES = {'engineering-hub': ['static']}
 
 @pytest_asyncio.fixture
 async def wire(tmp_path):
-    value = Wire(tmp_path)
+    value = Wire(tmp_path, scoped=True)
     try:
         yield value
     finally:
@@ -259,7 +280,7 @@ async def test_real_tls_lost_acceptance_restart_get_reconciliation_reserves_mach
     done = await restarted.reconcile(first['job']['id'])
     assert done['job']['state'] == 'succeeded'
     assert wire.posts() == 1
-    assert wire.counts[('GET', '/v1/jobs/' + first['job']['id'])] >= 1
+    assert wire.counts[('GET', '/v2/jobs/' + first['job']['id'])] >= 1
     assert (await restarted.run_once())['job']['id'] == second['job']['id']
     assert wire.posts() == 2
 
@@ -275,7 +296,7 @@ async def test_real_tls_revoked_grant_prevents_any_job_post(wire):
 
 @pytest.mark.asyncio
 async def test_real_tls_existing_production_priority_and_upstream_verifiers(tmp_path):
-    wire = Wire(tmp_path)
+    wire = Wire(tmp_path, scoped=True)
     try:
         # The same repository and physical queue are used by both environments.
         repo = wire.repo
@@ -345,18 +366,18 @@ async def test_real_tls_preview_and_cleanup_cas_lost_ack_original_get_only(wire)
     stale = wire.resources.cleanup_plan('codex', 'engineering-hub', kinds=['preview'])
     with pytest.raises(HubError):
         await wire.controller.cleanup_apply('codex', stale['plan_id'], 'sha256:' + '0' * 64)
-    assert wire.posts('/v1/cleanup') == 0
+    assert wire.posts('/v2/cleanup') == 0
     wire.drop_cleanup = True
     result = await wire.controller.cleanup_apply('codex', stale['plan_id'], stale['digest'])
-    assert result['failed'] and wire.posts('/v1/cleanup') == 1
+    assert result['failed'] and wire.posts('/v2/cleanup') == 1
     assert wire.resources.get_resource('codex', identity)['state'] == 'deleting'
     calls = list(wire.received)
     await wire.controller.close()
     wire.new_controller()  # Reconcile the persisted cleanup journal over a fresh TLS client.
     reconciled = await wire.controller.cleanup_apply('codex', stale['plan_id'], stale['digest'])
-    assert reconciled['removed'] == [identity] and wire.posts('/v1/cleanup') == 1
+    assert reconciled['removed'] == [identity] and wire.posts('/v2/cleanup') == 1
     operations = [path for method, path in wire.received[len(calls):]
-                  if method == 'GET' and path.startswith('/v1/operations/')]
+                  if method == 'GET' and path.startswith('/v2/operations/')]
     assert len(operations) == 1
     command = operations[0].rsplit('/', 1)[1]
     assert wire.service.operation(command)['state'] == 'succeeded'

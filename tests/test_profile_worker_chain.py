@@ -66,9 +66,12 @@ async def test_real_worker_wire_profile_binding_and_lost_ack(tmp_path, monkeypat
     from engineering_hub.modular_staging_profile import from_worker_recipe
     from tests.test_hub_staging_wire_integration import Wire, request
     from hub_staging_service import core
+    from hub_staging_service import __main__ as worker_http
     monkeypatch.setattr(core, '_PROFILE_PROTOCOL_READY', True)
     monkeypatch.setattr(core, '_SOURCE_ATTEMPT_ENABLED', True)
-    wire = Wire(tmp_path)
+    monkeypatch.setattr(core, '_SOURCE_EVIDENCE_ENABLED', True)
+    monkeypatch.setattr(worker_http, '_SCOPED_LIFECYCLE_READY', True)
+    wire = Wire(tmp_path, scoped=True)
     try:
         monkeypatch.setattr(staging_controller, '_PROFILE_PROTOCOL_READY', True)
         enrolled = wire.resources.get_profile('human:1', 'engineering-hub', 'static')
@@ -295,11 +298,14 @@ async def test_real_source_ack_loss_never_reposts_to_replacement_worker(tmp_path
     from engineering_hub.repository import HubError
     from engineering_hub.staging_client import StagingClientError
     from hub_staging_service import core
+    from hub_staging_service import __main__ as worker_http
     from tests.test_hub_staging_wire_integration import Wire, request
     monkeypatch.setattr(staging_controller, '_PROFILE_PROTOCOL_READY', True)
     monkeypatch.setattr(core, '_PROFILE_PROTOCOL_READY', True)
     monkeypatch.setattr(core, '_SOURCE_ATTEMPT_ENABLED', True)
-    original = Wire(tmp_path)
+    monkeypatch.setattr(core, '_SOURCE_EVIDENCE_ENABLED', True)
+    monkeypatch.setattr(worker_http, '_SCOPED_LIFECYCLE_READY', True)
+    original = Wire(tmp_path, scoped=True)
     replacement = None
     original_client = original.controller.client
     try:
@@ -313,14 +319,14 @@ async def test_real_source_ack_loss_never_reposts_to_replacement_worker(tmp_path
         item = json.loads(row['data'])
         assert item['phase'] == 'deposit_unknown' and item['job_id'] is None
         assert original.service.db.execute('SELECT id FROM sources').fetchone()[0] == item['source_id']
-        assert original.counts[('POST', '/v2/sources')] == 1 and original.posts() == 0
+        assert original.counts[('POST', '/v2/source-attempts')] == 1 and original.posts() == 0
         other_root = tmp_path / 'replacement'; other_root.mkdir()
-        replacement = Wire(other_root)
+        replacement = Wire(other_root, scoped=True)
         original.controller.client = replacement.controller.client
         with pytest.raises(HubError, match='staging_source_receipt_uncertain'):
             await original.controller.submit('codex', payload)
         assert replacement.received == []
-        assert original.counts[('POST', '/v2/sources')] == 1 and original.posts() == 0
+        assert original.counts[('POST', '/v2/source-attempts')] == 1 and original.posts() == 0
         assert replacement.service.db.execute('SELECT count(*) FROM sources').fetchone()[0] == 0
         assert original.controller._read(item['id'])['source_id'] == item['source_id']
     finally:

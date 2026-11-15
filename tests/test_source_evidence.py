@@ -143,18 +143,27 @@ def test_gate_disabled_without_read(worker, monkeypatch):
         lookup(worker, make_source())
 
 
-def test_http_evidence_requires_bearer_and_does_not_expose_on_bad_query(worker):
+def test_http_evidence_requires_bearer_and_does_not_expose_on_bad_query(worker, monkeypatch):
     from hub_staging_service.__main__ import handler
+    from hub_staging_service import __main__ as worker_http
+    from hub_staging_service.modular_staging_profile import from_worker_recipe, profile_digest
     payload = make_source()
     token = 'synthetic-token-for-test-only'
-    server = ThreadingHTTPServer(('127.0.0.1', 0), handler(worker, token, {ip_address('127.0.0.1')}))
+    legacy = 'synthetic-legacy-token'
+    entries = (('alice', token, frozenset({'demo'}), {'demo':frozenset({'default'})}),)
+    monkeypatch.setattr(core, '_PROFILE_PROTOCOL_READY', True)
+    monkeypatch.setattr(core, '_SOURCE_ATTEMPT_ENABLED', True)
+    monkeypatch.setattr(worker_http, '_SCOPED_LIFECYCLE_READY', True)
+    profile_value = {'project':'demo', 'recipe':'default', 'generation':1,
+                     'digest':profile_digest(from_worker_recipe(worker.projects['demo']['default']))}
+    server = ThreadingHTTPServer(('127.0.0.1', 0), handler(worker, legacy, {ip_address('127.0.0.1')}, v2_credentials=entries))
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
     try:
         base = f'http://127.0.0.1:{server.server_port}/v2/source-evidence/{payload["source_id"]}'
         binding = verify(base64.b64decode(payload['source_zip_base64']),
                          payload['source_commit_object_base64'], payload['source_commit'])
-        query = urlencode({'project': 'demo', 'digest': payload['source_digest'],
+        query = urlencode({'project': 'demo', 'recipe':'default', 'digest': payload['source_digest'],
                            'binding': json.dumps(binding, separators=(',', ':'))})
         with httpx.Client(trust_env=False, timeout=5) as client:
             assert client.get(base + '?' + query).status_code == 401
@@ -164,9 +173,10 @@ def test_http_evidence_requires_bearer_and_does_not_expose_on_bad_query(worker):
         assert response.status_code == 200 and response.json() == {
             'state': 'unknown', 'authority': 'observation_only'}
         if os.name == 'posix':
-            expected = worker.put_source(payload)
+            expected = worker.put_source_attempt(payload, principal='alice', recipe='default', reviewed_profile=profile_value)
             with httpx.Client(trust_env=False, timeout=5) as client:
                 response = client.get(base + '?' + query, headers=headers)
+            expected = {key: value for key, value in expected.items() if key not in ('state', 'authority')}
             assert response.json() == {'state': 'present', 'authority': 'observation_only',
                                        'binding_assurance': 'journal_match_tree_checked', **expected}
     finally:

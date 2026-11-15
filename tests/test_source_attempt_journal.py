@@ -77,9 +77,18 @@ def test_reopen_feature_off_retains_attempt_and_legacy_data(tmp_path, monkeypatc
 
 def test_http_attempt_respects_auth_gate_and_never_replays(worker, monkeypatch):
     from hub_staging_service.__main__ import handler
+    from hub_staging_service import __main__ as worker_http
+    from hub_staging_service.modular_staging_profile import from_worker_recipe, profile_digest
     payload = make_source()
+    profile_value = {'project':'demo', 'recipe':'default', 'generation':1,
+                     'digest':profile_digest(from_worker_recipe(worker.projects['demo']['default']))}
+    payload['reviewed_profile'] = profile_value
     token = 'synthetic-attempt-token'
-    server = ThreadingHTTPServer(('127.0.0.1', 0), handler(worker, token, {ip_address('127.0.0.1')}))
+    legacy = 'synthetic-legacy-token'
+    entries = (('alice', token, frozenset({'demo'}), {'demo':frozenset({'default'})}),)
+    monkeypatch.setattr(core, '_SOURCE_EVIDENCE_ENABLED', True)
+    monkeypatch.setattr(worker_http, '_SCOPED_LIFECYCLE_READY', True)
+    server = ThreadingHTTPServer(('127.0.0.1', 0), handler(worker, legacy, {ip_address('127.0.0.1')}, v2_credentials=entries))
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
     try:
@@ -95,8 +104,9 @@ def test_http_attempt_respects_auth_gate_and_never_replays(worker, monkeypatch):
             assert response.status_code == 200 and response.json()['state'] == 'historical_observation'
             repeated = client.post(base, json=payload, headers=headers)
             assert repeated.status_code == 409 and repeated.json()['error'] == 'source_attempt_unknown'
-            read = client.get(base + '/' + payload['source_id'], params={'project': 'demo'}, headers=headers)
+            read = client.get(base + '/' + payload['source_id'], params={'project': 'demo', 'recipe':'default'}, headers=headers)
             assert read.status_code == 200 and read.json()['state'] == 'historical_observation'
+            assert read.json()['reviewed_profile'] == profile_value
             assert worker.db.execute('SELECT COUNT(*) FROM sources').fetchone()[0] == 1
     finally:
         server.shutdown()

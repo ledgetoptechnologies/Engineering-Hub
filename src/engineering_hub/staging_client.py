@@ -18,7 +18,7 @@ import re
 import ssl
 import stat
 from types import MappingProxyType
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from uuid import UUID
 
 import httpx
@@ -173,9 +173,11 @@ class StagingConnectionConfig:
     auto_run: bool = False
     projects: object = field(default_factory=dict, repr=False)
     schema: int = 1
+    protocol_mode: str = 'legacy'
 
     def __post_init__(self):
         _check(type(self.schema) is int and self.schema == 1
+               and self.protocol_mode in ('legacy', 'scoped-v2')
                and type(self.enabled) is bool and type(self.auto_run) is bool
                and (not self.auto_run or self.enabled)
                and type(self.admin_actors) is frozenset)
@@ -254,7 +256,7 @@ def load_optional_config(path):
             return None, {'state': 'not_configured', 'enabled': False}
         data = json.loads(_read_file(target, 65536), object_pairs_hook=_unique)
         allowed = {'schema', 'origin', 'credential_file', 'ca_file', 'admin_actors',
-                   'preview_origin', 'enabled', 'auto_run', 'projects'}
+                   'preview_origin', 'enabled', 'auto_run', 'projects', 'protocol_mode'}
         _check(type(data) is dict and not set(data) - allowed and data.get('schema') == 1
                and type(data.get('admin_actors', [])) is list)
         data['admin_actors'] = frozenset(data.get('admin_actors', []))
@@ -310,6 +312,15 @@ class StagingClient:
         if recipe is not None:
             _check(recipe in self.config.projects[project]['recipes'])
 
+    def validate_scoped_source_profile(self, project, recipe, profile):
+        """Local preflight only; never proof of receiver authorization or revocation."""
+        _check(self.config.protocol_mode == 'scoped-v2')
+        self._project(project, recipe)
+        _check(type(profile) is dict and set(profile) == {'project', 'recipe', 'generation', 'digest'}
+               and profile['project'] == project and profile['recipe'] == recipe
+               and type(profile['generation']) is int and 1 <= profile['generation'] < 2**31
+               and type(profile['digest']) is str and _PROFILE_SHA.fullmatch(profile['digest']))
+
     @staticmethod
     def _source(payload):
         _check(type(payload['source_digest']) is str and _SHA.fullmatch(payload['source_digest']))
@@ -333,7 +344,7 @@ class StagingClient:
         try:
             content = None if payload is None else json.dumps(payload, separators=(',', ':'), allow_nan=False).encode()
             _check(content is None or len(content) <= self.MAX_UPLOAD_BYTES)
-            timeout = 30.0 if path in {'/v1/sources', '/v2/sources'} else 15.0
+            timeout = 30.0 if path in {'/v1/sources', '/v2/sources', '/v2/source-attempts'} else 15.0
             headers = {'Authorization': 'Bearer ' + self._token, 'Accept-Encoding': 'identity',
                        'Accept': '*/*' if file_types else 'application/json'}
             if content is not None:
@@ -366,7 +377,7 @@ class StagingClient:
                     return bytes(data), media
                 result = json.loads(data, object_pairs_hook=_unique)
                 _check(type(result) is dict)
-                if (self._definitive_rejections and method == 'POST'
+                if (self._definitive_rejections and self.config.protocol_mode == 'legacy' and method == 'POST'
                         and path in _NOT_ACCEPTED and set(result) == {'error'}):
                     reason = result['error']
                     allowed = _NOT_ACCEPTED[path].get(response.status_code, frozenset())
@@ -385,6 +396,8 @@ class StagingClient:
 
     @_opaque
     async def status(self):
+        if self.config.protocol_mode == 'scoped-v2':
+            return await self.status_v2()
         result = await self._request('GET', '/v1/status')
         _shape(result, {'schema', 'active_command_id', 'projects'})
         _check(result['schema'] == 'hub-staging.v1' and type(result['projects']) is dict
@@ -417,11 +430,13 @@ class StagingClient:
 
     @_opaque
     async def runtime(self):
+        _check(self.config.protocol_mode != 'scoped-v2')  # No scoped runtime contract yet.
         from .staging_runtime import validate_runtime_snapshot
         return validate_runtime_snapshot(await self._request('GET', '/v1/runtime', maximum=128 * 1024))
 
     @_opaque
     async def _legacy_put_source(self, payload):
+        _check(self.config.protocol_mode != 'scoped-v2')
         fields = {'source_id', 'project', 'source_digest', 'source_zip_base64'}
         _check(type(payload) is dict and set(payload) in
                (fields, fields | {'source_commit', 'source_commit_object_base64'}))
@@ -462,11 +477,17 @@ class StagingClient:
 
     @_opaque
     async def _put_source_v2(self, payload):
-        fields = {'source_id', 'project', 'source_digest', 'source_zip_base64',
+        # Profile-bound effects must never be sent with the legacy broad bearer,
+        # even if an old receiver advertises its experimental protocol as ready.
+        _check(self.config.protocol_mode == 'scoped-v2')
+        fields = {'source_id', 'project', 'reviewed_profile', 'source_digest', 'source_zip_base64',
                   'source_commit', 'source_commit_object_base64', 'profile_protocol'}
         _check(type(payload) is dict and set(payload) == fields
                and payload['profile_protocol'] == 'hub-staging-profile.v2')
-        _uuid(payload['source_id']); self._project(payload['project'])
+        _uuid(payload['source_id'])
+        profile = payload['reviewed_profile']
+        _check(type(profile) is dict and 'recipe' in profile)
+        self.validate_scoped_source_profile(payload['project'], profile['recipe'], profile)
         size = self._source(payload)
         proof_supplied = 'source_commit' in payload
         if proof_supplied:
@@ -475,12 +496,13 @@ class StagingClient:
                    and 0 < len(payload['source_commit_object_base64']) <= 87384)
             proof = base64.b64decode(payload['source_commit_object_base64'], validate=True)
             _check(0 < len(proof) <= 65536)
-        result = await self._request('POST', '/v2/sources', payload)
-        base_result = {'source_id', 'source_digest', 'size_bytes', 'project'}
+        result = await self._request('POST', '/v2/source-attempts',
+                                     {k: v for k, v in payload.items() if k != 'profile_protocol'})
+        base_result = {'source_id', 'source_digest', 'size_bytes', 'project', 'reviewed_profile'}
         expected_result = (base_result | {'source_binding'} if proof_supplied else base_result) | {'state', 'authority'}
         _check(type(result) is dict and set(result) == expected_result)
         _check(result['state'] == 'historical_observation' and result['authority'] == 'observation_only')
-        _check(all(result[key] == payload[key] for key in ('source_id', 'source_digest', 'project'))
+        _check(all(result[key] == payload[key] for key in ('source_id', 'source_digest', 'project', 'reviewed_profile'))
                and type(result['size_bytes']) is int and result['size_bytes'] == size)
         if proof_supplied:
             binding = result['source_binding']
@@ -494,6 +516,50 @@ class StagingClient:
                 and binding['commit_object_sha256'] == hashlib.sha256(proof).hexdigest()
                 and type(binding['expanded_bytes']) is int and 0 <= binding['expanded_bytes'] <= 64 * 1024**2
                 and type(binding['entries']) is int and 1 <= binding['entries'] <= 5000)
+        return result
+
+    @_opaque
+    async def observe_source_attempt(self, identity, project, profile, digest, binding):
+        """Original-ID observation only; never proof that an effect did not occur."""
+        _uuid(identity)
+        _check(type(profile) is dict and 'recipe' in profile)
+        self.validate_scoped_source_profile(project, profile['recipe'], profile)
+        _check(type(digest) is str and _SHA.fullmatch(digest) and type(binding) is dict
+               and binding.get('archive_sha256') == digest)
+        query = urlencode({'project': project, 'recipe': profile['recipe']})
+        result = await self._request('GET', '/v2/source-attempts/' + identity + '?' + query)
+        if result == {'state': 'unknown', 'authority': 'observation_only'}:
+            return result
+        _shape(result, {'state', 'authority', 'source_id', 'project', 'source_digest',
+                        'source_binding', 'reviewed_profile'})
+        _check(result['state'] in ('uncertain', 'historical_observation')
+               and result['authority'] == 'observation_only' and result['source_id'] == identity
+               and result['project'] == project and result['source_digest'] == digest
+               and result['source_binding'] == binding and result['reviewed_profile'] == profile)
+        return result
+
+    @_opaque
+    async def observe_source_evidence(self, identity, project, profile, digest, binding):
+        """Bound source observation, not authority to release a held request."""
+        _uuid(identity)
+        _check(type(profile) is dict and 'recipe' in profile)
+        self.validate_scoped_source_profile(project, profile['recipe'], profile)
+        _check(type(digest) is str and _SHA.fullmatch(digest) and type(binding) is dict
+               and binding.get('archive_sha256') == digest)
+        canonical = json.dumps(binding, sort_keys=True, separators=(',', ':'), allow_nan=False)
+        _check(len(canonical) <= 1024)
+        query = urlencode({'project': project, 'recipe': profile['recipe'], 'digest': digest, 'binding': canonical})
+        result = await self._request('GET', '/v2/source-evidence/' + identity + '?' + query)
+        if result == {'state': 'unknown', 'authority': 'observation_only'}:
+            return result
+        _shape(result, {'state', 'authority', 'binding_assurance', 'source_id', 'project',
+                        'source_digest', 'size_bytes', 'source_binding', 'reviewed_profile'})
+        _check(result['state'] == 'present' and result['authority'] == 'observation_only'
+               and result['binding_assurance'] == 'journal_match_tree_checked'
+               and result['source_id'] == identity and result['project'] == project
+               and result['source_digest'] == digest and result['source_binding'] == binding
+               and result['reviewed_profile'] == profile and type(result['size_bytes']) is int
+               and 0 < result['size_bytes'] <= 8 * 1024**2)
         return result
 
     @staticmethod
@@ -572,6 +638,7 @@ class StagingClient:
 
     @_opaque
     async def _legacy_submit(self, payload):
+        _check(self.config.protocol_mode != 'scoped-v2')
         required = {'job_id', 'command_id', 'idempotency_key', 'project', 'recipe',
                     'source_commit', 'source_digest', 'resource_ids'}
         legacy = (required | {'source_id'}, required | {'source_zip_base64'})
@@ -599,6 +666,7 @@ class StagingClient:
 
     @_opaque
     async def _submit_v2(self, payload):
+        _check(self.config.protocol_mode == 'scoped-v2')
         required = {'job_id', 'command_id', 'idempotency_key', 'project', 'recipe',
                     'source_commit', 'source_digest', 'resource_ids'}
         bound = required | {'source_id', 'require_source_binding', 'expected_source_binding'}
@@ -627,7 +695,10 @@ class StagingClient:
     @_opaque
     async def job(self, identity):
         identity = _uuid(identity)
-        return self._operation(await self._request('GET', '/v1/jobs/' + identity), job_id=identity)
+        return self._operation(await self._request('GET', self._lifecycle_path('/jobs/' + identity)), job_id=identity)
+
+    def _lifecycle_path(self, path):
+        return ('/v2' if self.config.protocol_mode == 'scoped-v2' else '/v1') + path
 
     @_opaque
     async def operation(self, identity):
@@ -638,7 +709,7 @@ class StagingClient:
         durable original cleanup request before recording confirmed absence.
         """
         identity = _uuid(identity)
-        result = self._operation(await self._request('GET', '/v1/operations/' + identity),
+        result = self._operation(await self._request('GET', self._lifecycle_path('/operations/' + identity)),
                                  command_id=identity, cleanup=True)
         _check(not set(result['result']) - {'error', 'deleted_resource_ids'})
         if result['state'] == 'succeeded':
@@ -649,7 +720,7 @@ class StagingClient:
     @_opaque
     async def resource(self, identity):
         identity = _uuid(identity)
-        result = await self._request('GET', '/v1/resources/' + identity + '/metadata')
+        result = await self._request('GET', self._lifecycle_path('/resources/' + identity + '/metadata'))
         _shape(result, {'id', 'job_id', 'kind', 'revision', 'state', 'inode', 'manifest', 'bytes', 'refs'})
         _uuid(result['job_id'])
         _check(result['id'] == identity and type(result['kind']) is str and result['kind'] in _KINDS
@@ -674,14 +745,14 @@ class StagingClient:
         identity, path = _uuid(identity), _relative(path)
         extension = path.rsplit('.', 1)[-1].lower()
         _check(extension in _FILE_TYPES)
-        return await self._request('GET', '/v1/resources/' + identity + '/files/' + path,
+        return await self._request('GET', self._lifecycle_path('/resources/' + identity + '/files/' + path),
                                    file_types=_FILE_TYPES[extension])
 
     @_opaque
     async def diagnostic_file(self, identity, path, manifest_sha256):
         identity, path = _uuid(identity), _relative(path)
         _check(type(manifest_sha256) is str and _SHA.fullmatch(manifest_sha256))
-        return await self._request('GET', '/v1/resources/' + identity + '/diagnostics/' + manifest_sha256 + '/' + path,
+        return await self._request('GET', self._lifecycle_path('/resources/' + identity + '/diagnostics/' + manifest_sha256 + '/' + path),
                                    file_types=('application/octet-stream',), maximum=8*1024**2)
 
     @_opaque
@@ -695,7 +766,7 @@ class StagingClient:
             identities.append(_uuid(item['resource_id']))
             _check(type(item['expected_revision']) is int and item['expected_revision'] >= 1)
         _check(len(set(identities)) == len(identities))
-        result = await self._request('POST', '/v1/cleanup', payload)
+        result = await self._request('POST', self._lifecycle_path('/cleanup'), payload)
         result = self._operation(result, command_id=payload['command_id'], cleanup=True)
         if result['state'] == 'succeeded':
             _check(set(result['result'].get('deleted_resource_ids', [])) == set(identities))
