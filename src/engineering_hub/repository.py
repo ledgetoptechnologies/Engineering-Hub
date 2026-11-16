@@ -24,6 +24,7 @@ TASK_STATUS_ACTIONS = ('task.created', 'task.proposed', 'task.claimed', 'task.cl
 # hub_task_update may set only these; claim/candidate/review keep their own flows.
 UPDATE_STATUSES = frozenset({'waiting_on_beau', 'done', 'assigned', 'claimed', 'in_review', 'verified'})
 MAX_ACCEPTANCE, MAX_NOTES = 20, 50
+TASK_UPDATE_RECEIPT = 'task_update_receipt'
 # Long backlog text left out of hub_overview; hub_task_get returns the full record.
 OVERVIEW_OMITTED = frozenset({'acceptance', 'notes', 'request_text', 'completion_evidence', 'waiting_resolved'})
 # Audit actions that record who created a task or decision. Withdrawal by an agent
@@ -90,9 +91,6 @@ class HubRepository:
                     PRIMARY KEY(run_id,event_id));
                 CREATE TABLE IF NOT EXISTS hub_target_fences (
                     target TEXT PRIMARY KEY, generation INTEGER NOT NULL CHECK(generation > 0));
-                CREATE TABLE IF NOT EXISTS hub_task_update_requests (
-                    actor TEXT NOT NULL, key TEXT NOT NULL, fingerprint TEXT NOT NULL,
-                    task_id TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(actor,key));
                 CREATE TABLE IF NOT EXISTS hub_run_requests (
                     actor TEXT NOT NULL, key TEXT NOT NULL, fingerprint TEXT NOT NULL,
                     run_id TEXT NOT NULL, PRIMARY KEY(actor,key));
@@ -390,19 +388,23 @@ class HubRepository:
             raise HubError('invalid_input')
         fingerprint = hashlib.sha256(_json([identity, expected_revision, content, backlog, note, status,
                                             waiting, evidence]).encode()).hexdigest()
+        # Receipts reuse hub_requests (namespaced key) and an inert receipt row holding the original
+        # result, so the ledger keeps its existing table set.
+        receipt_key = None if key is None else 'task_update:' + key
         with self._transaction() as db:
-            if key is not None:
-                prior = db.execute('SELECT fingerprint, result FROM hub_task_update_requests WHERE actor=? AND key=?',
-                                   (actor, key)).fetchone()
+            if receipt_key is not None:
+                prior = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, receipt_key)).fetchone()
                 if prior:
                     if prior['fingerprint'] != fingerprint:
                         raise HubError('idempotency_conflict', 409)
-                    return json.loads(prior['result'])
+                    return self._get(db, prior['entity_id'], TASK_UPDATE_RECEIPT)['result']
             result = self._update_task(db, actor, human, identity, expected_revision, content, backlog, note,
                                        status, waiting, evidence)
-            if key is not None:
-                db.execute('INSERT INTO hub_task_update_requests VALUES(?,?,?,?,?)',
-                           (actor, key, fingerprint, identity, _json(result)))
+            if receipt_key is not None:
+                receipt = str(uuid.uuid4())
+                db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
+                           (receipt, TASK_UPDATE_RECEIPT, _json(dict(id=receipt, task_id=identity, result=result))))
+                db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, receipt_key, fingerprint, receipt))
             return result
 
     def _update_task(self, db, actor, human, identity, expected_revision, content, backlog, note, status,
