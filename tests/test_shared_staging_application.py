@@ -35,6 +35,7 @@ async def shared_app(rig, tmp_path, monkeypatch):
     path = config_file(tmp_path)
     data = json.loads(path.read_text())
     data['admin_actors'] = [rig.owner_actor]
+    data['protocol_mode'] = 'scoped-v2'
     path.write_text(json.dumps(data))
     rig.settings = replace(rig.settings, staging_config_path=path)
     rig.modular_clients, rig.modular_requests = [], []
@@ -221,7 +222,7 @@ async def test_listener_stop_drains_accepted_http_upload_before_transport_and_ow
     state = shared_app
     entered, release = asyncio.Event(), asyncio.Event()
     async def upload(request):
-        assert request.url.path == '/v2/sources'
+        assert request.url.path == '/v2/source-attempts'
         value = json.loads(request.content)
         entered.set()
         await release.wait()
@@ -229,7 +230,7 @@ async def test_listener_stop_drains_accepted_http_upload_before_transport_and_ow
         from hub_staging_service.source_provenance import verify
         raw = base64.b64decode(value['source_zip_base64'])
         binding = verify(raw, value['source_commit_object_base64'], value['source_commit'])
-        return httpx.Response(200, json={key: value[key] for key in ('source_id', 'source_digest', 'project')} |
+        return httpx.Response(200, json={key: value[key] for key in ('source_id', 'source_digest', 'project', 'reviewed_profile')} |
                              {'size_bytes': len(raw), 'source_binding': binding, 'state':'historical_observation', 'authority':'observation_only'})
     state.modular_handler = upload
     stop, task, addresses = await start(state)
@@ -312,10 +313,10 @@ async def test_shared_configured_action_rechecks_review_at_boundaries(shared_app
     from hub_staging_service.source_provenance import verify
     state = shared_app
     async def worker(request):
-        assert request.url.path == '/v2/sources'
+        assert request.url.path == '/v2/source-attempts'
         value = json.loads(request.content)
         raw = base64.b64decode(value['source_zip_base64'])
-        return httpx.Response(200, json={key: value[key] for key in ('source_id', 'source_digest', 'project')} |
+        return httpx.Response(200, json={key: value[key] for key in ('source_id', 'source_digest', 'project', 'reviewed_profile')} |
             {'size_bytes': len(raw), 'source_binding': verify(raw, value['source_commit_object_base64'], value['source_commit']), 'state':'historical_observation', 'authority':'observation_only'})
     state.modular_handler = worker
     stop, task, addresses = await start(state)

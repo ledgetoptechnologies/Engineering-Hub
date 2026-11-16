@@ -19,17 +19,21 @@ async def test_shared_hub_to_worker_journal_reviewed_source_and_lost_ack(shared_
     from engineering_hub import staging_controller
     from engineering_hub.modular_staging_profile import from_worker_recipe
     from hub_staging_service import core
+    from hub_staging_service import __main__ as worker_http
     monkeypatch.setattr(staging_controller, '_PROFILE_PROTOCOL_READY', True)
     monkeypatch.setattr(core, '_PROFILE_PROTOCOL_READY', True)
     monkeypatch.setattr(core, '_SOURCE_ATTEMPT_ENABLED', True)
+    monkeypatch.setattr(core, '_SOURCE_EVIDENCE_ENABLED', True)
+    monkeypatch.setattr(worker_http, '_SCOPED_LIFECYCLE_READY', True)
     state = shared_app
     worker_root = tmp_path / 'disposable-worker'
     worker_root.mkdir()
-    wire = Wire(worker_root)
+    wire = Wire(worker_root, scoped=True)
     config_path = state.settings.staging_config_path
     config = json.loads(config_path.read_text())
     config.update(origin=wire.config.origin, credential_file=str(wire.config.credential_file),
-                  ca_file=str(wire.config.ca_file), projects={'engineering-hub': {'recipes': ['static']}})
+                  ca_file=str(wire.config.ca_file), projects={'engineering-hub': {'recipes': ['static']}},
+                  protocol_mode='scoped-v2')
     config_path.write_text(json.dumps(config))
     # Use the actual network transport and the queue owned by this application.
     monkeypatch.setattr(service, 'prepare_shared_staging', staging_module.prepare_shared_staging)
@@ -52,7 +56,7 @@ async def test_shared_hub_to_worker_journal_reviewed_source_and_lost_ack(shared_
             repeated = await agent.post(BASE + '/staging/jobs', json=request)
             assert repeated.status_code == 202
             assert repeated.json()['job']['id'] == submission['job']['id']
-        assert wire.posts('/v2/sources') == 1
+        assert wire.posts('/v2/source-attempts') == 1
         wire.drop_jobs = True
         held = await controller.run_once()
         assert held['job']['state'] == 'held'

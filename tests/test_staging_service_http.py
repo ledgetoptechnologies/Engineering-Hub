@@ -16,6 +16,12 @@ class Stub:
     active = None
     backend = object()
     projects = {'demo': {'static': {}}}
+    def legacy_active(self, *, scoped_mode=False):
+        return self.active
+    def legacy_runtime_allowed(self):
+        return True
+    def legacy_operation(self, command_id):
+        return self.operation(command_id)
     def put_source(self, payload):
         return {'source_id': payload['source_id'], 'source_digest': 'a' * 64, 'size_bytes': 4}
     def operation(self, command_id):

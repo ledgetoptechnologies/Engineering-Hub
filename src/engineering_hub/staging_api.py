@@ -164,6 +164,10 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
             if principal not in controller.resources.admin_actors:
                 raise HubError('staging_admin_required', 403)
             result = await controller.runtime(principal)
+        # The remote inventory request may outlive the human session. Recheck
+        # the same read-only authentication before releasing global metadata.
+        if authenticated(request, human_only=True) != principal:
+            raise HubError('staging_identity_changed', 403)
         if result.get('snapshot') is not None:
             from .staging_runtime import validate_runtime_snapshot
             try:

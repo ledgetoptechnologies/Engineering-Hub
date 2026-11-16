@@ -22,6 +22,9 @@ from engineering_hub.staging_client import StagingNotAccepted
 
 class Client:
     def __init__(self):
+        from types import SimpleNamespace
+        # Synthetic controller fixture, not a receiver credential or grant.
+        self.config = SimpleNamespace(protocol_mode='scoped-v2')
         self.bindings = {}
         self.jobs, self.facts, self.posts, self.deposits = {}, {}, 0, 0
         self.lost_ack, self.cleanup_lost = False, False
@@ -40,7 +43,13 @@ class Client:
         from hub_staging_service.source_provenance import verify
         binding = verify(base64.b64decode(payload['source_zip_base64']), payload['source_commit_object_base64'], payload['source_commit'])
         self.bindings[payload['source_id']] = binding
-        return {key: payload[key] for key in ('source_id', 'project', 'source_digest')} | {'size_bytes': 1, 'source_binding': binding}
+        result = {key: payload[key] for key in ('source_id', 'project', 'source_digest')} | {'size_bytes': 1, 'source_binding': binding}
+        if 'reviewed_profile' in payload:
+            result['reviewed_profile'] = payload['reviewed_profile']
+        return result
+
+    def validate_scoped_source_profile(self, project, recipe, profile):
+        assert profile['project'] == project and profile['recipe'] == recipe
 
     async def submit(self, payload):
         self.posts += 1
@@ -1600,6 +1609,7 @@ async def test_actual_client_contract_through_registered_worker_core(env, tmp_pa
     from engineering_hub.modular_staging_profile import from_worker_recipe
     monkeypatch.setattr(core, '_PROFILE_PROTOCOL_READY', True)
     monkeypatch.setattr(core, '_SOURCE_ATTEMPT_ENABLED', True)
+    monkeypatch.setattr(core, '_SOURCE_EVIDENCE_ENABLED', True)
     service = Service(tmp_path / 'private-worker', {'engineering-hub': {'recipes': {'static': profile}}}, Backend())
     env[2].enroll_profile('human:1', 'engineering-hub', 'static', 1,
                           from_worker_recipe(service.projects['engineering-hub']['static']))
@@ -1608,7 +1618,12 @@ async def test_actual_client_contract_through_registered_worker_core(env, tmp_pa
         if request.method == 'POST':
             import json
             body = json.loads(request.content)
-            result = service.put_source(body) if path[-1] == 'sources' else service.submit(body)
+            if path[-1] == 'source-attempts':
+                bound = body.pop('reviewed_profile')
+                result = service.put_source_attempt(body, principal='alice', recipe=bound['recipe'], reviewed_profile=bound)
+            else:
+                result = service._submit_v2(body, principal='alice', projects=frozenset({'engineering-hub'}),
+                                            recipes={'engineering-hub':frozenset({'static'})})
             if worker_blocked and path[-1] == 'jobs':
                 assert entered_worker.wait(2), 'worker did not enter backend before polling'
             return httpx.Response(202 if path[-1] == 'jobs' else 200, json=result)
@@ -1617,16 +1632,19 @@ async def test_actual_client_contract_through_registered_worker_core(env, tmp_pa
                 'profile_protocol':'hub-staging-profile.v2', 'profile_protocol_ready':True,
                 'projects':{'engineering-hub':['static']}})
         if path[2] == 'jobs':
-            return httpx.Response(200, json=service.status(path[3]))
+            return httpx.Response(200, json=service.scoped_status(path[3], 'alice', frozenset({'engineering-hub'}),
+                                                                  {'engineering-hub':frozenset({'static'})}))
         if path[-1] == 'metadata':
-            return httpx.Response(200, json=service.metadata(path[3]))
+            return httpx.Response(200, json=service.scoped_metadata(path[3], 'alice', frozenset({'engineering-hub'}),
+                                                                    {'engineering-hub':frozenset({'static'})}))
         if path[4] == 'files':
-            return httpx.Response(200, content=service.file(path[3], '/'.join(path[5:])), headers={'Content-Type': 'text/html'})
+            return httpx.Response(200, content=service.scoped_file(path[3], '/'.join(path[5:]), 'alice',
+                frozenset({'engineering-hub'}), {'engineering-hub':frozenset({'static'})}), headers={'Content-Type': 'text/html'})
         raise AssertionError('unexpected request')
     token = tmp_path / 'synthetic-token'
     token.write_text('synthetic-test-worker-secret-only'); token.chmod(0o600)
     client = StagingClient(StagingConnectionConfig('http://127.0.0.1:8780', token, enabled=True,
-                           projects={'engineering-hub': {'recipes': ['static']}}), test_transport=httpx.MockTransport(transport))
+                           projects={'engineering-hub': {'recipes': ['static']}}, protocol_mode='scoped-v2'), test_transport=httpx.MockTransport(transport))
     controller = env[0]
     controller.client = client
     # The shared fixture's 100ms window tests fast fakes; the actual worker

@@ -200,7 +200,10 @@ async def test_exact_known_post_rejection_is_safe_subtype_without_retry(config, 
     client = StagingClient(config, test_transport=httpx.MockTransport(respond))
     try:
         with pytest.raises(StagingNotAccepted) as error:
-            await getattr(client, method)(job() if method == 'submit' else cleanup_payload())
+            # These are the original v1 definitive-rejection guarantees. A
+            # profile-bound job requires scoped mode and stays uncertain until
+            # the original-worker/first-dispatch fence is independently proven.
+            await getattr(client, method)(legacy_job() if method == 'submit' else cleanup_payload())
         assert error.value.reason == reason
         assert error.value.code == 'staging_worker_rejected' and error.value.status == 409
         assert str(error.value) == 'staging_worker_rejected'
@@ -233,7 +236,7 @@ async def test_conflict_unknown_wrong_status_or_wrong_route_remains_uncertain(co
     client = StagingClient(config, test_transport=httpx.MockTransport(respond))
     try:
         with pytest.raises(StagingClientError) as error:
-            await getattr(client, method)(job() if method == 'submit' else cleanup_payload())
+            await getattr(client, method)(legacy_job() if method == 'submit' else cleanup_payload())
         assert type(error.value) is StagingClientError
         assert TOKEN not in str(error.value) and len(requests) == 1
     finally:
@@ -262,7 +265,7 @@ async def test_rejection_subtype_requires_full_bounded_validated_private_respons
     client = StagingClient(config, test_transport=httpx.MockTransport(respond))
     try:
         with pytest.raises(StagingClientError) as error:
-            await client.submit(job())
+            await client.submit(legacy_job())
         assert type(error.value) is StagingClientError
         assert TOKEN not in str(error.value) and 'foreign.invalid' not in str(error.value)
         assert len(requests) == 1
@@ -280,7 +283,7 @@ async def test_known_error_get_source_and_file_responses_remain_opaque(config):
         return httpx.Response(401, json={'error': 'unauthorized'})
     client = StagingClient(config, test_transport=httpx.MockTransport(respond))
     try:
-        for invoke in (client.status, lambda: client.put_source(source()),
+        for invoke in (client.status, lambda: client.put_source(legacy_source()),
                        lambda: client.operation(str(uuid4())), lambda: client.file(str(uuid4()), 'index.html')):
             with pytest.raises(StagingClientError) as error:
                 await invoke()
@@ -311,7 +314,7 @@ async def test_plaintext_channel_policy_keeps_even_valid_rejection_opaque(config
     client._definitive_rejections = False
     try:
         with pytest.raises(StagingClientError) as error:
-            await client.submit(job())
+            await client.submit(legacy_job())
         assert type(error.value) is StagingClientError and len(requests) == 1
     finally:
         await client.aclose()
@@ -335,18 +338,39 @@ async def test_accepted_held_operation_receipt_never_becomes_not_accepted(config
 
 
 def source():
-    raw = b'Synthetic bytes; archive validation belongs to worker'
-    return dict(source_id=str(uuid4()), project='demo', source_digest=hashlib.sha256(raw).hexdigest(),
-                source_zip_base64=base64.b64encode(raw).decode(), profile_protocol='hub-staging-profile.v2',
-                source_commit='a'*40, source_commit_object_base64=base64.b64encode(b'proof').decode())
+    from tests.test_source_evidence import make_source
+    return dict(make_source(), profile_protocol='hub-staging-profile.v2', reviewed_profile=_reviewed_profile())
 
 
-def job():
+def legacy_source():
+    payload = source()
+    del payload['profile_protocol'], payload['reviewed_profile']
+    return payload
+
+
+def _reviewed_profile():
+    from hub_staging_service.core import recipe
+    from hub_staging_service.modular_staging_profile import from_worker_recipe, profile_digest
+    from tests.test_staging_service_core import profile
+    return {'project':'demo', 'recipe':'static', 'generation':1,
+            'digest':profile_digest(from_worker_recipe(recipe(profile())))}
+
+
+def job(source_payload=None):
+    from hub_staging_service.source_provenance import verify
+    src = source_payload or source()
+    binding = verify(base64.b64decode(src['source_zip_base64']), src['source_commit_object_base64'], src['source_commit'])
     return dict(job_id=str(uuid4()), command_id=str(uuid4()), idempotency_key='fixture-submit',
-        project='demo', recipe='static', source_commit='a' * 40, source_digest='b' * 64,
-        source_id=str(uuid4()), resource_ids={kind: str(uuid4()) for kind in KINDS},
-        require_source_binding=True, expected_source_binding={},
-        reviewed_profile={'project':'demo', 'recipe':'static', 'generation':1, 'digest':'sha256:'+'c'*64})
+        project='demo', recipe='static', source_commit=src['source_commit'], source_digest=src['source_digest'],
+        source_id=src['source_id'], resource_ids={kind: str(uuid4()) for kind in KINDS},
+        require_source_binding=True, expected_source_binding=binding,
+        reviewed_profile=src['reviewed_profile'])
+
+
+def legacy_job():
+    payload = job()
+    del payload['reviewed_profile']
+    return payload
 
 
 @pytest.mark.parametrize('origin', ['http://192.168.50.90:8780', 'https://8.8.8.8',
@@ -468,7 +492,8 @@ async def test_owned_client_has_no_default_cookie_auth_redirect_or_environment_m
 
 @pytest.mark.asyncio
 async def test_source_submit_job_metadata_file_cleanup_match_fixed_worker_contract(config):
-    payload, source_payload = job(), source()
+    source_payload = source()
+    payload = job(source_payload)
     resource_id = payload['resource_ids']['preview']
     cleanup = dict(command_id=str(uuid4()), idempotency_key='cleanup',
                    resources=[{'resource_id': resource_id, 'expected_revision': 1}])
@@ -476,28 +501,28 @@ async def test_source_submit_job_metadata_file_cleanup_match_fixed_worker_contra
     def handle(request):
         seen.append((request.method, request.url.path))
         body = json.loads(request.content) if request.content else None
-        if request.url.path == '/v2/sources':
-            assert body == source_payload and request.extensions['timeout']['write'] == 30
-            return httpx.Response(200, json={key: source_payload[key] for key in ('source_id', 'source_digest', 'project')} | {'size_bytes': 53, 'state':'historical_observation', 'authority':'observation_only',
-                'source_binding':{'scheme':'git-sha1-tree-v1','commit_oid':'a'*40,'tree_oid':'b'*40,
-                    'archive_sha256':source_payload['source_digest'], 'commit_object_sha256':hashlib.sha256(b'proof').hexdigest(),
-                    'expanded_bytes':1, 'entries':1}})
+        if request.url.path == '/v2/source-attempts':
+            assert body == {key: value for key, value in source_payload.items() if key != 'profile_protocol'}
+            assert request.extensions['timeout']['write'] == 30
+            return httpx.Response(200, json={key: source_payload[key] for key in ('source_id', 'source_digest', 'project', 'reviewed_profile')}
+                | {'size_bytes':len(base64.b64decode(source_payload['source_zip_base64'])), 'state':'historical_observation',
+                   'authority':'observation_only', 'source_binding':payload['expected_source_binding']})
         if request.url.path == '/v2/jobs':
             assert body == payload
             return httpx.Response(202, json=operation(payload['job_id'], payload['command_id'], state='accepted'))
-        if request.url.path == '/v1/jobs/' + payload['job_id']:
+        if request.url.path == '/v2/jobs/' + payload['job_id']:
             return httpx.Response(200, json=operation(payload['job_id'], payload['command_id']))
-        if request.url.path.endswith('/metadata'):
+        if request.url.path == '/v2/resources/' + resource_id + '/metadata':
             return httpx.Response(200, json=dict(id=resource_id, job_id=payload['job_id'], kind='preview',
                 revision=1, state='ready', inode=10, manifest={'index.html': {'bytes': 4, 'sha256': 'c' * 64}}, bytes=4, refs=[]))
-        if request.url.path.endswith('/files/index.html'):
+        if request.url.path == '/v2/resources/' + resource_id + '/files/index.html':
             return httpx.Response(200, content=b'demo', headers={'content-type': 'text/html'})
-        if request.url.path == '/v1/cleanup':
+        if request.url.path == '/v2/cleanup':
             assert body == cleanup
             return httpx.Response(200, json=operation(command_id=cleanup['command_id'],
                 result={'deleted_resource_ids': [resource_id]}))
         pytest.fail('Unexpected route')
-    client = StagingClient(config, test_transport=httpx.MockTransport(handle))
+    client = StagingClient(replace(config, protocol_mode='scoped-v2'), test_transport=httpx.MockTransport(handle))
     try:
         assert (await client.put_source(source_payload))['source_id'] == source_payload['source_id']
         assert (await client.submit(payload))['state'] == 'accepted'
@@ -505,7 +530,10 @@ async def test_source_submit_job_metadata_file_cleanup_match_fixed_worker_contra
         assert (await client.resource(resource_id))['id'] == resource_id
         assert await client.file(resource_id, 'index.html') == (b'demo', 'text/html')
         assert (await client.cleanup(cleanup))['state'] == 'succeeded'
-        assert len(seen) == 6
+        assert seen == [('POST', '/v2/source-attempts'), ('POST', '/v2/jobs'),
+                        ('GET', '/v2/jobs/' + payload['job_id']),
+                        ('GET', '/v2/resources/' + resource_id + '/metadata'),
+                        ('GET', '/v2/resources/' + resource_id + '/files/index.html'), ('POST', '/v2/cleanup')]
     finally:
         await client.aclose()
 
@@ -563,7 +591,7 @@ async def test_invalid_file_path_never_reaches_transport(config, path):
 
 @pytest.mark.asyncio
 async def test_input_schema_and_project_recipe_scope_deny_before_transport(config):
-    client = StagingClient(config, test_transport=httpx.MockTransport(lambda request: pytest.fail('network')))
+    client = StagingClient(replace(config, protocol_mode='scoped-v2'), test_transport=httpx.MockTransport(lambda request: pytest.fail('network')))
     try:
         for changes in ({'project': 'other'}, {'recipe': 'other'}, {'source_commit': 'main'},
                         {'extra': 'not-allowed'}, {'job_id': 'https://evil'}, {'resource_ids': {}}):

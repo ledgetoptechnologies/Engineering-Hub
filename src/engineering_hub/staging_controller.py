@@ -416,6 +416,9 @@ class StagingController:
                     item = json.loads(old['data'])
                 else:
                     _require(_PROFILE_PROTOCOL_READY, 'staging_profile_protocol_unavailable', 503)
+                    _require(getattr(getattr(self.client, 'config', None), 'protocol_mode', None) == 'scoped-v2',
+                             'staging_profile_protocol_unavailable', 503)
+                    self.client.validate_scoped_source_profile(project, recipe, reviewed_profile)
                     item = dict(public, id=str(uuid.uuid4()), actor=actor, source_id=str(uuid.uuid4()),
                                 phase='depositing', job_id=None, resource_ids={}, command_id=str(uuid.uuid4()), topic=topic)
                     db.execute('INSERT INTO hub_staging_submissions VALUES(?,?,?,?,?)',
@@ -432,6 +435,9 @@ class StagingController:
             if item['phase'] == 'deposit_unknown':
                 raise HubError('staging_source_receipt_uncertain', 409)
             if item['phase'] == 'depositing':
+                _require(getattr(getattr(self.client, 'config', None), 'protocol_mode', None) == 'scoped-v2',
+                         'staging_profile_protocol_unavailable', 503)
+                self.client.validate_scoped_source_profile(project, recipe, item['reviewed_profile'])
                 self._shared_guard(admission=True)
                 remote = await self.client.status_v2()
                 _require(type(remote) is dict and remote.get('schema') == 'hub-staging.v2'
@@ -451,15 +457,18 @@ class StagingController:
                     _require(self.repo.reviewed_staging_profile(db, item['review_task_id'], actor,
                         item['review_task_revision'], item['source_commit'], project, recipe) == item['reviewed_profile'],
                         'staging_review_required', 409)
+                    _require(type(item['reviewed_profile']) is dict and item['reviewed_profile'].get('recipe') == recipe
+                             and item.get('recipe') == recipe, 'staging_review_required', 409)
                     _require(_PROFILE_PROTOCOL_READY, 'staging_profile_protocol_unavailable', 503)
                     item['phase'] = 'deposit_unknown'
                     db.execute('UPDATE hub_staging_submissions SET data=? WHERE id=?', (_json(item), item['id']))
                 receipt = await self.client.put_source({'source_id': item['source_id'], 'project': project,
+                    'reviewed_profile': item['reviewed_profile'],
                     'profile_protocol': 'hub-staging-profile.v2', 'source_digest': item['source_digest'], 'source_zip_base64': encoded,
                     'source_commit': item['source_commit'],
                     'source_commit_object_base64': payload['source_commit_object_base64']})
                 self._shared_guard()
-                _require(all(receipt.get(key) == item[key] for key in ('source_id', 'source_digest', 'project')),
+                _require(all(receipt.get(key) == item[key] for key in ('source_id', 'source_digest', 'project', 'reviewed_profile')),
                          'staging_source_receipt_mismatch', 502)
                 _require(receipt.get('source_binding') == binding, 'staging_source_binding_receipt_mismatch', 502)
                 item['phase'] = 'deposited'; self._save(item)
@@ -828,6 +837,14 @@ class StagingController:
             item = self._read(job_id=claim['id'])
             try:
                 _require(item['phase'] == 'queued', 'staging_dispatch_already_attempted', 409)
+                if ('reviewed_profile' in item and
+                        getattr(getattr(self.client, 'config', None), 'protocol_mode', None) != 'scoped-v2'):
+                    # The claim was acquired before inspecting the item. No
+                    # safe unclaim transition exists; hold the original work
+                    # without persisting dispatching or issuing a remote POST.
+                    # This conservatively retains the machine reservation.
+                    self._hold(item, claim)
+                    return self._view(item)
                 self._grants(item['actor'], item['project'])
                 self.queue.live_claim(job_id=claim['id'], worker=self.worker, fence=claim['fence'])
                 self._shared_guard(admission=True)
