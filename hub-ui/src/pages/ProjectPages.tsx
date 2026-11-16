@@ -18,12 +18,14 @@ import { ArchiveProjectDialog, ProjectEditorDialog, STATUS_LABEL, STATUS_TONE } 
 import { safeHref } from "../markdown";
 import type { Project } from "../types";
 import { readProject } from "../projectsApi";
+import { isActive } from "../backlog";
 import { ComponentsPanel, GroupedProjectsPanel } from "../ComponentsPanel";
 import { ReviewsPanel } from "../ReviewsPanel";
 
 const STATUSES: Task["status"][] = ["assigned", "claimed", "in_review", "verified"];
 const columnName: Record<Task["status"], string> = {
   assigned: "Assigned", claimed: "In progress", in_review: "In review", verified: "Review passed", withdrawn: "Withdrawn",
+  waiting_on_beau: "Waiting on Beau", done: "Done",
 };
 
 export interface ProjectStats {
@@ -41,7 +43,7 @@ export function projectStats(hub: Hub, id: string): ProjectStats {
   const agents = [...new Set(tasks.flatMap((task) => [actorFamily(task.owner, task.owner_family) ?? task.owner,
     actorFamily(task.proposed_by, task.proposed_family) ?? task.proposed_by, task.review ? actorFamily(task.review.actor) ?? task.review.actor : null])
     .filter((a): a is string => !!a))];
-  return { waiting, tasks, byStatus, lastActivity, agents, active: tasks.length - byStatus.verified };
+  return { waiting, tasks, byStatus, lastActivity, agents, active: tasks.filter(isActive).length };
 }
 
 /** Status shown until projects carry their own health: derived only from current records. */

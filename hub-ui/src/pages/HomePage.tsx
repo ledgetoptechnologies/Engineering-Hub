@@ -6,6 +6,7 @@ import type { Hub } from "../hub";
 import { Badge, Icon, PageHeader, names } from "../ui";
 import { answeredDecisions, openDecisions, RecentAnswers } from "./decisions";
 import { statusLabel, statusTone } from "./tasks";
+import { isActive, waitingKind, waitingTasks } from "../backlog";
 import { DayBars, StageBar, StageLegend, dailyCounts } from "../charts";
 
 function greeting(now = new Date()) {
@@ -14,10 +15,19 @@ function greeting(now = new Date()) {
 }
 
 export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
-  const waiting = openDecisions(hub);
+  const decisions = openDecisions(hub);
+  const items = waitingTasks(hub.data.tasks);
+  // Decisions and task items share one list; both need Beau.
+  const waiting = [
+    ...decisions.map((decision) => ({ id: decision.id, title: decision.title,
+      meta: `${hub.projectName(decision.project)}${decision.protected ? " · Protected" : ""}` })),
+    ...items.map((task) => ({ id: task.id, title: task.waiting_on!.text,
+      meta: `${hub.projectName(task.project)} · ${waitingKind(task)} · ${task.title}` })),
+  ];
   const projects = hub.data.projects.filter((item) => !item.archived);
   const tasks = hub.data.tasks;
-  const active = tasks.filter((task) => task.status !== "verified");
+  const active = tasks.filter(isActive);
+  const passed = tasks.filter((task) => task.status === "verified").length;
   const connected = hub.agents.filter((agent) => connectionView(agent, !hub.demo && hub.stale).connected);
   const targets = projects.filter((item) => item.executor_enabled).length;
   return (
@@ -28,12 +38,12 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
         <a className={`kpi ${waiting.length ? "attention" : ""}`} href={link("/inbox")}>
           <span className="kpi-label"><Icon kind="inbox" size={16} /> Needs you</span>
           <strong>{waiting.length}</strong>
-          <span className="kpi-note">{waiting.length === 0 ? "Nothing waiting" : waiting.length === 1 ? "decision" : "decisions"}</span>
+          <span className="kpi-note">{waiting.length === 0 ? "Nothing waiting" : waiting.length === 1 ? "item" : "items"}</span>
         </a>
         <a className="kpi" href={link("/work")}>
           <span className="kpi-label"><Icon kind="work" size={16} /> Work in motion</span>
           <strong>{active.length}</strong>
-          <span className="kpi-note">{tasks.length - active.length} review passed</span>
+          <span className="kpi-note">{passed} review passed</span>
         </a>
         <a className="kpi" href={link("/agents")}>
           <span className="kpi-label"><Icon kind="agents" size={16} /> Agent streams observed</span>
@@ -57,13 +67,11 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
             <p className="panel-description">Nothing is waiting on you right now.</p>
           ) : (
             <ul className="preview-list">
-              {waiting.slice(0, 6).map((decision) => (
-                <li key={decision.id}>
+              {waiting.slice(0, 6).map((item) => (
+                <li key={item.id}>
                   <a href={link("/inbox")}>
-                    <span className="preview-title">{decision.title}</span>
-                    <span className="preview-meta">
-                      {hub.projectName(decision.project)}{decision.protected ? " · Protected" : ""}
-                    </span>
+                    <span className="preview-title">{item.title}</span>
+                    <span className="preview-meta">{item.meta}</span>
                   </a>
                 </li>
               ))}
@@ -146,7 +154,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
           <ul className="project-mini">
             {projects.map((project) => {
               const open = openDecisions(hub, project.id).length;
-              const work = hub.data.tasks.filter((task) => task.project === project.id && task.status !== "verified").length;
+              const work = hub.data.tasks.filter((task) => task.project === project.id && isActive(task)).length;
               return (
                 <li key={project.id}>
                   <a href={link(`/projects/${project.id}`)}>

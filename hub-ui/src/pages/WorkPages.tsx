@@ -7,30 +7,66 @@ import { answeredDecisions, DecisionList, openDecisions, RecentAnswers } from ".
 import { TaskTable } from "./tasks";
 import { WithdrawnList } from "./Withdraw";
 import { ownershipRows, UNCLAIMED, WorkOwnership } from "./WorkOwnership";
+import { WORK_FILTERS, waitingKind, waitingTasks } from "../backlog";
+import { statusLabel } from "./tasks";
+
+/** One task item Beau must clear: an action he marks Done, or a decision he answers in the note. */
+export function WaitingItemCard({ hub, task }: { hub: Hub; task: Task }) {
+  const [note, setNote] = useState("");
+  const decision = task.waiting_on?.type === "decision";
+  return (
+    <form className="waiting-item" onSubmit={(event) => {
+      event.preventDefault();
+      void hub.resolveWaiting(task, note.trim()).then((ok) => { if (ok) setNote(""); });
+    }}>
+      <Badge tone="amber">{waitingKind(task)}</Badge>
+      <strong>{task.waiting_on?.text}</strong>
+      <small><a className="project-chip" href={link(`/projects/${task.project}`)}>{hub.projectName(task.project)}</a> · {task.title}</small>
+      <label className="field">
+        <span className="sr-only">{decision ? "Your answer" : "Note (optional)"}</span>
+        <textarea rows={2} maxLength={2000} value={note} onChange={(event) => setNote(event.target.value)}
+          placeholder={decision ? "Your answer" : "Note (optional)"} />
+      </label>
+      <button className="primary" disabled={!hub.writable || (decision && !note.trim())}>
+        {decision ? "Send answer" : "Done"}
+      </button>
+    </form>
+  );
+}
 
 export function InboxPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const [project, setProject] = useState("all");
   const all = openDecisions(hub);
   const waiting = project === "all" ? all : all.filter((item) => item.project === project);
-  const projectsWithItems = hub.data.projects.filter((item) => all.some((decision) => decision.project === item.id));
+  const allItems = waitingTasks(hub.data.tasks);
+  const items = project === "all" ? allItems : allItems.filter((task) => task.project === project);
+  const count = (id: string) => all.filter((decision) => decision.project === id).length
+    + allItems.filter((task) => task.project === id).length;
+  const projectsWithItems = hub.data.projects.filter((item) => count(item.id) > 0);
   return (
     <>
       <PageHeader eyebrow="INBOX" title="Needs you"
         subtitle="Questions that need a human, kept in one place.">{actions}</PageHeader>
       <div className="filter-bar" role="group" aria-label="Filter by project">
         <button className={project === "all" ? "chip selected" : "chip"} onClick={() => setProject("all")}>
-          All <span>{all.length}</span>
+          All <span>{all.length + allItems.length}</span>
         </button>
         {projectsWithItems.map((item) => (
           <button key={item.id} className={project === item.id ? "chip selected" : "chip"} onClick={() => setProject(item.id)}>
-            {item.name} <span>{all.filter((decision) => decision.project === item.id).length}</span>
+            {item.name} <span>{count(item.id)}</span>
           </button>
         ))}
       </div>
+      {items.length > 0 && (
+        <section className="panel waiting-items" id="task-items">
+          <PanelTitle title="From tasks" count={items.length} />
+          <div className="decision-list">{items.map((task) => <WaitingItemCard key={task.id} hub={hub} task={task} />)}</div>
+        </section>
+      )}
       <section className="panel decisions" id="decisions">
         <PanelTitle title="Needs Beau" count={waiting.length} />
         <p className="panel-description">Pick an answer and record it. Recording an answer never deploys anything.</p>
-        <DecisionList hub={hub} decisions={waiting} />
+        {(waiting.length > 0 || items.length === 0) && <DecisionList hub={hub} decisions={waiting} />}
         <RecentAnswers hub={hub} decisions={answeredDecisions(hub, project === "all" ? undefined : project)} />
         <WithdrawnList hub={hub} kind="decision" project={project === "all" ? undefined : project} />
         <p className="panel-footnote">Only your signed-in session can answer. Agents can request, not approve.</p>
@@ -39,7 +75,7 @@ export function InboxPage({ hub, actions }: { hub: Hub; actions: React.ReactNode
   );
 }
 
-const statuses: (Task["status"] | "all")[] = ["all", "assigned", "claimed", "in_review", "verified"];
+const statuses = WORK_FILTERS;
 
 export function WorkPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const [project, setProject] = useState("all");
@@ -75,7 +111,7 @@ export function WorkPage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
         <div className="chip-row" role="group" aria-label="Filter by state">
           {statuses.map((value) => (
             <button key={value} className={status === value ? "chip selected" : "chip"} onClick={() => setStatus(value)}>
-              {value === "all" ? "All" : value === "verified" ? "Review passed" : pretty(value)}{" "}
+              {value === "all" ? "All" : statusLabel({ status: value } as Task)}{" "}
               <span>{byOwner.filter((task) => value === "all" || task.status === value).length}</span>
             </button>
           ))}

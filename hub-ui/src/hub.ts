@@ -21,6 +21,8 @@ export interface Hub {
   requestPause: (paused: boolean) => void;
   /** Withdraw a superseded task or question (kept for history). Resolves true when the server accepted it. */
   withdraw: (kind: "task" | "decision", item: Task | Decision, reason: string, supersededBy: string | null) => Promise<boolean>;
+  /** Clear a task's decision/action item (Beau only); the task returns to its earlier state. */
+  resolveWaiting: (task: Task, note: string) => Promise<boolean>;
   clearPrivateWorkspace: () => void;
   /** Re-read the workspace snapshot (after a successful human change). */
   refresh: () => Promise<void>;
