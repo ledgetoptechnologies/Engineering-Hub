@@ -1995,13 +1995,19 @@ class Service:
             # Existing unscoped installs keep their original startup/status
             # behavior. Scoped configuration or retained scoped journal tables
             # require the indexed fail-closed status path, not a full scan.
-            guarded = scoped_mode or self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name IN "
-                "('source_attempts','source_attempt_owners','source_attempt_witnesses','scoped_jobs','scoped_cleanups') LIMIT 1").fetchone() is not None
+            try:
+                guarded = scoped_mode or self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name IN "
+                    "('source_attempts','source_attempt_owners','source_attempt_witnesses','scoped_jobs','scoped_cleanups') LIMIT 1").fetchone() is not None
+            except sqlite3.Error:
+                raise Rejected('worker_status_unavailable', 503) from None
             if guarded:
                 ensure(self._receipt_fault is None, 'worker_status_unavailable', 503)
             if self.active is None:
                 return self._status_without_active() if guarded else self._legacy_idle_status()
-            row = self.db.execute('SELECT job_id,payload FROM operations WHERE command_id=?', (self.active,)).fetchone()
+            try:
+                row = self.db.execute('SELECT job_id,payload FROM operations WHERE command_id=?', (self.active,)).fetchone()
+            except sqlite3.Error:
+                raise Rejected('worker_status_unavailable', 503) from None
             if row is None or row['job_id'] is None:
                 raise Rejected('worker_status_unavailable', 503)
             try:
