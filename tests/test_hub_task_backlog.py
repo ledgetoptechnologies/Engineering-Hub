@@ -177,6 +177,16 @@ def test_content_edit_invalidates_review_like_context_update(repo):
     assert audit(repo, task['id'])[-1] == ('claude', 'task.context_invalidated')
 
 
+def test_content_edit_on_waiting_task_keeps_it_waiting(repo):
+    task = verified(repo, create(repo, owner='claude', reviewer='codex'))
+    task = repo.update_task('claude', task['id'], task['revision'], status='waiting_on_beau',
+                            waiting={'type': 'action', 'text': 'Merge the PR.'})
+    edited = repo.update_context(BEAU, 'task', task['id'], task['revision'], 'New details', None)
+    assert edited['status'] == 'waiting_on_beau' and edited['review'] is None
+    assert edited['waiting_on']['previous_status'] == 'claimed'
+    assert repo.resolve_waiting(BEAU, task['id'], edited['revision'])['status'] == 'claimed'
+
+
 def test_notes_are_capped(repo):
     task = create(repo, owner='claude')
     for index in range(55):

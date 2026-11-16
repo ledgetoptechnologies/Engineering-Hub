@@ -383,8 +383,7 @@ class HubRepository:
                     raise HubError('queued_pilot_admission_required', 409)
                 self._no_active_run(db, identity)
                 # Changed instructions never keep an earlier candidate's review, as in update_context.
-                if item.get('candidate_commit') is not None or item.get('review') is not None:
-                    item.update(candidate_commit=None, review=None, status='claimed' if item.get('owner') else 'assigned')
+                if self._invalidate(item):
                     action = 'task.context_invalidated'
                 item.update(content)
             if 'owner' in backlog or 'reviewer' in backlog:
@@ -424,6 +423,20 @@ class HubRepository:
                     raise HubError('invalid_transition', 409)
                 return self._resolve(db, actor, item, None, now)
             return self._save(db, actor, action, 'task', item)
+
+    @staticmethod
+    def _invalidate(item):
+        """Changed instructions never keep an earlier candidate's review. A task waiting on Beau
+        stays waiting; it returns to the reset status when he clears the item."""
+        if item.get('candidate_commit') is None and item.get('review') is None:
+            return False
+        reset = 'claimed' if item.get('owner') else 'assigned'
+        item.update(candidate_commit=None, review=None)
+        if item['status'] == 'waiting_on_beau' and item.get('waiting_on'):
+            item['waiting_on'] = dict(item['waiting_on'], previous_status=reset)
+        else:
+            item['status'] = reset
+        return True
 
     def _resolve(self, db, actor, item, note, now):
         waiting_on = item.pop('waiting_on')
@@ -641,9 +654,9 @@ class HubRepository:
                 if self.queued_pilot_enrolled(db):
                     raise HubError('queued_pilot_admission_required', 409)
                 self._no_active_run(db, identity)
-                if item.get('candidate_commit') is not None or item.get('review') is not None:
-                    item.update(candidate_commit=None, review=None,
-                                status='claimed' if item.get('owner') else 'assigned')
+                if item['status'] == 'done':
+                    raise HubError('task_closed', 409)
+                if self._invalidate(item):
                     action = 'task.context_invalidated'
             for field in ('details', 'links'):
                 item.pop(field, None)
