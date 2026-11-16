@@ -27,6 +27,9 @@ export function BacklogDetail({ hub, task }: { hub: Hub; task: Task }) {
   return (
     <>
       {task.reviewer && <p>Named reviewer: <strong>{name(task.reviewer)}</strong></p>}
+      {task.request_text && (
+        <p>Request, as quoted by {task.proposed_by ? actorName(task.proposed_by, { family: task.proposed_family, viewer: hub.session?.actor }) : "its creator"}: {task.request_text}</p>
+      )}
       {!!task.acceptance?.length && (
         <div className="acceptance">
           <strong>Acceptance criteria</strong>

@@ -59,6 +59,9 @@ describe("backlog views", () => {
     expect(html).toContain("Named reviewer");
     expect(html).toContain("<li>Agents can create tasks</li>");
     expect(html).toContain("PR 200 merged");
+    const quoted = renderToStaticMarkup(<BacklogDetail hub={hubWith([])} task={{ ...base, proposed_by: "claude",
+      request_text: "Make the Hub the backlog" }} />);
+    expect(quoted).toMatch(/Request, as quoted by [^:]+: Make the Hub the backlog/);
   });
   it("offers Done for an action and a required answer for a decision", () => {
     const action = renderToStaticMarkup(<WaitingItemCard hub={hubWith([])} task={waiting("action")} />);
