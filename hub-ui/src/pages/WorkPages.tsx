@@ -7,17 +7,22 @@ import { answeredDecisions, DecisionList, openDecisions, RecentAnswers } from ".
 import { TaskTable } from "./tasks";
 import { WithdrawnList } from "./Withdraw";
 import { ownershipRows, UNCLAIMED, WorkOwnership } from "./WorkOwnership";
-import { WORK_FILTERS, waitingKind, waitingTasks } from "../backlog";
+import { draftFor, type ItemDraft, WORK_FILTERS, waitingItemKey, waitingKind, waitingTasks } from "../backlog";
 import { statusLabel } from "./tasks";
 
 /** One task item Beau must clear: an action he marks Done, or a decision he answers in the note. */
 export function WaitingItemCard({ hub, task }: { hub: Hub; task: Task }) {
-  const [note, setNote] = useState("");
+  // The draft belongs to one waiting item, not the task: a new item on the same task starts empty.
+  const item = waitingItemKey(task);
+  const [draft, setDraft] = useState<ItemDraft>({ item, text: "" });
+  const note = draftFor(draft, item);
+  const setNote = (text: string) => setDraft({ item, text });
   const decision = task.waiting_on?.type === "decision";
   return (
     <form className="waiting-item" onSubmit={(event) => {
       event.preventDefault();
-      void hub.resolveWaiting(task, note.trim()).then((ok) => { if (ok) setNote(""); });
+      if (draft.item !== item) { setDraft({ item, text: "" }); return; }
+      void hub.resolveWaiting(task, note.trim()).then((ok) => { if (ok) setDraft({ item, text: "" }); });
     }}>
       <Badge tone="amber">{waitingKind(task)}</Badge>
       <strong>{task.waiting_on?.text}</strong>
@@ -60,7 +65,7 @@ export function InboxPage({ hub, actions }: { hub: Hub; actions: React.ReactNode
       {items.length > 0 && (
         <section className="panel waiting-items" id="task-items">
           <PanelTitle title="From tasks" count={items.length} />
-          <div className="decision-list">{items.map((task) => <WaitingItemCard key={task.id} hub={hub} task={task} />)}</div>
+          <div className="decision-list">{items.map((task) => <WaitingItemCard key={waitingItemKey(task)} hub={hub} task={task} />)}</div>
         </section>
       )}
       <section className="panel decisions" id="decisions">

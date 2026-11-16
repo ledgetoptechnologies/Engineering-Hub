@@ -2914,7 +2914,7 @@ code {
 }
 .stat-row {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   gap: 10px;
 }
 .stat {
@@ -2951,6 +2951,7 @@ code {
 .segment.claimed { background: #3b82f6; }
 .segment.in_review { background: #f59e0b; }
 .segment.verified { background: #22c55e; }
+.segment.waiting_on_beau { background: #c98a1b; }
 .details-panel h2 {
   font-size: 15px;
   margin-bottom: 8px;
@@ -2980,7 +2981,7 @@ code {
 
 .board {
   display: grid;
-  grid-template-columns: repeat(4, minmax(220px, 1fr));
+  grid-template-columns: repeat(5, minmax(220px, 1fr));
   gap: 14px;
   overflow-x: auto;
   padding-bottom: 8px;
@@ -3014,6 +3015,7 @@ code {
 .status-dot.claimed { background: #3b82f6; }
 .status-dot.in_review { background: #f59e0b; }
 .status-dot.verified { background: #22c55e; }
+.status-dot.waiting_on_beau { background: #c98a1b; }
 .board-cards {
   display: grid;
   gap: 8px;
@@ -3124,7 +3126,7 @@ code {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .board {
-    grid-template-columns: repeat(4, 80vw);
+    grid-template-columns: repeat(5, 80vw);
     scroll-snap-type: x mandatory;
   }
   .board-column {

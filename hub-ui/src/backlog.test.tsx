@@ -1,7 +1,8 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { HubClient } from "./api";
-import { isActive, parseAcceptance, WORK_FILTERS, waitingTasks } from "./backlog";
+import { draftFor, isActive, parseAcceptance, WORK_FILTERS, waitingItemKey, waitingTasks } from "./backlog";
+import { projectStats, STATUSES, WorkBoard } from "./pages/ProjectPages";
 import { waitingOn } from "./dashboardText";
 import type { Hub } from "./hub";
 import { createDemoOverview, DEMO_SESSION } from "./mocks";
@@ -96,5 +97,30 @@ describe("demo client", () => {
     const stored = overview.tasks.find((item) => item.id === task.id)!;
     expect(stored.status).toBe("assigned");
     await expect(client.resolveWaiting(task.id, task.revision, "", csrf)).rejects.toMatchObject({ code: "not_waiting" });
+  });
+});
+
+describe("waiting item drafts and project counts", () => {
+  it("keys a draft to one waiting item, so a later item on the same task starts empty", () => {
+    const a = waiting("decision");
+    const b = { ...a, revision: 5, waiting_on: { ...a.waiting_on!, text: "Item B", at: "2026-11-16T11:00:00Z" } };
+    const draft = { item: waitingItemKey(a), text: "Answer meant for A" };
+    expect(waitingItemKey(a)).not.toBe(waitingItemKey(b));
+    expect(draftFor(draft, waitingItemKey(a))).toBe("Answer meant for A");
+    expect(draftFor(draft, waitingItemKey(b))).toBe("");
+  });
+  it("counts waiting task items in a project's Needs you, and shows them as a board column without a Done column", () => {
+    const done: Task = { ...base, id: "t-done", status: "done", title: "Finished work" };
+    const hub = hubWith([waiting("action"), done, { ...waiting("decision", "t-other"), project: "3d-viewer" }]);
+    const stats = projectStats(hub, "engineering-hub");
+    expect(stats.items.map((task) => task.id)).toEqual(["t-wait"]);
+    expect(stats.needsYou).toBe(stats.waiting.length + 1);
+    expect(stats.byStatus.done).toBe(1);
+    expect(stats.active).toBe(1);
+    expect(STATUSES).toContain("waiting_on_beau");
+    expect(STATUSES).not.toContain("done");
+    const board = renderToStaticMarkup(<WorkBoard hub={hub} tasks={stats.tasks} />);
+    expect(board).toContain('aria-label="Waiting on Beau"');
+    expect(board).not.toContain("Finished work");
   });
 });

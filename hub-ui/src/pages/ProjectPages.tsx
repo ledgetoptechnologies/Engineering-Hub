@@ -18,24 +18,28 @@ import { ArchiveProjectDialog, ProjectEditorDialog, STATUS_LABEL, STATUS_TONE } 
 import { safeHref } from "../markdown";
 import type { Project } from "../types";
 import { readProject } from "../projectsApi";
-import { isActive } from "../backlog";
+import { isActive, waitingItemKey, waitingKind, waitingTasks } from "../backlog";
+import { WaitingItemCard } from "./WorkPages";
 import { ComponentsPanel, GroupedProjectsPanel } from "../ComponentsPanel";
 import { ReviewsPanel } from "../ReviewsPanel";
 
-const STATUSES: Task["status"][] = ["assigned", "claimed", "in_review", "verified"];
+// Board columns. Done is counted (and listed under the Work page Done filter) but has no column.
+export const STATUSES: Task["status"][] = ["assigned", "claimed", "in_review", "waiting_on_beau", "verified"];
+const COUNTED: Task["status"][] = [...STATUSES, "done"];
 const columnName: Record<Task["status"], string> = {
   assigned: "Assigned", claimed: "In progress", in_review: "In review", verified: "Review passed", withdrawn: "Withdrawn",
   waiting_on_beau: "Waiting on Beau", done: "Done",
 };
 
 export interface ProjectStats {
-  waiting: Decision[]; tasks: Task[]; byStatus: Record<Task["status"], number>;
+  waiting: Decision[]; items: Task[]; needsYou: number; tasks: Task[]; byStatus: Record<Task["status"], number>;
   lastActivity: string | null; agents: string[]; active: number;
 }
 export function projectStats(hub: Hub, id: string): ProjectStats {
   const waiting = openDecisions(hub, id);
   const tasks = hub.data.tasks.filter((task) => task.project === id);
-  const byStatus = Object.fromEntries(STATUSES.map((status) => [status, tasks.filter((task) => task.status === status).length])) as ProjectStats["byStatus"];
+  const items = waitingTasks(hub.data.tasks, id);
+  const byStatus = Object.fromEntries(COUNTED.map((status) => [status, tasks.filter((task) => task.status === status).length])) as ProjectStats["byStatus"];
   const times = [...tasks.map((task) => task.updated_at), ...hub.data.decisions.filter((d) => d.project === id).map((d) => d.updated_at)]
     .filter((value) => Number.isFinite(Date.parse(value)));
   const lastActivity = times.length ? times.reduce((a, b) => (Date.parse(a) > Date.parse(b) ? a : b)) : null;
@@ -43,12 +47,13 @@ export function projectStats(hub: Hub, id: string): ProjectStats {
   const agents = [...new Set(tasks.flatMap((task) => [actorFamily(task.owner, task.owner_family) ?? task.owner,
     actorFamily(task.proposed_by, task.proposed_family) ?? task.proposed_by, task.review ? actorFamily(task.review.actor) ?? task.review.actor : null])
     .filter((a): a is string => !!a))];
-  return { waiting, tasks, byStatus, lastActivity, agents, active: tasks.filter(isActive).length };
+  return { waiting, items, needsYou: waiting.length + items.length, tasks, byStatus, lastActivity, agents,
+    active: tasks.filter(isActive).length };
 }
 
 /** Status shown until projects carry their own health: derived only from current records. */
 export function derivedStatus(stats: ProjectStats): { label: string; tone: string } {
-  if (stats.waiting.length) return { label: "Needs you", tone: "attention" };
+  if (stats.needsYou) return { label: "Needs you", tone: "attention" };
   if (stats.byStatus.in_review) return { label: "In review", tone: "amber" };
   if (stats.active) return { label: "Active", tone: "info" };
   return { label: "Quiet", tone: "neutral" };
@@ -119,7 +124,7 @@ export function ProjectsPage({ hub, actions }: { hub: Hub; actions: React.ReactN
                     </a>
                   </th>
                   <td><span className={`status-pill ${status.tone}`}>{status.label}</span></td>
-                  <td className={`num ${stats.waiting.length ? "attention" : ""}`}>{stats.waiting.length}</td>
+                  <td className={`num ${stats.needsYou ? "attention" : ""}`}>{stats.needsYou}</td>
                   <td className="num">{stats.active}</td>
                   <td className="num">{stats.byStatus.in_review}</td>
                   <td className="num">{stats.byStatus.verified}</td>
@@ -137,7 +142,7 @@ export function ProjectsPage({ hub, actions }: { hub: Hub; actions: React.ReactN
   );
 }
 
-function WorkBoard({ hub, tasks }: { hub: Hub; tasks: Task[] }) {
+export function WorkBoard({ hub, tasks }: { hub: Hub; tasks: Task[] }) {
   return (
     <div className="board" role="list" aria-label="Work board">
       {STATUSES.map((status) => {
@@ -315,7 +320,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
   const changes = latestChanges(hub, id);
   const tabs: { key: ProjectTab; label: string; count?: number }[] = [
     { key: "overview", label: "Overview" },
-    { key: "decisions", label: "Needs you", count: stats.waiting.length },
+    { key: "decisions", label: "Needs you", count: stats.needsYou },
     { key: "work", label: "Work", count: stats.active },
     // Notes and plans are one place: written context, with the plan/idea backlog beside it.
     { key: "notes", label: "Notes & plans" },
@@ -364,10 +369,11 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
         <div className="overview-layout">
           <div className="overview-main">
             <div className="stat-row">
-              <a className="stat" href={tabHref("decisions")}><span>Needs you</span><strong className={stats.waiting.length ? "attention" : ""}>{stats.waiting.length}</strong></a>
+              <a className="stat" href={tabHref("decisions")}><span>Needs you</span><strong className={stats.needsYou ? "attention" : ""}>{stats.needsYou}</strong></a>
               {STATUSES.map((s) => (
                 <a key={s} className="stat" href={tabHref("work")}><span>{columnName[s]}</span><strong>{stats.byStatus[s]}</strong></a>
               ))}
+              <a className="stat" href={link("/work")}><span>{columnName.done}</span><strong>{stats.byStatus.done}</strong></a>
             </div>
             {stats.tasks.length > 0 && (
               <div className="segment-bar" aria-label="Work by state">
@@ -380,10 +386,14 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
             <ComponentsPanel hub={hub} project={project} />
             <GroupedProjectsPanel hub={hub} project={project} />
             <section className="panel" aria-label="Waiting on you">
-              <div className="panel-title"><h2>Waiting on you</h2><span className="count">{stats.waiting.length}</span>
+              <div className="panel-title"><h2>Waiting on you</h2><span className="count">{stats.needsYou}</span>
                 <span className="panel-action"><a className="text-link" href={tabHref("decisions")}>Answer →</a></span></div>
-              {stats.waiting.length === 0 ? <p className="panel-description">Nothing waiting on you in this project.</p> : (
+              {stats.needsYou === 0 ? <p className="panel-description">Nothing waiting on you in this project.</p> : (
                 <ul className="preview-list">
+                  {stats.items.slice(0, 5).map((task) => (
+                    <li key={task.id}><a href={tabHref("decisions")}><span className="preview-title">{task.waiting_on!.text}</span>
+                      <span className="preview-meta">{waitingKind(task)} · {task.title}</span></a></li>
+                  ))}
                   {stats.waiting.slice(0, 5).map((decision) => (
                     <li key={decision.id}><a href={tabHref("decisions")}><span className="preview-title">{decision.title}</span>
                       <span className="preview-meta">{decision.protected ? "Protected · " : ""}{decision.options.length} choices</span></a></li>
@@ -420,7 +430,12 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
 
       {tab === "decisions" && (
         <section className="panel decisions" aria-label={`${project.name} decisions`}>
-          <DecisionList hub={projectHub} decisions={stats.waiting} emptyNote="No open questions for this project." />
+          {stats.items.length > 0 && (
+            <div className="decision-list">{stats.items.map((task) => <WaitingItemCard key={waitingItemKey(task)} hub={projectHub} task={task} />)}</div>
+          )}
+          {(stats.waiting.length > 0 || stats.items.length === 0) && (
+            <DecisionList hub={projectHub} decisions={stats.waiting} emptyNote="No open questions for this project." />
+          )}
           <RecentAnswers hub={hub} decisions={answeredDecisions(hub, id, 10)} />
           <WithdrawnList hub={hub} kind="decision" project={id} />
           <p className="panel-footnote">Only your signed-in session can answer. Agents can request, not approve.</p>

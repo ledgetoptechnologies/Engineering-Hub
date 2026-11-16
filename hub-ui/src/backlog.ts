@@ -15,3 +15,11 @@ export const WORK_FILTERS: (Task["status"] | "all")[] =
 export const parseAcceptance = (text: string) => text.split("\n").map((line) => line.trim()).filter(Boolean);
 
 export const waitingKind = (task: Task) => task.waiting_on?.type === "action" ? "Action" : "Decision";
+
+/** Identity of one waiting item: the task plus the server time the item was raised. */
+export const waitingItemKey = (task: Task) =>
+  task.waiting_on ? `${task.id}|${task.waiting_on.at}|${task.waiting_on.by}` : task.id;
+
+export interface ItemDraft { item: string; text: string }
+/** A draft written for an earlier item is never shown, or sent, for a later one. */
+export const draftFor = (draft: ItemDraft, item: string) => draft.item === item ? draft.text : "";
