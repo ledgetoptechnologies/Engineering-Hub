@@ -7558,6 +7558,12 @@
             "minimum": 1.0,
             "title": "Expected Revision"
           },
+          "client_request_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Client Request Id"
+          },
           "details": {
             "anyOf": [
               {
@@ -7692,7 +7698,8 @@
         "additionalProperties": false,
         "type": "object",
         "required": [
-          "expected_revision"
+          "expected_revision",
+          "client_request_id"
         ],
         "title": "TaskUpdate"
       },

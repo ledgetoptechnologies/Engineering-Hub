@@ -201,6 +201,7 @@ class WaitingItem(Input):
 
 
 class TaskUpdate(Revision):
+    client_request_id: str = Field(min_length=1, max_length=128)
     details: str | None = Field(default=None, max_length=4096)
     links: list[dict[str, str]] | None = Field(default=None, max_length=8)
     acceptance: list[str] | None = Field(default=None, max_length=20)
@@ -1072,7 +1073,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                                 details=payload.details, links=payload.links, acceptance=payload.acceptance,
                                 owner=payload.assignee, reviewer=payload.assigned_reviewer, note=payload.note,
                                 status=payload.status, evidence=payload.evidence,
-                                waiting=payload.waiting.model_dump() if payload.waiting else None)
+                                waiting=payload.waiting.model_dump() if payload.waiting else None,
+                                client_request_id=payload.client_request_id)
 
     @app.post('/api/hub/v1/tasks/{task_id}/resolve-waiting', response_model=TaskDTO, response_model_exclude_unset=True)
     def resolve_waiting(task_id: str, payload: ResolveWaiting, request: Request):

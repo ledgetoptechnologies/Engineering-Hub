@@ -81,12 +81,18 @@ projects and explicit capability flags. Unknown host/agent state is not online.
 Humans assign tasks, and agents may add ordinary backlog tasks (`hub_task_create`
 or `POST /api/hub/v1/tasks`) with acceptance criteria, an assignee, a separate
 reviewer and the originating request. An agent-created task records `proposed_by`
-and grants no environment or production permission. `hub_task_update` lets the
-owner, the named reviewer or a human edit those fields, append a progress note,
+and grants no environment or production permission. `hub_task_update` (with a
+`client_request_id`; an identical retry returns the first result) lets the owner,
+the named reviewer, the creating agent or a human append a progress note. Details,
+links and acceptance are edited by a human, or by an agent only on a task its family
+created. Owner and reviewer are set by a human, or by the creating agent while the
+task is unclaimed. A named reviewer is the only agent family that may review the
+candidate. A creating agent may withdraw its task only while it is unclaimed. Updates can also
 park the task as `waiting_on_beau` (a `decision` or `action` item in one sentence;
 only a human clears it, via `POST /tasks/{id}/resolve-waiting`, which restores the
-previous status) or close it as `done` (a human from any open state, the owner
-only after `verified`, with completion evidence). `hub_overview` omits long
+previous status) or close it as `done` (a human from any open state, which also
+records the closed waiting item; the owner only after `verified`, with completion
+evidence). `hub_overview` omits long
 backlog text (acceptance, notes, request) and gives counts; `hub_task_get` returns
 the full record.
 

@@ -90,6 +90,9 @@ class HubRepository:
                     PRIMARY KEY(run_id,event_id));
                 CREATE TABLE IF NOT EXISTS hub_target_fences (
                     target TEXT PRIMARY KEY, generation INTEGER NOT NULL CHECK(generation > 0));
+                CREATE TABLE IF NOT EXISTS hub_task_update_requests (
+                    actor TEXT NOT NULL, key TEXT NOT NULL, fingerprint TEXT NOT NULL,
+                    task_id TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(actor,key));
                 CREATE TABLE IF NOT EXISTS hub_run_requests (
                     actor TEXT NOT NULL, key TEXT NOT NULL, fingerprint TEXT NOT NULL,
                     run_id TEXT NOT NULL, PRIMARY KEY(actor,key));
@@ -337,16 +340,36 @@ class HubRepository:
     def _is_reviewer(self, item, actor):
         return item.get('reviewer') in AGENTS and session_context.family(actor) == item['reviewer']
 
+    @staticmethod
+    def _owner_family(item):
+        return item.get('owner_family') or item.get('owner')
+
+    @staticmethod
+    def _is_creator(item, actor):
+        """The agent family that created the task, from its server-set provenance; humans' tasks have none."""
+        creator = item.get('proposed_by')
+        if type(creator) is not str:
+            return False
+        family = item.get('proposed_family') if creator.startswith('installation:') else creator
+        return family in AGENTS and session_context.family(actor) == family
+
     def update_task(self, actor, identity, expected_revision, *, details=None, links=None, acceptance=None,
-                    owner=None, reviewer=None, note=None, status=None, waiting=None, evidence=None):
+                    owner=None, reviewer=None, note=None, status=None, waiting=None, evidence=None,
+                    client_request_id=None):
         """CAS edit by the owner, the named reviewer or a human. Omitted fields are unchanged.
 
         Status here covers only the backlog states: waiting_on_beau (with a decision/action item),
         done (human from any open state, the owner only after verified, with evidence) and, for a
         human, leaving waiting_on_beau back to the previous status. Claim, candidate and review keep
         their own flows. Nothing here approves, reviews or grants environment access.
+
+        Content (details, links, acceptance) is editable by a human, or by an agent only on a task
+        its own family created. Owner and reviewer are set by a human, or by the creating agent while
+        the task is still assigned. With client_request_id, an identical retry returns the original
+        result and a changed payload under the same id conflicts.
         """
         self._actor(actor)
+        key = None if client_request_id is None else self._text(client_request_id, 128)
         human = actor not in AGENTS and not session_context.actor_allowed(actor)
         backlog = self._backlog_fields(acceptance, owner, reviewer)
         content = self._context(details, links)
@@ -365,64 +388,91 @@ class HubRepository:
             evidence = self._bounded(evidence, 2000, 'invalid_evidence')
         if not (content or backlog or note or status):
             raise HubError('invalid_input')
+        fingerprint = hashlib.sha256(_json([identity, expected_revision, content, backlog, note, status,
+                                            waiting, evidence]).encode()).hexdigest()
         with self._transaction() as db:
-            item = self._get(db, identity, 'task')
-            self._project(item['project'], db)
-            self._cas(item, expected_revision)
-            if not (human or self._is_owner(item, actor) or self._is_reviewer(item, actor)):
+            if key is not None:
+                prior = db.execute('SELECT fingerprint, result FROM hub_task_update_requests WHERE actor=? AND key=?',
+                                   (actor, key)).fetchone()
+                if prior:
+                    if prior['fingerprint'] != fingerprint:
+                        raise HubError('idempotency_conflict', 409)
+                    return json.loads(prior['result'])
+            result = self._update_task(db, actor, human, identity, expected_revision, content, backlog, note,
+                                       status, waiting, evidence)
+            if key is not None:
+                db.execute('INSERT INTO hub_task_update_requests VALUES(?,?,?,?,?)',
+                           (actor, key, fingerprint, identity, _json(result)))
+            return result
+
+    def _update_task(self, db, actor, human, identity, expected_revision, content, backlog, note, status,
+                     waiting, evidence):
+        item = self._get(db, identity, 'task')
+        self._project(item['project'], db)
+        self._cas(item, expected_revision)
+        if not (human or self._is_owner(item, actor) or self._is_reviewer(item, actor)
+                or self._is_creator(item, actor)):
+            raise HubError('forbidden', 403)
+        current = item['status']
+        if current in {'withdrawn', 'done'}:
+            raise HubError('task_closed', 409)
+        if current == 'waiting_on_beau' and status is not None and not human:
+            raise HubError('waiting_on_beau', 409)
+        action = 'task.updated'
+        now = datetime.now(timezone.utc).isoformat()
+        if content:
+            if not (human or self._is_creator(item, actor)):
                 raise HubError('forbidden', 403)
-            current = item['status']
-            if current in {'withdrawn', 'done'}:
-                raise HubError('task_closed', 409)
-            if current == 'waiting_on_beau' and status is not None and not human:
+            if self.queued_pilot_enrolled(db):
+                raise HubError('queued_pilot_admission_required', 409)
+            self._no_active_run(db, identity)
+            # Changed instructions never keep an earlier candidate's review, as in update_context.
+            if self._invalidate(item):
+                action = 'task.context_invalidated'
+            item.update(content)
+        if 'owner' in backlog or 'reviewer' in backlog:
+            # Only a human reassigns; the creating agent may set both while the task is unclaimed.
+            if not (human or (self._is_creator(item, actor) and item['status'] == 'assigned')):
+                raise HubError('forbidden', 403)
+            merged_owner = backlog.get('owner', self._owner_family(item))
+            if backlog.get('reviewer', item.get('reviewer')) == merged_owner:
+                raise HubError('independent_review_required', 403)
+            # Compare by family: re-sending the current owner's family keeps an installation's claim.
+            if 'owner' in backlog and backlog['owner'] != self._owner_family(item):
+                # Reassignment is only for unstarted work; the new owner claims it to start.
+                if item['status'] not in WITHDRAWABLE_TASK_STATUSES or item.get('candidate_commit') or item.get('review'):
+                    raise HubError('task_in_progress', 409)
+                for field in ('owner_family', 'owner_session_id'):
+                    item.pop(field, None)
+                item.update(owner=backlog['owner'], status='assigned')
+                action = 'task.reassigned'
+            if 'reviewer' in backlog:
+                item['reviewer'] = backlog['reviewer']
+        if note:
+            item['notes'] = (item.get('notes') or [])[-(MAX_NOTES - 1):] + [dict(at=now, by=actor, text=note)]
+        if status == 'waiting_on_beau':
+            if item['status'] == 'waiting_on_beau':
                 raise HubError('waiting_on_beau', 409)
-            action = 'task.updated'
-            now = datetime.now(timezone.utc).isoformat()
-            if content:
-                if self.queued_pilot_enrolled(db):
-                    raise HubError('queued_pilot_admission_required', 409)
-                self._no_active_run(db, identity)
-                # Changed instructions never keep an earlier candidate's review, as in update_context.
-                if self._invalidate(item):
-                    action = 'task.context_invalidated'
-                item.update(content)
-            if 'owner' in backlog or 'reviewer' in backlog:
-                merged_owner = backlog.get('owner', item.get('owner_family') or item.get('owner'))
-                if backlog.get('reviewer', item.get('reviewer')) == merged_owner:
-                    raise HubError('independent_review_required', 403)
-                if 'owner' in backlog and backlog['owner'] != item.get('owner'):
-                    # Reassignment is only for unstarted work; the new owner claims it to start.
-                    if item['status'] not in WITHDRAWABLE_TASK_STATUSES or item.get('candidate_commit') or item.get('review'):
-                        raise HubError('task_in_progress', 409)
-                    for field in ('owner_family', 'owner_session_id'):
-                        item.pop(field, None)
-                    item.update(owner=backlog['owner'], status='assigned')
-                    action = 'task.reassigned'
-                if 'reviewer' in backlog:
-                    item['reviewer'] = backlog['reviewer']
-            if note:
-                item['notes'] = (item.get('notes') or [])[-(MAX_NOTES - 1):] + [dict(at=now, by=actor, text=note)]
-            if status == 'waiting_on_beau':
-                if item['status'] == 'waiting_on_beau':
-                    raise HubError('waiting_on_beau', 409)
-                item.update(status='waiting_on_beau', waiting_on=dict(waiting, previous_status=item['status'], by=actor, at=now))
-                action = 'task.waiting'
-            elif status == 'done':
-                if not human and not (self._is_owner(item, actor) and item['status'] == 'verified'):
-                    raise HubError('forbidden', 403)
-                if not human and evidence is None:
-                    raise HubError('invalid_evidence')
-                self._no_active_run(db, identity)
-                item.pop('waiting_on', None)
-                item.update(status='done', completed_by=actor, completed_at=now,
-                            **({'completion_evidence': evidence} if evidence is not None else {}))
-                action = 'task.done'
-            elif status is not None:
-                waiting_on = item.get('waiting_on')
-                if item['status'] != 'waiting_on_beau' or not waiting_on or status != waiting_on['previous_status']:
-                    raise HubError('invalid_transition', 409)
-                return self._resolve(db, actor, item, None, now)
-            return self._save(db, actor, action, 'task', item)
+            item.update(status='waiting_on_beau', waiting_on=dict(waiting, previous_status=item['status'], by=actor, at=now))
+            action = 'task.waiting'
+        elif status == 'done':
+            if not human and not (self._is_owner(item, actor) and item['status'] == 'verified'):
+                raise HubError('forbidden', 403)
+            if not human and evidence is None:
+                raise HubError('invalid_evidence')
+            self._no_active_run(db, identity)
+            if item['status'] == 'waiting_on_beau':
+                # Beau's item is closed with the task, and that is audited, not silently dropped.
+                item = self._resolve(db, actor, item, 'Closed with the task as done', now)
+            item.update(status='done', completed_by=actor, completed_at=now,
+                        **({'completion_evidence': evidence} if evidence is not None else {}))
+            action = 'task.done'
+        elif status is not None:
+            waiting_on = item.get('waiting_on')
+            if item['status'] != 'waiting_on_beau' or not waiting_on or status != waiting_on['previous_status']:
+                raise HubError('invalid_transition', 409)
+            return self._resolve(db, actor, item, None, now)
+        return self._save(db, actor, action, 'task', item)
 
     @staticmethod
     def _invalidate(item):
@@ -606,6 +656,9 @@ class HubRepository:
             if (item['owner'] == actor
                     or session_context.family(actor) == item.get('candidate_family', item.get('owner_family', item['owner']))):
                 raise HubError('independent_review_required', 403)
+            # A named reviewer binds who may review; tasks without one keep the open rule.
+            if item.get('reviewer') is not None and session_context.family(actor) != item['reviewer']:
+                raise HubError('named_reviewer_required', 403)
             if item['status'] != 'in_review' or not commit or item['candidate_commit'] != commit:
                 raise HubError('stale_review', 409)
             item.update(status='verified' if verdict == 'approve' else 'claimed',
@@ -703,7 +756,12 @@ class HubRepository:
             item = self._get(db, identity, kind)
             # Archived projects keep their records; retiring a stale one there is allowed.
             self._project(item['project'], db, require_active=False)
-            if (actor in AGENTS or session_context.actor_allowed(actor)) and self._creator(db, kind, identity) != actor:
+            agent = actor in AGENTS or session_context.actor_allowed(actor)
+            if agent and self._creator(db, kind, identity) != actor:
+                raise HubError('forbidden', 403)
+            # A creating agent may withdraw its task only while nobody has claimed it.
+            if (agent and kind == 'task' and item['status'] != 'withdrawn'
+                    and (item['status'] != 'assigned' or item.get('owner_session_id') is not None)):
                 raise HubError('forbidden', 403)
             if (session_context.actor_allowed(actor) and item.get('owner') == actor
                     and not session_context.continuation_allowed(item, actor)):

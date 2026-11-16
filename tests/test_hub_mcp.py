@@ -110,13 +110,17 @@ def test_backlog_task_create_update_and_compact_overview(hub):
         "acceptance": ["Visible in the Work page"], "assignee": "codex", "assigned_reviewer": "claude",
         "request_text": "Original request"}, "fixture-codex")["structuredContent"]
     assert again["id"] == created["id"]
-    denied = call(client, "hub_task_update", {"task_id": created["id"], "expected_revision": 1, "note": "x"},
+    denied = call(client, "hub_task_update", {"task_id": created["id"], "expected_revision": 1, "client_request_id": "u0", "note": "x"},
                   "fixture-hermes")
     assert denied["isError"] is True and "forbidden" in denied["content"][0]["text"]
     waiting = call(client, "hub_task_update", {
-        "task_id": created["id"], "expected_revision": 1, "note": "Blocked on access",
+        "task_id": created["id"], "expected_revision": 1, "client_request_id": "u1", "note": "Blocked on access",
         "status": "waiting_on_beau", "waiting_type": "action", "waiting_text": "Grant repo access."})
     assert waiting["structuredContent"]["status"] == "waiting_on_beau"
+    replay = call(client, "hub_task_update", {
+        "task_id": created["id"], "expected_revision": 1, "client_request_id": "u1", "note": "Blocked on access",
+        "status": "waiting_on_beau", "waiting_type": "action", "waiting_text": "Grant repo access."})
+    assert replay["structuredContent"] == waiting["structuredContent"]
     task = call(client, "hub_overview")["structuredContent"]["tasks"][0]
     assert task["waiting_on"]["text"] == "Grant repo access." and task["acceptance_count"] == 1
     assert task["notes_count"] == 1 and not {"acceptance", "notes", "request_text"} & task.keys()

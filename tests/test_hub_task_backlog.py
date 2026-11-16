@@ -244,7 +244,8 @@ def test_rest_agent_create_update_and_beau_clears_action(hub):
     assert task['proposed_by'] == 'claude' and task['reviewer'] == 'codex' and task['acceptance'] == ['A']
     assert client.post(BASE + '/tasks', headers=agent('claude'), json=body).json()['id'] == task['id']
     update = client.post(f"{BASE}/tasks/{task['id']}/update", headers=agent('claude'), json={
-        'expected_revision': 1, 'status': 'waiting_on_beau', 'waiting': {'type': 'action', 'text': 'Approve the spend.'}})
+        'expected_revision': 1, 'client_request_id': 'u1', 'status': 'waiting_on_beau',
+        'waiting': {'type': 'action', 'text': 'Approve the spend.'}})
     assert update.status_code == 200, update.text
     assert update.json()['waiting_on']['type'] == 'action'
     denied = client.post(f"{BASE}/tasks/{task['id']}/resolve-waiting", headers=agent('claude'),
@@ -262,5 +263,109 @@ def test_rest_agent_create_update_and_beau_clears_action(hub):
     listed = client.get(BASE + '/tasks', headers=agent('hermes')).json()['items']
     assert listed[0]['waiting_resolved']['by'] == BEAU
     spoof = client.post(f"{BASE}/tasks/{task['id']}/update", headers=agent('claude'),
-                        json={'expected_revision': 3, 'note': 'x', 'actor': 'human:42'})
+                        json={'expected_revision': 3, 'client_request_id': 'u2', 'note': 'x', 'actor': 'human:42'})
     assert spoof.status_code == 422
+
+
+# Lead review fixes: each test below fails on the first version of this branch.
+
+def test_agent_edits_content_only_on_its_own_familys_tasks(repo):
+    beaus = repo.claim_task('claude', repo.create_task(BEAU, PROJECT, 'Beau task', 'h1', details='Original')['id'], 1)
+    for fields in (dict(details='Rewritten'), dict(acceptance=['Rewritten']),
+                   dict(links=[{'label': 'x', 'url': 'https://example.com'}])):
+        with pytest.raises(HubError, match='forbidden'):
+            repo.update_task('claude', beaus['id'], beaus['revision'], **fields)
+    noted = repo.update_task('claude', beaus['id'], beaus['revision'], note='Progress is fine')
+    assert noted['details'] == 'Original' and repo.task_allows_environment(beaus['id'], 'staging') is True
+    codexs = repo.claim_task('claude', create(repo, actor='codex', key='c1', owner='claude')['id'], 1)
+    with pytest.raises(HubError, match='forbidden'):
+        repo.update_task('claude', codexs['id'], codexs['revision'], details='Not my family')
+    assert repo.update_task('codex', codexs['id'], codexs['revision'], details='Creator edit')['details'] == 'Creator edit'
+    assert repo.update_task(BEAU, beaus['id'], noted['revision'], details='Beau edit')['details'] == 'Beau edit'
+
+
+def test_only_human_or_unclaimed_creator_reassigns(repo):
+    task = create(repo, owner='claude', reviewer='codex')
+    task = repo.claim_task('claude', task['id'], 1)
+    for actor in ('codex', 'claude'):  # the reviewer, then the owner-creator after the claim
+        with pytest.raises(HubError, match='forbidden'):
+            repo.update_task(actor, task['id'], 2, owner='codex', reviewer='hermes')
+        with pytest.raises(HubError, match='forbidden'):
+            repo.update_task(actor, task['id'], 2, reviewer='hermes')
+    assert repo.get_task(task['id'])['owner'] == 'claude'
+    unclaimed = create(repo, actor='hermes', key='h2', owner='claude', reviewer='codex')
+    moved = repo.update_task('hermes', unclaimed['id'], 1, owner='codex', reviewer='claude')
+    assert (moved['owner'], moved['reviewer'], moved['status']) == ('codex', 'claude', 'assigned')
+    with pytest.raises(HubError, match='forbidden'):
+        repo.update_task('codex', unclaimed['id'], 2, reviewer='hermes')
+    task = repo.set_candidate('claude', task['id'], 2, COMMIT)
+    assert repo.update_task(BEAU, task['id'], task['revision'], reviewer='hermes')['reviewer'] == 'hermes'
+
+
+def test_named_reviewer_binds_review(repo):
+    task = create(repo, owner='claude', reviewer='codex')
+    task = repo.claim_task('claude', task['id'], 1)
+    task = repo.set_candidate('claude', task['id'], 2, COMMIT)
+    with pytest.raises(HubError, match='named_reviewer_required'):
+        repo.review_task('hermes', task['id'], 3, COMMIT, 'approve')
+    with pytest.raises(HubError, match='independent_review_required'):
+        repo.review_task('claude', task['id'], 3, COMMIT, 'approve')
+    assert repo.review_task('codex', task['id'], 3, COMMIT, 'approve')['status'] == 'verified'
+    open_task = repo.create_task(BEAU, PROJECT, 'No reviewer', 'h3')
+    open_task = repo.claim_task('claude', open_task['id'], 1)
+    open_task = repo.set_candidate('claude', open_task['id'], 2, COMMIT)
+    assert repo.review_task('hermes', open_task['id'], 3, COMMIT, 'approve')['status'] == 'verified'
+
+
+def test_update_request_id_replays_original_result_and_conflicts_on_change(repo):
+    task = create(repo, owner='claude')
+    first = repo.update_task('claude', task['id'], 1, note='Once', client_request_id='u1')
+    later = repo.update_task('claude', task['id'], 2, note='Another')
+    assert repo.update_task('claude', task['id'], 1, note='Once', client_request_id='u1') == first
+    assert len(repo.get_task(task['id'])['notes']) == 2 and later['revision'] == 3
+    with pytest.raises(HubError, match='idempotency_conflict'):
+        repo.update_task('claude', task['id'], 1, note='Changed', client_request_id='u1')
+    # Keys are per actor: another actor's identical key is a separate request.
+    assert repo.update_task(BEAU, task['id'], 3, note='Beau', client_request_id='u1')['revision'] == 4
+
+
+def test_creator_agent_withdraws_only_unclaimed_tasks(repo):
+    task = repo.claim_task('codex', create(repo, key='w1')['id'], 1)
+    with pytest.raises(HubError, match='forbidden'):
+        repo.withdraw('claude', 'task', task['id'], 2, 'No longer needed')
+    assert repo.withdraw(BEAU, 'task', task['id'], 2, 'No longer needed')['status'] == 'withdrawn'
+    unclaimed = create(repo, key='w2', owner='codex')
+    assert repo.withdraw('claude', 'task', unclaimed['id'], 1, 'Superseded')['status'] == 'withdrawn'
+    assert repo.withdraw('claude', 'task', unclaimed['id'], 1, 'Superseded')['status'] == 'withdrawn'
+
+
+def test_beau_marking_waiting_task_done_audits_the_item(repo):
+    task = repo.update_task('claude', create(repo, owner='claude')['id'], 1, status='waiting_on_beau',
+                            waiting={'type': 'action', 'text': 'Rotate the key.'})
+    done = repo.update_task(BEAU, task['id'], 2, status='done')
+    assert done['status'] == 'done' and 'waiting_on' not in done
+    assert done['waiting_resolved']['text'] == 'Rotate the key.' and done['waiting_resolved']['by'] == BEAU
+    assert audit(repo, task['id'])[-2:] == [(BEAU, 'task.waiting_resolved'), (BEAU, 'task.done')]
+
+
+def test_rest_update_replay_and_bearer_cannot_resolve_waiting(hub):
+    client, app, settings = hub
+    task = client.post(BASE + '/tasks', headers=agent('claude'), json={
+        'project': PROJECT, 'title': 'Replay', 'client_request_id': 'r9', 'assignee': 'claude'}).json()
+    body = {'expected_revision': 1, 'client_request_id': 'u9', 'status': 'waiting_on_beau',
+            'waiting': {'type': 'action', 'text': 'Sign the form.'}}
+    first = client.post(f"{BASE}/tasks/{task['id']}/update", headers=agent('claude'), json=body)
+    again = client.post(f"{BASE}/tasks/{task['id']}/update", headers=agent('claude'), json=body)
+    assert first.status_code == again.status_code == 200 and first.json() == again.json()
+    changed = client.post(f"{BASE}/tasks/{task['id']}/update", headers=agent('claude'), json={**body, 'note': 'x'})
+    assert changed.status_code == 409
+    missing = client.post(f"{BASE}/tasks/{task['id']}/update", headers=agent('claude'),
+                          json={'expected_revision': 2, 'note': 'x'})
+    assert missing.status_code == 422
+    # A human cookie plus any bearer, including a session-installation token, never clears the item.
+    human = beau(client, app, settings)
+    for token in ('Bearer ehs_' + 'a' * 43, 'Bearer test-claude'):
+        response = client.post(f"{BASE}/tasks/{task['id']}/resolve-waiting",
+                               headers={**human, 'Authorization': token}, json={'expected_revision': 2})
+        assert response.status_code == 403
+    assert app.state.repository.get_task(task['id'])['status'] == 'waiting_on_beau'

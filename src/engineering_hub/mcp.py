@@ -189,7 +189,8 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
                                                reviewer=assigned_reviewer, request_text=request_text))
 
     @registration.tool()
-    def hub_task_update(task_id: str, expected_revision: int, ctx: Context, details: str | None = None,
+    def hub_task_update(task_id: str, expected_revision: int, client_request_id: str, ctx: Context,
+                        details: str | None = None,
                         acceptance: list[str] | None = None, assignee: str | None = None,
                         assigned_reviewer: str | None = None, links: list[dict[str, str]] | None = None,
                         note: str | None = None, status: str | None = None,
@@ -199,12 +200,14 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
 
         status waiting_on_beau needs waiting_type (decision or action) and waiting_text, one plain
         sentence of what Beau must decide or do; only Beau clears it. status done is for the owner
-        after verified, with evidence of completion. Claim, candidate and review keep their own tools.
+        after verified, with evidence of completion. details/links/acceptance only on tasks your
+        family created. Reuse a request ID only for the same update; a retry returns the first result.
         """
         waiting = None if waiting_type is None and waiting_text is None else {'type': waiting_type, 'text': waiting_text}
         return invoke(lambda: repo.update_task(identity(ctx), task_id, expected_revision, details=details,
                                                links=links, acceptance=acceptance, owner=assignee, reviewer=assigned_reviewer,
-                                               note=note, status=status, waiting=waiting, evidence=evidence))
+                                               note=note, status=status, waiting=waiting, evidence=evidence,
+                                               client_request_id=client_request_id))
 
     @registration.tool()
     def hub_task_get(task_id: str, ctx: Context) -> dict:

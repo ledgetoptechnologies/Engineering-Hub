@@ -746,3 +746,16 @@ def test_installation_backlog_create_and_update_are_family_scoped(env):
         actor, task['id'], 3, status='waiting_on_beau', waiting={'type': 'decision', 'text': 'Which name?'}))
     assert waiting['waiting_on']['previous_status'] == 'claimed'
     assert TOOLS['hub_task_create'] == 'task.create' and TOOLS['hub_task_update'] == 'task.update'
+
+
+def test_owner_family_resend_keeps_installation_claim_and_installation_cannot_resolve(env):
+    _, codex, _ = pair(env, 'codex-pc', 'codex')
+    task = env.repo.create_task(OWNER, PROJECT, 'Backlog', 'key', owner='codex', reviewer='claude')
+    claimed = call(env, codex, 'hub_task_claim', lambda actor: env.repo.claim_task(actor, task['id'], 1))
+    same = env.repo.update_task(OWNER, task['id'], claimed['revision'], owner='codex', note='Confirm owner')
+    assert same['status'] == 'claimed' and same['owner'] == claimed['owner']
+    assert same['owner_session_id'] == claimed['owner_session_id']
+    waiting = call(env, codex, 'hub_task_update', lambda actor: env.repo.update_task(
+        actor, task['id'], same['revision'], status='waiting_on_beau', waiting={'type': 'action', 'text': 'Approve.'}))
+    with pytest.raises(HubError, match='forbidden'):
+        call(env, codex, 'hub_task_update', lambda actor: env.repo.resolve_waiting(actor, task['id'], waiting['revision']))
