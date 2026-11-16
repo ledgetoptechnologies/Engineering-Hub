@@ -97,7 +97,28 @@ def test_executor_profile_rejects_unapproved_runtime_authority(mutation):
         launch.ExecutorLaunchProfile.model_validate(data)
 
 
-def test_real_kernel_pidfd_identity_denies_changed_start_and_dead_process():
+def require_real_pidfd():
+    # Some Linux Python builds omit this binding. Keep pure profile/journal and
+    # denial tests running; only the real kernel identity slices require it.
+    if not hasattr(os, 'pidfd_open'):
+        pytest.skip('This Python build has no os.pidfd_open binding')
+
+
+@pytest.fixture
+def real_pidfd():
+    require_real_pidfd()
+
+
+def test_missing_pidfd_binding_denies_before_process_inspection(monkeypatch):
+    monkeypatch.delattr(launch.os, 'pidfd_open', raising=False)
+    def unexpected_inspection():
+        pytest.fail('Missing pidfd support must deny before inspecting a process')
+    monkeypatch.setattr(launch, '_boot_id', unexpected_inspection)
+    with pytest.raises(launch.LaunchSupervisorError):
+        launch._Process(os.getpid())
+
+
+def test_real_kernel_pidfd_identity_denies_changed_start_and_dead_process(real_pidfd):
     live = launch._Process(os.getpid())
     try:
         live.check()
@@ -169,7 +190,7 @@ def short_root():
         yield Path(directory)
 
 
-def test_actual_unix_http_peer_and_original_oci_metadata_chain(short_root):
+def test_actual_unix_http_peer_and_original_oci_metadata_chain(short_root, real_pidfd):
     _, image, blobs = verified_image()
     with fake_engine_http(short_root, image=image, blobs=blobs) as (pin, requests):
         engine = launch._UnixEngine(pin)
@@ -182,7 +203,7 @@ def test_actual_unix_http_peer_and_original_oci_metadata_chain(short_root):
             engine.close()
 
 
-def test_real_unix_engine_wrong_peer_gid_and_socket_replacement_deny_before_http(short_root):
+def test_real_unix_engine_wrong_peer_gid_and_socket_replacement_deny_before_http(short_root, real_pidfd):
     with fake_engine_http(short_root) as (pin, requests):
         altered = launch._DaemonPin(pin.socket_path, pin.pid, pin.start_ticks, pin.uid, pin.gid + 1,
                                     pin.daemon_id, pin.api_version)
@@ -255,6 +276,9 @@ def synthetic_issuer(short_root, root_journal):
     root enrollment, actual container or successful launch attestation is claimed.
     The positive fixture's consumer is this process, NOT a real container init.
     """
+    # This fixture is imported by other modules: use the helper directly so
+    # those modules do not need to import an additional pytest fixture.
+    require_real_pidfd()
     authority = launch.LaunchSupervisor.__new__(launch.LaunchSupervisor)
     authority._pid, authority._mutex = os.getpid(), threading.Lock()
     authority._journal, authority._engine = root_journal, None
@@ -625,7 +649,7 @@ def test_public_current_real_fork_denied_before_inherited_mutex(synthetic_issuer
     assert not authority._held
 
 
-def test_launch_original_wall_ceiling_durable_before_create(root_journal):
+def test_launch_original_wall_ceiling_durable_before_create(root_journal, real_pidfd):
     authority, _ = synthetic_launcher(root_journal)
     original_reserve = root_journal.reserve
     retained = []
@@ -885,7 +909,7 @@ def synthetic_launcher(journal, *, failure=None, image_kind='config'):
 
 
 @pytest.mark.parametrize('image_kind', ['config', 'manifest', 'index'])
-def test_launcher_reserves_exact_single_create_and_start_before_fake_engine_effect(root_journal, image_kind):
+def test_launcher_reserves_exact_single_create_and_start_before_fake_engine_effect(root_journal, real_pidfd, image_kind):
     authority, events = synthetic_launcher(root_journal, image_kind=image_kind)
     try:
         assert authority.launch() == 'a' * 64
@@ -920,7 +944,7 @@ def test_fake_effect_ambiguity_or_wrong_effective_profile_holds_without_retry_or
         authority.close()
 
 
-def test_real_namespace_guard_rejects_issuer_namespace_as_executor_private_pid_namespace(root_journal):
+def test_real_namespace_guard_rejects_issuer_namespace_as_executor_private_pid_namespace(root_journal, real_pidfd):
     authority, _ = synthetic_launcher(root_journal)
     authority._consumer = launch._Process(os.getpid())
     try:
@@ -1054,7 +1078,7 @@ def test_daemon_pin_rejects_any_host_uid_except_allocated_rootless_pilot(uid):
         launch._DaemonPin('/run/synthetic.sock', 1, 1, uid, 10001, 'synthetic', '1.54')
 
 
-def test_fake_engine_missing_rootless_identity_denied_before_image_fetch(short_root):
+def test_fake_engine_missing_rootless_identity_denied_before_image_fetch(short_root, real_pidfd):
     _, image, blobs = verified_image()
     with fake_engine_http(short_root, image=image, blobs=blobs, rootless=False) as (pin, requests):
         engine = launch._UnixEngine(pin)
@@ -1209,7 +1233,7 @@ def root_file_constructor_fixture(short_root, root_journal):
             issuer.close()
 
 
-def test_whole_constructor_reads_protected_root_files_without_engine_effects(short_root, root_journal):
+def test_whole_constructor_reads_protected_root_files_without_engine_effects(short_root, root_journal, real_pidfd):
     with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
         authority = launch.LaunchSupervisor(**kwargs)
         try:
@@ -1252,7 +1276,7 @@ def test_whole_constructor_rejects_invalid_authority_before_journal_or_engine_ef
 
 @pytest.mark.parametrize('mutation', ['raw-pin', 'normalized-as-raw', 'commitment-pin', 'self-digest', 'other-field',
                                     'noncanonical', 'duplicate-key', 'missing-self', 'other-release'])
-def test_same_runner_bytes_must_satisfy_raw_commitment_and_independent_release(short_root, root_journal, mutation):
+def test_same_runner_bytes_must_satisfy_raw_commitment_and_independent_release(short_root, root_journal, real_pidfd, mutation):
     with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
         config_mount = next(mount for mount in data['profile']['mounts'] if mount['role'] == 'config')
         path = Path(config_mount['source'])
@@ -1285,7 +1309,7 @@ def test_same_runner_bytes_must_satisfy_raw_commitment_and_independent_release(s
             authority.close()
 
 
-def test_configuration_rewrite_after_first_verified_pin_is_rejected(short_root, root_journal):
+def test_configuration_rewrite_after_first_verified_pin_is_rejected(short_root, root_journal, real_pidfd):
     with root_file_constructor_fixture(short_root, root_journal) as (_, kwargs, requests):
         authority = launch.LaunchSupervisor(**kwargs)
         try:
@@ -1306,7 +1330,7 @@ def test_configuration_rewrite_after_first_verified_pin_is_rejected(short_root, 
 @pytest.mark.parametrize('terminate', [True, False])
 @pytest.mark.parametrize('accounting_lag', [0, 2])
 def test_graceful_stop_exact_sigterm_quiescence_or_timeout_never_forces_cleanup(
-        root_journal, terminate, accounting_lag):
+        root_journal, real_pidfd, terminate, accounting_lag):
     authority, events = synthetic_launcher(root_journal)
     child = None
     try:
