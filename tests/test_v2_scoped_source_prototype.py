@@ -611,7 +611,9 @@ def test_scoped_job_resource_and_cleanup_lifecycle(tmp_path, monkeypatch):
         service.db.execute('DELETE FROM operations WHERE job_id=?', (request['job_id'],))
         service.db.commit()
         service.active = request['command_id']
-        assert service.legacy_active() is None
+        with pytest.raises(core.Rejected) as error:
+            service.legacy_active()
+        assert error.value.code == 'worker_status_unavailable' and error.value.status == 503
         service.active = None
         retained = request['resource_ids']['build']
         with pytest.raises(core.Rejected, match='scoped_not_found'):
@@ -726,7 +728,9 @@ def test_legacy_active_preserved_for_valid_legacy_operation(tmp_path):
         assert service.legacy_active() == payload['command_id']
         service.db.execute('UPDATE operations SET job_id=NULL WHERE command_id=?', (payload['command_id'],))
         service.db.commit()
-        assert service.legacy_active() is None
+        with pytest.raises(core.Rejected) as error:
+            service.legacy_active()
+        assert error.value.code == 'worker_status_unavailable' and error.value.status == 503
         service.active = None
     finally:
         service.close()
