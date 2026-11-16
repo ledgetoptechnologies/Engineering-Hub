@@ -78,7 +78,19 @@ The REST contract is `contracts/hub-v1.openapi.json`; the running service expose
 `/openapi.json`. `/api/hub/v1/overview` supplies tasks, decisions, runs, configured
 projects and explicit capability flags. Unknown host/agent state is not online.
 
-Humans assign tasks. A distinct existing agent identity claims each task, records
+Humans assign tasks, and agents may add ordinary backlog tasks (`hub_task_create`
+or `POST /api/hub/v1/tasks`) with acceptance criteria, an assignee, a separate
+reviewer and the originating request. An agent-created task records `proposed_by`
+and grants no environment or production permission. `hub_task_update` lets the
+owner, the named reviewer or a human edit those fields, append a progress note,
+park the task as `waiting_on_beau` (a `decision` or `action` item in one sentence;
+only a human clears it, via `POST /tasks/{id}/resolve-waiting`, which restores the
+previous status) or close it as `done` (a human from any open state, the owner
+only after `verified`, with completion evidence). `hub_overview` omits long
+backlog text (acceptance, notes, request) and gives counts; `hub_task_get` returns
+the full record.
+
+A distinct existing agent identity claims each task, records
 an exact 40-character commit and obtains a different agent's review of that exact
 commit. All changes use expected revisions. Replacing a candidate invalidates
 review, without resetting the three-failure repair budget. SQLite transactions
@@ -91,8 +103,8 @@ GitHub merging and real host dispatch are not enabled by this scaffold.
 
 The separate control service MCP endpoint is `/mcp/`. It reuses the existing
 Hermes/Codex/Claude bearer identities and authenticates discovery and every call.
-Its nine `hub_*` tools expose task/review/decision-request/read operations, not
-human assignment, decision answers, pause changes or deployment. This is not a
+Its `hub_*` tools expose task/review/decision-request/read operations, not
+decision answers, clearing Beau's waiting items, pause changes or deployment. This is not a
 change to the existing production bus's MCP tool list.
 
 ## Fixture integration modules

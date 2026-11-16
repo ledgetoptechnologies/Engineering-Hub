@@ -723,3 +723,26 @@ def test_legacy_withdrawal_replay_retains_later_replacement_lifecycle_semantics(
     assert env.repo.withdraw(OWNER, 'decision', first['id'], 1, 'Superseded', replacement['id']) == withdrawn
     with env.repo._connection() as db:
         assert db.execute('SELECT count(*) FROM hub_audit').fetchone()[0] == count
+
+
+def test_installation_backlog_create_and_update_are_family_scoped(env):
+    _, codex, _ = pair(env, 'codex-pc', 'codex')
+    _, claude, _ = pair(env, 'claude-pc', 'claude')
+    _, narrow, _ = pair(env, 'narrow', 'codex', caps=('task.read',))
+    task = call(env, codex, 'hub_task_create', lambda actor: env.repo.create_task(
+        actor, PROJECT, 'Backlog', 'key', acceptance=['Works'], owner='codex', reviewer='claude'))
+    assert task['proposed_by'].startswith('installation:') and task['proposed_family'] == 'codex'
+    assert env.repo.task_allows_environment(task['id'], 'staging') is False
+    with pytest.raises(HubError, match='hub_capability_forbidden'):
+        call(env, narrow, 'hub_task_update', lambda actor: env.repo.update_task(actor, task['id'], 1, note='x'))
+    noted = call(env, claude, 'hub_task_update', lambda actor: env.repo.update_task(actor, task['id'], 1, note='Reviewer'))
+    assert noted['notes'][0]['by'].startswith('installation:')
+    with pytest.raises(HubError, match='forbidden'):
+        call(env, claude, 'hub_task_update', lambda actor: env.repo.update_task(
+            actor, task['id'], 2, status='done', evidence='Not the owner'))
+    claimed = call(env, codex, 'hub_task_claim', lambda actor: env.repo.claim_task(actor, task['id'], 2))
+    assert claimed['owner_family'] == 'codex'
+    waiting = call(env, codex, 'hub_task_update', lambda actor: env.repo.update_task(
+        actor, task['id'], 3, status='waiting_on_beau', waiting={'type': 'decision', 'text': 'Which name?'}))
+    assert waiting['waiting_on']['previous_status'] == 'claimed'
+    assert TOOLS['hub_task_create'] == 'task.create' and TOOLS['hub_task_update'] == 'task.update'

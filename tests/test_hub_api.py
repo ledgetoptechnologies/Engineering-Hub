@@ -116,15 +116,17 @@ def test_agent_cannot_mint_human_actions(hub):
     client.cookies.clear()
     for name in ("hermes", "codex", "claude"):
         bearer = agent_headers(name)
+        # Agents may add backlog tasks; the record names them and grants no environment.
         response = client.post(BASE + "/tasks", headers=bearer, json={
             "project": "3d-viewer", "title": "Unassigned work", "client_request_id": name,
         })
-        assert response.status_code == 403
+        assert response.status_code == 201 and response.json()["proposed_by"] == name
+        assert app.state.repository.task_allows_environment(response.json()["id"], "staging") is False
         response = client.post(f"{BASE}/decisions/{decision['id']}/answer", headers=bearer,
                                json={"expected_revision": 1, "answer": "Yes"})
         assert response.status_code == 403
         assert client.post(BASE + "/pause", headers=bearer, json={"paused": True}).status_code == 403
-    assert app.state.repository.list_tasks() == []
+    assert sorted(task["proposed_by"] for task in app.state.repository.list_tasks()) == ["claude", "codex", "hermes"]
     assert app.state.repository.list_decisions()[0]["status"] == "open"
     assert app.state.repository.get_paused() is False
 
@@ -140,7 +142,7 @@ def test_supplied_invalid_bearer_does_not_fall_back_to_human_cookie(hub, authori
     }).status_code == 401
     assert client.post(BASE + "/tasks", headers=headers, json={
         "project": "3d-viewer", "title": "Spoof", "client_request_id": "mixed-principal",
-    }).status_code == 403
+    }).status_code == 401
     assert client.post(BASE + "/pause", headers=headers, json={"paused": True}).status_code == 403
     assert app.state.repository.list_tasks() == []
     assert app.state.repository.list_decisions() == []
@@ -304,7 +306,7 @@ def test_integrated_mcp_initialize_and_list_on_configured_https_origin(hub):
         assert response.status_code == 200, response.text
         assert {tool["name"] for tool in response.json()["result"]["tools"]} == {
             "hub_overview", "hub_task_get", "hub_task_claim", "hub_task_candidate",
-            "hub_task_review", "hub_decision_request", "hub_run_list",
+            "hub_task_review", "hub_task_create", "hub_task_update", "hub_decision_request", "hub_run_list",
             "hub_topic_peers", "hub_topic_preflight", "hub_staging_task_propose",
             "hub_planning_list", "hub_planning_get", "hub_planning_put",
             "hub_label_set_create", "hub_label_set_put_image", "hub_label_set_results", "hub_label_set_list",

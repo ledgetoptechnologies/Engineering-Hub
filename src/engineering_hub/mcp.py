@@ -11,7 +11,7 @@ from agent_message_bus.knowledge import (KnowledgeConflict, KnowledgeError,
 from .planning_api import PlanningWrite, Scope, Kind, Status
 from . import planning
 
-from .repository import HubError
+from .repository import HubError, HubRepository
 from .work_queue import WorkWorker
 from .work_queue_api import (WorkList, WorkGet, WorkSubmission, WorkClaim,
                              WorkJobRenew, WorkJobComplete, submit_reviewed_work)
@@ -151,7 +151,7 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
     async def hub_overview(ctx: Context) -> dict:
         """Read shared tasks, decisions, runs and the emergency-pause state."""
         identity(ctx)
-        result = {"tasks": invoke(repo.list_task_views), "decisions": invoke(repo.list_decisions),
+        result = {"tasks": [HubRepository.overview_task(task) for task in invoke(repo.list_task_views)], "decisions": invoke(repo.list_decisions),
                   "runs": invoke(repo.list_runs), "paused": invoke(repo.get_paused)}
         if autonomy_status is not None:
             result['autonomy'] = invoke(autonomy_status)
@@ -172,6 +172,39 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         principal = identity(ctx)
         return invoke(lambda: repo.propose_staging_task(principal, project, title, client_request_id,
                                                        details=details, links=links))
+
+    @registration.tool()
+    def hub_task_create(project: str, title: str, client_request_id: str, ctx: Context,
+                        details: str | None = None, acceptance: list[str] | None = None,
+                        assignee: str | None = None, assigned_reviewer: str | None = None,
+                        links: list[dict[str, str]] | None = None, request_text: str | None = None) -> dict:
+        """Add a project task to the shared backlog; it grants no environment or production access.
+
+        acceptance lists checkable criteria. assignee/assigned_reviewer are hermes, codex or claude
+        and must differ. request_text quotes the original request. Reuse a request ID only for the same payload.
+        """
+        principal = identity(ctx)
+        return invoke(lambda: repo.create_task(principal, project, title, client_request_id, details=details,
+                                               links=links, acceptance=acceptance, owner=assignee,
+                                               reviewer=assigned_reviewer, request_text=request_text))
+
+    @registration.tool()
+    def hub_task_update(task_id: str, expected_revision: int, ctx: Context, details: str | None = None,
+                        acceptance: list[str] | None = None, assignee: str | None = None,
+                        assigned_reviewer: str | None = None, links: list[dict[str, str]] | None = None,
+                        note: str | None = None, status: str | None = None,
+                        waiting_type: str | None = None, waiting_text: str | None = None,
+                        evidence: str | None = None) -> dict:
+        """Edit a task you own or review: omitted fields stay as they are; note appends a progress note.
+
+        status waiting_on_beau needs waiting_type (decision or action) and waiting_text, one plain
+        sentence of what Beau must decide or do; only Beau clears it. status done is for the owner
+        after verified, with evidence of completion. Claim, candidate and review keep their own tools.
+        """
+        waiting = None if waiting_type is None and waiting_text is None else {'type': waiting_type, 'text': waiting_text}
+        return invoke(lambda: repo.update_task(identity(ctx), task_id, expected_revision, details=details,
+                                               links=links, acceptance=acceptance, owner=assignee, reviewer=assigned_reviewer,
+                                               note=note, status=status, waiting=waiting, evidence=evidence))
 
     @registration.tool()
     def hub_task_get(task_id: str, ctx: Context) -> dict:
