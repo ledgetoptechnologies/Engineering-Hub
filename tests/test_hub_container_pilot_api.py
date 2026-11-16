@@ -81,7 +81,9 @@ def human(client, app):
 def task_through_http(client, app, *, review=True):
     payload = {'project': 'engineering-hub', 'title': 'Trusted container pilot',
                'client_request_id': 'pilot-task'}
-    assert client.post(BASE + '/tasks', headers=CODEX, json=payload).status_code == 403
+    # Agents may add backlog tasks, which never grant an environment.
+    backlog = client.post(BASE + '/tasks', headers=CODEX, json={**payload, 'client_request_id': 'agent-backlog'})
+    assert backlog.status_code == 201 and not app.state.repository.task_allows_environment(backlog.json()['id'], 'staging')
     response = client.post(BASE + '/tasks', headers=human(client, app), json=payload)
     assert response.status_code == 201
     task = response.json()
