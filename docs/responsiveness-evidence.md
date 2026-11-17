@@ -1,7 +1,7 @@
 # Responsiveness evidence
 
-Both main-branch verification jobs upload structured responsiveness diagnostics
-after pytest, even if tests fail. Artifact names include the source SHA, workflow
+The main-branch verification job in `hub-control.yml` uploads structured
+responsiveness diagnostics after pytest, even if tests fail. Artifact names include the source SHA, workflow
 run and attempt; an unchanged rerun never replaces the earlier attempt's result.
 Retention is 14 days. The core Hub release evidence is a separate artifact.
 

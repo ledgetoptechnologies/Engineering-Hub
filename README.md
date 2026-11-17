@@ -111,12 +111,13 @@ The current Hub image is built by `.github/workflows/hub-control.yml`. Tested
 `ghcr.io/ledgetoptechnologies/engineering-hub-control:latest`. Hosted checks run
 only for pushes to `main`, or a manual Hub dispatch selecting `main`. A manual
 dispatch selecting a development branch is refused by the job condition. Pull
-requests, development-branch pushes and tag pushes do not run hosted CI; use
-local staging validation for those changes before merging. Registry publication
-is not operator deployment or executor enrollment.
+requests, development-branch pushes and tag pushes do not run hosted CI; run
+`python scripts/local_premerge.py` ([local pre-merge run](docs/local-premerge.md))
+and local staging validation for those changes before merging. Registry
+publication is not operator deployment or executor enrollment.
 
-The separate legacy bus workflow retains main-only tests, Compose validation and
-a container build. Its historical tag-publication job is explicitly disabled;
+The separate legacy bus workflow retains main-only Compose validation and a
+container build; the backend suite runs once, in the Hub workflow. Its historical tag-publication job is explicitly disabled;
 removing tag triggers must not accidentally republish the retired standalone
 `internal-mcp:stable` from a main push. This does not change or delete previously
 published images, tokens or live clients.
