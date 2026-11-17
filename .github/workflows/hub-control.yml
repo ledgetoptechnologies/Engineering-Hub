@@ -14,6 +14,9 @@ jobs:
     if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # Source gate only. The image is built once, in publish, which runs the
+    # isolated container checks on that exact candidate before any upload.
+    # Run scripts/local_premerge.py before merging (docs/local-premerge.md).
     steps:
       - uses: actions/checkout@v4
         with:
@@ -21,14 +24,46 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+          cache: npm
+          cache-dependency-path: hub-ui/package-lock.json
       - uses: astral-sh/setup-uv@v6
         with:
           version: '0.11.17'
           python-version: '3.12'
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - run: uv sync --locked
-      - run: uv run --locked python -W default -m pytest -q
+      - name: Dashboard install, unit tests and build
+        run: npm ci --ignore-scripts && npm test && npm run build
+        working-directory: hub-ui
+      - name: Playwright version
+        id: playwright
+        run: echo "version=$(node -p "require('./node_modules/@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+        working-directory: hub-ui
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}-chromium
+      - run: npx playwright install --with-deps chromium
+        working-directory: hub-ui
+      - name: Backend suite, with dashboard end-to-end alongside
         env:
           EH_RESPONSIVENESS_ARTIFACT_DIR: ${{ runner.temp }}/eh-responsiveness
+        run: |
+          # Billed time is per-job wall clock. pytest is mostly single-core, so
+          # the single-worker Playwright run uses the runner's other CPU instead
+          # of adding ~6.5 minutes afterwards. Both must pass.
+          (cd hub-ui && npm run test:e2e > "$RUNNER_TEMP/e2e.log" 2>&1) &
+          e2e_pid=$!
+          pytest_status=0
+          uv run --locked python -W default -m pytest -q || pytest_status=$?
+          e2e_status=0
+          wait "$e2e_pid" || e2e_status=$?
+          echo "::group::Dashboard end-to-end output"
+          cat "$RUNNER_TEMP/e2e.log"
+          echo "::endgroup::"
+          echo "pytest exit $pytest_status; Playwright exit $e2e_status"
+          [ "$pytest_status" -eq 0 ] && [ "$e2e_status" -eq 0 ]
       - name: Preserve responsiveness evidence on success and failure
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -37,28 +72,8 @@ jobs:
           path: ${{ runner.temp }}/eh-responsiveness/*.json
           if-no-files-found: warn
           retention-days: 14
-      - run: npm ci --ignore-scripts && npm test && npm run build && npx playwright install --with-deps chromium && npm run test:e2e
-        working-directory: hub-ui
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
-        id: build
-        with:
-          context: .
-          file: docker/Dockerfile.hub-control
-          load: true
-          push: false
-          build-args: VCS_REF=${{ github.sha }}
-          tags: ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-      - name: Isolated UID 568 startup and named-volume recreation
-        run: python scripts/hub_release_smoke.py --image "ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" --commit "$GITHUB_SHA"
-      - name: Isolated split ingress bindings and authentication
-        run: python scripts/hub_split_container_smoke.py --image "ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" --commit "$GITHUB_SHA"
-      - name: Isolated preserved bus state and unified native notifications
-        run: python scripts/hub_unified_container_smoke.py --image "ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" --commit "$GITHUB_SHA"
-      - name: Isolated persisted settings and unified restart preservation
-        run: python scripts/hub_settings_container_smoke.py --image "ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" --commit "$GITHUB_SHA"
-      - name: Isolated protected ledger and selective-mount recreation
-        run: python scripts/hub_protected_container_smoke.py --image "ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" --commit "$GITHUB_SHA"
+      - name: Real-kernel pidfd launcher tests in python:3.12-slim (uv Python lacks os.pidfd_open)
+        run: python scripts/hub_pidfd_slim_check.py --source .
   publish:
     needs: verify
     if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}

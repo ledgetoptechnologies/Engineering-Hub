@@ -335,7 +335,7 @@ def main():
     parser.add_argument('--ref', default='HEAD', help='commit to test (default HEAD)')
     parser.add_argument('--wsl-distro', default='Ubuntu-24.04')
     parser.add_argument('--wsl-venv', default='/root/.venvs/eh-test')
-    parser.add_argument('--e2e-workers', type=int, default=4, help='Playwright workers (CI uses 4)')
+    parser.add_argument('--e2e-workers', type=int, default=4, help='Playwright workers (CI runs 1 alongside pytest)')
     parser.add_argument('--skip-docker', action='store_true', help='report image steps as NOT RUN')
     parser.add_argument('--serial', action='store_true', help='do not run WSL and Windows steps concurrently')
     parser.add_argument('--keep', action='store_true', help='keep work dirs and the built image')
