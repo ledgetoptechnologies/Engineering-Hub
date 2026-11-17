@@ -360,6 +360,9 @@ def main():
     args = parser.parse_args()
     if os.name != 'nt':
         raise SystemExit('Run from Windows (Git Bash); it drives WSL for the Linux parts.')
+    # Logs carry non-cp1252 characters; never let printing them crash the run.
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding='utf-8', errors='replace')
 
     commit = git('rev-parse', '--verify', args.ref + '^{commit}')
     subject = git('log', '-1', '--format=%s', commit)
