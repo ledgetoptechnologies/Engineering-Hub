@@ -348,7 +348,9 @@ def main():
     subject = git('log', '-1', '--format=%s', commit)
     dirty = bool(git('status', '--porcelain', '--untracked-files=no')) if args.ref == 'HEAD' else False
     nonce = uuid.uuid4().hex[:8]
-    base = Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'eh-premerge'
+    # Not under AppData: Microsoft Store Python silently redirects writes there,
+    # where git, Docker and WSL cannot see them.
+    base = Path.home() / '.eh-premerge'
     args.work_dir = args.work_dir or str(base / f'{commit[:12]}-{nonce}')
     work = Path(args.work_dir)
     work.mkdir(parents=True, exist_ok=True)

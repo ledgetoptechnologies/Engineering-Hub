@@ -18,7 +18,7 @@ The backend step fails if any real-kernel pidfd test is skipped and prints the
 skip count and top reasons. A step that cannot run, such as the Docker steps
 with Docker Desktop stopped, is reported `NOT RUN` and the exit code is 2, never
 a pass. Paste the printed Markdown summary into the PR body. Logs stay under
-`%LOCALAPPDATA%\eh-premerge\<commit>-<id>\`; `--help` lists the options.
+`~/.eh-premerge/<commit>-<id>/`; `--help` lists the options.
 
 Not covered locally: GHCR push, the registry-digest re-test and `latest`
 promotion, which only the main `publish` job performs.
