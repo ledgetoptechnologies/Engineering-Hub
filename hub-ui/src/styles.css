@@ -4257,3 +4257,4 @@ button.text-button.danger { color: #a3402f; }
 @media (max-width: 700px) {
   .waiting-options { grid-template-columns: minmax(0, 1fr); }
 }
+.later-hint { margin-left: 6px; font-size: 11px; color: var(--ink-3, #6b7280); white-space: nowrap; }

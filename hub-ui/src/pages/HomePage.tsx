@@ -6,7 +6,7 @@ import type { Hub } from "../hub";
 import { Badge, Icon, PageHeader, names } from "../ui";
 import { answeredDecisions, openDecisions, RecentAnswers } from "./decisions";
 import { statusLabel, statusTone } from "./tasks";
-import { isActive, waitingKind, waitingTasks } from "../backlog";
+import { isActive, laterHint, waitingKind, waitingTasks } from "../backlog";
 import { DayBars, StageBar, StageLegend, dailyCounts } from "../charts";
 
 function greeting(now = new Date()) {
@@ -38,7 +38,8 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
         <a className={`kpi ${waiting.length ? "attention" : ""}`} href={link("/inbox")}>
           <span className="kpi-label"><Icon kind="inbox" size={16} /> Needs you</span>
           <strong>{waiting.length}</strong>
-          <span className="kpi-note">{waiting.length === 0 ? "Nothing waiting" : waiting.length === 1 ? "item" : "items"}</span>
+          <span className="kpi-note">{waiting.length === 0 ? "Nothing waiting" : waiting.length === 1 ? "item" : "items"}
+            {laterHint(hub.data.tasks) && ` · ${laterHint(hub.data.tasks)}`}</span>
         </a>
         <a className="kpi" href={link("/work")}>
           <span className="kpi-label"><Icon kind="work" size={16} /> Work in motion</span>
@@ -161,7 +162,8 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
                     <span className="project-square" />
                     <strong>{project.name}</strong>
                     <span className="preview-meta">
-                      {open ? `${open} waiting · ` : ""}{work} open {work === 1 ? "task" : "tasks"}
+                      {open ? `${open} waiting · ` : ""}{laterHint(hub.data.tasks, project.id) && `${laterHint(hub.data.tasks, project.id)} · `}
+                      {work} open {work === 1 ? "task" : "tasks"}
                     </span>
                     <StageBar tasks={hub.data.tasks.filter((task) => task.project === project.id)} label={`${project.name} progress`} height={6} />
                   </a>

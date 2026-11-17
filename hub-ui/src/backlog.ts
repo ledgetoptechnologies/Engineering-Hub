@@ -2,6 +2,11 @@
 import type { Task } from "./types";
 
 export const waitingLevel = (task: Task) => task.waiting_on?.level ?? "now";
+/** Later items stay out of the counts but are never silent: "2 later", or empty when there are none. */
+export const laterHint = (tasks: Task[], project?: string) => {
+  const count = waitingTasks(tasks, project, "later").length;
+  return count ? `${count} later` : "";
+};
 
 /** Tasks parked on Beau with an item he must clear; counts use the "now" level, "later" items wait behind them. */
 export const waitingTasks = (tasks: Task[], project?: string, level: "now" | "later" = "now") =>

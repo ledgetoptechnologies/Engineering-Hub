@@ -7,7 +7,7 @@ import { answeredDecisions, DecisionList, openDecisions, RecentAnswers } from ".
 import { TaskTable } from "./tasks";
 import { WithdrawnList } from "./Withdraw";
 import { ownershipRows, UNCLAIMED, WorkOwnership } from "./WorkOwnership";
-import { draftFor, type ItemDraft, WORK_FILTERS, waitingItemKey, waitingKind, waitingLevel, waitingTasks } from "../backlog";
+import { draftFor, type ItemDraft, laterHint, WORK_FILTERS, waitingItemKey, waitingKind, waitingLevel, waitingTasks } from "../backlog";
 import { statusLabel } from "./tasks";
 
 /** One task item Beau must clear: a question he answers with one of three options or his own text, or an action he
@@ -45,7 +45,7 @@ export function WaitingItemCard({ hub, task, selected, onSelect }: {
       {options.length > 0 && (
         <div className="waiting-options" role="group" aria-label="Options">
           {options.map((option, index) => (
-            <button type="button" key={index} disabled={!hub.writable} onClick={() => send({ option: index })}
+            <button type="button" key={index} disabled={!hub.writable} onClick={() => send({ option: index, note: text })}
               className={index === waiting.recommended ? "waiting-option recommended" : "waiting-option"}>
               <span className="waiting-option-label">{option.label}</span>
               {index === waiting.recommended && <Badge tone="forest">Recommended</Badge>}
@@ -116,7 +116,8 @@ export function InboxPage({ hub, actions }: { hub: Hub; actions: React.ReactNode
   const later = waitingTasks(hub.data.tasks, project === "all" ? undefined : project, "later");
   const count = (id: string) => all.filter((decision) => decision.project === id).length
     + allItems.filter((task) => task.project === id).length;
-  const projectsWithItems = hub.data.projects.filter((item) => count(item.id) > 0);
+  // A project whose items are all later still gets its chip; its count stays the now count.
+  const projectsWithItems = hub.data.projects.filter((item) => count(item.id) > 0 || laterHint(hub.data.tasks, item.id));
   return (
     <>
       <PageHeader eyebrow="INBOX" title="Needs you"
@@ -127,7 +128,7 @@ export function InboxPage({ hub, actions }: { hub: Hub; actions: React.ReactNode
         </button>
         {projectsWithItems.map((item) => (
           <button key={item.id} className={project === item.id ? "chip selected" : "chip"} onClick={() => setProject(item.id)}>
-            {item.name} <span>{count(item.id)}</span>
+            {item.name} <span>{count(item.id)}</span>{laterHint(hub.data.tasks, item.id) && <small className="later-hint">{laterHint(hub.data.tasks, item.id)}</small>}
           </button>
         ))}
       </div>

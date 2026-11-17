@@ -15,7 +15,7 @@ import { ProjectPage, ProjectsPage } from "./pages/ProjectPages";
 import { AgentsPage, StagingPage } from "./pages/SystemPages";
 import { InfrastructurePage } from "./pages/InfrastructurePage";
 import { acceptsAnswer, retainsAnswerDraft, openDecisions } from "./pages/decisions";
-import { isActive, parseAcceptance, waitingTasks } from "./backlog";
+import { isActive, laterHint, parseAcceptance, waitingTasks } from "./backlog";
 import { LabelSetPage } from "./pages/LabelSets";
 import { ReviewPage } from "./ReviewsPanel";
 import type {
@@ -621,9 +621,10 @@ export function HubApp() {
   } : null;
   const waitingCount = hub ? openDecisions(hub).length + waitingTasks(hub.data.tasks).length : 0;
   const activeWork = data ? data.tasks.filter(isActive).length : 0;
-  const nav: { route: Route; label: string; icon: IconKind; count?: number; attention?: boolean }[] = [
+  const nav: { route: Route; label: string; icon: IconKind; count?: number; attention?: boolean; hint?: string }[] = [
     { route: { page: "home" }, label: "Home", icon: "grid" },
-    { route: { page: "inbox" }, label: "Needs you", icon: "inbox", count: data ? waitingCount : undefined, attention: waitingCount > 0 },
+    { route: { page: "inbox" }, label: "Needs you", icon: "inbox", count: data ? waitingCount : undefined, attention: waitingCount > 0,
+      hint: data ? laterHint(data.tasks) : undefined },
     { route: { page: "work" }, label: "Work", icon: "work", count: data ? activeWork : undefined },
     { route: { page: "projects" }, label: "Projects", icon: "folder" },
     { route: { page: "agents" }, label: "Agents", icon: "agents" },
@@ -686,6 +687,7 @@ export function HubApp() {
                 {item.count !== undefined && item.count > 0 && (
                   <span className={`nav-count ${item.attention ? "attention" : ""}`}>{item.count}</span>
                 )}
+                {item.hint && <small className="later-hint">{item.hint}</small>}
               </a>
             ))}
           </nav>

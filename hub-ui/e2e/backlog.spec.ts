@@ -98,6 +98,8 @@ test("questions are answered by option or text, dismissed, and cleared in bulk f
   await expect(card("Question 1?").locator(".waiting-option.recommended")).toContainText("Split it");
   await expect(card("Question 1?")).toContainText("Smaller reviews");
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  // Text typed before clicking an option goes with it as the note.
+  await card("Question 1?").getByRole("textbox").fill("Because it is simplest");
   await card("Question 1?").getByRole("button", { name: /Keep it/ }).click();
   await expect(card("Question 1?")).toHaveCount(0);
   await card("Question 2?").getByRole("textbox").fill("Ship it behind a flag");
@@ -112,7 +114,7 @@ test("questions are answered by option or text, dismissed, and cleared in bulk f
   await expect(page.locator("form.waiting-item")).toHaveCount(0);
   const path = (id: string) => `/api/hub/v1/tasks/${id}/resolve-waiting`;
   expect(state.posts).toEqual([
-    { path: path(ids[0]), body: { expected_revision: 2, option: 0 } },
+    { path: path(ids[0]), body: { expected_revision: 2, option: 0, note: "Because it is simplest" } },
     { path: path(ids[1]), body: { expected_revision: 2, answer: "Ship it behind a flag" } },
     { path: path(ids[2]), body: { expected_revision: 2, note: "Not needed", dismiss: true } },
     { path: "/api/hub/v1/tasks/resolve-waiting", body: { items: [
@@ -125,7 +127,12 @@ test("later items stay out of the Needs you count until expanded", async ({ page
   await fixture(page, [question(ids[0], "Now question?"), later]);
   await page.goto("/#/inbox");
   await expect(page.locator("#task-items .count").first()).toHaveText("1");
+  await expect(page.getByRole("navigation", { name: "Workspace navigation" })).toContainText("1 later");
   await expect(page.locator("form.waiting-item", { hasText: "Later question?" })).toHaveCount(0);
   await page.getByRole("button", { name: "Later 1" }).click();
   await expect(page.locator("form.waiting-item", { hasText: "Later question?" })).toBeVisible();
+  await page.goto("/#/");
+  await expect(page.locator(".kpi.attention")).toContainText("1 later");
+  await page.goto("/#/projects/engineering-hub");
+  await expect(page.locator(".stat-row .stat").first()).toContainText("1 later");
 });

@@ -57,9 +57,10 @@ export interface Task extends Versioned {
   request_text?: string | null;
   notes?: TaskNote[] | null;
   waiting_on?: WaitingItem | null;
-  waiting_resolved?: (Pick<WaitingItem, "type" | "text" | "by" | "at"> & { note?: string | null;
+  /** Outcomes name their question by asked_at (the item's at); raising a new item clears them. */
+  waiting_resolved?: (WaitingQuestion & { note?: string | null;
     outcome?: "answered" | "dismissed" | null; answer?: { option?: number | null; label?: string | null; text?: string | null } | null }) | null;
-  waiting_retracted?: (Pick<WaitingItem, "type" | "text" | "by" | "at"> & { reason: string }) | null;
+  waiting_retracted?: (WaitingQuestion & { reason: string }) | null;
   completion_evidence?: string | null;
   completed_by?: string | null;
   completed_at?: string | null;
@@ -79,6 +80,8 @@ export interface WaitingItem {
   recommended?: number | null;
   recommended_reason?: string | null;
 }
+type WaitingQuestion = Pick<WaitingItem, "type" | "text" | "by" | "at" | "level" | "options" | "recommended"
+  | "recommended_reason"> & { asked_at?: string | null };
 /** How Beau clears an item: one option, his own text, Done (with an optional note), or dismissed. */
 export interface WaitingResolution { option?: number; answer?: string; note?: string; dismiss?: boolean }
 export interface Decision extends Versioned {

@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { HubClient, resolutionBody } from "./api";
-import { draftFor, isActive, parseAcceptance, WORK_FILTERS, waitingItemKey, waitingTasks } from "./backlog";
+import { draftFor, isActive, laterHint, parseAcceptance, WORK_FILTERS, waitingItemKey, waitingTasks } from "./backlog";
 import { projectStats, STATUSES, WorkBoard } from "./pages/ProjectPages";
 import { waitingOn } from "./dashboardText";
 import type { Hub } from "./hub";
@@ -98,6 +98,16 @@ describe("backlog views", () => {
     const home = renderToStaticMarkup(<HomePage hub={hub} actions={null} />);
     expect(home).not.toContain("Question later-1");
     expect(projectStats(hub, "engineering-hub").items.map((task) => task.id)).toEqual(["now-1"]);
+  });
+  it("hints at later items on Home, the project and an Inbox chip for a project whose items are all later", () => {
+    const hub = hubWith([question("now-1"), { ...question("later-1", "later"), project: "3d-viewer" }]);
+    expect(laterHint(hub.data.tasks)).toBe("1 later");
+    expect(laterHint(hub.data.tasks, "engineering-hub")).toBe("");
+    const home = renderToStaticMarkup(<HomePage hub={hub} actions={null} />);
+    expect(home).toContain(" · 1 later");
+    expect(projectStats(hub, "3d-viewer")).toMatchObject({ needsYou: projectStats(hub, "3d-viewer").waiting.length, later: "1 later" });
+    const inbox = renderToStaticMarkup(<InboxPage hub={hub} actions={null} />);
+    expect(inbox).toMatch(/<span>\d+<\/span><small class="later-hint">1 later<\/small><\/button>/);
   });
   it("lists task items with decisions in the Inbox and the Home Needs you card", () => {
     const hub = hubWith([base, waiting("action")]);
