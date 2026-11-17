@@ -83,10 +83,6 @@ def test_manual_package_verification_also_requires_main():
 def test_protected_image_profile_runs_before_upload_and_latest_promotion():
     jobs = workflow('hub-control.yml')['jobs']
     helper = 'python scripts/hub_protected_container_smoke.py'
-    verify = [step['run'] for step in jobs['verify']['steps'] if helper in step.get('run', '')]
-    assert len(verify) == 1
-    assert '--image "ghcr.io/ledgetoptechnologies/engineering-hub-control:build-' in verify[0]
-    assert '--commit "$GITHUB_SHA"' in verify[0]
     steps = jobs['publish']['steps']
     local = next(i for i, step in enumerate(steps)
                  if helper + ' --image "$BUILD_IMAGE"' in step.get('run', ''))
@@ -100,3 +96,40 @@ def test_protected_image_profile_runs_before_upload_and_latest_promotion():
     assert '--commit "$GITHUB_SHA" > hub-local-protected-startup.json' in steps[local]['run']
     assert '--commit "$GITHUB_SHA" > hub-registry-protected-startup.json' in steps[registry]['run']
     assert any('hub-*-startup.json' in step.get('with', {}).get('path', '') for step in steps)
+
+
+SMOKES = ('hub_release_smoke', 'hub_split_container_smoke', 'hub_unified_container_smoke',
+          'hub_settings_container_smoke', 'hub_protected_container_smoke')
+
+
+def test_image_is_built_once_and_every_check_gates_upload_and_promotion():
+    jobs = workflow('hub-control.yml')['jobs']
+    # verify is the source gate; the only image build is the publication candidate.
+    verify = jobs['verify']['steps']
+    assert not any('build-push-action' in step.get('uses', '') for step in verify)
+    assert not any('_smoke.py' in step.get('run', '') for step in verify)
+    steps = jobs['publish']['steps']
+    builds = [i for i, step in enumerate(steps) if 'build-push-action' in step.get('uses', '')]
+    assert len(builds) == 1 and steps[builds[0]]['with']['push'] == 'false'
+    upload = next(i for i, step in enumerate(steps) if 'docker push "$BUILD_IMAGE"' in step.get('run', ''))
+    promote = next(i for i, step in enumerate(steps) if 'imagetools create' in step.get('run', ''))
+    for smoke in SMOKES:
+        local = next(i for i, step in enumerate(steps)
+                     if f'python scripts/{smoke}.py --image "$BUILD_IMAGE"' in step.get('run', ''))
+        registry = next(i for i, step in enumerate(steps)
+                        if f'python scripts/{smoke}.py --image "$PACKAGE@$DIGEST"' in step.get('run', ''))
+        assert builds[0] < local < upload == registry < promote
+
+
+def test_verify_runs_backend_e2e_and_pidfd_gates_once():
+    verify = workflow('hub-control.yml')['jobs']['verify']['steps']
+    runs = [step.get('run', '') for step in verify]
+    combined = [run for run in runs if 'python -W default -m pytest -q' in run]
+    assert len(combined) == 1
+    assert 'npm run test:e2e' in combined[0]
+    assert '[ "$pytest_status" -eq 0 ] && [ "$e2e_status" -eq 0 ]' in combined[0]
+    assert sum('python scripts/hub_pidfd_slim_check.py' in run for run in runs) == 1
+    assert sum('npm test' in run and 'npm run build' in run for run in runs) == 1
+    # The legacy workflow no longer repeats the backend suite.
+    legacy = workflow('container.yml')['jobs']['verify']['steps']
+    assert not any('pytest' in step.get('run', '') for step in legacy)
