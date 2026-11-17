@@ -290,7 +290,9 @@ def ui_and_docker(run):
             run.steps[name].detail = reason
         return
     run.docker_version = probe.stdout.strip()
-    tag = f'eh-premerge-control:{run.commit[:12]}-{run.nonce}'
+    # The smoke scripts accept only the release repository name; this tag is
+    # local-only and never pushed.
+    tag = f'ghcr.io/ledgetoptechnologies/engineering-hub-control:build-local-{run.commit[:12]}-{run.nonce}'
 
     def build():
         ok, output = run.execute(run.steps['image'], [docker, 'build', '-f', 'docker/Dockerfile.hub-control',
