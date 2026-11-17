@@ -236,8 +236,8 @@ def test_outcomes_name_their_question_and_a_new_item_clears_old_outcomes(repo):
 
 
 @pytest.mark.parametrize('field,value', [
-    ('label', 'Keep‮ti'), ('label', '​'), ('label', 'A\n\x1b[31mred'), ('detail', 'x⁦y'),
-    ('recommended_reason', 'fine\x07'), ('label', 'zero‍width'),
+    ('label', 'Keep\u202eti'), ('label', '\u200b'), ('label', 'A\n\x1b[31mred'), ('detail', 'x\u2066y'),
+    ('recommended_reason', 'fine\x07'), ('label', '\u200dzero-width'),
 ])
 def test_invisible_and_control_characters_are_refused_with_the_field(repo, field, value):
     options = [dict(OPTIONS[0]), dict(OPTIONS[1]), dict(OPTIONS[2])]
@@ -253,7 +253,7 @@ def test_invisible_and_control_characters_are_refused_with_the_field(repo, field
 
 def test_typed_answer_keeps_newlines_but_refuses_controls(repo):
     task = raised(repo)
-    for bad in ('Go‮', '​​', 'Go\x1b[2J'):
+    for bad in ('Go\u202e', '\u200b\u200b', 'Go\x1b[2J'):
         with pytest.raises(HubError, match='invalid_input') as error:
             repo.resolve_waiting(BEAU, task['id'], 2, answer=bad)
         assert error.value.field == 'answer'
@@ -308,3 +308,43 @@ def test_private_gateway_allows_the_inbox_routes_only():
     for path in (f'/api/hub/v1/tasks/{task}/update', '/api/hub/v1/tasks/x/resolve-waiting',
                  f'/api/hub/v1/decisions/{task}/waiting-level'):
         assert browser_route_allowed('POST', path) is False
+
+
+
+# Lead re-review polish.
+
+@pytest.mark.parametrize('label', ['\U0001F468\u200d\U0001F469\u200d\U0001F467', 'mi\u200cravam', '\u2764\ufe0f\u200d\U0001F525'])
+def test_joiners_inside_words_and_emoji_are_kept(repo, label):
+    waiting = dict(QUESTION, options=[{'label': label}] + OPTIONS[1:])
+    assert raised(repo, waiting=waiting)['waiting_on']['options'][0]['label'] == label
+
+
+@pytest.mark.parametrize('label', ['\u200dKeep', 'Keep\u200c', 'a \u200d b', '\u3164', '\u2800', '\u115f', '\u1160',
+                                   '\uffa0', '\u3164 \u2800', '\u00ad', '\u2060'])
+def test_blank_looking_labels_and_stray_joiners_are_refused(repo, label):
+    with pytest.raises(HubError, match='invalid_waiting_item') as error:
+        raised(repo, waiting=dict(QUESTION, options=[{'label': label}] + OPTIONS[1:]))
+    assert error.value.field == 'waiting.options.label'
+
+
+def test_titles_and_notes_use_the_same_filter_and_old_rows_still_read(repo):
+    for title in ('Fix\u202e it', '\u3164', 'Two\nlines'):
+        with pytest.raises(HubError, match='invalid_input') as error:
+            repo.create_task(BEAU, PROJECT, title, 'bad')
+        assert error.value.field == 'title'
+        with pytest.raises(HubError, match='invalid_input'):
+            repo.propose_staging_task('claude', PROJECT, title, 'bad')
+    task = repo.create_task('claude', PROJECT, 'Clean', 'k1', owner='codex')
+    with pytest.raises(HubError) as error:
+        repo.update_task('claude', task['id'], 1, title='Bad\x1btitle')
+    assert error.value.field == 'title'
+    with pytest.raises(HubError) as error:
+        repo.update_task('codex', task['id'], 1, note='Hidden\u200b')
+    assert error.value.field == 'note'
+    noted = repo.update_task('codex', task['id'], 1, note='Line one\n\tLine two')
+    assert noted['notes'][-1]['text'] == 'Line one\n\tLine two'
+    stored = dict(noted, title='Old\u202etitle')
+    with repo._transaction() as db:
+        db.execute('UPDATE hub_entities SET data=? WHERE id=?', (json.dumps(stored), task['id']))
+    assert repo.get_task(task['id'])['title'] == 'Old\u202etitle'
+    assert repo.update_task('codex', task['id'], 2, note='Still fine')['title'] == 'Old\u202etitle'

@@ -31,6 +31,8 @@ OVERVIEW_OMITTED = frozenset({'acceptance', 'notes', 'request_text', 'completion
                               'waiting_retracted'})
 # A question to Beau: exactly three agent-written options, one recommended, plus his own text.
 WAITING_OPTIONS, WAITING_LEVELS, MAX_BULK_RESOLVE = 3, frozenset({'now', 'later'}), 50
+# Blank-rendering letters and symbols that must not count as visible; ZWNJ/ZWJ allowed only inside words.
+BLANK_CHARS, JOINERS = frozenset('\u115f\u1160\u3164\uffa0\u2800'), frozenset('\u200c\u200d')
 WAITING_FIELDS = frozenset({'type', 'text', 'options', 'recommended', 'recommended_reason', 'level'})
 # Audit actions that record who created a task or decision. Withdrawal by an agent
 # is limited to the agent named here, read from the audit log, never from the record.
@@ -302,16 +304,25 @@ class HubRepository:
         except ValueError:
             raise HubError(code, field=field, limit=None if field is None else maximum) from None
 
+    @staticmethod
+    def _shown(char):
+        """A character that renders as something: not space, control, format, separator or a blank filler."""
+        return (not char.isspace() and char not in BLANK_CHARS
+                and unicodedata.category(char) not in {'Cc', 'Cf', 'Zl', 'Zp', 'Zs', 'Cs', 'Co', 'Cn'})
+
     def _plain(self, value, maximum, code, field, lines=False):
         """Bounded text Beau reads as written: no control, format (bidi, zero-width) or line-separator
-        characters (a typed answer may keep newlines and tabs), and at least one visible character."""
+        characters (a typed answer or note may keep newlines and tabs), and at least one visible character.
+        ZWNJ and ZWJ are kept only between two visible characters (Persian text, emoji sequences)."""
         value = self._bounded(value, maximum, code, field)
-        for char in value:
+        for index, char in enumerate(value):
             if char in '\n\t' and lines:
+                continue
+            if char in JOINERS and 0 < index < len(value) - 1 and self._shown(value[index - 1]) and self._shown(value[index + 1]):
                 continue
             if unicodedata.category(char) in {'Cc', 'Cf', 'Zl', 'Zp', 'Cs', 'Co', 'Cn'}:
                 raise HubError(code, field=field)
-        if not any(not char.isspace() for char in value):
+        if not any(self._shown(char) for char in value):
             raise HubError(code, field=field)
         return value
 
@@ -339,7 +350,7 @@ class HubRepository:
         an agent-created task records proposed_by without a scope, which task_allows_environment vetoes."""
         self._actor(actor)
         human = actor not in AGENTS and not session_context.actor_allowed(actor)
-        title, key = self._text(title), self._text(client_request_id)
+        title, key = self._plain(title, 200, 'invalid_input', 'title'), self._text(client_request_id)
         context = self._context(details, links)
         backlog =self._backlog_fields(acceptance, owner, reviewer, request_text)
         # Keep the legacy human fingerprint byte-for-byte when no backlog field is supplied.
@@ -412,8 +423,8 @@ class HubRepository:
         content = self._context(details, links)
         if 'acceptance' in backlog:
             content['acceptance'] = backlog.pop('acceptance')
-        note = None if note is None else self._bounded(note, 500, field='note')
-        title = None if title is None else self._bounded(title, 200, field='title')
+        note = None if note is None else self._plain(note, 500, 'invalid_input', 'note', lines=True)
+        title = None if title is None else self._plain(title, 200, 'invalid_input', 'title')
         retract = None if retract_reason is None else self._plain(retract_reason, 500, 'invalid_input', 'retract_reason')
         if status is not None and status not in UPDATE_STATUSES:
             raise HubError('invalid_status')
@@ -786,7 +797,7 @@ class HubRepository:
     def propose_staging_task(self, actor, project, title, client_request_id, *, details=None, links=None):
         """An agent may propose work, never grant execution or production authority."""
         self._actor(actor, agent=True)
-        title, key = self._text(title), self._text(client_request_id, 128)
+        title, key = self._plain(title, 200, 'invalid_input', 'title'), self._text(client_request_id, 128)
         context = self._context(details, links)
         payload = ['staging_task_proposal', project, title] + ([context] if context else [])
         fingerprint = hashlib.sha256(_json(payload).encode()).hexdigest()
