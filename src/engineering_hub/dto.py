@@ -89,9 +89,18 @@ class WaitingAnswerDTO(ResponseDTO):
     text: str | None = None
 
 
-class WaitingResolvedDTO(ResponseDTO):
+class WaitingQuestionDTO(ResponseDTO):
+    """The question an outcome belongs to; asked_at is the waiting item's at. Absent on older rows."""
     type: Literal['decision', 'action']
     text: str
+    asked_at: str | None = None
+    level: Literal['now', 'later'] | None = None
+    options: list[WaitingOptionDTO] | None = Field(default=None, min_length=3, max_length=3)
+    recommended: int | None = Field(default=None, ge=0, le=2)
+    recommended_reason: str | None = None
+
+
+class WaitingResolvedDTO(WaitingQuestionDTO):
     by: HumanId
     at: str
     note: str | None = None
@@ -100,9 +109,7 @@ class WaitingResolvedDTO(ResponseDTO):
     answer: WaitingAnswerDTO | None = None
 
 
-class WaitingRetractedDTO(ResponseDTO):
-    type: Literal['decision', 'action']
-    text: str
+class WaitingRetractedDTO(WaitingQuestionDTO):
     by: AgentActor
     at: str
     reason: str

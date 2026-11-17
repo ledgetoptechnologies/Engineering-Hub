@@ -207,7 +207,8 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         sentence of what Beau must decide or do. A decision also needs waiting_options: exactly three
         {label, detail?} (label up to 80 chars, detail one line), waiting_recommended (0-2, your pick)
         and waiting_reason (one line why). waiting_level is now (default) or later for non-urgent items.
-        Only Beau answers or dismisses; read his answer in waiting_resolved. If the item was settled
+        Only Beau answers or dismisses: waiting_resolved holds his outcome for the question whose waiting_on.at
+        equals its asked_at (raising a new item clears it; history is in the audit). If the item was settled
         another way or is no longer needed, retract_reason (alone, or with a note) takes it back: allowed
         for the family that raised it and the task's owner. status done is for the owner after verified,
         with evidence. title/details/links/acceptance only on tasks your family created. Reuse a request

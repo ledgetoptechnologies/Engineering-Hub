@@ -57,8 +57,8 @@ def test_beau_answers_by_option_or_text_and_agents_read_it(repo):
         repo.resolve_waiting(BEAU, task['id'], 2, option=0, answer='Both')
     answered = repo.resolve_waiting(BEAU, task['id'], 2, 'Go', option=1)
     assert answered['status'] == 'assigned' and 'waiting_on' not in answered
-    assert answered['waiting_resolved'] == dict(type='decision', text=QUESTION['text'], by=BEAU, note='Go',
-                                                at=answered['waiting_resolved']['at'], outcome='answered',
+    assert answered['waiting_resolved'] == dict(QUESTION, by=BEAU, note='Go', asked_at=task['waiting_on']['at'],
+                                                level='now', at=answered['waiting_resolved']['at'], outcome='answered',
                                                 answer=dict(option=1, label='Split it'))
     assert repo.resolve_waiting(BEAU, task['id'], 2, 'Go', option=1) == answered  # idempotent retry
     with pytest.raises(HubError, match='revision_conflict|not_waiting'):
@@ -99,7 +99,7 @@ def test_raising_family_or_owner_retracts_others_cannot(repo):
     back = repo.update_task('claude', task['id'], 2, retract_reason='Answered in chat', note='Beau said split',
                            client_request_id='r1')
     assert back['status'] == 'assigned' and 'waiting_on' not in back and back['notes'][-1]['text'] == 'Beau said split'
-    assert back['waiting_retracted'] == dict(type='decision', text=QUESTION['text'], by='claude',
+    assert back['waiting_retracted'] == dict(QUESTION, by='claude', asked_at=task['waiting_on']['at'], level='now',
                                              at=back['waiting_retracted']['at'], reason='Answered in chat')
     assert repo.update_task('claude', task['id'], 2, retract_reason='Answered in chat', note='Beau said split',
                             client_request_id='r1') == back
@@ -207,3 +207,104 @@ def test_title_edit_by_human_or_creating_family_and_link_limit(repo):
     with pytest.raises(HubError) as error:
         repo.update_task('claude', task['id'], 3, note='n' * 501)
     assert error.value.message == 'invalid_input: note (limit 500)'
+
+
+# Lead review fixes: each test below fails on d8fdf9f0.
+
+def test_agents_never_retract_an_item_beau_raised_even_as_owner(repo):
+    task = repo.create_task(BEAU, PROJECT, 'Beau asks', 'k1', owner='codex', reviewer='claude')
+    task = repo.update_task(BEAU, task['id'], 1, status='waiting_on_beau', waiting=dict(type='action', text='Call the ISP.'))
+    for family in ('codex', 'claude'):
+        with pytest.raises(HubError, match='forbidden'):
+            repo.update_task(family, task['id'], 2, retract_reason='Done already')
+    assert repo.get_task(task['id'])['status'] == 'waiting_on_beau'
+
+
+def test_outcomes_name_their_question_and_a_new_item_clears_old_outcomes(repo):
+    first = raised(repo)
+    answered = repo.resolve_waiting(BEAU, first['id'], 2, option=2)
+    assert answered['waiting_resolved']['asked_at'] == first['waiting_on']['at']
+    assert answered['waiting_resolved']['options'] == OPTIONS and answered['waiting_resolved']['level'] == 'now'
+    again = repo.update_task('claude', first['id'], 3, status='waiting_on_beau',
+                             waiting=dict(QUESTION, text='Second question?', level='later'))
+    assert 'waiting_resolved' not in again and 'waiting_retracted' not in again
+    back = repo.update_task('claude', first['id'], 4, retract_reason='Moot')
+    assert 'waiting_resolved' not in back
+    assert back['waiting_retracted']['asked_at'] == again['waiting_on']['at'] and back['waiting_retracted']['level'] == 'later'
+    third = repo.update_task('claude', first['id'], 5, status='waiting_on_beau', waiting=QUESTION)
+    assert 'waiting_retracted' not in repo.resolve_waiting(BEAU, third['id'], 6, dismiss=True)
+
+
+@pytest.mark.parametrize('field,value', [
+    ('label', 'Keep‮ti'), ('label', '​'), ('label', 'A\n\x1b[31mred'), ('detail', 'x⁦y'),
+    ('recommended_reason', 'fine\x07'), ('label', 'zero‍width'),
+])
+def test_invisible_and_control_characters_are_refused_with_the_field(repo, field, value):
+    options = [dict(OPTIONS[0]), dict(OPTIONS[1]), dict(OPTIONS[2])]
+    waiting = dict(QUESTION, options=options)
+    if field == 'recommended_reason':
+        waiting[field] = value
+    else:
+        options[0][field] = value
+    with pytest.raises(HubError, match='invalid_waiting_item') as error:
+        raised(repo, waiting=waiting)
+    assert error.value.field == ('waiting.' + field if field == 'recommended_reason' else 'waiting.options.' + field)
+
+
+def test_typed_answer_keeps_newlines_but_refuses_controls(repo):
+    task = raised(repo)
+    for bad in ('Go‮', '​​', 'Go\x1b[2J'):
+        with pytest.raises(HubError, match='invalid_input') as error:
+            repo.resolve_waiting(BEAU, task['id'], 2, answer=bad)
+        assert error.value.field == 'answer'
+    assert repo.resolve_waiting(BEAU, task['id'], 2, answer='Line one\nLine two')['waiting_resolved']['answer'] == {
+        'text': 'Line one\nLine two'}
+
+
+def test_retract_with_evidence_is_refused(repo):
+    task = raised(repo)
+    with pytest.raises(HubError, match='invalid_input') as error:
+        repo.update_task('claude', task['id'], 2, retract_reason='Moot', evidence='PR merged')
+    assert error.value.field == 'retract_reason'
+
+
+def test_waiting_request_without_level_keeps_its_earlier_fingerprint(repo):
+    import hashlib
+    from engineering_hub.repository import _json
+    task = repo.create_task(BEAU, PROJECT, 'Old client', 'k1', owner='claude')
+    waiting = dict(type='action', text='Sign the form.')
+    repo.update_task('claude', task['id'], 1, status='waiting_on_beau', waiting=waiting, client_request_id='old')
+    before = hashlib.sha256(_json([task['id'], 1, {}, {}, None, 'waiting_on_beau', waiting, None]).encode()).hexdigest()
+    with repo._connection() as db:
+        stored = db.execute("SELECT fingerprint FROM hub_requests WHERE key='task_update:old'").fetchone()[0]
+    assert stored == before
+
+
+def test_bulk_error_names_item_index_and_task(repo):
+    first, second = raised(repo), raised(repo, key='k2')
+    with pytest.raises(HubError, match='revision_conflict') as error:
+        repo.resolve_waiting_many(BEAU, [dict(task_id=first['id'], expected_revision=2, option=1),
+                                         dict(task_id=second['id'], expected_revision=7, option=1)])
+    assert error.value.detail == dict(code='revision_conflict', index=1, task_id=second['id'])
+    with pytest.raises(HubError) as error:
+        repo.resolve_waiting_many(BEAU, [dict(task_id=first['id'], expected_revision=2, option=9)])
+    assert error.value.index == 0 and error.value.field == 'option'
+
+
+def test_beau_clearing_a_question_by_status_records_a_dismissal(repo):
+    task = raised(repo)
+    back = repo.update_task(BEAU, task['id'], 2, status='assigned')
+    assert back['waiting_resolved']['outcome'] == 'dismissed' and back['waiting_resolved']['by'] == BEAU
+    assert back['waiting_resolved']['asked_at'] == task['waiting_on']['at']
+
+
+def test_private_gateway_allows_the_inbox_routes_only():
+    from engineering_hub.private_gateway import browser_route_allowed
+    task = '11111111-2222-4333-8444-000000000001'
+    for path in ('/api/hub/v1/tasks/resolve-waiting', f'/api/hub/v1/tasks/{task}/resolve-waiting',
+                 f'/api/hub/v1/tasks/{task}/waiting-level'):
+        assert browser_route_allowed('POST', path) is True
+        assert browser_route_allowed('GET', path) is False
+    for path in (f'/api/hub/v1/tasks/{task}/update', '/api/hub/v1/tasks/x/resolve-waiting',
+                 f'/api/hub/v1/decisions/{task}/waiting-level'):
+        assert browser_route_allowed('POST', path) is False

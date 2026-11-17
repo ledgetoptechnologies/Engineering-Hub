@@ -39,7 +39,8 @@ _GET = frozenset({
         'staging/shared/status')),
 })
 _POST = frozenset('/api/hub/v1/' + name for name in (
-    'auth/bootstrap', 'auth/logout', 'tasks', 'decisions', 'pause', 'work/pause', 'notes', 'planning',
+    'auth/bootstrap', 'auth/logout', 'tasks', 'tasks/resolve-waiting', 'decisions', 'pause', 'work/pause',
+    'notes', 'planning',
     'staging/session-reconciliation', 'staging/cleanup/plan', 'staging/cleanup/apply',
     'staging/shared/recover'))
 _REQUEST_HEADERS = frozenset({
@@ -148,6 +149,7 @@ def browser_route_allowed(method, path):
         r'/api/hub/v1/interactive-reviews/' + _UUID + '/answers', path) is not None or re.fullmatch(
         r'/api/hub/v1/decisions/' + _UUID + '/answer', path) is not None
         or re.fullmatch(r'/api/hub/v1/(?:tasks|decisions)/' + _UUID + '/(?:context|withdraw)', path) is not None
+        or re.fullmatch(r'/api/hub/v1/tasks/' + _UUID + '/(?:resolve-waiting|waiting-level)', path) is not None
         or path == '/api/hub/v1/projects'
         or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + '/components', path) is not None
         or re.fullmatch(r'/api/hub/v1/components/' + _UUID + '/retire', path) is not None
