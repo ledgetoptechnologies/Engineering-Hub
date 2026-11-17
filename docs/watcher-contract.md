@@ -24,7 +24,11 @@ General lead delivery belongs to a separate control route, never a per-task
 binding or a project subscription. A per-task lead binding here represents only
 that task's explicitly configured escalation destination. Held escalations
 return `escalation_intent=False` to prevent recursive escalation. Same-role
-self-wakes are invalid. Before a live dispatcher, the authenticated envelope
+self-wakes are invalid. A held escalation must still reach Lead through a
+separate lead control route or durable alert; absence of a per-task lead binding
+must never silently discard it. Delivery and alert reconciliation belong to the
+future durable dispatcher, not this pure decision function. Before a live
+dispatcher, the authenticated envelope
 sender must be resolved against the authoritative task owner/reviewer and
 matched to `from_role`; this slice has no sender-authority integration.
 
