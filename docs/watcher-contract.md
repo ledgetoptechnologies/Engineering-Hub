@@ -20,6 +20,14 @@ worker escalation. Ordinary `projects-lead` messages need a separate lead route;
 they cannot enter this task-routing function. Project subscriptions are not
 fallbacks for worker traffic.
 
+General lead delivery belongs to a separate control route, never a per-task
+binding or a project subscription. A per-task lead binding here represents only
+that task's explicitly configured escalation destination. Held escalations
+return `escalation_intent=False` to prevent recursive escalation. Same-role
+self-wakes are invalid. Before a live dispatcher, the authenticated envelope
+sender must be resolved against the authoritative task owner/reviewer and
+matched to `from_role`; this slice has no sender-authority integration.
+
 `plan_task_delivery` holds missing/duplicate bindings, recipient mismatches,
 unsupported adapters, missing sessions and stale targets. A hold returns a
 reason and escalation intent, without sending anything or discarding the message.
@@ -44,6 +52,16 @@ sends by thread ID. None establishes the required atomic conditional operation.
 Consequently no production Codex adapter is implemented or claimed supported
 by this PR. Claude/Hermes adapters remain unqualified as well.
 
+The capability booleans are integration inputs, not evidence of atomicity.
+Before any real adapter is admitted, a reusable conformance suite parameterized
+over adapters must reject an observer that merely echoes the supplied target
+and an adapter that sends by thread ID without the generation precondition.
+It must exercise independently changed/missing sessions, the observation/send
+race, and mismatched receipts against the actual runtime. The synthetic fixture
+in this slice illustrates expected semantics only. Observation provenance must
+come from an independently authenticated exact-host/agent/session runtime read,
+not from message bodies, stored bindings, or a capability self-declaration.
+
 Future adapters return a receipt echoing the exact request. Accepted means only
 the app accepted the pointer, never that the model ran or completed the task.
 Stale/missing/unsupported hold. Exceptions, timeouts, malformed/mismatched
@@ -59,6 +77,11 @@ deduplication, singleton per PC/agent, capped batches and wake budgets, durable
 escalations, and restart reconciliation are still required. Cursor advancement,
 receipt, task evidence and message disposal are different transitions. Messages
 remain retained until their decisions/evidence are recorded on the Hub task.
+Escalation intent must enter a durable deduplicated queue with a per-lead wake
+budget; it is not a request to immediately send a new lead message on each hold.
+The dispatcher must revalidate records at trust boundaries. This module validates
+copy updates and revalidates inputs, but direct `model_construct` or Python object
+mutation is not an authentication mechanism and must not be exposed to peers.
 
 No daemon, logon registration, new subscription, polling, SDK runtime injection
 or migration is included. Existing listeners remain in service. Contract tests

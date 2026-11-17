@@ -3,7 +3,7 @@ import pytest
 from pydantic import ValidationError
 
 from engineering_hub.watcher_contract import (
-    AdapterCapabilities, DeliveryReceipt, SessionTarget, TaskBinding, TaskMessage,
+    AdapterCapabilities, DeliveryReceipt, DeliveryRequest, RouteDecision, SessionTarget, TaskBinding, TaskMessage,
     TaskRoute, plan_task_delivery,
 )
 
@@ -39,7 +39,7 @@ def plan(bindings=None, observed=None, capabilities=CAPABLE, msg=None):
 
 def test_exact_binding_preserves_message_and_entire_target():
     result = plan(observed=target())
-    assert (result.action, result.escalate, result.reason) == ('ready', False, 'exact_binding')
+    assert (result.action, result.escalation_intent, result.reason) == ('ready', False, 'exact_binding')
     assert result.request.message_id == MESSAGE
     assert result.request.binding == binding()
 
@@ -49,7 +49,7 @@ def test_exact_binding_preserves_message_and_entire_target():
 def test_no_task_role_or_project_fallback(change):
     result = plan(bindings=(binding(**change),), observed=target())
     assert result.reason == 'binding_missing'
-    assert result.action == 'hold' and result.escalate and result.request is None
+    assert result.action == 'hold' and result.escalation_intent and result.request is None
 
 
 def test_duplicates_hold_even_identical_targets():
@@ -61,7 +61,7 @@ def test_duplicates_hold_even_identical_targets():
 def test_stale_observation_never_retargets(change):
     result = plan(observed=target(**change))
     assert result.reason == 'session_stale'
-    assert result.action == 'hold' and result.escalate and result.request is None
+    assert result.action == 'hold' and result.escalation_intent and result.request is None
 
 
 def test_missing_session_holds():
@@ -106,6 +106,7 @@ def test_malformed_or_cross_topic_worker_message_rejected(change):
 def test_explicit_worker_escalation_requires_exact_lead_binding():
     msg = message(to_role='lead', kind='escalation')
     assert plan(msg=msg, observed=target()).reason == 'binding_missing'
+    assert plan(msg=msg, observed=target()).escalation_intent is False
     result = plan(msg=msg, bindings=(binding(role='lead'),), observed=target())
     assert result.request.binding.route.role == 'lead'
     with pytest.raises(ValidationError):
@@ -137,3 +138,51 @@ async def test_adapter_contract_rejects_restart_between_preflight_and_acceptance
     receipt = await adapter.accept_if_current(result.request)
     assert receipt.outcome == 'stale'
     assert adapter.accepted == []
+
+
+@pytest.mark.parametrize('change', [dict(request=None), dict(escalation_intent=True),
+                                    dict(reason='session_stale')])
+def test_invalid_ready_decision_rejected(change):
+    valid = plan(observed=target()).model_dump()
+    with pytest.raises(ValidationError):
+        RouteDecision(**(valid | change))
+
+
+@pytest.mark.parametrize('change', [dict(request=DeliveryRequest(message_id=MESSAGE, binding=binding())),
+                                    dict(reason='exact_binding')])
+def test_invalid_hold_decision_rejected(change):
+    with pytest.raises(ValidationError):
+        RouteDecision(**(dict(action='hold', reason='binding_missing') | change))
+
+
+@pytest.mark.parametrize('value', ['', MESSAGE[:8], '00000000-0000-0000-0000-000000000000'])
+def test_request_and_task_ids_require_full_non_nil_uuid(value):
+    with pytest.raises(ValidationError):
+        DeliveryRequest(message_id=value, binding=binding())
+    with pytest.raises(ValidationError):
+        binding(task_id=value)
+
+
+@pytest.mark.parametrize('field', ['host_id', 'session_id', 'generation'])
+@pytest.mark.parametrize('suffix', ['\x7f', '\u2028', '\u2029', '\u200b', '\ufeff'])
+def test_opaque_ids_reject_invisible_characters(field, suffix):
+    with pytest.raises(ValidationError):
+        target(**{field: 'visible' + suffix})
+
+
+def test_same_role_wake_is_invalid():
+    with pytest.raises(ValidationError):
+        message(from_role='owner')
+
+
+def test_copy_updates_and_unsafe_construct_revalidated():
+    with pytest.raises(ValidationError):
+        target().model_copy(update={'generation': ''})
+    with pytest.raises(ValidationError):
+        plan(observed=target()).model_copy(update={'request': None})
+    with pytest.raises(ValidationError):
+        plan(observed=SessionTarget.model_construct(**(target().model_dump() | {'generation': ''})))
+    with pytest.raises(ValidationError):
+        unsafe = TaskBinding.model_construct(route=binding().route,
+                                             target=SessionTarget.model_construct(**(target().model_dump() | {'generation': ''})))
+        plan(bindings=(unsafe,), observed=target())
