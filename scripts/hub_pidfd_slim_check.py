@@ -7,18 +7,26 @@ throwaway container (source mounted read-only, copied inside) and FAILS if the b
 missing, if any test in the module is skipped, or if none ran. Used by
 .github/workflows/hub-control.yml and scripts/local_premerge.py.
 Needs Docker and network access to PyPI for the locked test dependencies.
+The container has an owned name and label; on timeout, Ctrl+C or any error it
+is removed and verified gone, or the check fails naming what is left.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
-import subprocess
+import re
 import sys
+import tempfile
+import uuid
+
+from owned_cleanup import Cancelled, CleanupError, StepTimeout, remove_containers, run_owned
 
 IMAGE = 'python:3.12-slim'
 MODULE = 'tests/test_hub_container_executor_launch_supervisor.py'
 MARKER = 'EH_PIDFD_RESULT='
+OWNER_LABEL = 'eh.pidfd-check.owner'
 INNER = r'''
 set -eu
 python -m pip install -q --no-cache-dir --root-user-action=ignore uv==0.11.17
@@ -49,23 +57,42 @@ def main():
     parser.add_argument('--image', default=IMAGE)
     parser.add_argument('--cpus', help='optional docker --cpus limit')
     parser.add_argument('--memory', help='optional docker --memory limit')
+    parser.add_argument('--owner', default=None,
+                        help='owner token for the container name/label (default: random)')
+    parser.add_argument('--timeout', type=float, default=900, help='seconds before the container is removed')
+    parser.add_argument('--stand-in-sleep', type=int, default=None,
+                        help='cleanup self-test only: sleep instead of testing (always reported as FAIL)')
     args = parser.parse_args()
     source = Path(args.source).resolve()
     if not (source / MODULE).is_file():
         raise SystemExit(f'{MODULE} not found under {source}')
+    owner = args.owner or uuid.uuid4().hex
+    if not re.fullmatch(r'[a-z0-9-]{8,64}', owner):
+        raise SystemExit('--owner must be 8-64 lowercase letters, digits or dashes')
+    name = 'eh-pidfd-' + owner
+    label = f'{OWNER_LABEL}={owner}'
     limits = (['--cpus', args.cpus] if args.cpus else []) + (['--memory', args.memory] if args.memory else [])
-    command = ['docker', 'run', '--rm', '--user', '0:0', *limits,
+    inner = INNER if args.stand_in_sleep is None else f'sleep {int(args.stand_in_sleep)}'
+    command = ['docker', 'run', '--rm', '--name', name, '--label', label, '--user', '0:0', *limits,
                '--mount', f'type=bind,source={source},target=/src,readonly',
                '-e', 'PYTHONDONTWRITEBYTECODE=1', '-e', 'UV_PROJECT_ENVIRONMENT=/tmp/eh-venv',
                '-e', 'UV_PYTHON_DOWNLOADS=never', '-e', 'UV_LINK_MODE=copy',
-               args.image, 'sh', '-c', INNER]
-    result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8',
-                            errors='replace', timeout=900)
-    sys.stdout.write(result.stdout)
-    sys.stderr.write(result.stderr)
-    lines = [line for line in result.stdout.splitlines() if line.startswith(MARKER)]
-    if result.returncode or not lines:
-        raise SystemExit(f'pidfd slim check did not complete (docker exit {result.returncode})')
+               args.image, 'sh', '-c', inner]
+    with tempfile.TemporaryDirectory(prefix='eh-pidfd-') as scratch:
+        log = os.path.join(scratch, 'docker.log')
+        try:
+            code, output = run_owned(command, log_path=log, timeout=args.timeout,
+                                     after=lambda killed: remove_containers('docker', [f'label={label}']))
+        except CleanupError as error:
+            sys.stdout.write(open(log, encoding='utf-8', errors='replace').read())
+            raise SystemExit(f'FAIL: {error}; remove it with: docker rm -f {name}') from None
+        except (StepTimeout, Cancelled) as error:
+            sys.stdout.write(open(log, encoding='utf-8', errors='replace').read())
+            raise SystemExit(f'FAIL: {type(error).__name__} ({error}); container {name} removed and verified gone') from None
+    sys.stdout.write(output)
+    lines = [line for line in output.splitlines() if line.startswith(MARKER)]
+    if code or not lines:
+        raise SystemExit(f'FAIL: pidfd slim check did not complete (docker exit {code})')
     report = json.loads(lines[-1][len(MARKER):])
     problems = []
     if not report['pidfd_open']:
