@@ -126,3 +126,26 @@ def test_backlog_task_create_update_and_compact_overview(hub):
     assert task["notes_count"] == 1 and not {"acceptance", "notes", "request_text"} & task.keys()
     full = call(client, "hub_task_get", {"task_id": created["id"]})["structuredContent"]
     assert full["acceptance"] == ["Visible in the Work page"] and full["request_text"] == "Original request"
+
+
+def test_task_update_question_options_retract_and_field_errors(hub):
+    client, repo = hub
+    task = call(client, "hub_task_create", {"project": "3d-viewer", "title": "Q", "client_request_id": "q1",
+                                            "assignee": "codex"})["structuredContent"]
+    base = {"task_id": task["id"], "expected_revision": 1, "status": "waiting_on_beau", "waiting_type": "decision",
+            "waiting_text": "Which way?"}
+    missing = call(client, "hub_task_update", {**base, "client_request_id": "q2"})
+    assert missing["isError"] is True and "waiting_options_required: waiting.options (limit 3)" in missing["content"][0]["text"]
+    asked = call(client, "hub_task_update", {**base, "client_request_id": "q3", "waiting_level": "later",
+                                             "waiting_options": [{"label": "A"}, {"label": "B", "detail": "Slower"}, {"label": "C"}],
+                                             "waiting_recommended": 2, "waiting_reason": "Cheapest"})["structuredContent"]
+    assert asked["waiting_on"]["options"][1] == {"label": "B", "detail": "Slower"}
+    assert asked["waiting_on"]["recommended"] == 2 and asked["waiting_on"]["level"] == "later"
+    long_note = call(client, "hub_task_update", {"task_id": task["id"], "expected_revision": 2, "client_request_id": "q4",
+                                                 "note": "x" * 501})
+    assert "invalid_input: note (limit 500)" in long_note["content"][0]["text"]
+    back = call(client, "hub_task_update", {"task_id": task["id"], "expected_revision": 2, "client_request_id": "q5",
+                                            "retract_reason": "Settled in chat"})["structuredContent"]
+    assert back["status"] == "assigned" and back["waiting_retracted"]["reason"] == "Settled in chat"
+    full = call(client, "hub_task_get", {"task_id": task["id"]})["structuredContent"]
+    assert full["waiting_retracted"]["by"] == "codex"

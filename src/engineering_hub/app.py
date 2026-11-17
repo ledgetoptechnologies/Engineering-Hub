@@ -151,6 +151,20 @@ class Input(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
+_LIMITS = {"string_too_long": "max_length", "string_too_short": "min_length", "too_long": "max_length",
+           "too_short": "min_length", "less_than_equal": "le", "greater_than_equal": "ge"}
+
+
+def validation_detail(errors):
+    """invalid_input plus the first bounded field and its limit; never the submitted value or unknown keys."""
+    for error in errors:
+        bound = _LIMITS.get(error.get("type"))
+        if bound and bound in (error.get("ctx") or {}):
+            field = ".".join(str(part) for part in error["loc"][1:] if not isinstance(part, int))
+            return {"code": "invalid_input", "field": field, "limit": error["ctx"][bound]}
+    return {"code": "invalid_input"}
+
+
 class NewTask(Input):
     project: str = Field(min_length=1, max_length=100)
     title: str = Field(min_length=1, max_length=200)
@@ -195,9 +209,19 @@ class EntityContext(Revision):
     links: list[dict[str, str]] | None = Field(default=None, max_length=8)
 
 
+class WaitingOption(Input):
+    label: str = Field(min_length=1, max_length=80)
+    detail: str | None = Field(default=None, max_length=160)
+
+
 class WaitingItem(Input):
     type: Literal["decision", "action"]
     text: str = Field(min_length=1, max_length=300)
+    # An agent's decision needs exactly three options and the index of the one it recommends.
+    options: list[WaitingOption] | None = Field(default=None, min_length=3, max_length=3)
+    recommended: int | None = Field(default=None, ge=0, le=2)
+    recommended_reason: str | None = Field(default=None, max_length=160)
+    level: Literal["now", "later"] | None = None
 
 
 class TaskUpdate(Revision):
@@ -212,10 +236,28 @@ class TaskUpdate(Revision):
     status: Literal["waiting_on_beau", "done", "assigned", "claimed", "in_review", "verified"] | None = None
     waiting: WaitingItem | None = None
     evidence: str | None = Field(default=None, max_length=2000)
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    # Take back an item your family raised (or on a task you own); distinct from Beau's answer.
+    retract_reason: str | None = Field(default=None, min_length=1, max_length=500)
 
 
 class ResolveWaiting(Revision):
     note: str | None = Field(default=None, max_length=2000)
+    option: int | None = Field(default=None, ge=0, le=2)
+    answer: str | None = Field(default=None, min_length=1, max_length=2000)
+    dismiss: bool = False
+
+
+class ResolveWaitingItem(ResolveWaiting):
+    task_id: str = Field(pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+class ResolveWaitingMany(Input):
+    items: list[ResolveWaitingItem] = Field(min_length=1, max_length=50)
+
+
+class WaitingLevel(Revision):
+    level: Literal["now", "later"]
 
 
 class Withdraw(Revision):
@@ -745,11 +787,11 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
 
     @app.exception_handler(HubError)
     async def domain_error(request, error):
-        return JSONResponse({"detail": {"code": error.code}}, status_code=error.status)
+        return JSONResponse({"detail": error.detail}, status_code=error.status)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, error):
-        return JSONResponse({"detail": {"code": "invalid_input"}}, status_code=422)
+        return JSONResponse({"detail": validation_detail(error.errors())}, status_code=422)
 
     def human(request: Request, *, mutation=False):
         if request.headers.get("authorization"):
@@ -1073,12 +1115,23 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                                 details=payload.details, links=payload.links, acceptance=payload.acceptance,
                                 owner=payload.assignee, reviewer=payload.assigned_reviewer, note=payload.note,
                                 status=payload.status, evidence=payload.evidence,
-                                waiting=payload.waiting.model_dump() if payload.waiting else None,
-                                client_request_id=payload.client_request_id)
+                                waiting=payload.waiting.model_dump(exclude_none=True) if payload.waiting else None,
+                                client_request_id=payload.client_request_id, title=payload.title,
+                                retract_reason=payload.retract_reason)
 
     @app.post('/api/hub/v1/tasks/{task_id}/resolve-waiting', response_model=TaskDTO, response_model_exclude_unset=True)
     def resolve_waiting(task_id: str, payload: ResolveWaiting, request: Request):
-        return repo.resolve_waiting(human(request, mutation=True), task_id, payload.expected_revision, payload.note)
+        return repo.resolve_waiting(human(request, mutation=True), task_id, payload.expected_revision, payload.note,
+                                    option=payload.option, answer=payload.answer, dismiss=payload.dismiss)
+
+    @app.post('/api/hub/v1/tasks/resolve-waiting', response_model=TaskListDTO, response_model_exclude_unset=True)
+    def resolve_waiting_many(payload: ResolveWaitingMany, request: Request):
+        actor_id = human(request, mutation=True)
+        return {"items": repo.resolve_waiting_many(actor_id, [item.model_dump(exclude_none=True) for item in payload.items])}
+
+    @app.post('/api/hub/v1/tasks/{task_id}/waiting-level', response_model=TaskDTO, response_model_exclude_unset=True)
+    def set_waiting_level(task_id: str, payload: WaitingLevel, request: Request):
+        return repo.set_waiting_level(human(request, mutation=True), task_id, payload.expected_revision, payload.level)
 
     @app.post('/api/hub/v1/tasks/{task_id}/context', response_model=TaskDTO, response_model_exclude_unset=True)
     def update_task_context(task_id: str, payload: EntityContext, request: Request):

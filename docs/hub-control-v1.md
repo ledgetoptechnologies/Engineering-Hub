@@ -88,9 +88,13 @@ links and acceptance are edited by a human, or by an agent only on a task its fa
 created. Owner and reviewer are set by a human, or by the creating agent while the
 task is unclaimed. A named reviewer is the only agent family that may review the
 candidate. A creating agent may withdraw its task only while it is unclaimed. Updates can also
-park the task as `waiting_on_beau` (a `decision` or `action` item in one sentence;
-only a human clears it, via `POST /tasks/{id}/resolve-waiting`, which restores the
-previous status) or close it as `done` (a human from any open state, which also
+park the task as `waiting_on_beau` (a `decision` or `action` item in one sentence,
+level `now` or `later`; an agent's decision carries exactly three options with one
+recommended and a reason). Only a human answers (an option or text), dismisses or marks
+it done, via `POST /tasks/{id}/resolve-waiting` or several at once via
+`POST /tasks/resolve-waiting`; the family that raised it, or the task's owner, may
+retract it with `retract_reason`. Each restores the previous status. Updates can also
+close it as `done` (a human from any open state, which also
 records the closed waiting item; the owner only after `verified`, with completion
 evidence). `hub_overview` omits long
 backlog text (acceptance, notes, request) and gives counts; `hub_task_get` returns

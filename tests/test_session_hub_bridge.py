@@ -742,9 +742,24 @@ def test_installation_backlog_create_and_update_are_family_scoped(env):
             actor, task['id'], 2, status='done', evidence='Not the owner'))
     claimed = call(env, codex, 'hub_task_claim', lambda actor: env.repo.claim_task(actor, task['id'], 2))
     assert claimed['owner_family'] == 'codex'
+    with pytest.raises(HubError, match='waiting_options_required'):
+        call(env, codex, 'hub_task_update', lambda actor: env.repo.update_task(
+            actor, task['id'], 3, status='waiting_on_beau', waiting={'type': 'decision', 'text': 'Which name?'}))
+    question = {'type': 'decision', 'text': 'Which name?', 'options': [{'label': 'A'}, {'label': 'B'}, {'label': 'C'}],
+                'recommended': 0, 'recommended_reason': 'Shortest'}
     waiting = call(env, codex, 'hub_task_update', lambda actor: env.repo.update_task(
-        actor, task['id'], 3, status='waiting_on_beau', waiting={'type': 'decision', 'text': 'Which name?'}))
-    assert waiting['waiting_on']['previous_status'] == 'claimed'
+        actor, task['id'], 3, status='waiting_on_beau', waiting=question))
+    assert waiting['waiting_on']['previous_status'] == 'claimed' and waiting['waiting_on']['by_family'] == 'codex'
+    # The raising installation cannot answer or dismiss; another family's installation cannot retract.
+    for resolve in (lambda actor: env.repo.resolve_waiting(actor, task['id'], 4, option=0),
+                    lambda actor: env.repo.resolve_waiting_many(actor, [dict(task_id=task['id'], expected_revision=4, dismiss=True)])):
+        with pytest.raises(HubError, match='forbidden'):
+            call(env, codex, 'hub_task_update', resolve)
+    with pytest.raises(HubError, match='forbidden'):
+        call(env, claude, 'hub_task_update', lambda actor: env.repo.update_task(actor, task['id'], 4, retract_reason='Not mine'))
+    retracted = call(env, codex, 'hub_task_update', lambda actor: env.repo.update_task(
+        actor, task['id'], 4, retract_reason='Settled in chat'))
+    assert retracted['status'] == 'claimed' and retracted['waiting_retracted']['by'].startswith('installation:')
     assert TOOLS['hub_task_create'] == 'task.create' and TOOLS['hub_task_update'] == 'task.update'
 
 
