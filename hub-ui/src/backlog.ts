@@ -1,9 +1,12 @@
 /** Backlog views over tasks: what waits on Beau, what is still moving, and the Work page filters. */
 import type { Task } from "./types";
 
-/** Tasks parked on Beau with a decision or action item he must clear. */
-export const waitingTasks = (tasks: Task[], project?: string) =>
-  tasks.filter((task) => task.status === "waiting_on_beau" && !!task.waiting_on && (!project || task.project === project));
+export const waitingLevel = (task: Task) => task.waiting_on?.level ?? "now";
+
+/** Tasks parked on Beau with an item he must clear; counts use the "now" level, "later" items wait behind them. */
+export const waitingTasks = (tasks: Task[], project?: string, level: "now" | "later" = "now") =>
+  tasks.filter((task) => task.status === "waiting_on_beau" && !!task.waiting_on && (!project || task.project === project)
+    && waitingLevel(task) === level);
 
 /** Still in motion: not review-passed, done or withdrawn. */
 export const isActive = (task: Task) => !["verified", "done", "withdrawn"].includes(task.status);

@@ -604,9 +604,16 @@ export function HubApp() {
       setDecisionChoices((previous) => ({ ...previous, [decision.id]: { revision: decision.revision, answer } })),
     recordDecision: (event: FormEvent<HTMLFormElement>, decision: Decision) => void recordDecision(event, decision),
     requestPause: (paused: boolean) => setPauseChoice(paused),
-    resolveWaiting: (task, note) => mutate(
-      () => client.resolveWaiting(task.id, task.revision, note, session!.csrf_token!),
-      task.waiting_on?.type === "decision" ? "Answer recorded." : "Marked done."),
+    resolveWaiting: (task, resolution) => mutate(
+      () => client.resolveWaiting(task.id, task.revision, resolution, session!.csrf_token!),
+      resolution.dismiss ? "Dismissed." : task.waiting_on?.type === "decision" ? "Answer recorded." : "Marked done."),
+    resolveWaitingMany: (items) => mutate(
+      () => client.resolveWaitingMany(items.map(({ task, resolution }) => ({ id: task.id, revision: task.revision, resolution })),
+        session!.csrf_token!),
+      `${items.length} ${items.length === 1 ? "item" : "items"} cleared.`),
+    setWaitingLevel: (task, level) => mutate(
+      () => client.setWaitingLevel(task.id, task.revision, level, session!.csrf_token!),
+      level === "later" ? "Moved to later." : "Moved to now."),
     withdraw: (kind, item, reason, supersededBy) => mutate(
       () => client.withdraw(kind, item.id, item.revision, reason, supersededBy, session!.csrf_token!),
       kind === "task" ? "Task withdrawn. It is kept under Withdrawn with its history." : "Question withdrawn. It is kept under Withdrawn with its history."),

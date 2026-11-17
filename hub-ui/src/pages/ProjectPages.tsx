@@ -18,8 +18,8 @@ import { ArchiveProjectDialog, ProjectEditorDialog, STATUS_LABEL, STATUS_TONE } 
 import { safeHref } from "../markdown";
 import type { Project } from "../types";
 import { readProject } from "../projectsApi";
-import { isActive, waitingItemKey, waitingKind, waitingTasks } from "../backlog";
-import { WaitingItemCard } from "./WorkPages";
+import { isActive, waitingKind, waitingTasks } from "../backlog";
+import { WaitingItemList } from "./WorkPages";
 import { ComponentsPanel, GroupedProjectsPanel } from "../ComponentsPanel";
 import { ReviewsPanel } from "../ReviewsPanel";
 
@@ -430,10 +430,8 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
 
       {tab === "decisions" && (
         <section className="panel decisions" aria-label={`${project.name} decisions`}>
-          {stats.items.length > 0 && (
-            <div className="decision-list">{stats.items.map((task) => <WaitingItemCard key={waitingItemKey(task)} hub={projectHub} task={task} />)}</div>
-          )}
-          {(stats.waiting.length > 0 || stats.items.length === 0) && (
+          <WaitingItemList hub={projectHub} tasks={stats.items} later={waitingTasks(hub.data.tasks, id, "later")} />
+          {(stats.waiting.length > 0 || stats.items.length + waitingTasks(hub.data.tasks, id, "later").length === 0) && (
             <DecisionList hub={projectHub} decisions={stats.waiting} emptyNote="No open questions for this project." />
           )}
           <RecentAnswers hub={hub} decisions={answeredDecisions(hub, id, 10)} />

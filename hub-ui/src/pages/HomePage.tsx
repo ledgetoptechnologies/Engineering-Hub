@@ -153,7 +153,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
           </div>
           <ul className="project-mini">
             {projects.map((project) => {
-              const open = openDecisions(hub, project.id).length;
+              const open = openDecisions(hub, project.id).length + waitingTasks(hub.data.tasks, project.id).length;
               const work = hub.data.tasks.filter((task) => task.project === project.id && isActive(task)).length;
               return (
                 <li key={project.id}>

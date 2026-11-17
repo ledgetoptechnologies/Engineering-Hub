@@ -25,10 +25,16 @@ async function fixture(page: Page, tasks: Task[]) {
     if (path.endsWith("/peers")) return respond(createDemoTopic("auto-wake-v1-test"));
     if (path.endsWith("/work/status")) return respond({}, 423);
     if (path.endsWith("/resolve-waiting") && request.method() === "POST") {
-      state.posts.push({ path, body: request.postDataJSON() as Record<string, unknown> });
-      const task = overview.tasks.find((item) => path.includes(item.id))!;
-      const { waiting_on, ...rest } = task;
-      return respond({ ...rest, status: waiting_on!.previous_status, revision: task.revision + 1 });
+      const body = request.postDataJSON() as Record<string, unknown>;
+      state.posts.push({ path, body });
+      const cleared = (id: string) => {
+        const { waiting_on, ...rest } = overview.tasks.find((item) => item.id === id)!;
+        overview.tasks = overview.tasks.filter((item) => item.id !== id);
+        return { ...rest, status: waiting_on!.previous_status, revision: rest.revision + 1 };
+      };
+      if (path.endsWith("/tasks/resolve-waiting"))
+        return respond({ items: (body.items as { task_id: string }[]).map((item) => cleared(item.task_id)) });
+      return respond(cleared(overview.tasks.find((item) => path.includes(item.id))!.id));
     }
     if (request.method() === "GET") return respond({ items: [] });
     return respond({ detail: { code: "gateway_route_forbidden" } }, 403);
@@ -52,7 +58,7 @@ test("a draft written for one waiting item is not sent as the answer to the next
   await card.getByRole("textbox").fill("Answer for B");
   await card.getByRole("button", { name: "Send answer" }).click();
   await expect.poll(() => state.posts).toEqual([{ path: `/api/hub/v1/tasks/${TASK}/resolve-waiting`,
-    body: { expected_revision: 5, note: "Answer for B" } }]);
+    body: { expected_revision: 5, answer: "Answer for B" } }]);
 });
 
 test("the project board shows waiting tasks and the project's Needs you count includes them", async ({ page }) => {
@@ -73,4 +79,53 @@ test("the project board shows waiting tasks and the project's Needs you count in
   await expect(page.locator(".stat-row")).toContainText("Done");
   await page.goto("/#/projects/engineering-hub/decisions");
   await expect(page.locator("form.waiting-item")).toContainText("Item A: which domain?");
+});
+
+const question = (id: string, text: string, revision = 2): Task => ({
+  ...waitingTask(text, "2026-11-17T10:00:00+00:00", revision), id, title: `Task ${id.slice(-2)}`,
+  waiting_on: { type: "decision", text, previous_status: "claimed", by: "claude", at: "2026-11-17T10:00:00+00:00",
+    options: [{ label: "Keep it" }, { label: "Split it", detail: "Two PRs" }, { label: "Drop it" }],
+    recommended: 1, recommended_reason: "Smaller reviews" },
+});
+const ids = ["11111111-2222-4333-8444-0000000000c1", "11111111-2222-4333-8444-0000000000c2",
+  "11111111-2222-4333-8444-0000000000c3", "11111111-2222-4333-8444-0000000000c4", "11111111-2222-4333-8444-0000000000c5"];
+
+test("questions are answered by option or text, dismissed, and cleared in bulk from the Inbox", async ({ page }) => {
+  const { state } = await fixture(page, ids.map((id, index) => question(id, `Question ${index + 1}?`)));
+  await page.setViewportSize({ width: 390, height: 900 });
+  await page.goto("/#/inbox");
+  const card = (text: string) => page.locator("form.waiting-item", { hasText: text });
+  await expect(card("Question 1?").locator(".waiting-option.recommended")).toContainText("Split it");
+  await expect(card("Question 1?")).toContainText("Smaller reviews");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await card("Question 1?").getByRole("button", { name: /Keep it/ }).click();
+  await expect(card("Question 1?")).toHaveCount(0);
+  await card("Question 2?").getByRole("textbox").fill("Ship it behind a flag");
+  await card("Question 2?").getByRole("button", { name: "Send answer" }).click();
+  await expect(card("Question 2?")).toHaveCount(0);
+  await card("Question 3?").getByRole("textbox").fill("Not needed");
+  await card("Question 3?").getByRole("button", { name: "Dismiss" }).click();
+  await expect(card("Question 3?")).toHaveCount(0);
+  await page.getByRole("checkbox", { name: "Select: Question 4?" }).check();
+  await page.getByRole("checkbox", { name: "Select: Question 5?" }).check();
+  await page.getByRole("group", { name: "Selected items" }).getByRole("button", { name: "Accept recommended" }).click();
+  await expect(page.locator("form.waiting-item")).toHaveCount(0);
+  const path = (id: string) => `/api/hub/v1/tasks/${id}/resolve-waiting`;
+  expect(state.posts).toEqual([
+    { path: path(ids[0]), body: { expected_revision: 2, option: 0 } },
+    { path: path(ids[1]), body: { expected_revision: 2, answer: "Ship it behind a flag" } },
+    { path: path(ids[2]), body: { expected_revision: 2, note: "Not needed", dismiss: true } },
+    { path: "/api/hub/v1/tasks/resolve-waiting", body: { items: [
+      { task_id: ids[3], expected_revision: 2, option: 1 }, { task_id: ids[4], expected_revision: 2, option: 1 }] } },
+  ]);
+});
+
+test("later items stay out of the Needs you count until expanded", async ({ page }) => {
+  const later = { ...question(ids[1], "Later question?"), waiting_on: { ...question(ids[1], "Later question?").waiting_on!, level: "later" as const } };
+  await fixture(page, [question(ids[0], "Now question?"), later]);
+  await page.goto("/#/inbox");
+  await expect(page.locator("#task-items .count").first()).toHaveText("1");
+  await expect(page.locator("form.waiting-item", { hasText: "Later question?" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Later 1" }).click();
+  await expect(page.locator("form.waiting-item", { hasText: "Later question?" })).toBeVisible();
 });
