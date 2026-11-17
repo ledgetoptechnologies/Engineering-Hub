@@ -314,7 +314,8 @@ def backend(run, wsl_dir, tar):
         script = (CONTRACT_SCRIPT.replace('__DIR__', wsl_dir).replace('__VENV__', run.args.wsl_venv)
                   .replace('__WINSRC__', to_wsl(run.src)))
         ok, output = wsl(run, contract, script, timeout=300)
-        last = (output.strip().splitlines() or ['no output'])[-1]
+        lines = [l for l in output.strip().splitlines() if l.strip() and not l.startswith('[')]
+        last = (lines or ['no output'])[-1]
         return (PASS if ok else FAIL), last[:120]
 
     run.timed(contract, check_contract)
