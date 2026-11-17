@@ -47,11 +47,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', default='.', help='Repository checkout to mount read-only')
     parser.add_argument('--image', default=IMAGE)
+    parser.add_argument('--cpus', help='optional docker --cpus limit')
+    parser.add_argument('--memory', help='optional docker --memory limit')
     args = parser.parse_args()
     source = Path(args.source).resolve()
     if not (source / MODULE).is_file():
         raise SystemExit(f'{MODULE} not found under {source}')
-    command = ['docker', 'run', '--rm', '--user', '0:0',
+    limits = (['--cpus', args.cpus] if args.cpus else []) + (['--memory', args.memory] if args.memory else [])
+    command = ['docker', 'run', '--rm', '--user', '0:0', *limits,
                '--mount', f'type=bind,source={source},target=/src,readonly',
                '-e', 'PYTHONDONTWRITEBYTECODE=1', '-e', 'UV_PROJECT_ENVIRONMENT=/tmp/eh-venv',
                '-e', 'UV_PYTHON_DOWNLOADS=never', '-e', 'UV_LINK_MODE=copy',

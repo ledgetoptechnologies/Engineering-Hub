@@ -109,6 +109,13 @@ class Run:
         return result == PASS
 
 
+def port_open(port):
+    import socket
+    with socket.socket() as sock:
+        sock.settimeout(1)
+        return sock.connect_ex(('127.0.0.1', port)) == 0
+
+
 def git(*args):
     return subprocess.run(['git', '-C', str(REPO), *args], check=True, capture_output=True,
                           text=True).stdout.strip()
@@ -154,10 +161,11 @@ D="__DIR__"
 rm -rf "$D"; mkdir -p "$D/src" "$D/bin" "$D/tmp"
 tar -xf "__TAR__" -C "$D/src"
 . "__VENV__/bin/activate"
-unset PYTHONPATH
+# No pip install -e: the venv is shared, so an editable install from another
+# tree (or a concurrent run) could leak into subprocesses. Pin this snapshot.
+export PYTHONPATH="$D/src/src:$D/src"
 cd "$D/src"
-pip install -q --no-deps -e . >/dev/null
-python -c "import os,sys; print('EH_PY', sys.version.split()[0], 'pidfd_open=%s' % hasattr(os,'pidfd_open'), 'uid=%d' % os.getuid())"
+python -c "import os,sys,engineering_hub; print('EH_PY', sys.version.split()[0], 'pidfd_open=%s' % hasattr(os,'pidfd_open'), 'uid=%d' % os.getuid()); assert engineering_hub.__file__.startswith(os.environ['PWD'] + '/src/'), 'engineering_hub imported from ' + engineering_hub.__file__"
 python -W default -m pytest -q -p no:cacheprovider --basetemp "$D/tmp" -rs --junitxml "__JUNIT__"
 '''
 
@@ -167,7 +175,7 @@ mkdir -p "$D/bin"
 NODE="$(command -v node || command -v node.exe || echo '/mnt/c/Program Files/nodejs/node.exe')"
 ln -sf "$NODE" "$D/bin/node"
 . "__VENV__/bin/activate"
-unset PYTHONPATH
+export PYTHONPATH="$D/src/src:$D/src"
 export PATH="$D/bin:$PATH"
 cd "__WINSRC__"
 "$D/bin/node" --version
@@ -273,7 +281,10 @@ def ui_and_docker(run):
             ok, output = run.execute(run.steps['e2e'], argv, cwd=ui_dir, env=env, timeout=1800)
             found = re.findall(r'(\d+) (passed|failed|flaky|skipped)', output)
             detail = ', '.join(f'{n} {k}' for n, k in found[-4:]) or 'no result line'
-            return (PASS if ok else FAIL), f'{detail} (Edge channel, {run.args.e2e_workers} workers)'
+            detail += f' (Edge channel, {run.args.e2e_workers} worker(s))'
+            if port_open(5174):  # playwright.config.ts webServer port
+                return FAIL, detail + '; dev server still listening on 5174 afterwards'
+            return (PASS if ok else FAIL), detail
 
         if run.timed(run.steps['ui'], ui):
             run.timed(run.steps['e2e'], e2e)
@@ -317,7 +328,8 @@ def ui_and_docker(run):
 
     def pidfd_slim():
         ok, output = run.execute(run.steps['pidfd-slim'], [sys.executable, '-B',
-                                 'scripts/hub_pidfd_slim_check.py', '--source', str(run.src)],
+                                 'scripts/hub_pidfd_slim_check.py', '--source', str(run.src),
+                                 '--cpus', run.args.docker_cpus, '--memory', run.args.docker_memory],
                                  cwd=run.src, env=env, timeout=900)
         line = [l for l in output.splitlines() if l.startswith('pidfd slim check:') or l.startswith('FAIL')]
         return (PASS if ok else FAIL), (line[-1] if line else 'no result line')[18:].strip()
@@ -337,9 +349,12 @@ def main():
     parser.add_argument('--ref', default='HEAD', help='commit to test (default HEAD)')
     parser.add_argument('--wsl-distro', default='Ubuntu-24.04')
     parser.add_argument('--wsl-venv', default='/root/.venvs/eh-test')
-    parser.add_argument('--e2e-workers', type=int, default=4, help='Playwright workers (CI runs 1 alongside pytest)')
+    parser.add_argument('--e2e-workers', type=int, default=1, help='Playwright workers (default 1, as CI)')
+    parser.add_argument('--docker-cpus', default='2', help='CPU limit for the pidfd container (default 2)')
+    parser.add_argument('--docker-memory', default='4g', help='memory limit for the pidfd container (default 4g)')
     parser.add_argument('--skip-docker', action='store_true', help='report image steps as NOT RUN')
-    parser.add_argument('--serial', action='store_true', help='do not run WSL and Windows steps concurrently')
+    parser.add_argument('--parallel', action='store_true',
+                        help='run the WSL backend concurrently with the Windows/Docker steps (default: one heavy step at a time)')
     parser.add_argument('--keep', action='store_true', help='keep work dirs and the built image')
     parser.add_argument('--work-dir', default=None)
     args = parser.parse_args()
@@ -370,7 +385,7 @@ def main():
 
     say(f'Local pre-merge run for {commit} ({subject}); logs in {work}')
     tar = work / 'source.tar'
-    subprocess.run(['git', '-C', str(REPO), '-c', 'core.autocrlf=false', 'archive', '--format=tar',
+    subprocess.run(['git', '-C', str(REPO), '-c', 'core.autocrlf=false', '-c', 'core.eol=lf', 'archive', '--format=tar',
                     '-o', str(tar), commit], check=True)
     run.src.mkdir()
     with tarfile.open(tar) as archive:
@@ -378,7 +393,7 @@ def main():
     wsl_dir = f'/root/eh-premerge/{commit[:12]}-{nonce}'
 
     started = time.monotonic()
-    if args.serial:
+    if not args.parallel:
         backend(run, wsl_dir, tar)
         ui_and_docker(run)
     else:
@@ -399,7 +414,7 @@ def main():
              f'- host: Windows {platform.version()}; WSL {args.wsl_distro} Python {py[0] if py else "?"}'
              f' (uid {py[2] if py else "?"}, os.pidfd_open={py[1] if py else "?"}); node {node};'
              f' Docker {run.docker_version or "unavailable"}',
-             f'- wall time: {fmt(wall)} (WSL and Windows steps {"serial" if args.serial else "concurrent"})',
+             f'- wall time: {fmt(wall)} (steps {"concurrent" if args.parallel else "one at a time"})',
              '', '| step | result | time | detail |', '|---|---|---|---|']
     for s in run.steps.values():
         lines.append(f'| {s.label} | {s.result} | {fmt(s.seconds)} | {s.detail} |')
