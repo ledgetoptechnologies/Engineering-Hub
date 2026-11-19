@@ -389,3 +389,19 @@ async def test_malformed_health_on_a_matching_target_is_unknown(service,health):
     desk=result['devices'][0]
     # Scrape time is still real, so freshness is reported; up is unknown, never false.
     assert desk['up'] is None and desk['state']=='fresh' and result['source']=={'status':'ok'}
+
+
+@pytest.mark.asyncio
+async def test_more_disks_than_the_cap_keeps_the_fullest(service,monkeypatch):
+    from engineering_hub.infrastructure_metrics import MAX_DISKS
+    names=[f'{chr(ord("A")+index)}:' for index in range(MAX_DISKS+1)]
+    # Every volume is 10% used except the last by name, which is 95% used.
+    free={name:('5' if name==names[-1] else '90') for name in names}
+    series={**SERIES,'disk_size':[sample('100',**W,volume=name) for name in names],
+            'disk_free':[sample(free[name],**W,volume=name) for name in names]}
+    monkeypatch.setattr(sys.modules[__name__],'SERIES',series)
+    result=await reader(service,handler_for(),[MAPPINGS[0]]).read('human:1')
+    mounts=[disk['mount'] for disk in result['devices'][0]['disks']]
+    assert len(mounts)==MAX_DISKS and names[-1] in mounts, 'the nearly full disk must not be cut by name'
+    assert mounts==sorted(mounts)
+

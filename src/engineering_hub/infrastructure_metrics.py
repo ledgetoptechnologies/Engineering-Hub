@@ -259,7 +259,12 @@ class MetricsReader:
         sizes,free=by('disk_size'),by('disk_free')
         disks=[{'mount':name,'size_bytes':size,'free_bytes':free.get(name)} for name,size in sizes.items() if size>0]
         disks=[disk for disk in disks if disk['free_bytes'] is None or disk['free_bytes']<=disk['size_bytes']]
-        return sorted(disks,key=lambda disk:disk['mount'])[:MAX_DISKS]
+        # Keep the fullest disks when there are more than the cap, so the one nearest full is never
+        # dropped for sorting late by name. Unknown free space counts as least full.
+        def used(disk):
+            return -1.0 if disk['free_bytes'] is None else 1-disk['free_bytes']/disk['size_bytes']
+        kept=sorted(disks,key=lambda disk:(-used(disk),disk['mount']))[:MAX_DISKS]
+        return sorted(kept,key=lambda disk:disk['mount'])
 
     def _processes(self,results,mapping):
         counts={}

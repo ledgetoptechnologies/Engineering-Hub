@@ -85,6 +85,24 @@ async def test_history_keeps_gaps_as_null_and_splits_disks_by_mount():
 
 
 @pytest.mark.asyncio
+async def test_history_with_more_disks_than_the_cap_keeps_the_fullest():
+    from engineering_hub.infrastructure_metrics import MAX_DISKS
+    names = [f'/m{index:02d}' for index in range(MAX_DISKS + 1)]
+
+    def values(query, params):
+        start = int(params['start'][0])
+        if 'node_filesystem' in query:
+            # The last mount by name is the fullest by its latest reading.
+            return [{'metric': {'mountpoint': name},
+                     'values': [[start, '0.1'], [start + 30, '0.97' if name == names[-1] else '0.2']]} for name in names]
+        return []
+
+    result = await reader(prometheus(values, [])).history('internal', key_for('nas'), '1h')
+    labels = [item['label'] for item in result['series'] if item['key'] == 'disk']
+    assert len(labels) == MAX_DISKS and names[-1] in labels and labels == sorted(labels)
+
+
+@pytest.mark.asyncio
 async def test_unknown_machine_and_bad_input_are_refused_before_any_range_query():
     calls = []
     source = reader(prometheus(lambda *_: [], calls))

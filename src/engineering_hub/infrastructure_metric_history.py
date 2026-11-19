@@ -68,6 +68,12 @@ def _series_queries(exporter, job, instance, window):
     )
 
 
+def _latest(samples):
+    """The newest non-null value of one series, or -1 when it has none."""
+    found = [(at, value) for at, value in samples.items() if value is not None]
+    return max(found)[1] if found else -1.0
+
+
 def _matrix(raw):
     def finite(value):
         number = float(value)
@@ -179,7 +185,9 @@ async def read_history(reader, actor, host_key, span, targets_parser):
                 continue
             if (key, label) not in seen and any(value is not None for value in samples.values()):
                 rows.append((label, samples))
-        for label, samples in sorted(rows, key=lambda row: row[0] or '')[:MAX_DISKS]:
+        # More disks than the cap: keep the fullest by latest reading, then list them by name.
+        kept = sorted(rows, key=lambda row: (-_latest(row[1]), row[0] or ''))[:MAX_DISKS]
+        for label, samples in sorted(kept, key=lambda row: row[0] or ''):
             seen.add((key, label))
             series.append({'key': key, 'label': label, 'unit': unit, 'points': _points(samples, unit, start, end, step)})
     return _envelope(reader, host_key, span, 'ok' if len(results) == planned and not truncated else 'partial', series)
