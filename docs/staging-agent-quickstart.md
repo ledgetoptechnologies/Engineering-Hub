@@ -146,8 +146,9 @@ do not substitute a permissive callback or edit held SQL to make the pilot pass.
    from the existing agent bearer, never a supplied actor or owner. Persisted
    `scope: staging` and `proposed_by` remain visible in task records and the UI;
    the transactional audit records `task.proposed`. Creation grants no review,
-   worker enrollment, execution, infrastructure or production authority. Existing
-   human-only `POST /tasks` is unchanged. An agent claims the task, proposes a full lowercase
+   worker enrollment, execution, infrastructure or production authority. Agents may
+   also add ordinary backlog tasks with `hub_task_create` or `POST /tasks`; those
+   carry no scope and are vetoed for every environment. An agent claims the task, proposes a full lowercase
    40-character candidate commit, and a **different** agent approves that exact
    commit using the existing `/api/hub/v1/tasks/...` review workflow.
    Agent-proposed staging scope is an unconditional queue veto for production

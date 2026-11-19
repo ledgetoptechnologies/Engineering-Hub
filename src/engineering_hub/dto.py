@@ -54,10 +54,36 @@ class ContextLinkDTO(ResponseDTO):
     url: str
 
 
+TaskActor = AgentActor | HumanId
+TaskStatus = Literal['assigned', 'claimed', 'in_review', 'verified', 'withdrawn', 'waiting_on_beau', 'done']
+
+
+class TaskNoteDTO(ResponseDTO):
+    at: str
+    by: TaskActor
+    text: str
+
+
+class WaitingOnDTO(ResponseDTO):
+    type: Literal['decision', 'action']
+    text: str
+    previous_status: Literal['assigned', 'claimed', 'in_review', 'verified']
+    by: TaskActor
+    at: str
+
+
+class WaitingResolvedDTO(ResponseDTO):
+    type: Literal['decision', 'action']
+    text: str
+    by: HumanId
+    at: str
+    note: str | None = None
+
+
 class TaskDTO(EntityDTO):
     project: ProjectId
     title: str
-    status: Literal['assigned', 'claimed', 'in_review', 'verified', 'withdrawn']
+    status: TaskStatus
     owner: AgentActor | None
     candidate_commit: Commit | None
     review: ReviewDTO | None
@@ -79,6 +105,16 @@ class TaskDTO(EntityDTO):
     withdrawn_at: str | None = None
     withdrawn_family: AgentId | None = None
     withdrawn_session_id: SessionId | None = None
+    # Backlog fields; absent on older rows.
+    acceptance: list[str] | None = None
+    reviewer: AgentId | None = None
+    request_text: str | None = None
+    notes: list[TaskNoteDTO] | None = None
+    waiting_on: WaitingOnDTO | None = None
+    waiting_resolved: WaitingResolvedDTO | None = None
+    completion_evidence: str | None = None
+    completed_by: TaskActor | None = None
+    completed_at: str | None = None
 
     @model_validator(mode='after')
     def installation_provenance_required(self):

@@ -263,7 +263,7 @@ def test_mcp_discovery_and_topic_tools_preserve_original_identity(make_hub):
                                  "clientInfo": {"name": "fixture", "version": "1"}})
     assert response.status_code == 200, response.text
     tools = rpc("tools/list", {}).json()["result"]["tools"]
-    assert len(tools) == 36
+    assert len(tools) == 38
     assert {
         "hub_infrastructure_list", "hub_infrastructure_get",
         "hub_infrastructure_maintenance_open", "hub_infrastructure_maintenance_resolve",

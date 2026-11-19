@@ -262,7 +262,7 @@ async def test_unified_stateful_session_and_native_notifications_cross_agent_ali
         async with mcp_client(primary, AUTH.codex_token) as (codex, events, sid, initialized):
             assert initialized.capabilities.resources.subscribe is True
             tools = (await codex.list_tools()).tools
-            assert len(tools) == 54 and {
+            assert len(tools) == 56 and {
                 'hub_overview', 'hub_component_create', 'hub_component_update', 'hub_component_retire',
             } <= {tool.name for tool in tools}
             await codex.subscribe_resource('agentbus://inbox/codex')
@@ -273,7 +273,7 @@ async def test_unified_stateful_session_and_native_notifications_cross_agent_ali
                 response = await http.post(url(alias) + '/mcp', headers=headers, json=rpc)
                 assert response.status_code == 200
                 body = json.loads(next(line[6:] for line in response.text.splitlines() if line.startswith('data: '))) if response.headers['content-type'].startswith('text/event-stream') else response.json()
-                assert len(body['result']['tools']) == 54
+                assert len(body['result']['tools']) == 56
                 assert {tool['name'] for tool in body['result']['tools']} == {tool.name for tool in tools}
                 foreign = {**headers, 'Authorization': 'Bearer ' + AUTH.hermes_token}
                 assert (await http.post(url(alias) + '/mcp', headers=foreign, json=rpc)).status_code == 404

@@ -50,8 +50,8 @@ def test_task_idempotency_and_payload_conflict(repo):
     assert len(repo.list_tasks()) == 1
 
 
-@pytest.mark.parametrize('actor', ['codex', 'unknown', 'human:', 'human:beau', 'human:0', 'human:-1', 'human:1.0'])
-def test_create_requires_human(repo, actor):
+@pytest.mark.parametrize('actor', ['unknown', 'human:', 'human:beau', 'human:0', 'human:-1', 'human:1.0'])
+def test_create_requires_known_actor(repo, actor):
     with pytest.raises(HubError, match='forbidden'):
         repo.create_task(actor, 'treedar', 'Pilot', 'key')
 

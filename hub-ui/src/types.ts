@@ -26,7 +26,7 @@ export interface Review {
 export interface Task extends Versioned {
   project: ProjectId;
   title: string;
-  status: "assigned" | "claimed" | "in_review" | "verified" | "withdrawn";
+  status: "assigned" | "claimed" | "in_review" | "verified" | "withdrawn" | "waiting_on_beau" | "done";
   /** A legacy family, or "installation:<uuid>"; the installation's family is in owner_family. */
   owner: string | null;
   owner_family?: Agent | null;
@@ -51,6 +51,25 @@ export interface Task extends Versioned {
   withdrawn_family?: Agent | null;
   withdrawn_session_id?: string | null;
   withdrawn_at?: string | null;
+  /** Backlog fields; absent on older tasks. */
+  acceptance?: string[] | null;
+  reviewer?: Agent | null;
+  request_text?: string | null;
+  notes?: TaskNote[] | null;
+  waiting_on?: WaitingItem | null;
+  waiting_resolved?: (Omit<WaitingItem, "previous_status"> & { note?: string | null }) | null;
+  completion_evidence?: string | null;
+  completed_by?: string | null;
+  completed_at?: string | null;
+}
+export interface TaskNote { at: string; by: string; text: string }
+/** What a task needs from Beau: a decision or an action, in one sentence. */
+export interface WaitingItem {
+  type: "decision" | "action";
+  text: string;
+  previous_status: "assigned" | "claimed" | "in_review" | "verified";
+  by: string;
+  at: string;
 }
 export interface Decision extends Versioned {
   project: ProjectId;

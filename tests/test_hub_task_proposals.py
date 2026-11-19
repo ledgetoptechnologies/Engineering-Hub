@@ -169,7 +169,8 @@ def test_http_and_mcp_equivalence_and_existing_human_boundary(tmp_path):
         client.cookies.set(settings.auth_config.cookie_name, session['cookie_token'])
         assert client.post(BASE + '/staging/tasks', headers={
             'Origin': settings.auth_config.origin, 'X-Hub-CSRF': session['csrf_token']}, json=body).status_code == 401
-        assert client.post(BASE + '/tasks', headers=headers, json=body).status_code == 403
+        # Agents may add backlog tasks at /tasks, but never a staging-scoped one there.
+        assert client.post(BASE + '/tasks', headers=headers, json={**body, 'scope': 'staging'}).status_code == 422
         for forbidden in ['actor', 'owner', 'environment', 'scope', 'proposed_by', 'review']:
             assert client.post(BASE + '/staging/tasks', headers=headers, json={**body, forbidden: 'production'}).status_code == 422
         response = client.post(BASE + '/staging/tasks', headers=headers, json=body)
