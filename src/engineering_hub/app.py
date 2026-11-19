@@ -157,6 +157,11 @@ class NewTask(Input):
     client_request_id: str = Field(min_length=1, max_length=128)
     details: str | None = Field(default=None, max_length=4096)
     links: list[dict[str, str]] | None = Field(default=None, max_length=8)
+    acceptance: list[str] | None = Field(default=None, max_length=20)
+    # Assignment designations, not caller identity; stored as owner/reviewer.
+    assignee: Literal["hermes", "codex", "claude"] | None = None
+    assigned_reviewer: Literal["hermes", "codex", "claude"] | None = None
+    request_text: str | None = Field(default=None, max_length=2000)
 
 
 class Revision(Input):
@@ -188,6 +193,29 @@ class Answer(Revision):
 class EntityContext(Revision):
     details: str | None = Field(default=None, max_length=4096)
     links: list[dict[str, str]] | None = Field(default=None, max_length=8)
+
+
+class WaitingItem(Input):
+    type: Literal["decision", "action"]
+    text: str = Field(min_length=1, max_length=300)
+
+
+class TaskUpdate(Revision):
+    client_request_id: str = Field(min_length=1, max_length=128)
+    details: str | None = Field(default=None, max_length=4096)
+    links: list[dict[str, str]] | None = Field(default=None, max_length=8)
+    acceptance: list[str] | None = Field(default=None, max_length=20)
+    # Assignment designations, not caller identity; stored as owner/reviewer.
+    assignee: Literal["hermes", "codex", "claude"] | None = None
+    assigned_reviewer: Literal["hermes", "codex", "claude"] | None = None
+    note: str | None = Field(default=None, max_length=500)
+    status: Literal["waiting_on_beau", "done", "assigned", "claimed", "in_review", "verified"] | None = None
+    waiting: WaitingItem | None = None
+    evidence: str | None = Field(default=None, max_length=2000)
+
+
+class ResolveWaiting(Revision):
+    note: str | None = Field(default=None, max_length=2000)
 
 
 class Withdraw(Revision):
@@ -1033,9 +1061,24 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
 
     @app.post("/api/hub/v1/tasks", status_code=201, response_model=TaskDTO, response_model_exclude_unset=True)
     def create_task(payload: NewTask, request: Request):
-        return repo.create_task(human(request, mutation=True), payload.project,
+        # Agents may add backlog tasks too; that never grants environment or production rights.
+        return repo.create_task(actor(request, mutation=True), payload.project,
                                 payload.title, payload.client_request_id,
-                                details=payload.details, links=payload.links)
+                                details=payload.details, links=payload.links, acceptance=payload.acceptance,
+                                owner=payload.assignee, reviewer=payload.assigned_reviewer, request_text=payload.request_text)
+
+    @app.post('/api/hub/v1/tasks/{task_id}/update', response_model=TaskDTO, response_model_exclude_unset=True)
+    def update_task(task_id: str, payload: TaskUpdate, request: Request):
+        return repo.update_task(actor(request, mutation=True), task_id, payload.expected_revision,
+                                details=payload.details, links=payload.links, acceptance=payload.acceptance,
+                                owner=payload.assignee, reviewer=payload.assigned_reviewer, note=payload.note,
+                                status=payload.status, evidence=payload.evidence,
+                                waiting=payload.waiting.model_dump() if payload.waiting else None,
+                                client_request_id=payload.client_request_id)
+
+    @app.post('/api/hub/v1/tasks/{task_id}/resolve-waiting', response_model=TaskDTO, response_model_exclude_unset=True)
+    def resolve_waiting(task_id: str, payload: ResolveWaiting, request: Request):
+        return repo.resolve_waiting(human(request, mutation=True), task_id, payload.expected_revision, payload.note)
 
     @app.post('/api/hub/v1/tasks/{task_id}/context', response_model=TaskDTO, response_model_exclude_unset=True)
     def update_task_context(task_id: str, payload: EntityContext, request: Request):

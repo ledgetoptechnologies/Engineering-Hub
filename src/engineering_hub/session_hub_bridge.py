@@ -31,7 +31,8 @@ TOOLS = {
     'hub_component_list': 'component.read', 'hub_component_get': 'component.read',
     'hub_component_create': 'component.write', 'hub_component_update': 'component.write',
     'hub_component_retire': 'component.write', 'hub_task_get': 'task.read',
-    'hub_staging_task_propose': 'task.propose', 'hub_task_claim': 'task.claim',
+    'hub_staging_task_propose': 'task.propose', 'hub_task_create': 'task.create',
+    'hub_task_update': 'task.update', 'hub_task_claim': 'task.claim',
     'hub_task_candidate': 'task.candidate', 'hub_task_review': 'task.review',
     'hub_planning_list': 'planning.read', 'hub_planning_get': 'planning.read',
     'hub_planning_put': 'planning.write', 'hub_decision_request': 'decision.request',
@@ -379,7 +380,7 @@ class SessionHubBridge:
         project = arguments.get('project', data.get('project'))
         if tool == 'hub_project_get':
             project = arguments['project_id']
-        elif tool in {'hub_task_get', 'hub_task_claim', 'hub_task_candidate', 'hub_task_review'}:
+        elif tool in {'hub_task_get', 'hub_task_claim', 'hub_task_candidate', 'hub_task_review', 'hub_task_update'}:
             project = self.repo.get_task(arguments['task_id'])['project']
         elif tool in {'hub_component_get', 'hub_component_update', 'hub_component_retire'}:
             identity = arguments.get('component_id', data.get('component_id'))
