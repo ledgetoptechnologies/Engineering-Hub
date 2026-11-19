@@ -34,6 +34,9 @@ export function answeredBy(answeredByActor: string | null | undefined, viewerAct
 export function waitingOn(task: Task, agentName: (id: string, family?: string | null) => string): string {
   const owner = task.owner ? agentName(task.owner, task.owner_family) : "";
   const ownerFamily = task.owner ? actorFamily(task.owner, task.owner_family) : null;
+  if (task.status === "waiting_on_beau")
+    return task.waiting_on ? `Waiting on Beau: ${task.waiting_on.text}` : "Waiting on Beau.";
+  if (task.status === "done") return "Done.";
   if (task.status === "assigned") return "Waiting for an agent to claim it.";
   if (task.status === "claimed")
     return task.owner

@@ -28,7 +28,7 @@ export interface Grant {
 /** family is the trusted family behind an installation reviewer; legacy reviews have none. */
 export interface BridgeReview { actor: string; commit: string; verdict: "approve" | "reject"; family: Agent | null }
 export interface BridgeTask {
-  id: string; project: string; title: string; status: "assigned" | "claimed" | "in_review" | "verified" | "withdrawn";
+  id: string; project: string; title: string; status: "assigned" | "claimed" | "in_review" | "verified" | "withdrawn" | "waiting_on_beau" | "done";
   owner: string | null; owner_family: Agent | null; owner_session_id: string | null; revision: number;
   candidate_commit: string | null; candidate_family: Agent | null; review: BridgeReview | null; repair_count: number;
   scope: "staging" | null; proposed_by: string | null; proposed_family: Agent | null; updated_at: string;
@@ -132,7 +132,10 @@ function parseReview(value: unknown): BridgeReview {
 const TASK_KEYS = ["id", "project", "title", "status", "owner", "revision", "candidate_commit", "review", "repair_count", "updated_at"] as const;
 /** Present only on some tasks: proposals, installation provenance, context and withdrawal records. */
 const TASK_OPTIONAL = ["scope", "proposed_by", "proposed_family", "owner_session_id", "owner_family", "candidate_family", "state_since",
-  "details", "links", "withdrawn_reason", "superseded_by", "withdrawn_by", "withdrawn_at", "withdrawn_family", "withdrawn_session_id"] as const;
+  "details", "links", "withdrawn_reason", "superseded_by", "withdrawn_by", "withdrawn_at", "withdrawn_family", "withdrawn_session_id",
+  // Backlog fields: accepted so newer records still parse; this page doesn't show them.
+  "acceptance", "reviewer", "request_text", "notes", "waiting_on", "waiting_resolved", "completion_evidence", "completed_by",
+  "completed_at"] as const;
 function parseLinks(value: unknown): { label: string; url: string }[] {
   return list(value, item => { const row = record(item, ["label", "url"]); return { label: context(100)(row.label), url: linkUrl(row.url) }; }, 8, false);
 }
@@ -143,7 +146,7 @@ export function parseBridgeTask(value: unknown): BridgeTask {
   optional(row, "withdrawn_reason", context(500)); optional(row, "superseded_by", str(uuid)); optional(row, "withdrawn_at", time);
   optional(row, "withdrawn_session_id", str(uuid));
   return { id: str(uuid)(row.id), project: str(projectId)(row.project), title: text(200)(row.title),
-    status: oneOf(["assigned", "claimed", "in_review", "verified", "withdrawn"] as const)(row.status),
+    status: oneOf(["assigned", "claimed", "in_review", "verified", "withdrawn", "waiting_on_beau", "done"] as const)(row.status),
     owner: nullable(row.owner, str(actorPattern)), owner_family: optional(row, "owner_family", family),
     owner_session_id: optional(row, "owner_session_id", str(uuid)), revision: count(1)(row.revision),
     candidate_commit: nullable(row.candidate_commit, str(commit)), candidate_family: optional(row, "candidate_family", family),

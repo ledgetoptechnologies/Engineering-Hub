@@ -248,6 +248,22 @@ export class HubClient {
     });
     return structuredClone(decision);
   }
+  /** Beau clears a task's decision/action item; the server restores the task's earlier state. */
+  async resolveWaiting(id: string, revision: number, note: string, csrf: string): Promise<Task> {
+    const body = { expected_revision: revision, ...(note.trim() ? { note: note.trim() } : {}) };
+    if (this.mode === "live") return this.request(`/tasks/${encodeURIComponent(id)}/resolve-waiting`, body, csrf);
+    this.demoHuman(csrf);
+    const task = this.demo.tasks.find((item) => item.id === id);
+    if (!task) throw new HubApiError(404, "not_found");
+    if (task.revision !== revision) throw new HubApiError(409, "revision_conflict");
+    if (task.status !== "waiting_on_beau" || !task.waiting_on) throw new HubApiError(409, "not_waiting");
+    const { previous_status, type, text } = task.waiting_on;
+    const at = new Date().toISOString();
+    Object.assign(task, { status: previous_status, waiting_on: undefined, revision: task.revision + 1, updated_at: at,
+      waiting_resolved: { type, text, by: this.demoSession.actor, at, ...(body.note ? { note: body.note } : {}) } });
+    delete task.waiting_on;
+    return structuredClone(task);
+  }
   /** Retire a superseded task or question; the server keeps it, with the reason and replacement. */
   async withdraw(
     kind: "task" | "decision",
@@ -279,11 +295,16 @@ export class HubClient {
     title: string,
     key: string,
     csrf: string,
+    extra: { acceptance?: string[]; reviewer?: Agent | null } = {},
   ): Promise<Task> {
+    const backlog = {
+      ...(extra.acceptance?.length ? { acceptance: extra.acceptance } : {}),
+      ...(extra.reviewer ? { assigned_reviewer: extra.reviewer } : {}),
+    };
     if (this.mode === "live")
       return this.request(
         "/tasks",
-        { project, title, client_request_id: key },
+        { project, title, client_request_id: key, ...backlog },
         csrf,
       );
     this.demoHuman(csrf);
@@ -310,6 +331,8 @@ export class HubClient {
       candidate_commit: null,
       review: null,
       repair_count: 0,
+      ...(backlog.acceptance ? { acceptance: backlog.acceptance } : {}),
+      ...(backlog.assigned_reviewer ? { reviewer: backlog.assigned_reviewer } : {}),
     };
     this.demo.tasks.push(task);
     this.demoRequests.set(key, { project, title, task });
