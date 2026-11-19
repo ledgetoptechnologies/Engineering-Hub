@@ -15,9 +15,36 @@ export function stateAge(task: Task): string {
     : "Time in this state not recorded";
 }
 
-export const statusLabel = (task: Task) => task.status === "verified" ? "Review passed" : pretty(task.status);
+export const statusLabel = (task: Task) => task.status === "verified" ? "Review passed"
+  : task.status === "waiting_on_beau" ? "Waiting on Beau" : pretty(task.status);
 export const statusTone = (task: Task) =>
-  task.status === "verified" ? "forest" : task.status === "in_review" ? "amber" : "neutral";
+  task.status === "verified" || task.status === "done" ? "forest"
+    : task.status === "in_review" || task.status === "waiting_on_beau" ? "amber" : "neutral";
+
+/** Reviewer, acceptance criteria, Beau's item and completion: the backlog part of a task. */
+export function BacklogDetail({ hub, task }: { hub: Hub; task: Task }) {
+  const name = (id: string) => actorName(id, { viewer: hub.session?.actor });
+  return (
+    <>
+      {task.reviewer && <p>Named reviewer: <strong>{name(task.reviewer)}</strong></p>}
+      {task.request_text && (
+        <p>Request, as quoted by {task.proposed_by ? actorName(task.proposed_by, { family: task.proposed_family, viewer: hub.session?.actor }) : "its creator"}: {task.request_text}</p>
+      )}
+      {!!task.acceptance?.length && (
+        <div className="acceptance">
+          <strong>Acceptance criteria</strong>
+          <ul>{task.acceptance.map((item, index) => <li key={index}>{item}</li>)}</ul>
+        </div>
+      )}
+      {task.waiting_on && <p>Waiting on Beau ({task.waiting_on.type}): {task.waiting_on.text}</p>}
+      {task.status === "done" && (
+        <p>Done{task.completed_by ? ` · closed by ${name(task.completed_by)}` : ""}
+          {task.completion_evidence ? ` · ${task.completion_evidence}` : ""}</p>
+      )}
+      {!!task.notes?.length && <p>Latest note: {task.notes[task.notes.length - 1].text}</p>}
+    </>
+  );
+}
 
 export function TaskRow({ hub, task }: { hub: Hub; task: Task }) {
   const [expanded, setExpanded] = useState(false);
@@ -41,6 +68,7 @@ export function TaskRow({ hub, task }: { hub: Hub; task: Task }) {
       </summary>
       <div className="task-detail">
         <DetailsBlock entity={task} kind="task" load={expanded && !hub.demo} onUnauthorized={hub.clearPrivateWorkspace} />
+        <BacklogDetail hub={hub} task={task} />
         <p>Candidate: <code>{task.candidate_commit ?? "Not submitted"}</code></p>
         <p>
           Independent reviewer:{" "}

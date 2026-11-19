@@ -36,7 +36,7 @@ const stamp = (value: string | null | undefined) => {
 export function ownershipRows(tasks: Task[], now = Date.now()): OwnerRow[] {
   const rows = new Map<string, OwnerRow>();
   for (const task of tasks) {
-    if (task.status === "withdrawn") continue;
+    if (task.status === "withdrawn" || task.status === "done") continue;
     const key = task.owner ?? UNCLAIMED;
     let row = rows.get(key);
     if (!row) {

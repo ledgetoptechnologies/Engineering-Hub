@@ -19,10 +19,12 @@ import { InfrastructurePage } from "./pages/InfrastructurePage";
 import { OrchestrationPage } from "./pages/OrchestrationPage";
 import { orchestrationEnabled } from "./orchestrationApi";
 import { acceptsAnswer, retainsAnswerDraft, openDecisions } from "./pages/decisions";
+import { isActive, parseAcceptance, waitingTasks } from "./backlog";
 import { LabelSetPage } from "./pages/LabelSets";
 import { ReviewPage } from "./ReviewsPanel";
 import type {
   Decision,
+  Agent,
   AgentSummary,
   EventsStatus,
   Overview,
@@ -86,6 +88,8 @@ export function HubApp() {
   const [newTask, setNewTask] = useState(false);
   const [taskTitle, setTaskTitle] = useState("");
   const [taskProject, setTaskProject] = useState<ProjectId>("engineering-hub");
+  const [taskAcceptance, setTaskAcceptance] = useState("");
+  const [taskReviewer, setTaskReviewer] = useState<Agent | "">("");
   const [pauseChoice, setPauseChoice] = useState<boolean | null>(null);
   const [decisionChoices, setDecisionChoices] = useState<
     Record<string, { revision: number; answer: string }>
@@ -529,7 +533,9 @@ export function HubApp() {
 
   async function saveTask(event: FormEvent) {
     event.preventDefault();
-    const payload = JSON.stringify([taskProject, taskTitle.trim()]);
+    const acceptance = parseAcceptance(taskAcceptance);
+    const reviewer = taskReviewer || null;
+    const payload = JSON.stringify([taskProject, taskTitle.trim(), acceptance, reviewer]);
     if (!taskRequest.current || taskRequest.current.payload !== payload)
       taskRequest.current = { payload, key: crypto.randomUUID() };
     const ok = await mutate(
@@ -539,6 +545,7 @@ export function HubApp() {
           taskTitle.trim(),
           taskRequest.current!.key,
           session!.csrf_token!,
+          { acceptance, reviewer },
         ),
       "Task assigned.",
     );
@@ -546,6 +553,8 @@ export function HubApp() {
       taskRequest.current = null;
       setNewTask(false);
       setTaskTitle("");
+      setTaskAcceptance("");
+      setTaskReviewer("");
     }
   }
   async function recordDecision(
@@ -599,13 +608,16 @@ export function HubApp() {
       setDecisionChoices((previous) => ({ ...previous, [decision.id]: { revision: decision.revision, answer } })),
     recordDecision: (event: FormEvent<HTMLFormElement>, decision: Decision) => void recordDecision(event, decision),
     requestPause: (paused: boolean) => setPauseChoice(paused),
+    resolveWaiting: (task, note) => mutate(
+      () => client.resolveWaiting(task.id, task.revision, note, session!.csrf_token!),
+      task.waiting_on?.type === "decision" ? "Answer recorded." : "Marked done."),
     withdraw: (kind, item, reason, supersededBy) => mutate(
       () => client.withdraw(kind, item.id, item.revision, reason, supersededBy, session!.csrf_token!),
       kind === "task" ? "Task withdrawn. It is kept under Withdrawn with its history." : "Question withdrawn. It is kept under Withdrawn with its history."),
     clearPrivateWorkspace, refresh: async () => { await refresh(); }, peers, topic, topicDraft, setTopicDraft, checkTopic, selectTopic, topicError, topicStale, peerState,
   } : null;
-  const waitingCount = hub ? openDecisions(hub).length : 0;
-  const activeWork = data ? data.tasks.filter((task) => task.status !== "verified").length : 0;
+  const waitingCount = hub ? openDecisions(hub).length + waitingTasks(hub.data.tasks).length : 0;
+  const activeWork = data ? data.tasks.filter(isActive).length : 0;
   const nav = workspaceNav({
     infrastructure: demo || data?.capabilities.infrastructure === true,
     orchestration: orchestrationEnabled(demo ? "demo" : "live"),
@@ -826,6 +838,18 @@ export function HubApp() {
               What needs to happen?
               <textarea autoFocus value={taskTitle} onChange={(event) => setTaskTitle(event.target.value)}
                 maxLength={200} required rows={3} placeholder="A concrete, testable outcome…" />
+            </label>
+            <label className="field">
+              Acceptance criteria
+              <textarea value={taskAcceptance} onChange={(event) => setTaskAcceptance(event.target.value)}
+                rows={3} placeholder="One per line" />
+            </label>
+            <label className="field">
+              Reviewer
+              <select value={taskReviewer} onChange={(event) => setTaskReviewer(event.target.value as Agent | "")}>
+                <option value="">Any other agent</option>
+                {(["claude", "codex", "hermes"] as Agent[]).map((agent) => <option key={agent} value={agent}>{pretty(agent)}</option>)}
+              </select>
             </label>
             <div className="modal-actions">
               <button className="secondary" type="button" onClick={() => setNewTask(false)}>Cancel</button>
