@@ -1,18 +1,15 @@
 /**
  * Orchestration: Beau's requests and the per-role dispatches an orchestrator split them into.
- * Read-only and demo-only for now (see orchestrationEnabled). Agent-written text is rendered as
+ * Read-only; shows nothing until the backend exists (see ORCHESTRATION_BACKEND_READY). Agent-written text is rendered as
  * plain React text; nothing here uses markdown or HTML.
  */
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import type { HubMode } from "../api";
 import { relativeAge } from "../dashboardText";
-import type { Hub } from "../hub";
 import {
-  checklistPercent, FINISHED_STATES, formatEta, isAgentCreated, isStale, liveOrchestrationReader, orchestrationEnabled,
+  checklistPercent, FINISHED_STATES, formatEta, isAgentCreated, isStale, liveOrchestrationReader, ORCHESTRATION_BACKEND_READY,
   type Dispatch, type DispatchState, type OrchestrationReader, type RequestDetail, type RequestSummary, type RoleLease,
 } from "../orchestrationApi";
-import { demoOrchestrationReader } from "../orchestrationDemo";
 import { href } from "../router";
 import { Badge, EmptyState, PageHeader, PanelTitle } from "../ui";
 
@@ -39,7 +36,7 @@ export function ProgressBar({ label, percent }: { label: string; percent: number
 export function RequestListView({ items, truncated, selected, now = Date.now() }: {
   items: RequestSummary[]; truncated: boolean; selected: string | null; now?: number;
 }) {
-  if (!items.length) return <EmptyState title="No requests yet">When you ask the orchestrator for something, it appears here.</EmptyState>;
+  if (!items.length) return <EmptyState title="No orchestrations yet" />;
   return (
     <>
       <ul className="orchestration-requests">
@@ -151,11 +148,11 @@ export function RequestDetailView({ detail, now = Date.now() }: { detail: Reques
 
 type Load<T> = { state: "loading" } | { state: "loaded"; value: T } | { state: "failed" };
 
-/** The gated body: in live mode it renders a notice and never reads anything. */
-export function OrchestrationView({ mode, requestId, reader }: { mode: HubMode; requestId: string | null; reader?: OrchestrationReader }) {
-  if (!orchestrationEnabled(mode))
-    return <p className="notice">Orchestration isn't available in the live dashboard yet. It can be previewed in the demo.</p>;
-  return <OrchestrationLoader requestId={requestId} reader={reader ?? (mode === "demo" ? demoOrchestrationReader : liveOrchestrationReader)} />;
+/** Without a backend there is nothing to read, so it says so and fetches nothing. No sample data in any mode. */
+export function OrchestrationView({ requestId, reader }: { requestId: string | null; reader?: OrchestrationReader }) {
+  const source = reader ?? (ORCHESTRATION_BACKEND_READY ? liveOrchestrationReader : null);
+  if (!source) return <EmptyState title="No orchestrations yet" />;
+  return <OrchestrationLoader requestId={requestId} reader={source} />;
 }
 
 function OrchestrationLoader({ requestId, reader }: { requestId: string | null; reader: OrchestrationReader }) {
@@ -193,12 +190,11 @@ function OrchestrationLoader({ requestId, reader }: { requestId: string | null; 
   );
 }
 
-export function OrchestrationPage({ hub, actions, requestId = null }: { hub: Hub; actions: ReactNode; requestId?: string | null }) {
+export function OrchestrationPage({ actions, requestId = null }: { actions: ReactNode; requestId?: string | null }) {
   return (
     <>
-      <PageHeader eyebrow="ORCHESTRATION · DEMO" title="Requests in flight"
-        subtitle="Each request, split into one dispatch per role. Read-only; sample data until the backend exists.">{actions}</PageHeader>
-      <OrchestrationView mode={hub.demo ? "demo" : "live"} requestId={requestId} />
+      <PageHeader eyebrow="WORK" title="Orchestration">{actions}</PageHeader>
+      <OrchestrationView requestId={requestId} />
     </>
   );
 }

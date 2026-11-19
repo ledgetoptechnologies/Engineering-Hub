@@ -19,7 +19,7 @@ export interface NavItem {
 export interface NavOptions {
   /** Global, not per-project: only when the Hub grants this caller infrastructure access (or in demo). */
   infrastructure: boolean;
-  /** Fixture-backed preview: demo mode only until the backend exists. */
+  /** Shown in every mode; the page says there is nothing yet until the backend exists. */
   orchestration: boolean;
   waiting?: number;
   activeWork?: number;

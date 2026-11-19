@@ -2,23 +2,31 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import fixture from "../fixtures/orchestration-wire-v1.json";
 import { parseRequestDetail, parseRequestList } from "../orchestrationApi";
-import { OrchestrationView, ProgressBar, RequestDetailView, RequestListView } from "./OrchestrationPage";
+import { OrchestrationPage, OrchestrationView, ProgressBar, RequestDetailView, RequestListView } from "./OrchestrationPage";
 
 const now = Date.parse("2026-11-03T11:00:00Z");
 const viewer = parseRequestDetail(structuredClone(fixture.details[0]), fixture.details[0].request.request_id);
 const billing = parseRequestDetail(structuredClone(fixture.details[1]), fixture.details[1].request.request_id);
 
 describe("orchestration gate", () => {
-  it("renders only a notice in live mode and never reads", () => {
-    const reader = { list: vi.fn(), read: vi.fn() };
-    const html = renderToStaticMarkup(<OrchestrationView mode="live" requestId="req-demo-viewer-refresh" reader={reader} />);
-    expect(html).toContain("available in the live dashboard yet");
-    expect(html).not.toContain("progressbar");
-    expect(reader.list).not.toHaveBeenCalled();
-    expect(reader.read).not.toHaveBeenCalled();
+  it("says there are no orchestrations and fetches nothing while the backend is missing", () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    try {
+      const html = renderToStaticMarkup(<OrchestrationView requestId="req-demo-viewer-refresh" />);
+      expect(html).toContain("No orchestrations yet");
+      expect(html).not.toContain("progressbar");
+      for (const item of fixture.list.items) expect(html).not.toContain(item.title);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally { fetchSpy.mockRestore(); }
   });
-  it("renders the loader in demo mode", () => {
-    expect(renderToStaticMarkup(<OrchestrationView mode="demo" requestId={null} />)).toContain("Loading requests");
+  it("renders the loader when given a reader", () => {
+    const reader = { list: vi.fn(() => new Promise<never>(() => {})), read: vi.fn() };
+    expect(renderToStaticMarkup(<OrchestrationView requestId={null} reader={reader} />)).toContain("Loading requests");
+  });
+  it("titles the page without a demo label or blurb", () => {
+    const html = renderToStaticMarkup(<OrchestrationPage actions={null} />);
+    expect(html).toContain(">Orchestration<");
+    expect(html).not.toMatch(/demo|sample/i);
   });
 });
 
@@ -38,6 +46,11 @@ describe("progress bar", () => {
 });
 
 describe("request list", () => {
+  it("has a title-only empty state", () => {
+    const html = renderToStaticMarkup(<RequestListView items={[]} truncated={false} selected={null} />);
+    expect(html).toContain("No orchestrations yet");
+    expect(html).not.toMatch(/<p[ >]/);
+  });
   it("shows each request with waiting and stale counts", () => {
     const list = parseRequestList(structuredClone(fixture.list));
     const html = renderToStaticMarkup(<RequestListView items={list.items} truncated={false} selected="req-demo-billing-export" now={now} />);

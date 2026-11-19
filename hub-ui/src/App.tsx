@@ -17,7 +17,6 @@ import { ProjectPage, ProjectsPage } from "./pages/ProjectPages";
 import { AgentsPage, StagingPage } from "./pages/SystemPages";
 import { InfrastructurePage } from "./pages/InfrastructurePage";
 import { OrchestrationPage } from "./pages/OrchestrationPage";
-import { orchestrationEnabled } from "./orchestrationApi";
 import { acceptsAnswer, retainsAnswerDraft, openDecisions } from "./pages/decisions";
 import { isActive, parseAcceptance, waitingTasks } from "./backlog";
 import { LabelSetPage } from "./pages/LabelSets";
@@ -620,7 +619,7 @@ export function HubApp() {
   const activeWork = data ? data.tasks.filter(isActive).length : 0;
   const nav = workspaceNav({
     infrastructure: demo || data?.capabilities.infrastructure === true,
-    orchestration: orchestrationEnabled(demo ? "demo" : "live"),
+    orchestration: true,
     waiting: data ? waitingCount : undefined, attention: waitingCount > 0,
     activeWork: data ? activeWork : undefined,
     deviceId: route.page === "device" ? route.id : null,
@@ -795,8 +794,8 @@ export function HubApp() {
             {route.page === "staging-resources" && <StagingPage hub={hub} actions={actions} view="resources" />}
             {route.page === "infrastructure" && <InfrastructurePage hub={hub} actions={actions} />}
             {route.page === "device" && <InfrastructurePage hub={hub} actions={actions} deviceId={route.id} />}
-            {route.page === "orchestration" && <OrchestrationPage hub={hub} actions={actions} />}
-            {route.page === "orchestration-request" && <OrchestrationPage hub={hub} actions={actions} requestId={route.id} />}
+            {route.page === "orchestration" && <OrchestrationPage actions={actions} />}
+            {route.page === "orchestration-request" && <OrchestrationPage actions={actions} requestId={route.id} />}
           </div>
         )}
         <footer className="page-footer">

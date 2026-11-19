@@ -1,17 +1,15 @@
 /**
  * Orchestration view: one request from Beau, split by an orchestrator into one dispatch per role.
- * Read-only. Not shown in the live dashboard yet: the backend is owned by Codex and not built, so
- * the page only appears in demo mode (?demo=1), fed by fixtures/orchestration-wire-v1.json.
+ * Read-only. The backend is owned by Codex and not built yet, so the page reads nothing and says
+ * there are no orchestrations. fixtures/orchestration-wire-v1.json is for tests only.
  *
  * Everything agent-written here (titles, status lines, checklist items, questions) is plain text.
  * It is rendered as React text only, never as HTML or markdown.
  */
-import { HubApiError, isMissingRoute, type HubMode } from "./api";
+import { HubApiError, isMissingRoute } from "./api";
 
-/** The gate: shown only in demo mode until the backend exists and is reviewed. */
-export function orchestrationEnabled(mode: HubMode): boolean {
-  return mode === "demo";
-}
+/** Flip once /api/hub/v1/orchestration/... exists and is reviewed. Until then nothing is fetched. */
+export const ORCHESTRATION_BACKEND_READY = false;
 
 export const ORCHESTRATION_SCHEMA = "hub-orchestration.v1";
 export const DISPATCH_STATES = ["dispatched", "working", "blocked", "asked", "done", "failed", "stale"] as const;
@@ -219,7 +217,7 @@ export function isStale(dispatch: Dispatch): boolean {
 /*
  * PROVISIONAL endpoints (prefix agreed with Codex; backend not built yet). The server filters every
  * list and detail to projects the caller may read, so counts here cover only authorized dispatches.
- * Nothing calls these while orchestrationEnabled() is false for live mode.
+ * Nothing calls these while ORCHESTRATION_BACKEND_READY is false.
  */
 export const PROVISIONAL_LIST_PATH = "/api/hub/v1/orchestration/requests";
 export const provisionalDetailPath = (requestId: string) => `/api/hub/v1/orchestration/requests/${id(requestId)}`;

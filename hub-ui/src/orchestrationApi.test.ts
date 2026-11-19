@@ -2,10 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import { HubApiError } from "./api";
 import fixture from "./fixtures/orchestration-wire-v1.json";
 import {
-  checklistPercent, DISPATCH_STATES, formatEta, isAgentCreated, isStale, listOrchestrationRequests, orchestrationEnabled,
+  checklistPercent, DISPATCH_STATES, formatEta, isAgentCreated, isStale, listOrchestrationRequests, ORCHESTRATION_BACKEND_READY,
   parseRequestDetail, parseRequestList, readOrchestrationRequest,
 } from "./orchestrationApi";
-import { demoOrchestrationReader } from "./orchestrationDemo";
+import { fixtureOrchestrationReader } from "./fixtures/orchestrationTestReader";
 
 const clone = <T,>(value: T): T => structuredClone(value);
 const [viewer, billing] = fixture.details;
@@ -14,9 +14,8 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
 const signal = () => new AbortController().signal;
 
 describe("orchestration gate", () => {
-  it("is shown in demo mode only", () => {
-    expect(orchestrationEnabled("demo")).toBe(true);
-    expect(orchestrationEnabled("live")).toBe(false);
+  it("stays off until the backend exists", () => {
+    expect(ORCHESTRATION_BACKEND_READY).toBe(false);
   });
 });
 
@@ -39,9 +38,9 @@ describe("wire fixture", () => {
     expect(detail.dispatches.some(item => item.task.status_line.includes("<script>"))).toBe(true);
   });
   it("serves the demo through the same parsers", async () => {
-    expect((await demoOrchestrationReader.list(signal())).items).toHaveLength(2);
-    expect((await demoOrchestrationReader.read(billing.request.request_id, signal())).dispatches).toHaveLength(3);
-    await expect(demoOrchestrationReader.read("nope", signal())).rejects.toMatchObject({ status: 404 });
+    expect((await fixtureOrchestrationReader.list(signal())).items).toHaveLength(2);
+    expect((await fixtureOrchestrationReader.read(billing.request.request_id, signal())).dispatches).toHaveLength(3);
+    await expect(fixtureOrchestrationReader.read("nope", signal())).rejects.toMatchObject({ status: 404 });
   });
 });
 
