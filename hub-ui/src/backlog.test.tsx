@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { HubClient } from "./api";
-import { draftFor, isActive, parseAcceptance, WORK_FILTERS, waitingItemKey, waitingTasks } from "./backlog";
+import { draftFor, isActive, parseAcceptance, WORK_FILTERS, waitingItemKey, waitingTasks, withdrawnWaitingTasks } from "./backlog";
 import { projectStats, STATUSES, WorkBoard } from "./pages/ProjectPages";
 import { waitingOn } from "./dashboardText";
 import type { Hub } from "./hub";
@@ -22,7 +22,7 @@ function hubWith(tasks: Task[], overrides: Partial<Hub> = {}): Hub {
   return { demo: true, session: DEMO_SESSION, data, agents: [], stale: false, loading: false, writable: true,
     connection: "demo", projectName: (id: string) => id, decisionChoices: {}, chooseAnswer: () => {},
     recordDecision: () => {}, requestPause: () => {}, withdraw: async () => true, resolveWaiting: async () => true,
-    clearPrivateWorkspace: () => {}, refresh: async () => {}, peers: null, topicDraft: "", setTopicDraft: () => {},
+    restoreWaiting: async () => true, clearPrivateWorkspace: () => {}, refresh: async () => {}, peers: null, topicDraft: "", setTopicDraft: () => {},
     checkTopic: () => {}, topic: "", selectTopic: () => {}, topicError: "", topicStale: false, peerState: () => "",
     ...overrides } as Hub;
 }
@@ -84,6 +84,17 @@ describe("backlog views", () => {
     expect(home).toContain("Choose the initial scratch-storage benchmark");
     expect(home).toMatch(/<strong>2<\/strong><span class="kpi-note">items<\/span>/);
   });
+  it("shows agent-withdrawn questions collapsed, with the reason and an Undo", () => {
+    const pulled: Task = { ...base, id: "t-pulled", waiting_withdrawn: { type: "decision", text: "Pick the domain name.",
+      previous_status: "claimed", raised_by: "claude", raised_at: "2026-11-16T10:00:00Z", by: "claude",
+      at: "2026-11-17T10:00:00Z", reason: "Answered in the PR thread" } };
+    const closed: Task = { ...pulled, id: "t-closed", status: "done" };
+    expect(withdrawnWaitingTasks([base, pulled, closed, waiting("action")]).map((task) => task.id)).toEqual(["t-pulled"]);
+    const inbox = renderToStaticMarkup(<InboxPage hub={hubWith([pulled])} actions={null} />);
+    expect(inbox).toMatch(/<details class="withdrawn-list"><summary>Withdrawn by agents \(1\)<\/summary>/);
+    expect(inbox).toContain("Answered in the PR thread");
+    expect(inbox).toMatch(/<button type="button" class="secondary">Undo<\/button>/);
+  });
 });
 
 describe("demo client", () => {
@@ -97,6 +108,7 @@ describe("demo client", () => {
     const stored = overview.tasks.find((item) => item.id === task.id)!;
     expect(stored.status).toBe("assigned");
     await expect(client.resolveWaiting(task.id, task.revision, "", csrf)).rejects.toMatchObject({ code: "not_waiting" });
+    await expect(client.restoreWaiting(task.id, task.revision, csrf)).rejects.toMatchObject({ code: "not_withdrawn" });
   });
 });
 

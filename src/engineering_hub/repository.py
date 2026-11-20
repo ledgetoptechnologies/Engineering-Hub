@@ -20,7 +20,7 @@ AGENTS = frozenset({'hermes', 'codex', 'claude'})
 # changing it, so those actions must not reset how long a task has been waiting.
 TASK_STATUS_ACTIONS = ('task.created', 'task.proposed', 'task.claimed', 'task.claim_recovered', 'task.candidate', 'task.reviewed',
                        'task.context_invalidated', 'task.withdrawn', 'task.reassigned', 'task.waiting',
-                       'task.waiting_resolved', 'task.done')
+                       'task.waiting_resolved', 'task.waiting_withdrawn', 'task.waiting_restored', 'task.done')
 # hub_task_update may set only these; claim/candidate/review keep their own flows.
 UPDATE_STATUSES = frozenset({'waiting_on_beau', 'done', 'assigned', 'claimed', 'in_review', 'verified'})
 MAX_ACCEPTANCE, MAX_NOTES = 20, 50
@@ -455,7 +455,11 @@ class HubRepository:
         if status == 'waiting_on_beau':
             if item['status'] == 'waiting_on_beau':
                 raise HubError('waiting_on_beau', 409)
-            item.update(status='waiting_on_beau', waiting_on=dict(waiting, previous_status=item['status'], by=actor, at=now))
+            # The raiser's family is recorded so only that agent may later withdraw its own item.
+            raiser = {'by_family': session_context.family(actor)} if session_context.actor_allowed(actor) else {}
+            item.pop('waiting_withdrawn', None)
+            item.update(status='waiting_on_beau',
+                        waiting_on=dict(waiting, previous_status=item['status'], by=actor, at=now, **raiser))
             action = 'task.waiting'
         elif status == 'done':
             if not human and not (self._is_owner(item, actor) and item['status'] == 'verified'):
@@ -514,6 +518,97 @@ class HubRepository:
             if item['status'] != 'waiting_on_beau' or not item.get('waiting_on'):
                 raise HubError('not_waiting', 409)
             return self._resolve(db, actor, item, note, datetime.now(timezone.utc).isoformat())
+
+    @staticmethod
+    def _waiting_raiser_family(db, task_id, waiting_on):
+        """The agent family that raised the waiting item, from server-set fields only."""
+        by = waiting_on.get('by')
+        if by in AGENTS:
+            return by
+        if type(by) is not str or not by.startswith('installation:'):
+            return None  # raised by a human: no agent owns it
+        if waiting_on.get('by_family') in AGENTS:
+            return waiting_on['by_family']
+        # Items raised before by_family was recorded: read the audited session provenance.
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_session_provenance'").fetchone():
+            return None
+        row = db.execute('''SELECT p.family FROM hub_audit a JOIN hub_session_provenance p ON p.audit_sequence=a.sequence
+            WHERE a.entity_id=? AND a.actor=? AND a.action='task.waiting' ORDER BY a.sequence DESC LIMIT 1''',
+                         (task_id, by)).fetchone()
+        return row['family'] if row and row['family'] in AGENTS else None
+
+    def withdraw_waiting(self, actor, identity, expected_revision, reason):
+        """The agent that raised a task's waiting-on-Beau question withdraws it, with a reason.
+
+        Only a `decision` item (a question) qualifies; an `action` item asks Beau to do or
+        approve something and stays until he clears it. Another agent's item, a human's item,
+        and an item Beau already cleared are refused. The task returns to its previous status
+        (never done), and the withdrawn item is kept on the task and in the audit log; Beau can
+        restore it. Retrying the same withdrawal returns the task unchanged.
+        """
+        self._actor(actor)
+        if actor not in AGENTS and not session_context.actor_allowed(actor):
+            raise HubError('waiting_withdraw_agents_only', 403)  # Beau clears items via resolve-waiting
+        try:
+            reason = bounded_text(reason, 500)
+        except ValueError:
+            raise HubError('invalid_reason') from None
+        family = session_context.family(actor)
+        with self._transaction() as db:
+            item = self._get(db, identity, 'task')
+            self._project(item['project'], db, require_active=False)
+            prior = item.get('waiting_withdrawn')
+            if (item['status'] != 'waiting_on_beau' and isinstance(prior, dict) and prior.get('by') == actor
+                    and prior.get('reason') == reason and item['revision'] == expected_revision + 1):
+                return item
+            self._cas(item, expected_revision)
+            waiting_on = item.get('waiting_on')
+            if item['status'] != 'waiting_on_beau' or not waiting_on:
+                if item.get('waiting_resolved'):
+                    raise HubError('waiting_already_answered', 409)
+                raise HubError('not_waiting', 409)
+            if self._waiting_raiser_family(db, identity, waiting_on) != family:
+                raise HubError('waiting_not_raised_by_you', 403)
+            if waiting_on.get('type') != 'decision':
+                raise HubError('waiting_action_needs_owner', 409)
+            now = datetime.now(timezone.utc).isoformat()
+            item.pop('waiting_on')
+            record = dict(type=waiting_on['type'], text=waiting_on['text'],
+                          previous_status=waiting_on['previous_status'], raised_by=waiting_on['by'],
+                          raised_at=waiting_on['at'], by=actor, at=now, reason=reason)
+            if waiting_on.get('by_family'):
+                record['raised_by_family'] = waiting_on['by_family']
+            if session_context.actor_allowed(actor):
+                record['by_family'] = family
+            item.update(status=waiting_on['previous_status'], waiting_withdrawn=record)
+            return self._save(db, actor, 'task.waiting_withdrawn', 'task', item)
+
+    def restore_waiting(self, actor, identity, expected_revision):
+        """Human-only undo of an agent's withdrawn waiting item: it is waiting on Beau again."""
+        self._actor(actor, human=True)
+        with self._transaction() as db:
+            item = self._get(db, identity, 'task')
+            self._project(item['project'], db, require_active=False)
+            waiting_on = item.get('waiting_on')
+            if (item['status'] == 'waiting_on_beau' and isinstance(waiting_on, dict)
+                    and waiting_on.get('restored_by') == actor and item['revision'] == expected_revision + 1):
+                return item
+            self._cas(item, expected_revision)
+            record = item.get('waiting_withdrawn')
+            if not isinstance(record, dict):
+                raise HubError('not_withdrawn', 409)
+            if item['status'] in {'withdrawn', 'done'}:
+                raise HubError('task_closed', 409)
+            if item['status'] == 'waiting_on_beau':
+                raise HubError('waiting_on_beau', 409)
+            item.pop('waiting_withdrawn')
+            restored = dict(type=record['type'], text=record['text'], previous_status=item['status'],
+                            by=record['raised_by'], at=record['raised_at'], restored_by=actor,
+                            restored_at=datetime.now(timezone.utc).isoformat())
+            if record.get('raised_by_family'):
+                restored['by_family'] = record['raised_by_family']
+            item.update(status='waiting_on_beau', waiting_on=restored)
+            return self._save(db, actor, 'task.waiting_restored', 'task', item)
 
     @staticmethod
     def overview_task(task):
@@ -745,6 +840,11 @@ class HubRepository:
         are refused. Retrying the same withdrawal returns the withdrawn item.
         """
         self._actor(actor)
+        if kind == 'waiting':
+            # A task's waiting-on-Beau question, not the task itself; it has no replacement.
+            if superseded_by is not None:
+                raise HubError('invalid_replacement')
+            return self.withdraw_waiting(actor, identity, expected_revision, reason)
         if kind not in CREATION_ACTIONS:
             raise HubError('invalid_kind')
         try:

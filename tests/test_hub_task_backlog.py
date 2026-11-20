@@ -116,6 +116,9 @@ def test_waiting_on_beau_round_trip_and_agent_cannot_clear(repo):
     for status in ('claimed', 'done'):
         with pytest.raises(HubError, match='waiting_on_beau'):
             repo.update_task('claude', task['id'], 3, status=status, evidence='x')
+    # The raising agent may withdraw only a decision item; this action item stays for Beau.
+    with pytest.raises(HubError, match='waiting_action_needs_owner'):
+        repo.withdraw('claude', 'waiting', task['id'], 3, 'No longer needed')
     with pytest.raises(HubError, match='forbidden'):
         repo.resolve_waiting('claude', task['id'], 3)
     with pytest.raises(HubError, match='waiting_on_beau'):

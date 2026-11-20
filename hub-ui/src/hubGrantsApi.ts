@@ -134,7 +134,7 @@ const TASK_KEYS = ["id", "project", "title", "status", "owner", "revision", "can
 const TASK_OPTIONAL = ["scope", "proposed_by", "proposed_family", "owner_session_id", "owner_family", "candidate_family", "state_since",
   "details", "links", "withdrawn_reason", "superseded_by", "withdrawn_by", "withdrawn_at", "withdrawn_family", "withdrawn_session_id",
   // Backlog fields: accepted so newer records still parse; this page doesn't show them.
-  "acceptance", "reviewer", "request_text", "notes", "waiting_on", "waiting_resolved", "completion_evidence", "completed_by",
+  "acceptance", "reviewer", "request_text", "notes", "waiting_on", "waiting_resolved", "waiting_withdrawn", "completion_evidence", "completed_by",
   "completed_at"] as const;
 function parseLinks(value: unknown): { label: string; url: string }[] {
   return list(value, item => { const row = record(item, ["label", "url"]); return { label: context(100)(row.label), url: linkUrl(row.url) }; }, 8, false);

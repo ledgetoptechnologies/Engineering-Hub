@@ -386,7 +386,8 @@ class SessionHubBridge:
             identity = arguments.get('component_id', data.get('component_id'))
             project = self.components.get_component(identity)['project']
         elif tool == 'hub_entity_withdraw':
-            project = self.repo._read(arguments['entity_id'], arguments['kind'])['project']
+            kind = 'task' if arguments['kind'] == 'waiting' else arguments['kind']
+            project = self.repo._read(arguments['entity_id'], kind)['project']
         if project is not None:
             operation.project(project)
 

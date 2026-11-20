@@ -7,7 +7,8 @@ import { answeredDecisions, DecisionList, openDecisions, RecentAnswers } from ".
 import { TaskTable } from "./tasks";
 import { WithdrawnList } from "./Withdraw";
 import { ownershipRows, UNCLAIMED, WorkOwnership } from "./WorkOwnership";
-import { draftFor, type ItemDraft, WORK_FILTERS, waitingItemKey, waitingKind, waitingTasks } from "../backlog";
+import { draftFor, type ItemDraft, WORK_FILTERS, waitingItemKey, waitingKind, waitingTasks, withdrawnWaitingTasks } from "../backlog";
+import { actorName } from "../actors";
 import { statusLabel } from "./tasks";
 
 /** One task item Beau must clear: an action he marks Done, or a decision he answers in the note. */
@@ -39,12 +40,40 @@ export function WaitingItemCard({ hub, task }: { hub: Hub; task: Task }) {
   );
 }
 
+/** Collapsed: questions their raising agent withdrew, with the reason and an Undo for Beau. */
+export function WithdrawnWaitingList({ hub, tasks }: { hub: Hub; tasks: Task[] }) {
+  if (tasks.length === 0) return null;
+  return (
+    <details className="withdrawn-list">
+      <summary>Withdrawn by agents ({tasks.length})</summary>
+      <ul aria-label="Withdrawn by agents">
+        {tasks.map((task) => {
+          const record = task.waiting_withdrawn!;
+          const by = actorName(record.by, { family: record.by_family, viewer: hub.session?.actor });
+          return (
+            <li key={`${task.id}|${record.at}`}>
+              <strong>{record.text}</strong>
+              <small>
+                {hub.projectName(task.project)} · {task.title} · withdrawn by {by} on {new Date(record.at).toLocaleDateString()}
+              </small>
+              <p>{record.reason}</p>
+              <button type="button" className="secondary" disabled={!hub.writable}
+                onClick={() => void hub.restoreWaiting(task)}>Undo</button>
+            </li>
+          );
+        })}
+      </ul>
+    </details>
+  );
+}
+
 export function InboxPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const [project, setProject] = useState("all");
   const all = openDecisions(hub);
   const waiting = project === "all" ? all : all.filter((item) => item.project === project);
   const allItems = waitingTasks(hub.data.tasks);
   const items = project === "all" ? allItems : allItems.filter((task) => task.project === project);
+  const withdrawnItems = withdrawnWaitingTasks(hub.data.tasks, project === "all" ? undefined : project);
   const count = (id: string) => all.filter((decision) => decision.project === id).length
     + allItems.filter((task) => task.project === id).length;
   const projectsWithItems = hub.data.projects.filter((item) => count(item.id) > 0);
@@ -62,10 +91,13 @@ export function InboxPage({ hub, actions }: { hub: Hub; actions: React.ReactNode
           </button>
         ))}
       </div>
-      {items.length > 0 && (
+      {(items.length > 0 || withdrawnItems.length > 0) && (
         <section className="panel waiting-items" id="task-items">
           <PanelTitle title="From tasks" count={items.length} />
-          <div className="decision-list">{items.map((task) => <WaitingItemCard key={waitingItemKey(task)} hub={hub} task={task} />)}</div>
+          {items.length > 0 && (
+            <div className="decision-list">{items.map((task) => <WaitingItemCard key={waitingItemKey(task)} hub={hub} task={task} />)}</div>
+          )}
+          <WithdrawnWaitingList hub={hub} tasks={withdrawnItems} />
         </section>
       )}
       <section className="panel decisions" id="decisions">

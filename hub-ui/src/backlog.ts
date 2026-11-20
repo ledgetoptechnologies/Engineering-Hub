@@ -5,6 +5,11 @@ import type { Task } from "./types";
 export const waitingTasks = (tasks: Task[], project?: string) =>
   tasks.filter((task) => task.status === "waiting_on_beau" && !!task.waiting_on && (!project || task.project === project));
 
+/** Open tasks whose waiting question the raising agent withdrew; Beau can see why and undo it. */
+export const withdrawnWaitingTasks = (tasks: Task[], project?: string) =>
+  tasks.filter((task) => !!task.waiting_withdrawn && task.status !== "waiting_on_beau"
+    && task.status !== "done" && task.status !== "withdrawn" && (!project || task.project === project));
+
 /** Still in motion: not review-passed, done or withdrawn. */
 export const isActive = (task: Task) => !["verified", "done", "withdrawn"].includes(task.status);
 

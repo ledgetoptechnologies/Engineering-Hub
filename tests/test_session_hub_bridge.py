@@ -759,3 +759,24 @@ def test_owner_family_resend_keeps_installation_claim_and_installation_cannot_re
         actor, task['id'], same['revision'], status='waiting_on_beau', waiting={'type': 'action', 'text': 'Approve.'}))
     with pytest.raises(HubError, match='forbidden'):
         call(env, codex, 'hub_task_update', lambda actor: env.repo.resolve_waiting(actor, task['id'], waiting['revision']))
+
+
+def test_installation_withdraws_only_its_familys_waiting_question(env):
+    _, codex, _ = pair(env, 'codex-pc', 'codex')
+    _, other_codex, _ = pair(env, 'codex-pc-2', 'codex')
+    _, claude, _ = pair(env, 'claude-pc', 'claude')
+    task = env.repo.create_task(OWNER, PROJECT, 'Backlog', 'key', owner='codex', reviewer='claude')
+    claimed = call(env, codex, 'hub_task_claim', lambda actor: env.repo.claim_task(actor, task['id'], 1))
+    waiting = call(env, codex, 'hub_task_update', lambda actor: env.repo.update_task(
+        actor, task['id'], claimed['revision'], status='waiting_on_beau', waiting={'type': 'decision', 'text': 'Which?'}))
+    assert waiting['waiting_on']['by_family'] == 'codex'
+    with pytest.raises(HubError, match='waiting_not_raised_by_you'):
+        call(env, claude, 'hub_entity_withdraw', lambda actor: env.repo.withdraw(
+            actor, 'waiting', task['id'], waiting['revision'], 'Not mine'))
+    # The same family on another installation (a clean-up session) may withdraw it.
+    done = call(env, other_codex, 'hub_entity_withdraw', lambda actor: env.repo.withdraw(
+        actor, 'waiting', task['id'], waiting['revision'], 'No answer needed'))
+    assert done['status'] == 'claimed' and done['waiting_withdrawn']['by_family'] == 'codex'
+    assert done['waiting_withdrawn']['raised_by_family'] == 'codex'
+    from engineering_hub.dto import TaskDTO
+    TaskDTO.model_validate(done)
