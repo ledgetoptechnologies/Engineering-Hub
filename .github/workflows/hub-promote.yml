@@ -3,8 +3,19 @@ name: Promote Engineering Hub control candidate to latest
 # every main candidate as an immutable digest with a write-once `sha-<commit>`
 # tag. This workflow moves `latest` to one of those tested digests and nothing
 # else moves it. It does not rebuild or deploy. Rollback is a promotion of an
-# older candidate. Approval is procedural: only people with write access can
-# dispatch it, and the run records who did.
+# older candidate.
+#
+# Approval: the approved_by and approval_reference inputs are written into the
+# rollback receipt as a RECORD of who authorized the promotion. They do not
+# enforce anything. The enforcing mechanism is a GitHub Environment with required
+# reviewers, which is an owner repository setting and is not created here.
+#
+# Exclusion: this is the only workflow that writes `latest` (a test fails if
+# another writer appears). The `hub-promote-latest` concurrency group stops two
+# promotions overlapping. Neither is a registry-wide lock: a package admin or an
+# older in-flight run could still write the tag, so the job re-reads `latest`
+# immediately before writing and aborts if it changed. That re-read narrows the
+# window but is NOT an atomic compare-and-swap.
 on:
   workflow_dispatch:
     inputs:
@@ -21,6 +32,14 @@ on:
         required: false
         default: false
         type: boolean
+      approved_by:
+        description: Who approved this promotion (recorded in the receipt; not enforced)
+        required: true
+        type: string
+      approval_reference:
+        description: Approval reference, e.g. a Hub task or decision id (recorded in the receipt; not enforced)
+        required: true
+        type: string
 permissions:
   contents: read
 concurrency:
@@ -39,6 +58,8 @@ jobs:
       PACKAGE: ghcr.io/ledgetoptechnologies/engineering-hub-control
       PROMOTE_COMMIT: ${{ inputs.commit }}
       PROMOTE_DIGEST: ${{ inputs.digest }}
+      APPROVED_BY: ${{ inputs.approved_by }}
+      APPROVAL_REFERENCE: ${{ inputs.approval_reference }}
     steps:
       - name: Validate requested candidate
         shell: bash
@@ -46,6 +67,8 @@ jobs:
           set -euo pipefail
           [[ "$PROMOTE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::commit must be a full lowercase 40-character SHA'; exit 1; }
           [[ "$PROMOTE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo '::error::digest must be sha256:<64 hex>'; exit 1; }
+          [[ "$APPROVED_BY" =~ ^[A-Za-z0-9][A-Za-z0-9._@\ -]{0,63}$ ]] || { echo '::error::approved_by is required (letters, digits, space, . _ @ -; max 64)'; exit 1; }
+          [[ "$APPROVAL_REFERENCE" =~ ^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,127}$ ]] || { echo '::error::approval_reference is required (e.g. a Hub task or decision id)'; exit 1; }
       - name: Check out promotion verifier
         uses: actions/checkout@v4
         with:
@@ -171,13 +194,14 @@ jobs:
           [[ "$CANDIDATE_RUN_ID" =~ ^[0-9]+$ ]]
           DIR="$RUNNER_TEMP/hub-promotion-receipt"
           mkdir -p "$DIR"
-          printf '{\n  "receiptSchemaVersion": 1,\n  "mode": "%s",\n  "image": "%s",\n  "previousDigest": "%s",\n  "newDigest": "%s",\n  "commit": "%s",\n  "candidateRunId": "%s",\n  "promotionRunId": "%s",\n  "promotionRunAttempt": "%s",\n  "recordedAt": "%s"\n}\n' \
+          printf '{\n  "receiptSchemaVersion": 2,\n  "mode": "%s",\n  "image": "%s",\n  "previousDigest": "%s",\n  "newDigest": "%s",\n  "commit": "%s",\n  "candidateRunId": "%s",\n  "promotionRunId": "%s",\n  "promotionRunAttempt": "%s",\n  "dispatchedBy": "%s",\n  "approvedBy": "%s",\n  "approvalReference": "%s",\n  "approvalEnforced": false,\n  "recordedAt": "%s"\n}\n' \
             "$PROMOTION_MODE" "$PACKAGE" "$PREVIOUS_DIGEST" "$PROMOTE_DIGEST" "$PROMOTE_COMMIT" "$CANDIDATE_RUN_ID" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
-            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$DIR/hub-promotion-receipt.json"
+            "$GITHUB_ACTOR" "$APPROVED_BY" "$APPROVAL_REFERENCE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$DIR/hub-promotion-receipt.json"
           {
             printf 'Rollback receipt (recorded before `latest` is changed)\n\n'
             printf -- '- Mode: %s (initialize = first-time creation of latest, explicitly requested)\n' "$PROMOTION_MODE"
             printf -- '- Previous latest (rollback target): `%s`\n- New digest: `%s`\n- Commit: `%s`\n' "$PREVIOUS_DIGEST" "$PROMOTE_DIGEST" "$PROMOTE_COMMIT"
+            printf -- '- Approved by: %s; approval reference: %s (a record, not enforced by this workflow)\n' "$APPROVED_BY" "$APPROVAL_REFERENCE"
             printf -- '- Candidate build run: %s/%s/actions/runs/%s\n\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$CANDIDATE_RUN_ID"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload the rollback receipt
@@ -198,14 +222,38 @@ jobs:
           mkdir -p "$(dirname "$RESULT")"
           record() { printf '{"status": "%s", "previousDigest": "%s", "newDigest": "%s", "commit": "%s", "latestAfter": "%s"}\n' "$1" "$PREVIOUS_DIGEST" "$PROMOTE_DIGEST" "$PROMOTE_COMMIT" "$2" > "$RESULT"; }
           rollback_help() {
+            echo "latest was NOT restored automatically."
             if [[ "$PREVIOUS_DIGEST" == absent ]]; then
-              echo "No latest existed before this promotion; repoint latest by hand if needed."
+              echo "No latest existed before this promotion; repoint or remove latest by hand if needed."
             else
-              echo "Rollback: run this workflow with the earlier candidate's commit and digest $PREVIOUS_DIGEST, or (package admin):"
+              echo "To roll back, run this workflow with the earlier candidate's commit and digest $PREVIOUS_DIGEST, or (package admin):"
               echo "  docker buildx imagetools create --prefer-index=false --tag $PACKAGE:latest $PACKAGE@$PREVIOUS_DIGEST"
             fi
           }
           record started unknown
+          # Fail-closed re-read immediately before the write: latest must still be
+          # exactly what the receipt recorded. This narrows the window for another
+          # writer but is NOT an atomic compare-and-swap; the registry offers none.
+          CURRENT=unreadable
+          for attempt in 1 2 3; do
+            if CURRENT="$(docker buildx imagetools inspect "$PACKAGE:latest" --format '{{json .Manifest.Digest}}' 2>"$RUNNER_TEMP/reread-error.txt")"; then
+              CURRENT="$(printf '%s' "$CURRENT" | tr -d '"')"
+              break
+            fi
+            if [[ "$PREVIOUS_DIGEST" == absent ]] \
+              && ! grep -qiE 'denied|unauthori[sz]ed|forbidden|toomanyrequests|timeout|refused|\b(401|403|429|5[0-9][0-9])\b' "$RUNNER_TEMP/reread-error.txt" \
+              && grep -qE '\bMANIFEST_UNKNOWN\b|\bmanifest unknown\b' "$RUNNER_TEMP/reread-error.txt"; then
+              CURRENT=absent
+              break
+            fi
+            CURRENT=unreadable
+            [[ "$attempt" == 3 ]] || sleep "${PROMOTE_RETRY_DELAY_SECONDS:-5}"
+          done
+          if [[ "$CURRENT" != "$PREVIOUS_DIGEST" ]]; then
+            record aborted-latest-changed "$CURRENT"
+            echo "::error::latest changed or could not be re-read before the write (receipt: $PREVIOUS_DIGEST, now: $CURRENT); nothing was written"
+            exit 1
+          fi
           if [[ "$PREVIOUS_DIGEST" != "$PROMOTE_DIGEST" ]]; then
             docker buildx imagetools create --prefer-index=false --tag "$PACKAGE:latest" "$PACKAGE@$PROMOTE_DIGEST" || {
               record write-failed unknown; echo '::error::moving latest failed; its state is unknown'; rollback_help; exit 1; }
@@ -221,8 +269,9 @@ jobs:
           done
           if [[ "$PROMOTED_DIGEST" != "$PROMOTE_DIGEST" ]]; then
             record verify-failed "$PROMOTED_DIGEST"
-            echo "::error::latest could not be confirmed as $PROMOTE_DIGEST (read: $PROMOTED_DIGEST)"
+            echo "::error::latest could not be confirmed as $PROMOTE_DIGEST (read: $PROMOTED_DIGEST). latest was NOT restored; see the rollback command below."
             rollback_help
+            printf 'Read-back FAILED: `latest` could not be confirmed as `%s`. It was NOT restored automatically; the rollback command is in the job log.\n' "$PROMOTE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
           record promoted "$PROMOTED_DIGEST"
