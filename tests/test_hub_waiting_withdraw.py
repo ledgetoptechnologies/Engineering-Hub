@@ -124,6 +124,21 @@ def test_owner_undo_restores_the_item_and_is_idempotent(repo):
         repo.restore_waiting(BEAU, task['id'], back['revision'] + 1)
 
 
+def test_owner_restored_item_is_pinned_until_the_owner_clears_it(repo):
+    task = waiting(repo)
+    done = repo.withdraw('claude', 'waiting', task['id'], task['revision'], 'Not needed')
+    back = repo.restore_waiting(BEAU, task['id'], done['revision'])
+    with pytest.raises(HubError, match='waiting_restored_by_owner'):
+        repo.withdraw('claude', 'waiting', task['id'], back['revision'], 'Still not needed')
+    assert repo.get_task(task['id']) == back
+    # Beau answering clears it; a later new question on the same task is the agent's again.
+    cleared = repo.resolve_waiting(BEAU, task['id'], back['revision'], 'Answered')
+    fresh = repo.update_task('claude', task['id'], cleared['revision'], status='waiting_on_beau',
+                             waiting={'type': 'decision', 'text': 'A new question.'})
+    assert 'restored_by' not in fresh['waiting_on']
+    assert repo.withdraw('claude', 'waiting', task['id'], fresh['revision'], 'Resolved')['status'] == 'claimed'
+
+
 def test_new_question_replaces_the_withdrawn_record(repo):
     task = waiting(repo)
     done = repo.withdraw('claude', 'waiting', task['id'], task['revision'], 'Not needed')

@@ -542,7 +542,8 @@ class HubRepository:
 
         Only a `decision` item (a question) qualifies; an `action` item asks Beau to do or
         approve something and stays until he clears it. Another agent's item, a human's item,
-        and an item Beau already cleared are refused. The task returns to its previous status
+        an item Beau already cleared and an item Beau restored after a withdrawal (it stays
+        until he clears it) are refused. The task returns to its previous status
         (never done), and the withdrawn item is kept on the task and in the audit log; Beau can
         restore it. Retrying the same withdrawal returns the task unchanged.
         """
@@ -571,6 +572,9 @@ class HubRepository:
                 raise HubError('waiting_not_raised_by_you', 403)
             if waiting_on.get('type') != 'decision':
                 raise HubError('waiting_action_needs_owner', 409)
+            # Beau restored this item after an earlier withdrawal: it stays until he clears it.
+            if waiting_on.get('restored_by'):
+                raise HubError('waiting_restored_by_owner', 409)
             now = datetime.now(timezone.utc).isoformat()
             item.pop('waiting_on')
             record = dict(type=waiting_on['type'], text=waiting_on['text'],

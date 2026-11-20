@@ -251,7 +251,8 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         kind 'waiting' with a task id withdraws the waiting-on-Beau question your agent raised on
         that task (decision items only; action items stay for Beau); the task returns to its
         previous status, Beau sees the reason and can undo it. Refusals name the rule:
-        waiting_not_raised_by_you, waiting_action_needs_owner, waiting_already_answered, not_waiting.
+        waiting_not_raised_by_you, waiting_action_needs_owner, waiting_restored_by_owner (Beau undid
+        an earlier withdrawal; it stays until he clears it), waiting_already_answered, not_waiting.
         """
         return invoke(repo.withdraw, identity(ctx), kind, entity_id, expected_revision, reason, superseded_by)
 

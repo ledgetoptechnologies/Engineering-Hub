@@ -98,7 +98,8 @@ required reason (`hub_entity_withdraw` with kind `waiting` and the task id, unde
 `waiting_withdrawn` records who, when, why and the prior state. Another agent's or a
 human's item, an `action` item (Beau must do or approve it) and an item Beau already
 cleared are refused, each with its own error code. Beau undoes it with
-`POST /tasks/{id}/restore-waiting`. `hub_overview` omits long
+`POST /tasks/{id}/restore-waiting`; a restored item cannot be withdrawn again by an
+agent and stays until Beau clears it. `hub_overview` omits long
 backlog text (acceptance, notes, request) and gives counts; `hub_task_get` returns
 the full record.
 
