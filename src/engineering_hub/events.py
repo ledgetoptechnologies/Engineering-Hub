@@ -137,22 +137,44 @@ class NativeHubEventFeed:
 
     def __init__(self, path: str | Path, *, queue_size=8,
                  source_factory: Callable = SQLiteEventSource,
-                 support_check: Callable = native_event_support):
+                 support_check: Callable = native_event_support,
+                 transient_busy_seconds=0):
+        # Zero keeps the original behavior: a held write lock fails the feed closed.
+        if (type(transient_busy_seconds) not in {int, float} or not 0 <= transient_busy_seconds <= 3600
+                or transient_busy_seconds != transient_busy_seconds):
+            raise ValueError("transient_busy_seconds must be between 0 and 3600")
         self.path = Path(path)
         self.broker = EventBroker(queue_size=queue_size)
         self._factory = source_factory
         self._support_check = support_check
+        self._transient_busy_seconds = transient_busy_seconds
         self._source = None
         self._loop = None
         self._lock = threading.Lock()
         self._scheduled = False
         self._pending_cursor = None
         self._pending_error = False
+        self._pending_state = None
+        # Set by the watcher thread the moment a suspend or resume is reported,
+        # cleared only once the event loop has moved the broker over. Until then
+        # the old epoch's streams may still be live, so nothing is available.
+        self._transition_pending = False
+        self._transition_seq = 0
+        # Each start() binds its source's callbacks to a new generation, so late
+        # callbacks from a stopped source can't move a restarted feed.
+        self._generation = 0
+        # Sticky until the next start(): a source error, or a broker transition
+        # that raised. Nothing can reopen the feed while it is set.
+        self._failed = False
+        # True while start() awaits the source. Drains that run meanwhile never
+        # activate the broker; start() settles the final state once it returns.
+        self._starting = False
         self.reason = "not_started"
 
     @property
     def available(self):
-        return self.broker.available and self._source is not None and self._source.healthy
+        return (self.broker.available and not self._transition_pending and not self._failed
+                and self._source is not None and self._source.healthy)
 
     @property
     def status(self):
@@ -165,28 +187,75 @@ class NativeHubEventFeed:
     def _error(self, _exc):
         self._schedule(error=True)
 
-    def _schedule(self, *, cursor=None, error=False):
+    def _state(self, state):
+        if state in {"suspended", "resumed"}:
+            self._schedule(state=state)
+
+    def _schedule(self, *, cursor=None, error=False, state=None, generation=None):
         # Native writes may burst while the ASGI loop is occupied: retain only
         # the latest head and at most one scheduled callback, not an unbounded
         # call_soon_threadsafe backlog. Errors always outrank invalidations.
         with self._lock:
-            if self._loop is None:
+            if self._loop is None or (generation is not None and generation != self._generation):
                 return
             if cursor is not None:
                 self._pending_cursor = max(cursor, self._pending_cursor or 0)
             self._pending_error |= error
+            if state is not None:
+                self._pending_state = state
+                self._transition_pending = True
+                self._transition_seq += 1
             if not self._scheduled:
                 self._scheduled = True
                 self._loop.call_soon_threadsafe(self._drain)
 
     def _drain(self):
         with self._lock:
-            cursor, error = self._pending_cursor, self._pending_error
-            self._pending_cursor = None
+            cursor, error, state = self._pending_cursor, self._pending_error, self._pending_state
+            seq = self._transition_seq
+            self._pending_cursor = self._pending_state = None
             self._pending_error = self._scheduled = False
-        if error:
+        try:
+            self._apply(cursor, error, state)
+        except Exception:
+            # A transition that broke partway must never leave an old epoch live:
+            # fail the broker and stay unavailable until the next start().
+            self._failed = True
+            self.reason = "native_source_failed"
+            try:
+                self.broker.fail()
+            except Exception:
+                pass
+        finally:
+            with self._lock:
+                # A transition reported after the snapshot keeps the gate shut
+                # until its own drain has moved the broker.
+                if self._transition_seq == seq:
+                    self._transition_pending = False
+
+    def _apply(self, cursor, error, state):
+        if self._failed:
+            self.broker.fail()
+        elif error:
+            self._failed = True
             self.reason = "native_source_failed"
             self.broker.fail()
+        elif state == "suspended":
+            # Every viewer is told it's no longer current and must reconnect later.
+            self.reason = "native_source_suspended"
+            self.broker.fail()
+        elif state == "resumed":
+            # A suspension happened, so no viewer may keep its old stream: end any
+            # stragglers, then reopen under a new epoch at the caught-up head.
+            # The pending cursor is already included in that head.
+            # The source reports healthy only after this callback was accepted,
+            # so its health isn't checked here. The feed stays unavailable
+            # until it is, because available also requires a healthy source.
+            source = self._source
+            self.broker.fail()
+            if source is not None and not self._starting:
+                self.broker.activate(int(source.stats["cursor"]))
+                self.reason = "native_source_active"
         elif cursor is not None:
             self.broker.publish(cursor)
 
@@ -198,17 +267,46 @@ class NativeHubEventFeed:
             self.reason = "native_source_unsupported"
             self.broker.fail()
             return self.status
+        with self._lock:
+            self._generation += 1
+            generation = self._generation
+            self._failed = False
         self._loop = asyncio.get_running_loop()
+
+        def notify(_channels, cursor):
+            self._schedule(cursor=cursor, generation=generation)
+
+        def error(_exc):
+            self._schedule(error=True, generation=generation)
+
+        def state(value):
+            if value in {"suspended", "resumed"}:
+                self._schedule(state=value, generation=generation)
+
         try:
-            self._source = self._factory(self.path, HubOutboxCursorReader(), self._notify,
-                                         on_error=self._error)
-            stats = await asyncio.to_thread(self._source.start)
+            # The transient options are passed only when enabled, so existing
+            # source factories keep their exact signature.
+            transient = ({"transient_busy_seconds": self._transient_busy_seconds, "on_state": state}
+                         if self._transient_busy_seconds else {})
+            self._source = self._factory(self.path, HubOutboxCursorReader(), notify,
+                                         on_error=error, **transient)
+            self._starting = True
+            try:
+                stats = await asyncio.to_thread(self._source.start)
+            finally:
+                self._starting = False
+            if self._failed:
+                # A drain during startup already failed the feed: keep it closed.
+                self.reason = "native_source_failed"
+                self.broker.fail()
+                return self.status
             self.broker.activate(int(stats["cursor"]))
             self.reason = "native_source_active"
             # Catch up changes delivered while start() was returning. The
             # source's stats is memory only, never another SQLite query.
             if not self._source.healthy:
-                self.reason = "native_source_failed"
+                suspended = bool(self._source.stats.get("suspended"))
+                self.reason = "native_source_suspended" if suspended else "native_source_failed"
                 self.broker.fail()
             else:
                 self.broker.publish(int(self._source.stats["cursor"]))
@@ -227,6 +325,6 @@ class NativeHubEventFeed:
             await asyncio.to_thread(source.stop)
         with self._lock:
             self._loop = None
-            self._pending_cursor = None
-            self._pending_error = self._scheduled = False
+            self._pending_cursor = self._pending_state = None
+            self._pending_error = self._scheduled = self._transition_pending = False
         self.reason = "stopped"
