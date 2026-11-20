@@ -150,6 +150,7 @@ def test_main_build_publishes_only_immutable_tags_and_never_moves_latest():
 
 
 PROMOTE_ORDER = [
+    'Require the protected promotion environment and its recorded approval',
     'Validate requested candidate', 'Check out promotion verifier', 'Require the commit to be on main',
     'Find the successful main build run for the commit', "Verify the candidate's evidence", None, None,
     'Require the private package', 'Verify the registry still holds the exact candidate',
@@ -172,6 +173,25 @@ def test_only_the_manual_main_promotion_moves_latest():
     assert job['permissions'] == {'contents': 'read', 'actions': 'read', 'packages': 'write'}
     assert [step.get('name') for step in job['steps']] == PROMOTE_ORDER
     steps = {step.get('name'): step for step in job['steps']}
+    assert job['environment'] == 'image-promotion'
+    gate = job['steps'][0]
+    assert gate['name'] == 'Require the protected promotion environment and its recorded approval'
+    assert gate['env']['PROMOTION_ENVIRONMENT'] == 'image-promotion'
+    assert gate['env']['PROMOTION_APPROVER_ID'] == '${{ vars.PROMOTION_APPROVER_ID }}'
+    assert gate['env']['PINNED_APPROVER_ID'] == '148508330'
+    gate_run = gate['run']
+    for requirement in [
+        '[[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]',
+        '[[ "$GITHUB_RUN_ATTEMPT" == 1 ]]',
+        '[[ "$PINNED_APPROVER_ID" == 148508330 && "$PROMOTION_APPROVER_ID" == "$PINNED_APPROVER_ID" ]]',
+        '.can_admins_bypass == false',
+        '[[ "$REVIEWERS" == "$PINNED_APPROVER_ID" ]]',
+        '[[ "$BRANCHES" == "branch:main" ]]',
+        '[[ "$REVIEWS" == "approved:$PINNED_APPROVER_ID" ]]',
+    ]:
+        assert requirement in gate_run
+    assert job['steps'].index(gate) < next(i for i, step in enumerate(job['steps']) if step.get('uses', '').startswith('actions/checkout@'))
+    assert not re.search(r'gh api[^\n]*(-X|--method)\s*(PUT|POST|PATCH|DELETE)', gate_run, re.I)
     # Inputs reach shell only through env; no build, no other secrets.
     assert all('${{ inputs.' not in step.get('run', '') for step in job['steps'])
     assert 'build-push-action' not in text and 'secrets.' not in text.replace('secrets.GITHUB_TOKEN', '')
@@ -200,7 +220,8 @@ def test_only_the_manual_main_promotion_moves_latest():
     assert 'inspect_digest "$PACKAGE@$PREVIOUS_DIGEST"' in body
     receipt = steps['Persist the rollback receipt before moving latest']['run']
     for field in ['"mode"', 'previousDigest', 'newDigest', '"commit"', 'candidateRunId', 'promotionRunId', 'recordedAt',
-                  'dispatchedBy', 'approvedBy', 'approvalReference', '"approvalEnforced": false']:
+                  'dispatchedBy', 'approvedBy', '"approvalEnvironment": "image-promotion"',
+                  'typedApprovedBy', 'approvalReference', '"approvalEnforced": true']:
         assert field in receipt
     assert steps['Upload the rollback receipt']['with']['if-no-files-found'] == 'error'
     assert steps['Upload the promotion result']['if'] == "${{ always() && steps.receipt.outcome == 'success' }}"
@@ -222,7 +243,7 @@ def test_only_the_manual_main_promotion_moves_latest():
     validate = steps['Validate requested candidate']['run']
     assert '$APPROVED_BY' in validate and '$APPROVAL_REFERENCE' in validate
     assert job['env']['APPROVED_BY'] == '${{ inputs.approved_by }}'
-    assert 'GitHub Environment with required' in text and 'reviewers' in text
+    assert 'protected GitHub Environment' in text and 'reviewer approves' in text
 
 
 def test_verify_runs_backend_e2e_and_pidfd_gates_once():
