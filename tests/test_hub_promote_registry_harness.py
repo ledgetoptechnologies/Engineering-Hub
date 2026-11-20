@@ -258,3 +258,25 @@ def test_pre_write_reread_refuses_mixed_absence_error(registry):
                  STUB_MISSING_MSG=MANIFEST_UNKNOWN, INITIALIZE_LATEST='true')
     assert r['move'].returncode == 1 and not (registry / 'reg' / 'written').exists()
     assert '"status": "aborted-latest-changed"' in _result(registry)
+
+
+@pytest.mark.parametrize('message', [
+    'ERROR: ghcr.io/ledgetoptechnologies/other-image:latest: MANIFEST_UNKNOWN: manifest unknown',
+    'ERROR: ghcr.io/someone-else/engineering-hub-control:latest: MANIFEST_UNKNOWN: manifest unknown',
+    'ERROR: docker.io/ledgetoptechnologies/engineering-hub-control:latest: MANIFEST_UNKNOWN: manifest unknown',
+    f'ERROR: {PACKAGE}@sha256:{"a" * 64}: MANIFEST_UNKNOWN: manifest unknown',
+    f'ERROR: {PACKAGE}:latest-old: MANIFEST_UNKNOWN: manifest unknown',
+    f'ERROR: {PACKAGE}:latest: MANIFEST_UNKNOWN: manifest unknown; map[Tag:other]',
+    f'ERROR: {PACKAGE}:latest: not found',
+    f'failed: {PACKAGE}:latest: MANIFEST_UNKNOWN: manifest unknown',
+])
+def test_absence_must_name_the_exact_requested_reference(registry, message):
+    r = _promote(registry, STUB_MISSING_MSG=message, INITIALIZE_LATEST='true')
+    assert r['previous'].returncode != 0 and r['receipt'] is None
+    assert not (registry / 'reg' / 'written').exists()
+
+
+def test_both_recognised_absence_forms_initialize(registry):
+    r = _promote(registry, STUB_MISSING_MSG=f'ERROR: {PACKAGE}:latest: MANIFEST_UNKNOWN: manifest unknown',
+                 INITIALIZE_LATEST='true')
+    assert r['move'].returncode == 0 and _read(registry, f'{PACKAGE}:latest') == NEW
