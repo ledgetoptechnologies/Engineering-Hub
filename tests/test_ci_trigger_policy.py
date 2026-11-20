@@ -192,6 +192,8 @@ def test_only_the_manual_main_promotion_moves_latest():
     assert 'imagetools create' not in body and '2>/dev/null' not in body
     assert r"grep -qE '\bMANIFEST_UNKNOWN\b|\bmanifest unknown\b'" in body and 'not found|' not in body
     assert 'for attempt in 1 2 3' in body
+    assert 'if manifest_unknown_only "$RUNNER_TEMP/inspect-error.txt" "${ref##*[:@]}"; then' in body
+    assert '[[ "$(grep -c . "$file")" == 1 ]] || return 1' in body and 'NAME_UNKNOWN' in body
     assert 'latest is missing although production latest is expected to exist' in body
     assert 'initialize_latest was requested but latest already exists' in body
     assert 'inspect_digest "$PACKAGE@$PREVIOUS_DIGEST"' in body
@@ -211,6 +213,7 @@ def test_only_the_manual_main_promotion_moves_latest():
     write = move.index('imagetools create --prefer-index=false --tag "$PACKAGE:latest"')
     assert reread < abort < write
     assert 'if [[ "$CURRENT" != "$PREVIOUS_DIGEST" ]]; then' in move
+    assert 'if [[ "$PREVIOUS_DIGEST" == absent ]] && manifest_unknown_only "$RUNNER_TEMP/reread-error.txt" latest; then' in move
     assert 'NOT an atomic compare-and-swap' in move
     assert 'NOT an atomic compare-and-swap' in text.split(chr(10) + 'on:' + chr(10))[0]
     assert 'latest was NOT restored automatically.' in move

@@ -18,7 +18,7 @@ OLD = 'sha256:' + 'a' * 64
 NEW = 'sha256:' + 'b' * 64
 OTHER = 'sha256:' + 'e' * 64
 COMMIT = 'c' * 40
-MANIFEST_UNKNOWN = 'ERROR: unexpected status from HEAD request: 404 MANIFEST_UNKNOWN: manifest unknown'
+MANIFEST_UNKNOWN = f'ERROR: {PACKAGE}:latest: MANIFEST_UNKNOWN: manifest unknown; map[Tag:latest]'
 
 STUB = r'''#!/usr/bin/env bash
 key() { echo "$REG/$(echo "$1" | tr '/:@' '___')"; }
@@ -235,3 +235,26 @@ def test_initialize_rereads_absence_before_write(registry):
     r = _promote(registry, before_move=lambda root: _tag(root, f'{PACKAGE}:latest', OTHER),
                  STUB_MISSING_MSG=MANIFEST_UNKNOWN, INITIALIZE_LATEST='true')
     assert r['move'].returncode == 1 and _read(registry, f'{PACKAGE}:latest') == OTHER
+
+
+@pytest.mark.parametrize('message', [
+    f'ERROR: {PACKAGE}:latest: MANIFEST_UNKNOWN: manifest unknown; 401 Unauthorized',
+    f'ERROR: {PACKAGE}:latest: MANIFEST_UNKNOWN: manifest unknown; NAME_UNKNOWN: repository name not known',
+    f'ERROR: {PACKAGE}:latest: MANIFEST_UNKNOWN: manifest unknown' + chr(10) + 'ERROR: dial tcp: i/o timeout',
+    f'ERROR: {PACKAGE}:latest: manifest unknown (tls handshake retry)',
+    f'ERROR: {PACKAGE}:other: MANIFEST_UNKNOWN: manifest unknown',
+    'MANIFEST_UNKNOWN',
+    '',
+])
+def test_mixed_or_ambiguous_absence_is_refused_even_with_opt_in(registry, message):
+    r = _promote(registry, STUB_MISSING_MSG=message, INITIALIZE_LATEST='true')
+    assert r['previous'].returncode != 0 and r['receipt'] is None
+    assert _read(registry, f'{PACKAGE}:latest') == 'absent' and not (registry / 'reg' / 'written').exists()
+
+
+def test_pre_write_reread_refuses_mixed_absence_error(registry):
+    mixed = f'ERROR: {PACKAGE}:latest: MANIFEST_UNKNOWN: manifest unknown; 503 Service Unavailable'
+    r = _promote(registry, before_move=lambda root: (root / 'reg' / 'latest-error.txt').write_text(mixed),
+                 STUB_MISSING_MSG=MANIFEST_UNKNOWN, INITIALIZE_LATEST='true')
+    assert r['move'].returncode == 1 and not (registry / 'reg' / 'written').exists()
+    assert '"status": "aborted-latest-changed"' in _result(registry)
