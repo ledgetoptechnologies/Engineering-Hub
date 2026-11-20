@@ -1,0 +1,307 @@
+name: Promote Engineering Hub control candidate to latest
+# Manual, main-only promotion. hub-control.yml builds, smoke-tests and publishes
+# every main candidate as an immutable digest with a write-once `sha-<commit>`
+# tag. This workflow moves `latest` to one of those tested digests and nothing
+# else moves it. It does not rebuild or deploy. Rollback is a promotion of an
+# older candidate.
+#
+# Approval: the approved_by and approval_reference inputs are written into the
+# rollback receipt as a RECORD of who authorized the promotion. They do not
+# enforce anything. The enforcing mechanism is a GitHub Environment with required
+# reviewers, which is an owner repository setting and is not created here.
+#
+# Exclusion: this is the only workflow that writes `latest` (a test fails if
+# another writer appears). The `hub-promote-latest` concurrency group stops two
+# promotions overlapping. Neither is a registry-wide lock: a package admin or an
+# older in-flight run could still write the tag, so the job re-reads `latest`
+# immediately before writing and aborts if it changed. That re-read narrows the
+# window but is NOT an atomic compare-and-swap.
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full 40-character main commit SHA of the tested candidate
+        required: true
+        type: string
+      digest:
+        description: The candidate's image digest (sha256:...), as shown in its hub-control run summary
+        required: true
+        type: string
+      initialize_latest:
+        description: First-time setup only. Allow promotion when latest does not exist yet (registry MANIFEST_UNKNOWN). Leave false for production.
+        required: false
+        default: false
+        type: boolean
+      approved_by:
+        description: Who approved this promotion (recorded in the receipt; not enforced)
+        required: true
+        type: string
+      approval_reference:
+        description: Approval reference, e.g. a Hub task or decision id (recorded in the receipt; not enforced)
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: hub-promote-latest
+  cancel-in-progress: false
+jobs:
+  promote:
+    if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    env:
+      PACKAGE: ghcr.io/ledgetoptechnologies/engineering-hub-control
+      PROMOTE_COMMIT: ${{ inputs.commit }}
+      PROMOTE_DIGEST: ${{ inputs.digest }}
+      APPROVED_BY: ${{ inputs.approved_by }}
+      APPROVAL_REFERENCE: ${{ inputs.approval_reference }}
+    steps:
+      - name: Validate requested candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$PROMOTE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::commit must be a full lowercase 40-character SHA'; exit 1; }
+          [[ "$PROMOTE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo '::error::digest must be sha256:<64 hex>'; exit 1; }
+          [[ "$APPROVED_BY" =~ ^[A-Za-z0-9][A-Za-z0-9._@\ -]{0,63}$ ]] || { echo '::error::approved_by is required (letters, digits, space, . _ @ -; max 64)'; exit 1; }
+          [[ "$APPROVAL_REFERENCE" =~ ^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,127}$ ]] || { echo '::error::approval_reference is required (e.g. a Hub task or decision id)'; exit 1; }
+      - name: Check out promotion verifier
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/hub_candidate_evidence.py
+          sparse-checkout-cone-mode: false
+      - name: Require the commit to be on main
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          STATUS="$(gh api "repos/$GITHUB_REPOSITORY/compare/$PROMOTE_COMMIT...$GITHUB_SHA" --jq .status)"
+          [[ "$STATUS" == ahead || "$STATUS" == identical ]] || { echo "::error::$PROMOTE_COMMIT is not part of main ($STATUS)"; exit 1; }
+      - name: Find the successful main build run for the commit
+        id: run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RUN_ID="$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/hub-control.yml/runs" \
+            -f head_sha="$PROMOTE_COMMIT" -f branch=main -f status=success -f per_page=20 \
+            --jq "[.workflow_runs[] | select(.head_sha == \"$PROMOTE_COMMIT\" and .head_branch == \"main\" and (.event == \"push\" or .event == \"workflow_dispatch\") and .conclusion == \"success\" and .path == \".github/workflows/hub-control.yml\" and .head_repository.full_name == \"$GITHUB_REPOSITORY\")] | first | .id // empty")"
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::no successful main build run for $PROMOTE_COMMIT; it is not a tested candidate"; exit 1; }
+          echo "id=$RUN_ID" >> "$GITHUB_OUTPUT"
+      - name: Verify the candidate's evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN_ID: ${{ steps.run.outputs.id }}
+        run: |
+          set -euo pipefail
+          DIR="$RUNNER_TEMP/candidate-evidence"
+          gh run download "$CANDIDATE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "hub-control-candidate-$PROMOTE_COMMIT" --dir "$DIR"
+          (cd "$DIR" && sha256sum --check --strict hub-candidate.sha256)
+          python3 scripts/hub_candidate_evidence.py verify "$DIR/hub-candidate.json"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Require the private package
+        run: |
+          python3 - <<'PY'
+          import urllib.request, urllib.error
+          url = 'https://ghcr.io/token?service=ghcr.io&scope=repository:ledgetoptechnologies/engineering-hub-control:pull'
+          try:
+              with urllib.request.urlopen(url, timeout=20):
+                  raise SystemExit('Anonymous pull token unexpectedly available; refusing promotion')
+          except urllib.error.HTTPError as e:
+              if e.code not in (401, 403):
+                  raise
+          print('Private registry gate passed')
+          PY
+      - name: Verify the registry still holds the exact candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA_DIGEST="$(docker buildx imagetools inspect "$PACKAGE:sha-$PROMOTE_COMMIT" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          test "$SHA_DIGEST" = "$PROMOTE_DIGEST" || { echo "::error::sha-$PROMOTE_COMMIT names $SHA_DIGEST, not $PROMOTE_DIGEST"; exit 1; }
+          docker pull "$PACKAGE@$PROMOTE_DIGEST"
+          test "$(docker inspect --format '{{.Config.User}}' "$PACKAGE@$PROMOTE_DIGEST")" = "568:568"
+          test "$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$PACKAGE@$PROMOTE_DIGEST")" = "$PROMOTE_COMMIT"
+      - name: Read current latest and resolve the rollback target
+        id: previous
+        shell: bash
+        env:
+          INITIALIZE_LATEST: ${{ inputs.initialize_latest }}
+        run: |
+          set -euo pipefail
+          # Production latest already exists, so anything other than a valid,
+          # resolvable digest aborts before anything is written, including an
+          # apparent absence. Only the explicit initialize_latest path accepts a
+          # missing latest, and only on the registry's MANIFEST_UNKNOWN response;
+          # a bare "not found" or any other error is retried, then aborts.
+          # Absence is accepted only when the whole error output is exactly one of the
+          # recognised registry responses for the exact requested tag reference
+          # (registry/repository:tag). Any other wording, reference, digest form,
+          # extra line or extra text is unknown and aborts.
+          manifest_unknown_only() {
+            local file="$1" ref="$2" line
+            [[ "$ref" =~ ^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+:[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$ ]] || return 1
+            [[ "$(wc -l < "$file")" -le 1 && "$(grep -c . "$file")" == 1 ]] || return 1
+            line="$(tr -d '\r\n' < "$file")"
+            [[ "$line" == "ERROR: $ref: MANIFEST_UNKNOWN: manifest unknown" \
+              || "$line" == "ERROR: $ref: MANIFEST_UNKNOWN: manifest unknown; map[Tag:${ref##*:}]" ]]
+          }
+          inspect_digest() {
+            local ref="$1" attempt out
+            for attempt in 1 2 3; do
+              if out="$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest.Digest}}' 2>"$RUNNER_TEMP/inspect-error.txt")"; then
+                printf '%s' "$out" | tr -d '"'
+                return 0
+              fi
+              if manifest_unknown_only "$RUNNER_TEMP/inspect-error.txt" "$ref"; then
+                printf 'manifest-unknown'
+                return 0
+              fi
+              echo "registry inspect of $ref failed (attempt $attempt):" >&2
+              cat "$RUNNER_TEMP/inspect-error.txt" >&2
+              [[ "$attempt" == 3 ]] || sleep "${PROMOTE_RETRY_DELAY_SECONDS:-5}"
+            done
+            return 1
+          }
+          [[ "$INITIALIZE_LATEST" == true || "$INITIALIZE_LATEST" == false ]] || { echo '::error::initialize_latest must be true or false'; exit 1; }
+          PREVIOUS_DIGEST="$(inspect_digest "$PACKAGE:latest")" || { echo '::error::cannot read the current latest; nothing was changed'; exit 1; }
+          if [[ "$PREVIOUS_DIGEST" == manifest-unknown ]]; then
+            [[ "$INITIALIZE_LATEST" == true ]] || { echo '::error::latest is missing although production latest is expected to exist; nothing was changed. Use initialize_latest only for a first-time setup.'; exit 1; }
+            PREVIOUS_DIGEST=absent
+            MODE=initialize
+          else
+            [[ "$INITIALIZE_LATEST" == false ]] || { echo '::error::initialize_latest was requested but latest already exists; nothing was changed'; exit 1; }
+            [[ "$PREVIOUS_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::current latest digest is malformed: $PREVIOUS_DIGEST; nothing was changed"; exit 1; }
+            RESOLVED="$(inspect_digest "$PACKAGE@$PREVIOUS_DIGEST")" || { echo '::error::cannot resolve the current latest digest; nothing was changed'; exit 1; }
+            test "$RESOLVED" = "$PREVIOUS_DIGEST" || { echo "::error::current latest digest $PREVIOUS_DIGEST does not resolve; nothing was changed"; exit 1; }
+            MODE=replace
+          fi
+          echo "digest=$PREVIOUS_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+      - name: Persist the rollback receipt before moving latest
+        id: receipt
+        shell: bash
+        env:
+          PREVIOUS_DIGEST: ${{ steps.previous.outputs.digest }}
+          PROMOTION_MODE: ${{ steps.previous.outputs.mode }}
+          CANDIDATE_RUN_ID: ${{ steps.run.outputs.id }}
+        run: |
+          set -euo pipefail
+          [[ ( "$PROMOTION_MODE" == initialize && "$PREVIOUS_DIGEST" == absent ) || ( "$PROMOTION_MODE" == replace && "$PREVIOUS_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ) ]]
+          [[ "$CANDIDATE_RUN_ID" =~ ^[0-9]+$ ]]
+          DIR="$RUNNER_TEMP/hub-promotion-receipt"
+          mkdir -p "$DIR"
+          printf '{\n  "receiptSchemaVersion": 2,\n  "mode": "%s",\n  "image": "%s",\n  "previousDigest": "%s",\n  "newDigest": "%s",\n  "commit": "%s",\n  "candidateRunId": "%s",\n  "promotionRunId": "%s",\n  "promotionRunAttempt": "%s",\n  "dispatchedBy": "%s",\n  "approvedBy": "%s",\n  "approvalReference": "%s",\n  "approvalEnforced": false,\n  "recordedAt": "%s"\n}\n' \
+            "$PROMOTION_MODE" "$PACKAGE" "$PREVIOUS_DIGEST" "$PROMOTE_DIGEST" "$PROMOTE_COMMIT" "$CANDIDATE_RUN_ID" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            "$GITHUB_ACTOR" "$APPROVED_BY" "$APPROVAL_REFERENCE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$DIR/hub-promotion-receipt.json"
+          {
+            printf 'Rollback receipt (recorded before `latest` is changed)\n\n'
+            printf -- '- Mode: %s (initialize = first-time creation of latest, explicitly requested)\n' "$PROMOTION_MODE"
+            printf -- '- Previous latest (rollback target): `%s`\n- New digest: `%s`\n- Commit: `%s`\n' "$PREVIOUS_DIGEST" "$PROMOTE_DIGEST" "$PROMOTE_COMMIT"
+            printf -- '- Approved by: %s; approval reference: %s (a record, not enforced by this workflow)\n' "$APPROVED_BY" "$APPROVAL_REFERENCE"
+            printf -- '- Candidate build run: %s/%s/actions/runs/%s\n\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$CANDIDATE_RUN_ID"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the rollback receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: hub-promotion-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hub-promotion-receipt/hub-promotion-receipt.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Move latest to the tested digest
+        id: move
+        shell: bash
+        env:
+          PREVIOUS_DIGEST: ${{ steps.previous.outputs.digest }}
+        run: |
+          set -euo pipefail
+          RESULT="$RUNNER_TEMP/hub-promotion-result/hub-promotion-result.json"
+          mkdir -p "$(dirname "$RESULT")"
+          record() { printf '{"status": "%s", "previousDigest": "%s", "newDigest": "%s", "commit": "%s", "latestAfter": "%s"}\n' "$1" "$PREVIOUS_DIGEST" "$PROMOTE_DIGEST" "$PROMOTE_COMMIT" "$2" > "$RESULT"; }
+          rollback_help() {
+            echo "latest was NOT restored automatically."
+            if [[ "$PREVIOUS_DIGEST" == absent ]]; then
+              echo "No latest existed before this promotion; repoint or remove latest by hand if needed."
+            else
+              echo "To roll back, run this workflow with the earlier candidate's commit and digest $PREVIOUS_DIGEST, or (package admin):"
+              echo "  docker buildx imagetools create --prefer-index=false --tag $PACKAGE:latest $PACKAGE@$PREVIOUS_DIGEST"
+            fi
+          }
+          # Absence is accepted only when the whole error output is exactly one of the
+          # recognised registry responses for the exact requested tag reference
+          # (registry/repository:tag). Any other wording, reference, digest form,
+          # extra line or extra text is unknown and aborts.
+          manifest_unknown_only() {
+            local file="$1" ref="$2" line
+            [[ "$ref" =~ ^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+:[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$ ]] || return 1
+            [[ "$(wc -l < "$file")" -le 1 && "$(grep -c . "$file")" == 1 ]] || return 1
+            line="$(tr -d '\r\n' < "$file")"
+            [[ "$line" == "ERROR: $ref: MANIFEST_UNKNOWN: manifest unknown" \
+              || "$line" == "ERROR: $ref: MANIFEST_UNKNOWN: manifest unknown; map[Tag:${ref##*:}]" ]]
+          }
+          record started unknown
+          # Fail-closed re-read immediately before the write: latest must still be
+          # exactly what the receipt recorded. This narrows the window for another
+          # writer but is NOT an atomic compare-and-swap; the registry offers none.
+          CURRENT=unreadable
+          for attempt in 1 2 3; do
+            if CURRENT="$(docker buildx imagetools inspect "$PACKAGE:latest" --format '{{json .Manifest.Digest}}' 2>"$RUNNER_TEMP/reread-error.txt")"; then
+              CURRENT="$(printf '%s' "$CURRENT" | tr -d '"')"
+              break
+            fi
+            if [[ "$PREVIOUS_DIGEST" == absent ]] && manifest_unknown_only "$RUNNER_TEMP/reread-error.txt" "$PACKAGE:latest"; then
+              CURRENT=absent
+              break
+            fi
+            CURRENT=unreadable
+            [[ "$attempt" == 3 ]] || sleep "${PROMOTE_RETRY_DELAY_SECONDS:-5}"
+          done
+          if [[ "$CURRENT" != "$PREVIOUS_DIGEST" ]]; then
+            record aborted-latest-changed "$CURRENT"
+            echo "::error::latest changed or could not be re-read before the write (receipt: $PREVIOUS_DIGEST, now: $CURRENT); nothing was written"
+            exit 1
+          fi
+          if [[ "$PREVIOUS_DIGEST" != "$PROMOTE_DIGEST" ]]; then
+            docker buildx imagetools create --prefer-index=false --tag "$PACKAGE:latest" "$PACKAGE@$PROMOTE_DIGEST" || {
+              record write-failed unknown; echo '::error::moving latest failed; its state is unknown'; rollback_help; exit 1; }
+          fi
+          PROMOTED_DIGEST=unreadable
+          for attempt in 1 2 3; do
+            if PROMOTED_DIGEST="$(docker buildx imagetools inspect "$PACKAGE:latest" --format '{{json .Manifest.Digest}}')"; then
+              PROMOTED_DIGEST="$(printf '%s' "$PROMOTED_DIGEST" | tr -d '"')"
+              break
+            fi
+            PROMOTED_DIGEST=unreadable
+            [[ "$attempt" == 3 ]] || sleep "${PROMOTE_RETRY_DELAY_SECONDS:-5}"
+          done
+          if [[ "$PROMOTED_DIGEST" != "$PROMOTE_DIGEST" ]]; then
+            record verify-failed "$PROMOTED_DIGEST"
+            echo "::error::latest could not be confirmed as $PROMOTE_DIGEST (read: $PROMOTED_DIGEST). latest was NOT restored; see the rollback command below."
+            rollback_help
+            printf 'Read-back FAILED: `latest` could not be confirmed as `%s`. It was NOT restored automatically; the rollback command is in the job log.\n' "$PROMOTE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          record promoted "$PROMOTED_DIGEST"
+          printf 'Promoted `%s:latest` to `%s` (previous `%s`)\n' "$PACKAGE" "$PROMOTE_DIGEST" "$PREVIOUS_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the promotion result
+        if: ${{ always() && steps.receipt.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: hub-promotion-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hub-promotion-result/hub-promotion-result.json
+          if-no-files-found: warn
+          retention-days: 90

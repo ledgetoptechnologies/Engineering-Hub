@@ -1,4 +1,6 @@
 name: Engineering Hub control image
+# Main builds publish an immutable, smoke-tested candidate (build-<sha>-<run>-<attempt>
+# and write-once sha-<commit>). They never move `latest`; that is hub-promote.yml.
 on:
   push:
     branches: [main]
@@ -14,6 +16,9 @@ jobs:
     if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # Source gate only. The image is built once, in publish, which runs the
+    # isolated container checks on that exact candidate before any upload.
+    # Run scripts/local_premerge.py before merging (docs/local-premerge.md).
     steps:
       - uses: actions/checkout@v4
         with:
@@ -21,14 +26,46 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+          cache: npm
+          cache-dependency-path: hub-ui/package-lock.json
       - uses: astral-sh/setup-uv@v6
         with:
           version: '0.11.17'
           python-version: '3.12'
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - run: uv sync --locked
-      - run: uv run --locked python -W default -m pytest -q
+      - name: Dashboard install, unit tests and build
+        run: npm ci --ignore-scripts && npm test && npm run build
+        working-directory: hub-ui
+      - name: Playwright version
+        id: playwright
+        run: echo "version=$(node -p "require('./node_modules/@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+        working-directory: hub-ui
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}-chromium
+      - run: npx playwright install --with-deps chromium
+        working-directory: hub-ui
+      - name: Backend suite, with dashboard end-to-end alongside
         env:
           EH_RESPONSIVENESS_ARTIFACT_DIR: ${{ runner.temp }}/eh-responsiveness
+        run: |
+          # Billed time is per-job wall clock. pytest is mostly single-core, so
+          # the single-worker Playwright run uses the runner's other CPU instead
+          # of adding ~6.5 minutes afterwards. Both must pass.
+          (cd hub-ui && npm run test:e2e > "$RUNNER_TEMP/e2e.log" 2>&1) &
+          e2e_pid=$!
+          pytest_status=0
+          uv run --locked python -W default -m pytest -q || pytest_status=$?
+          e2e_status=0
+          wait "$e2e_pid" || e2e_status=$?
+          echo "::group::Dashboard end-to-end output"
+          cat "$RUNNER_TEMP/e2e.log"
+          echo "::endgroup::"
+          echo "pytest exit $pytest_status; Playwright exit $e2e_status"
+          [ "$pytest_status" -eq 0 ] && [ "$e2e_status" -eq 0 ]
       - name: Preserve responsiveness evidence on success and failure
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -37,28 +74,8 @@ jobs:
           path: ${{ runner.temp }}/eh-responsiveness/*.json
           if-no-files-found: warn
           retention-days: 14
-      - run: npm ci --ignore-scripts && npm test && npm run build && npx playwright install --with-deps chromium && npm run test:e2e
-        working-directory: hub-ui
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
-        id: build
-        with:
-          context: .
-          file: docker/Dockerfile.hub-control
-          load: true
-          push: false
-          build-args: VCS_REF=${{ github.sha }}
-          tags: ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-      - name: Isolated UID 568 startup and named-volume recreation
-        run: python scripts/hub_release_smoke.py --image "ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" --commit "$GITHUB_SHA"
-      - name: Isolated split ingress bindings and authentication
-        run: python scripts/hub_split_container_smoke.py --image "ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" --commit "$GITHUB_SHA"
-      - name: Isolated preserved bus state and unified native notifications
-        run: python scripts/hub_unified_container_smoke.py --image "ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" --commit "$GITHUB_SHA"
-      - name: Isolated persisted settings and unified restart preservation
-        run: python scripts/hub_settings_container_smoke.py --image "ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" --commit "$GITHUB_SHA"
-      - name: Isolated protected ledger and selective-mount recreation
-        run: python scripts/hub_protected_container_smoke.py --image "ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" --commit "$GITHUB_SHA"
+      - name: Real-kernel pidfd launcher tests in python:3.12-slim (uv Python lacks os.pidfd_open)
+        run: python scripts/hub_pidfd_slim_check.py --source .
   publish:
     needs: verify
     if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
@@ -123,37 +140,64 @@ jobs:
           python scripts/hub_unified_container_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-unified-startup.json
           python scripts/hub_settings_container_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-settings-startup.json
           python scripts/hub_protected_container_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-protected-startup.json
-      - name: Require private package and current main before latest promotion
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Require private package before publishing the candidate
         run: |
           python - <<'PY'
-          import json, os, urllib.request, urllib.error
+          import urllib.request, urllib.error
           url = 'https://ghcr.io/token?service=ghcr.io&scope=repository:ledgetoptechnologies/engineering-hub-control:pull'
           try:
               with urllib.request.urlopen(url, timeout=20):
-                  raise SystemExit('Anonymous pull token unexpectedly available; refusing promotion')
+                  raise SystemExit('Anonymous pull token unexpectedly available; refusing publication')
           except urllib.error.HTTPError as e:
               if e.code not in (401, 403):
                   raise
-          req = urllib.request.Request('https://api.github.com/repos/ledgetoptechnologies/Engineering-Hub/branches/main', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-          with urllib.request.urlopen(req, timeout=20) as r:
-              head = json.load(r)['commit']['sha']
-          if head != os.environ['GITHUB_SHA']:
-              raise SystemExit('Main advanced; refusing stale latest promotion')
-          print('Private registry and current-main gates passed')
+          print('Private registry gate passed')
           PY
-      - name: Promote only the tested registry digest and read latest back
+      - name: Publish the write-once sha tag for the tested digest
+        # A main build never moves `latest`. Promotion is the separate, hand-run
+        # hub-promote.yml workflow. `sha-<commit>` is created once and never moved by
+        # this workflow (a test inventories every writer). The registry has no
+        # write-once lock, so this check-then-create is not atomic against a package
+        # admin writing the same tag concurrently.
         run: |
           set -eu
-          docker buildx imagetools create --prefer-index=false --tag "$PACKAGE:latest" "$PACKAGE@$IMAGE_DIGEST"
-          docker buildx imagetools inspect "$PACKAGE:latest" --raw > hub-latest-manifest.json
-          cmp hub-registry-manifest.json hub-latest-manifest.json
-          docker pull "$PACKAGE:latest"
-          python scripts/hub_release_smoke.py --image "$PACKAGE@$IMAGE_DIGEST" --commit "$GITHUB_SHA" > hub-latest-startup.json
-          printf 'source=%s\nimage=%s:latest\ndigest=%s\n' "$GITHUB_SHA" "$PACKAGE" "$IMAGE_DIGEST" > hub-release.txt
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          SHA_TAG="$PACKAGE:sha-$GITHUB_SHA"
+          if EXISTING="$(docker buildx imagetools inspect "$SHA_TAG" --format '{{json .Manifest.Digest}}' 2>sha-inspect-error.txt)"; then
+            EXISTING="$(printf '%s' "$EXISTING" | tr -d '"')"
+            test "$EXISTING" = "$IMAGE_DIGEST" || { echo "::error::$SHA_TAG already names $EXISTING; immutable sha tags are never moved"; exit 1; }
+          else
+            grep -qE '\bMANIFEST_UNKNOWN\b|\bmanifest unknown\b|: not found$' sha-inspect-error.txt \
+              && ! grep -qiE 'denied|unauthori[sz]ed|forbidden|toomanyrequests|timeout|refused|\b(401|403|429|5[0-9][0-9])\b' sha-inspect-error.txt \
+              || { cat sha-inspect-error.txt >&2; exit 1; }
+            docker buildx imagetools create --prefer-index=false --tag "$SHA_TAG" "$PACKAGE@$IMAGE_DIGEST"
+          fi
+          rm -f sha-inspect-error.txt
+          docker buildx imagetools inspect "$SHA_TAG" --raw > hub-sha-manifest.json
+          cmp hub-registry-manifest.json hub-sha-manifest.json
+          test "$(docker buildx imagetools inspect "$SHA_TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')" = "$IMAGE_DIGEST"
+      - name: Write candidate evidence for promotion
+        run: |
+          set -eu
+          printf 'source=%s\nimage=%s:sha-%s\ndigest=%s\nlatest=unchanged\n' "$GITHUB_SHA" "$PACKAGE" "$GITHUB_SHA" "$IMAGE_DIGEST" > hub-release.txt
+          python scripts/hub_candidate_evidence.py write hub-candidate.json
+          sha256sum hub-candidate.json hub-*-startup.json hub-registry-manifest.json > hub-candidate.sha256
+          printf 'Candidate for promotion: commit `%s`, digest `%s`. `latest` was not changed.\n' "$GITHUB_SHA" "$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload candidate evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: hub-control-candidate-${{ github.sha }}
+          path: |
+            hub-candidate.json
+            hub-candidate.sha256
+            hub-*-startup.json
+            hub-*-manifest.json
+            hub-release.txt
+          if-no-files-found: error
+          retention-days: 90
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: failure()
         with:
           name: hub-control-main-publication-evidence
           path: |
