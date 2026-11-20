@@ -64,20 +64,55 @@ class TaskNoteDTO(ResponseDTO):
     text: str
 
 
+class WaitingOptionDTO(ResponseDTO):
+    label: str
+    detail: str | None = None
+
+
 class WaitingOnDTO(ResponseDTO):
     type: Literal['decision', 'action']
     text: str
     previous_status: Literal['assigned', 'claimed', 'in_review', 'verified']
     by: TaskActor
     at: str
+    # Absent on older items: no family recorded, level now, no options.
+    by_family: AgentId | None = None
+    level: Literal['now', 'later'] | None = None
+    options: list[WaitingOptionDTO] | None = Field(default=None, min_length=3, max_length=3)
+    recommended: int | None = Field(default=None, ge=0, le=2)
+    recommended_reason: str | None = None
 
 
-class WaitingResolvedDTO(ResponseDTO):
+class WaitingAnswerDTO(ResponseDTO):
+    option: int | None = Field(default=None, ge=0, le=2)
+    label: str | None = None
+    text: str | None = None
+
+
+class WaitingQuestionDTO(ResponseDTO):
+    """The question an outcome belongs to; asked_at is the waiting item's at. Absent on older rows."""
     type: Literal['decision', 'action']
     text: str
+    asked_at: str | None = None
+    level: Literal['now', 'later'] | None = None
+    options: list[WaitingOptionDTO] | None = Field(default=None, min_length=3, max_length=3)
+    recommended: int | None = Field(default=None, ge=0, le=2)
+    recommended_reason: str | None = None
+
+
+class WaitingResolvedDTO(WaitingQuestionDTO):
     by: HumanId
     at: str
     note: str | None = None
+    # Absent when Beau marked the item done (and on older rows).
+    outcome: Literal['answered', 'dismissed'] | None = None
+    answer: WaitingAnswerDTO | None = None
+
+
+class WaitingRetractedDTO(WaitingQuestionDTO):
+    by: AgentActor
+    at: str
+    reason: str
 
 
 class TaskDTO(EntityDTO):
@@ -112,6 +147,7 @@ class TaskDTO(EntityDTO):
     notes: list[TaskNoteDTO] | None = None
     waiting_on: WaitingOnDTO | None = None
     waiting_resolved: WaitingResolvedDTO | None = None
+    waiting_retracted: WaitingRetractedDTO | None = None
     completion_evidence: str | None = None
     completed_by: TaskActor | None = None
     completed_at: str | None = None

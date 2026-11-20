@@ -123,7 +123,8 @@ def test_waiting_on_beau_round_trip_and_agent_cannot_clear(repo):
     assert repo.update_task('claude', task['id'], 3, note='Still blocked')['status'] == 'waiting_on_beau'
     resolved = repo.resolve_waiting(BEAU, task['id'], 4, 'Added it')
     assert resolved['status'] == 'claimed' and 'waiting_on' not in resolved
-    assert resolved['waiting_resolved'] == dict(type='action', text='Add the DNS record.', by=BEAU,
+    assert resolved['waiting_resolved'] == dict(type='action', text='Add the DNS record.', by=BEAU, level='now',
+                                                asked_at=task['waiting_on']['at'],
                                                 at=resolved['waiting_resolved']['at'], note='Added it')
     assert repo.resolve_waiting(BEAU, task['id'], 4, 'Added it') == resolved
     with pytest.raises(HubError, match='revision_conflict'):

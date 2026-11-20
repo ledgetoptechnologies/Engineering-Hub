@@ -12,9 +12,16 @@ import type {
   Task,
   TopicPreflight,
   TopicSnapshot,
+  WaitingResolution,
 } from "./types";
 
 export type HubMode = "live" | "demo";
+
+/** Only what Beau chose goes on the wire; a blank note or answer is left out. */
+export function resolutionBody({ option, answer, note, dismiss }: WaitingResolution) {
+  return { ...(option !== undefined ? { option } : {}), ...(answer?.trim() ? { answer: answer.trim() } : {}),
+    ...(note?.trim() ? { note: note.trim() } : {}), ...(dismiss ? { dismiss: true } : {}) };
+}
 
 /**
  * The private gateway answers routes it does not know (a feature this server
@@ -248,21 +255,55 @@ export class HubClient {
     });
     return structuredClone(decision);
   }
-  /** Beau clears a task's decision/action item; the server restores the task's earlier state. */
-  async resolveWaiting(id: string, revision: number, note: string, csrf: string): Promise<Task> {
-    const body = { expected_revision: revision, ...(note.trim() ? { note: note.trim() } : {}) };
+  /** Beau answers, dismisses or marks done a task's item; the server restores the task's earlier state. */
+  async resolveWaiting(id: string, revision: number, resolution: WaitingResolution, csrf: string): Promise<Task> {
+    const body = { expected_revision: revision, ...resolutionBody(resolution) };
     if (this.mode === "live") return this.request(`/tasks/${encodeURIComponent(id)}/resolve-waiting`, body, csrf);
     this.demoHuman(csrf);
+    return structuredClone(this.demoResolve(id, revision, resolution));
+  }
+  /** Several items in one request; the server applies all of them or none. */
+  async resolveWaitingMany(items: { id: string; revision: number; resolution: WaitingResolution }[], csrf: string): Promise<Task[]> {
+    const body = { items: items.map((item) => ({ task_id: item.id, expected_revision: item.revision, ...resolutionBody(item.resolution) })) };
+    if (this.mode === "live") return (await this.request<{ items: Task[] }>("/tasks/resolve-waiting", body, csrf)).items;
+    this.demoHuman(csrf);
+    const before = structuredClone(this.demo.tasks);
+    try {
+      return items.map((item) => structuredClone(this.demoResolve(item.id, item.revision, item.resolution)));
+    } catch (error) {
+      this.demo.tasks = before;
+      throw error;
+    }
+  }
+  async setWaitingLevel(id: string, revision: number, level: "now" | "later", csrf: string): Promise<Task> {
+    if (this.mode === "live")
+      return this.request(`/tasks/${encodeURIComponent(id)}/waiting-level`, { expected_revision: revision, level }, csrf);
+    this.demoHuman(csrf);
+    const task = this.demoWaiting(id, revision);
+    Object.assign(task, { waiting_on: { ...task.waiting_on!, level }, revision: task.revision + 1, updated_at: new Date().toISOString() });
+    return structuredClone(task);
+  }
+  private demoWaiting(id: string, revision: number): Task {
     const task = this.demo.tasks.find((item) => item.id === id);
     if (!task) throw new HubApiError(404, "not_found");
     if (task.revision !== revision) throw new HubApiError(409, "revision_conflict");
     if (task.status !== "waiting_on_beau" || !task.waiting_on) throw new HubApiError(409, "not_waiting");
-    const { previous_status, type, text } = task.waiting_on;
+    return task;
+  }
+  private demoResolve(id: string, revision: number, resolution: WaitingResolution): Task {
+    const task = this.demoWaiting(id, revision);
+    const { previous_status, type, text, options } = task.waiting_on!;
+    const body = resolutionBody(resolution);
+    if (options?.length && body.option === undefined && body.answer === undefined && !body.dismiss)
+      throw new HubApiError(409, "answer_required");
     const at = new Date().toISOString();
-    Object.assign(task, { status: previous_status, waiting_on: undefined, revision: task.revision + 1, updated_at: at,
-      waiting_resolved: { type, text, by: this.demoSession.actor, at, ...(body.note ? { note: body.note } : {}) } });
+    const answer = body.option !== undefined ? { option: body.option, label: options?.[body.option]?.label ?? "" }
+      : body.answer !== undefined ? { text: body.answer } : undefined;
+    Object.assign(task, { status: previous_status, revision: task.revision + 1, updated_at: at,
+      waiting_resolved: { type, text, by: this.demoSession.actor, at, ...(body.note ? { note: body.note } : {}),
+        ...(body.dismiss ? { outcome: "dismissed" } : answer ? { outcome: "answered", answer } : {}) } });
     delete task.waiting_on;
-    return structuredClone(task);
+    return task;
   }
   /** Retire a superseded task or question; the server keeps it, with the reason and replacement. */
   async withdraw(

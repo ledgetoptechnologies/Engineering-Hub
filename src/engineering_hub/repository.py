@@ -6,12 +6,13 @@ import json
 from pathlib import Path
 import re
 import sqlite3
+import unicodedata
 import uuid
 
 from agent_message_bus import session_hub_context as session_context
 from .pilot_ownership import PilotOwner
 from .image_state_boundary import ImageStateBoundaryError, require_image_state_mount
-from .entity_context import bounded_text, validated_context
+from .entity_context import MAX_LINKS, bounded_text, validated_context
 
 
 PROJECTS = frozenset({'engineering-hub', '3d-viewer', 'project-alpha', 'ledge-top-ops', 'treedar'})
@@ -20,13 +21,19 @@ AGENTS = frozenset({'hermes', 'codex', 'claude'})
 # changing it, so those actions must not reset how long a task has been waiting.
 TASK_STATUS_ACTIONS = ('task.created', 'task.proposed', 'task.claimed', 'task.claim_recovered', 'task.candidate', 'task.reviewed',
                        'task.context_invalidated', 'task.withdrawn', 'task.reassigned', 'task.waiting',
-                       'task.waiting_resolved', 'task.done')
+                       'task.waiting_resolved', 'task.waiting_retracted', 'task.done')
 # hub_task_update may set only these; claim/candidate/review keep their own flows.
 UPDATE_STATUSES = frozenset({'waiting_on_beau', 'done', 'assigned', 'claimed', 'in_review', 'verified'})
 MAX_ACCEPTANCE, MAX_NOTES = 20, 50
 TASK_UPDATE_RECEIPT = 'task_update_receipt'
 # Long backlog text left out of hub_overview; hub_task_get returns the full record.
-OVERVIEW_OMITTED = frozenset({'acceptance', 'notes', 'request_text', 'completion_evidence', 'waiting_resolved'})
+OVERVIEW_OMITTED = frozenset({'acceptance', 'notes', 'request_text', 'completion_evidence', 'waiting_resolved',
+                              'waiting_retracted'})
+# A question to Beau: exactly three agent-written options, one recommended, plus his own text.
+WAITING_OPTIONS, WAITING_LEVELS, MAX_BULK_RESOLVE = 3, frozenset({'now', 'later'}), 50
+# Blank-rendering letters and symbols that must not count as visible; ZWNJ/ZWJ allowed only inside words.
+BLANK_CHARS, JOINERS = frozenset('\u115f\u1160\u3164\uffa0\u2800'), frozenset('\u200c\u200d')
+WAITING_FIELDS = frozenset({'type', 'text', 'options', 'recommended', 'recommended_reason', 'level'})
 # Audit actions that record who created a task or decision. Withdrawal by an agent
 # is limited to the agent named here, read from the audit log, never from the record.
 CREATION_ACTIONS = {'task': ('task.created', 'task.proposed'), 'decision': ('decision.created',)}
@@ -37,9 +44,24 @@ HELD_REASONS = frozenset({'candidate_outcome_uncertain', 'staging_paused', 'roll
 
 
 class HubError(Exception):
-    def __init__(self, code, status=400):
-        self.code, self.status = code, status
-        super().__init__(code)
+    """A fixed error code; field and limit name the input that failed and its bound, never its value."""
+
+    def __init__(self, code, status=400, *, field=None, limit=None, index=None, task_id=None):
+        self.code, self.status, self.field, self.limit = code, status, field, limit
+        self.index, self.task_id = index, task_id
+        super().__init__(self.message)
+
+    @property
+    def message(self):
+        text = self.code if self.field is None else f'{self.code}: {self.field}' + (
+            '' if self.limit is None else f' (limit {self.limit})')
+        return text if self.index is None else f'{text} [item {self.index}, task {self.task_id}]'
+
+    @property
+    def detail(self):
+        extra = {key: value for key, value in (('field', self.field), ('limit', self.limit), ('index', self.index),
+                                               ('task_id', self.task_id)) if value is not None}
+        return dict(code=self.code, **extra)
 
 
 def _json(value):
@@ -268,17 +290,41 @@ class HubRepository:
 
     @staticmethod
     def _context(details, links):
+        if type(links) is list and len(links) > MAX_LINKS:
+            raise HubError('invalid_context', field='links', limit=MAX_LINKS)
         try:
             return validated_context(details, links)
         except ValueError:
             raise HubError('invalid_context') from None
 
     @staticmethod
-    def _bounded(value, maximum, code='invalid_input'):
+    def _bounded(value, maximum, code='invalid_input', field=None):
         try:
             return bounded_text(value, maximum)
         except ValueError:
-            raise HubError(code) from None
+            raise HubError(code, field=field, limit=None if field is None else maximum) from None
+
+    @staticmethod
+    def _shown(char):
+        """A character that renders as something: not space, control, format, separator or a blank filler."""
+        return (not char.isspace() and char not in BLANK_CHARS
+                and unicodedata.category(char) not in {'Cc', 'Cf', 'Zl', 'Zp', 'Zs', 'Cs', 'Co', 'Cn'})
+
+    def _plain(self, value, maximum, code, field, lines=False):
+        """Bounded text Beau reads as written: no control, format (bidi, zero-width) or line-separator
+        characters (a typed answer or note may keep newlines and tabs), and at least one visible character.
+        ZWNJ and ZWJ are kept only between two visible characters (Persian text, emoji sequences)."""
+        value = self._bounded(value, maximum, code, field)
+        for index, char in enumerate(value):
+            if char in '\n\t' and lines:
+                continue
+            if char in JOINERS and 0 < index < len(value) - 1 and self._shown(value[index - 1]) and self._shown(value[index + 1]):
+                continue
+            if unicodedata.category(char) in {'Cc', 'Cf', 'Zl', 'Zp', 'Cs', 'Co', 'Cn'}:
+                raise HubError(code, field=field)
+        if not any(self._shown(char) for char in value):
+            raise HubError(code, field=field)
+        return value
 
     def _backlog_fields(self, acceptance=None, owner=None, reviewer=None, request_text=None):
         """Optional backlog metadata. Only supplied fields are returned, so legacy shapes stay unchanged."""
@@ -304,7 +350,7 @@ class HubRepository:
         an agent-created task records proposed_by without a scope, which task_allows_environment vetoes."""
         self._actor(actor)
         human = actor not in AGENTS and not session_context.actor_allowed(actor)
-        title, key = self._text(title), self._text(client_request_id)
+        title, key = self._plain(title, 200, 'invalid_input', 'title'), self._text(client_request_id)
         context = self._context(details, links)
         backlog =self._backlog_fields(acceptance, owner, reviewer, request_text)
         # Keep the legacy human fingerprint byte-for-byte when no backlog field is supplied.
@@ -353,7 +399,7 @@ class HubRepository:
 
     def update_task(self, actor, identity, expected_revision, *, details=None, links=None, acceptance=None,
                     owner=None, reviewer=None, note=None, status=None, waiting=None, evidence=None,
-                    client_request_id=None):
+                    client_request_id=None, title=None, retract_reason=None):
         """CAS edit by the owner, the named reviewer or a human. Omitted fields are unchanged.
 
         Status here covers only the backlog states: waiting_on_beau (with a decision/action item),
@@ -361,10 +407,14 @@ class HubRepository:
         human, leaving waiting_on_beau back to the previous status. Claim, candidate and review keep
         their own flows. Nothing here approves, reviews or grants environment access.
 
-        Content (details, links, acceptance) is editable by a human, or by an agent only on a task
-        its own family created. Owner and reviewer are set by a human, or by the creating agent while
-        the task is still assigned. With client_request_id, an identical retry returns the original
-        result and a changed payload under the same id conflicts.
+        An agent's decision item carries three options, one recommended with a reason. Only Beau
+        answers or dismisses an item; retract_reason lets the family that raised it, or the task's
+        owner, take it back when it was settled another way or is no longer needed.
+
+        Content (details, links, acceptance) and the title are editable by a human, or by an agent
+        only on a task its own family created. Owner and reviewer are set by a human, or by the creating
+        agent while the task is still assigned. With client_request_id, an identical retry returns the
+        original result and a changed payload under the same id conflicts.
         """
         self._actor(actor)
         key = None if client_request_id is None else self._text(client_request_id, 128)
@@ -373,21 +423,28 @@ class HubRepository:
         content = self._context(details, links)
         if 'acceptance' in backlog:
             content['acceptance'] = backlog.pop('acceptance')
-        note = None if note is None else self._bounded(note, 500)
+        note = None if note is None else self._plain(note, 500, 'invalid_input', 'note', lines=True)
+        title = None if title is None else self._plain(title, 200, 'invalid_input', 'title')
+        retract = None if retract_reason is None else self._plain(retract_reason, 500, 'invalid_input', 'retract_reason')
         if status is not None and status not in UPDATE_STATUSES:
             raise HubError('invalid_status')
         if (status == 'waiting_on_beau') != (waiting is not None):
             raise HubError('invalid_waiting_item')
+        # A request that sent no level keeps its pre-level fingerprint, so earlier receipts still replay.
+        sent_level = isinstance(waiting, dict) and waiting.get('level') is not None
         if waiting is not None:
-            if type(waiting) is not dict or set(waiting) != {'type', 'text'} or waiting['type'] not in {'decision', 'action'}:
-                raise HubError('invalid_waiting_item')
-            waiting = dict(type=waiting['type'], text=self._bounded(waiting['text'], 300, 'invalid_waiting_item'))
+            waiting = self._waiting_item(waiting, human)
+        if retract is not None and (status or content or backlog or title or evidence is not None):
+            raise HubError('invalid_input', field='retract_reason')
         if evidence is not None:
-            evidence = self._bounded(evidence, 2000, 'invalid_evidence')
-        if not (content or backlog or note or status):
+            evidence = self._bounded(evidence, 2000, 'invalid_evidence', field='evidence')
+        if not (content or backlog or note or status or title or retract):
             raise HubError('invalid_input')
+        # New fields join the fingerprint only when supplied, so earlier receipts still replay.
+        extra = [[name, value] for name, value in (('title', title), ('retract', retract)) if value is not None]
+        printed = waiting if waiting is None or sent_level else {k: v for k, v in waiting.items() if k != 'level'}
         fingerprint = hashlib.sha256(_json([identity, expected_revision, content, backlog, note, status,
-                                            waiting, evidence]).encode()).hexdigest()
+                                            printed, evidence] + extra).encode()).hexdigest()
         # Receipts reuse hub_requests (namespaced key) and an inert receipt row holding the original
         # result, so the ledger keeps its existing table set.
         receipt_key = None if key is None else 'task_update:' + key
@@ -399,7 +456,7 @@ class HubRepository:
                         raise HubError('idempotency_conflict', 409)
                     return self._get(db, prior['entity_id'], TASK_UPDATE_RECEIPT)['result']
             result = self._update_task(db, actor, human, identity, expected_revision, content, backlog, note,
-                                       status, waiting, evidence)
+                                       status, waiting, evidence, title, retract)
             if receipt_key is not None:
                 receipt = str(uuid.uuid4())
                 db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
@@ -407,21 +464,91 @@ class HubRepository:
                 db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, receipt_key, fingerprint, receipt))
             return result
 
+    def _waiting_item(self, waiting, human):
+        """Normalize a waiting item. An agent's decision needs exactly three options and one recommendation."""
+        if (type(waiting) is not dict or not {'type', 'text'} <= set(waiting) or set(waiting) - WAITING_FIELDS
+                or waiting['type'] not in {'decision', 'action'}):
+            raise HubError('invalid_waiting_item')
+        item = dict(type=waiting['type'], text=self._plain(waiting['text'], 300, 'invalid_waiting_item', 'waiting.text'),
+                    level=waiting.get('level') or 'now')
+        if item['level'] not in WAITING_LEVELS:
+            raise HubError('invalid_waiting_item', field='waiting.level')
+        options = waiting.get('options')
+        if options is None:
+            if waiting.get('recommended') is not None or waiting.get('recommended_reason') is not None:
+                raise HubError('invalid_waiting_item', field='waiting.options')
+            if item['type'] == 'decision' and not human:
+                raise HubError('waiting_options_required', field='waiting.options', limit=WAITING_OPTIONS)
+            return item
+        if item['type'] != 'decision':
+            raise HubError('invalid_waiting_item', field='waiting.options')
+        if type(options) is not list or len(options) != WAITING_OPTIONS:
+            raise HubError('invalid_waiting_item', field='waiting.options', limit=WAITING_OPTIONS)
+        normalized = []
+        for option in options:
+            if type(option) is not dict or 'label' not in option or set(option) - {'label', 'detail'}:
+                raise HubError('invalid_waiting_item', field='waiting.options')
+            entry = dict(label=self._plain(option['label'], 80, 'invalid_waiting_item', 'waiting.options.label'))
+            if option.get('detail') is not None:
+                entry['detail'] = self._plain(option['detail'], 160, 'invalid_waiting_item', 'waiting.options.detail')
+            normalized.append(entry)
+        if len({entry['label'].casefold() for entry in normalized}) != WAITING_OPTIONS:
+            raise HubError('invalid_waiting_item', field='waiting.options.label')
+        recommended = waiting.get('recommended')
+        if type(recommended) is not int or not 0 <= recommended < WAITING_OPTIONS:
+            raise HubError('invalid_waiting_item', field='waiting.recommended')
+        reason = self._plain(waiting.get('recommended_reason'), 160, 'invalid_waiting_item', 'waiting.recommended_reason')
+        return dict(item, options=normalized, recommended=recommended, recommended_reason=reason)
+
+    @staticmethod
+    def _raiser_family(waiting_on):
+        """The agent family that raised an item (by_family, or a bare family id on older rows); None when Beau did."""
+        return (waiting_on or {}).get('by_family') or (
+            (waiting_on or {}).get('by') if (waiting_on or {}).get('by') in AGENTS else None)
+
+    @staticmethod
+    def _question(waiting_on):
+        """The exact question an outcome belongs to: asked_at identifies it; options and level as asked."""
+        return dict(type=waiting_on['type'], text=waiting_on['text'], asked_at=waiting_on['at'],
+                    **{key: waiting_on[key] for key in ('level', 'options', 'recommended', 'recommended_reason')
+                       if waiting_on.get(key) is not None})
+
     def _update_task(self, db, actor, human, identity, expected_revision, content, backlog, note, status,
-                     waiting, evidence):
+                     waiting, evidence, title=None, retract=None):
         item = self._get(db, identity, 'task')
         self._project(item['project'], db)
         self._cas(item, expected_revision)
-        if not (human or self._is_owner(item, actor) or self._is_reviewer(item, actor)
+        # Only an item an agent raised can be retracted: by that family, or by the task's owner. Beau's own stay his.
+        raiser = self._raiser_family(item.get('waiting_on'))
+        retracting = (retract is not None and not human and raiser is not None
+                      and (self._is_owner(item, actor) or session_context.family(actor) == raiser))
+        if not (human or retracting or self._is_owner(item, actor) or self._is_reviewer(item, actor)
                 or self._is_creator(item, actor)):
             raise HubError('forbidden', 403)
         current = item['status']
         if current in {'withdrawn', 'done'}:
             raise HubError('task_closed', 409)
+        now = datetime.now(timezone.utc).isoformat()
+        if retract is not None:
+            if current != 'waiting_on_beau' or not item.get('waiting_on'):
+                raise HubError('not_waiting', 409)
+            # Beau dismisses from the Inbox; another family's item is retracted only by the task's owner.
+            if not retracting:
+                raise HubError('forbidden', 403)
+            if note:
+                item['notes'] = (item.get('notes') or [])[-(MAX_NOTES - 1):] + [dict(at=now, by=actor, text=note)]
+            waiting_on = item.pop('waiting_on')
+            item.pop('waiting_resolved', None)
+            item.update(status=waiting_on['previous_status'], waiting_retracted=dict(
+                self._question(waiting_on), by=actor, at=now, reason=retract))
+            return self._save(db, actor, 'task.waiting_retracted', 'task', item)
         if current == 'waiting_on_beau' and status is not None and not human:
             raise HubError('waiting_on_beau', 409)
         action = 'task.updated'
-        now = datetime.now(timezone.utc).isoformat()
+        if title is not None:
+            if not (human or self._is_creator(item, actor)):
+                raise HubError('forbidden', 403)
+            item['title'] = title
         if content:
             if not (human or self._is_creator(item, actor)):
                 raise HubError('forbidden', 403)
@@ -455,7 +582,12 @@ class HubRepository:
         if status == 'waiting_on_beau':
             if item['status'] == 'waiting_on_beau':
                 raise HubError('waiting_on_beau', 409)
-            item.update(status='waiting_on_beau', waiting_on=dict(waiting, previous_status=item['status'], by=actor, at=now))
+            family = {} if human else {'by_family': session_context.family(actor)}
+            # A new question starts clean: earlier outcomes stay in hub_audit, not beside the new item.
+            for field in ('waiting_resolved', 'waiting_retracted'):
+                item.pop(field, None)
+            item.update(status='waiting_on_beau', waiting_on=dict(waiting, previous_status=item['status'], by=actor,
+                                                                  at=now, **family))
             action = 'task.waiting'
         elif status == 'done':
             if not human and not (self._is_owner(item, actor) and item['status'] == 'verified'):
@@ -465,7 +597,7 @@ class HubRepository:
             self._no_active_run(db, identity)
             if item['status'] == 'waiting_on_beau':
                 # Beau's item is closed with the task, and that is audited, not silently dropped.
-                item = self._resolve(db, actor, item, 'Closed with the task as done', now)
+                item = self._resolve(db, actor, item, dict(note='Closed with the task as done'), now)
             item.update(status='done', completed_by=actor, completed_at=now,
                         **({'completion_evidence': evidence} if evidence is not None else {}))
             action = 'task.done'
@@ -473,7 +605,7 @@ class HubRepository:
             waiting_on = item.get('waiting_on')
             if item['status'] != 'waiting_on_beau' or not waiting_on or status != waiting_on['previous_status']:
                 raise HubError('invalid_transition', 409)
-            return self._resolve(db, actor, item, None, now)
+            return self._resolve(db, actor, item, {}, now)
         return self._save(db, actor, action, 'task', item)
 
     @staticmethod
@@ -490,30 +622,134 @@ class HubRepository:
             item['status'] = reset
         return True
 
-    def _resolve(self, db, actor, item, note, now):
+    @staticmethod
+    def _resolution_record(waiting_on, resolution, strict):
+        """What Beau did with an item: answered (an option or his text), dismissed, or done (legacy shape)."""
+        record = {'note': resolution['note']} if resolution.get('note') else {}
+        if resolution.get('dismiss'):
+            return dict(record, outcome='dismissed')
+        if resolution.get('option') is not None:
+            options = waiting_on.get('options') or []
+            if not 0 <= resolution['option'] < len(options):
+                raise HubError('invalid_option', 409, field='option')
+            return dict(record, outcome='answered', answer=dict(option=resolution['option'],
+                                                                label=options[resolution['option']]['label']))
+        if resolution.get('answer') is not None:
+            if waiting_on['type'] != 'decision':
+                raise HubError('invalid_answer', 409, field='answer')
+            return dict(record, outcome='answered', answer=dict(text=resolution['answer']))
+        if waiting_on.get('options'):
+            # Beau answers a question with options, or dismisses it; Done alone is for actions. Clearing it
+            # another way (status back, or the task done) records a dismissal, so every question has an outcome.
+            if strict:
+                raise HubError('answer_required', 409)
+            return dict(record, outcome='dismissed')
+        return record
+
+    def _resolve(self, db, actor, item, resolution, now, strict=False):
+        record = self._resolution_record(item['waiting_on'], resolution, strict)
         waiting_on = item.pop('waiting_on')
+        item.pop('waiting_retracted', None)
         item.update(status=waiting_on['previous_status'], waiting_resolved=dict(
-            type=waiting_on['type'], text=waiting_on['text'], by=actor, at=now, **({'note': note} if note else {})))
+            self._question(waiting_on), by=actor, at=now, **record))
         return self._save(db, actor, 'task.waiting_resolved', 'task', item)
 
-    def resolve_waiting(self, actor, identity, expected_revision, note=None):
-        """Human-only: clear Beau's decision/action item and return the task to its previous status.
+    def _resolution(self, note=None, option=None, answer=None, dismiss=False):
+        resolution = {}
+        if note is not None and not (type(note) is str and not note.strip()):
+            resolution['note'] = self._plain(note, 2000, 'invalid_input', 'note', lines=True)
+        if option is not None:
+            if type(option) is not int or not 0 <= option < WAITING_OPTIONS:
+                raise HubError('invalid_option', field='option', limit=WAITING_OPTIONS - 1)
+            resolution['option'] = option
+        if answer is not None:
+            resolution['answer'] = self._plain(answer, 2000, 'invalid_input', 'answer', lines=True)
+        if dismiss is True:
+            resolution['dismiss'] = True
+        elif dismiss is not False:
+            raise HubError('invalid_input', field='dismiss')
+        if sum(key in resolution for key in ('option', 'answer', 'dismiss')) > 1:
+            raise HubError('invalid_input', field='option')
+        return resolution
 
-        Retrying the same resolution returns the task unchanged. The note is a record, never approval.
-        """
+    def _resolve_one(self, db, actor, identity, expected_revision, resolution):
+        item = self._get(db, identity, 'task')
+        self._project(item['project'], db)
+        resolved = item.get('waiting_resolved')
+        if (item['status'] != 'waiting_on_beau' and isinstance(resolved, dict) and resolved.get('by') == actor
+                and item['revision'] == expected_revision + 1
+                and {key: resolved.get(key) for key in ('note', 'outcome', 'answer')} == self._replay_view(resolved, resolution)):
+            return item
+        self._cas(item, expected_revision)
+        if item['status'] != 'waiting_on_beau' or not item.get('waiting_on'):
+            raise HubError('not_waiting', 409)
+        return self._resolve(db, actor, item, resolution, datetime.now(timezone.utc).isoformat(), strict=True)
+
+    @staticmethod
+    def _replay_view(resolved, resolution):
+        """The note/outcome/answer this resolution would have recorded, for an idempotent retry."""
+        outcome = 'dismissed' if resolution.get('dismiss') else (
+            'answered' if 'option' in resolution or 'answer' in resolution else None)
+        answer = None
+        if 'option' in resolution:
+            answer = dict(option=resolution['option'], label=(resolved.get('answer') or {}).get('label'))
+        elif 'answer' in resolution:
+            answer = dict(text=resolution['answer'])
+        return dict(note=resolution.get('note'), outcome=outcome, answer=answer)
+
+    def resolve_waiting(self, actor, identity, expected_revision, note=None, *, option=None, answer=None,
+                        dismiss=False):
+        """Human-only: answer (an option or text), dismiss, or mark done Beau's item; the task returns to
+        its previous status. Retrying the same resolution returns the task unchanged. Never approval."""
         self._actor(actor, human=True)
-        note = None if note is None or (type(note) is str and not note.strip()) else self._bounded(note, 2000)
+        resolution = self._resolution(note, option, answer, dismiss)
+        with self._transaction() as db:
+            return self._resolve_one(db, actor, identity, expected_revision, resolution)
+
+    def resolve_waiting_many(self, actor, items):
+        """Human-only: answer or dismiss several items in one transaction; all apply or none do."""
+        self._actor(actor, human=True)
+        if type(items) is not list or not 1 <= len(items) <= MAX_BULK_RESOLVE:
+            raise HubError('invalid_input', field='items', limit=MAX_BULK_RESOLVE)
+        def located(index, entry, step):
+            try:
+                return step()
+            except HubError as error:
+                task_id = entry.get('task_id') if isinstance(entry, dict) and type(entry.get('task_id')) is str else None
+                raise HubError(error.code, error.status, field=error.field, limit=error.limit, index=index,
+                               task_id=task_id) from None
+
+        def parsed(entry):
+            if type(entry) is not dict or set(entry) - {'task_id', 'expected_revision', 'note', 'option', 'answer', 'dismiss'}:
+                raise HubError('invalid_input', field='items')
+            return self._resolution(entry.get('note'), entry.get('option'), entry.get('answer'), entry.get('dismiss', False))
+
+        resolutions = [located(index, entry, lambda entry=entry: parsed(entry)) for index, entry in enumerate(items)]
+        seen = set()
+        for index, entry in enumerate(items):
+            if entry.get('task_id') in seen:
+                raise HubError('invalid_input', field='task_id', index=index, task_id=entry.get('task_id'))
+            seen.add(entry.get('task_id'))
+        with self._transaction() as db:
+            return [located(index, entry, lambda entry=entry, resolution=resolution: self._resolve_one(
+                db, actor, entry.get('task_id'), entry.get('expected_revision'), resolution))
+                for index, (entry, resolution) in enumerate(zip(items, resolutions))]
+
+    def set_waiting_level(self, actor, identity, expected_revision, level):
+        """Human-only: move an open item between now and later. Setting the current level is a no-op."""
+        self._actor(actor, human=True)
+        if level not in WAITING_LEVELS:
+            raise HubError('invalid_input', field='level')
         with self._transaction() as db:
             item = self._get(db, identity, 'task')
             self._project(item['project'], db)
-            resolved = item.get('waiting_resolved')
-            if (item['status'] != 'waiting_on_beau' and isinstance(resolved, dict) and resolved.get('by') == actor
-                    and resolved.get('note') == note and item['revision'] == expected_revision + 1):
-                return item
-            self._cas(item, expected_revision)
             if item['status'] != 'waiting_on_beau' or not item.get('waiting_on'):
                 raise HubError('not_waiting', 409)
-            return self._resolve(db, actor, item, note, datetime.now(timezone.utc).isoformat())
+            if (item['waiting_on'].get('level') or 'now') == level:
+                return item
+            self._cas(item, expected_revision)
+            item['waiting_on'] = dict(item['waiting_on'], level=level)
+            return self._save(db, actor, 'task.waiting_level', 'task', item)
 
     @staticmethod
     def overview_task(task):
@@ -561,7 +797,7 @@ class HubRepository:
     def propose_staging_task(self, actor, project, title, client_request_id, *, details=None, links=None):
         """An agent may propose work, never grant execution or production authority."""
         self._actor(actor, agent=True)
-        title, key = self._text(title), self._text(client_request_id, 128)
+        title, key = self._plain(title, 200, 'invalid_input', 'title'), self._text(client_request_id, 128)
         context = self._context(details, links)
         payload = ['staging_task_proposal', project, title] + ([context] if context else [])
         fingerprint = hashlib.sha256(_json(payload).encode()).hexdigest()

@@ -3,6 +3,8 @@ import ipaddress
 import re
 from urllib.parse import unquote, urlsplit
 
+MAX_LINKS = 8
+
 
 def bounded_text(value, maximum):
     if type(value) is not str or not value.strip() or len(value) > maximum:
@@ -57,7 +59,7 @@ def validated_context(details=None, links=None):
     if details is not None:
         result['details'] = bounded_text(details, 4096)
     if links is not None:
-        if type(links) is not list or len(links) > 8:
+        if type(links) is not list or len(links) > MAX_LINKS:
             raise ValueError('invalid_context')
         normalized = []
         for link in links:

@@ -71,8 +71,10 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
     def invoke(operation, *args):
         try:
             return operation(*args)
-        except (HubError, AgentSessionError) as error:
-            # Repository codes are fixed internal identifiers, never peer titles.
+        except HubError as error:
+            # Repository codes and field names are fixed internal identifiers, never peer titles.
+            raise ToolError(error.message) from None
+        except AgentSessionError as error:
             raise ToolError(error.code) from None
         except ToolError:
             raise
@@ -195,19 +197,32 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
                         assigned_reviewer: str | None = None, links: list[dict[str, str]] | None = None,
                         note: str | None = None, status: str | None = None,
                         waiting_type: str | None = None, waiting_text: str | None = None,
+                        waiting_options: list[dict[str, str]] | None = None, waiting_recommended: int | None = None,
+                        waiting_reason: str | None = None, waiting_level: str | None = None,
+                        retract_reason: str | None = None, title: str | None = None,
                         evidence: str | None = None) -> dict:
         """Edit a task you own or review: omitted fields stay as they are; note appends a progress note.
 
         status waiting_on_beau needs waiting_type (decision or action) and waiting_text, one plain
-        sentence of what Beau must decide or do; only Beau clears it. status done is for the owner
-        after verified, with evidence of completion. details/links/acceptance only on tasks your
-        family created. Reuse a request ID only for the same update; a retry returns the first result.
+        sentence of what Beau must decide or do. A decision also needs waiting_options: exactly three
+        {label, detail?} (label up to 80 chars, detail one line), waiting_recommended (0-2, your pick)
+        and waiting_reason (one line why). waiting_level is now (default) or later for non-urgent items.
+        Only Beau answers or dismisses: waiting_resolved holds his outcome for the question whose waiting_on.at
+        equals its asked_at (raising a new item clears it; history is in the audit). If the item was settled
+        another way or is no longer needed, retract_reason (alone, or with a note) takes it back: allowed
+        for the family that raised it and the task's owner. status done is for the owner after verified,
+        with evidence. title/details/links/acceptance only on tasks your family created. Reuse a request
+        ID only for the same update; a retry returns the first result.
         """
-        waiting = None if waiting_type is None and waiting_text is None else {'type': waiting_type, 'text': waiting_text}
+        extra = {key: value for key, value in (('options', waiting_options), ('recommended', waiting_recommended),
+                 ('recommended_reason', waiting_reason), ('level', waiting_level)) if value is not None}
+        waiting = None if waiting_type is None and waiting_text is None and not extra else dict(
+            type=waiting_type, text=waiting_text, **extra)
         return invoke(lambda: repo.update_task(identity(ctx), task_id, expected_revision, details=details,
                                                links=links, acceptance=acceptance, owner=assignee, reviewer=assigned_reviewer,
                                                note=note, status=status, waiting=waiting, evidence=evidence,
-                                               client_request_id=client_request_id))
+                                               client_request_id=client_request_id, title=title,
+                                               retract_reason=retract_reason))
 
     @registration.tool()
     def hub_task_get(task_id: str, ctx: Context) -> dict:

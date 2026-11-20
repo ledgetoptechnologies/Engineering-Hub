@@ -18,8 +18,8 @@ import { ArchiveProjectDialog, ProjectEditorDialog, STATUS_LABEL, STATUS_TONE } 
 import { safeHref } from "../markdown";
 import type { Project } from "../types";
 import { readProject } from "../projectsApi";
-import { isActive, waitingItemKey, waitingKind, waitingTasks } from "../backlog";
-import { WaitingItemCard } from "./WorkPages";
+import { isActive, laterHint, waitingKind, waitingTasks } from "../backlog";
+import { WaitingItemList } from "./WorkPages";
 import { ComponentsPanel, GroupedProjectsPanel } from "../ComponentsPanel";
 import { ReviewsPanel } from "../ReviewsPanel";
 
@@ -32,7 +32,7 @@ const columnName: Record<Task["status"], string> = {
 };
 
 export interface ProjectStats {
-  waiting: Decision[]; items: Task[]; needsYou: number; tasks: Task[]; byStatus: Record<Task["status"], number>;
+  waiting: Decision[]; items: Task[]; needsYou: number; later: string; tasks: Task[]; byStatus: Record<Task["status"], number>;
   lastActivity: string | null; agents: string[]; active: number;
 }
 export function projectStats(hub: Hub, id: string): ProjectStats {
@@ -47,7 +47,7 @@ export function projectStats(hub: Hub, id: string): ProjectStats {
   const agents = [...new Set(tasks.flatMap((task) => [actorFamily(task.owner, task.owner_family) ?? task.owner,
     actorFamily(task.proposed_by, task.proposed_family) ?? task.proposed_by, task.review ? actorFamily(task.review.actor) ?? task.review.actor : null])
     .filter((a): a is string => !!a))];
-  return { waiting, items, needsYou: waiting.length + items.length, tasks, byStatus, lastActivity, agents,
+  return { waiting, items, needsYou: waiting.length + items.length, later: laterHint(hub.data.tasks, id), tasks, byStatus, lastActivity, agents,
     active: tasks.filter(isActive).length };
 }
 
@@ -124,7 +124,8 @@ export function ProjectsPage({ hub, actions }: { hub: Hub; actions: React.ReactN
                     </a>
                   </th>
                   <td><span className={`status-pill ${status.tone}`}>{status.label}</span></td>
-                  <td className={`num ${stats.needsYou ? "attention" : ""}`}>{stats.needsYou}</td>
+                  <td className={`num ${stats.needsYou ? "attention" : ""}`}>{stats.needsYou}
+                    {stats.later && <small className="later-hint">{stats.later}</small>}</td>
                   <td className="num">{stats.active}</td>
                   <td className="num">{stats.byStatus.in_review}</td>
                   <td className="num">{stats.byStatus.verified}</td>
@@ -318,9 +319,9 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
   const repository = project.repository_url ? safeHref(project.repository_url) : null;
   const parent = project.parent_project ? hub.data.projects.find((item) => item.id === project.parent_project) : null;
   const changes = latestChanges(hub, id);
-  const tabs: { key: ProjectTab; label: string; count?: number }[] = [
+  const tabs: { key: ProjectTab; label: string; count?: number; hint?: string }[] = [
     { key: "overview", label: "Overview" },
-    { key: "decisions", label: "Needs you", count: stats.needsYou },
+    { key: "decisions", label: "Needs you", count: stats.needsYou, hint: stats.later },
     { key: "work", label: "Work", count: stats.active },
     // Notes and plans are one place: written context, with the plan/idea backlog beside it.
     { key: "notes", label: "Notes & plans" },
@@ -361,6 +362,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
           <a key={item.key} href={tabHref(item.key)} className={tabIs(item.key) ? "tab current" : "tab"}
             aria-current={tabIs(item.key) ? "page" : undefined}>
             {item.label}{item.count ? <span className={`tab-count ${item.key === "decisions" ? "attention" : ""}`}>{item.count}</span> : null}
+            {item.hint && <small className="later-hint">{item.hint}</small>}
           </a>
         ))}
       </nav>
@@ -369,7 +371,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
         <div className="overview-layout">
           <div className="overview-main">
             <div className="stat-row">
-              <a className="stat" href={tabHref("decisions")}><span>Needs you</span><strong className={stats.needsYou ? "attention" : ""}>{stats.needsYou}</strong></a>
+              <a className="stat" href={tabHref("decisions")}><span>Needs you</span><strong className={stats.needsYou ? "attention" : ""}>{stats.needsYou}</strong>{stats.later && <small className="later-hint">{stats.later}</small>}</a>
               {STATUSES.map((s) => (
                 <a key={s} className="stat" href={tabHref("work")}><span>{columnName[s]}</span><strong>{stats.byStatus[s]}</strong></a>
               ))}
@@ -430,10 +432,8 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
 
       {tab === "decisions" && (
         <section className="panel decisions" aria-label={`${project.name} decisions`}>
-          {stats.items.length > 0 && (
-            <div className="decision-list">{stats.items.map((task) => <WaitingItemCard key={waitingItemKey(task)} hub={projectHub} task={task} />)}</div>
-          )}
-          {(stats.waiting.length > 0 || stats.items.length === 0) && (
+          <WaitingItemList hub={projectHub} tasks={stats.items} later={waitingTasks(hub.data.tasks, id, "later")} />
+          {(stats.waiting.length > 0 || stats.items.length + waitingTasks(hub.data.tasks, id, "later").length === 0) && (
             <DecisionList hub={projectHub} decisions={stats.waiting} emptyNote="No open questions for this project." />
           )}
           <RecentAnswers hub={hub} decisions={answeredDecisions(hub, id, 10)} />

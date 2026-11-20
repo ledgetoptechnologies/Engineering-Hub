@@ -1,6 +1,6 @@
 /** The view of Hub state that pages read. All mutation still goes through HubApp. */
 import type { FormEvent } from "react";
-import type { AgentSummary, Decision, Overview, PublicReachability, Session, Task, TopicSnapshot } from "./types";
+import type { AgentSummary, Decision, Overview, PublicReachability, Session, Task, TopicSnapshot, WaitingResolution } from "./types";
 
 export interface DecisionChoice { revision: number; answer: string }
 
@@ -22,7 +22,10 @@ export interface Hub {
   /** Withdraw a superseded task or question (kept for history). Resolves true when the server accepted it. */
   withdraw: (kind: "task" | "decision", item: Task | Decision, reason: string, supersededBy: string | null) => Promise<boolean>;
   /** Clear a task's decision/action item (Beau only); the task returns to its earlier state. */
-  resolveWaiting: (task: Task, note: string) => Promise<boolean>;
+  resolveWaiting: (task: Task, resolution: WaitingResolution) => Promise<boolean>;
+  /** Answer or dismiss several items at once; all apply or none do. */
+  resolveWaitingMany: (items: { task: Task; resolution: WaitingResolution }[]) => Promise<boolean>;
+  setWaitingLevel: (task: Task, level: "now" | "later") => Promise<boolean>;
   clearPrivateWorkspace: () => void;
   /** Re-read the workspace snapshot (after a successful human change). */
   refresh: () => Promise<void>;

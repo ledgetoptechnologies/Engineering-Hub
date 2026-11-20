@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { HubClient } from "./api";
-import { draftFor, isActive, parseAcceptance, WORK_FILTERS, waitingItemKey, waitingTasks } from "./backlog";
+import { HubClient, resolutionBody } from "./api";
+import { draftFor, isActive, laterHint, parseAcceptance, WORK_FILTERS, waitingItemKey, waitingTasks } from "./backlog";
 import { projectStats, STATUSES, WorkBoard } from "./pages/ProjectPages";
 import { waitingOn } from "./dashboardText";
 import type { Hub } from "./hub";
@@ -16,6 +16,9 @@ const base: Task = { id: "t1", revision: 3, updated_at: "2026-11-16T10:00:00Z", 
 const waiting = (type: "action" | "decision", id = "t-wait"): Task => ({ ...base, id, status: "waiting_on_beau",
   waiting_on: { type, text: type === "action" ? "Add the DNS record." : "Pick the domain name.",
     previous_status: "claimed", by: "claude", at: "2026-11-16T10:00:00Z" } });
+const question = (id = "t-q", level: "now" | "later" = "now"): Task => ({ ...waiting("decision", id), waiting_on: {
+  ...waiting("decision", id).waiting_on!, text: `Question ${id}`, level, recommended: 1, recommended_reason: "Smaller reviews",
+  options: [{ label: "Keep it" }, { label: "Split it", detail: "Two PRs" }, { label: "Drop it" }] } });
 
 function hubWith(tasks: Task[], overrides: Partial<Hub> = {}): Hub {
   const data = { ...createDemoOverview(new Date("2026-11-16T10:00:00Z")), tasks };
@@ -73,6 +76,39 @@ describe("backlog views", () => {
     const readOnly = renderToStaticMarkup(<WaitingItemCard hub={hubWith([], { writable: false })} task={waiting("action")} />);
     expect(readOnly).toMatch(/<button class="primary" disabled="">Done<\/button>/);
   });
+  it("shows three options with the recommended one marked and its reason, plus a text box and Dismiss", () => {
+    const html = renderToStaticMarkup(<WaitingItemCard hub={hubWith([])} task={question()} />);
+    expect(html.match(/class="waiting-option( recommended)?"/g)).toHaveLength(3);
+    expect(html).toMatch(/class="waiting-option recommended"><span class="waiting-option-label">Split it<\/span>/);
+    expect(html).toContain("Recommended");
+    expect(html).toContain("Smaller reviews");
+    expect(html).toContain("Two PRs");
+    expect(html).toContain('placeholder="Your answer"');
+    expect(html).toMatch(/<button type="button">Dismiss<\/button>/);
+    expect(html).toMatch(/<button type="button">Later<\/button>/);
+  });
+  it("keeps later items out of the counts and collapses them behind their count", () => {
+    const hub = hubWith([question("now-1"), question("later-1", "later"), question("later-2", "later")]);
+    expect(waitingTasks(hub.data.tasks).map((task) => task.id)).toEqual(["now-1"]);
+    expect(waitingTasks(hub.data.tasks, undefined, "later")).toHaveLength(2);
+    const inbox = renderToStaticMarkup(<InboxPage hub={hub} actions={null} />);
+    expect(inbox).toContain("Question now-1");
+    expect(inbox).not.toContain("Question later-1");
+    expect(inbox).toMatch(/aria-expanded="false">Later <span>2<\/span>/);
+    const home = renderToStaticMarkup(<HomePage hub={hub} actions={null} />);
+    expect(home).not.toContain("Question later-1");
+    expect(projectStats(hub, "engineering-hub").items.map((task) => task.id)).toEqual(["now-1"]);
+  });
+  it("hints at later items on Home, the project and an Inbox chip for a project whose items are all later", () => {
+    const hub = hubWith([question("now-1"), { ...question("later-1", "later"), project: "3d-viewer" }]);
+    expect(laterHint(hub.data.tasks)).toBe("1 later");
+    expect(laterHint(hub.data.tasks, "engineering-hub")).toBe("");
+    const home = renderToStaticMarkup(<HomePage hub={hub} actions={null} />);
+    expect(home).toContain(" · 1 later");
+    expect(projectStats(hub, "3d-viewer")).toMatchObject({ needsYou: projectStats(hub, "3d-viewer").waiting.length, later: "1 later" });
+    const inbox = renderToStaticMarkup(<InboxPage hub={hub} actions={null} />);
+    expect(inbox).toMatch(/<span>\d+<\/span><small class="later-hint">1 later<\/small><\/button>/);
+  });
   it("lists task items with decisions in the Inbox and the Home Needs you card", () => {
     const hub = hubWith([base, waiting("action")]);
     const inbox = renderToStaticMarkup(<InboxPage hub={hub} actions={null} />);
@@ -96,11 +132,34 @@ describe("demo client", () => {
     const overview = await client.getOverview();
     const stored = overview.tasks.find((item) => item.id === task.id)!;
     expect(stored.status).toBe("assigned");
-    await expect(client.resolveWaiting(task.id, task.revision, "", csrf)).rejects.toMatchObject({ code: "not_waiting" });
+    await expect(client.resolveWaiting(task.id, task.revision, {}, csrf)).rejects.toMatchObject({ code: "not_waiting" });
+  });
+  it("answers by option or text, dismisses, moves levels and applies a bulk change all or nothing", async () => {
+    const client = new HubClient({ mode: "demo" });
+    const csrf = DEMO_SESSION.csrf_token!;
+    const tasks = (await client.getOverview()).tasks;
+    const [a, b, c] = ["q1", "q2", "q3"].map((id) => ({ ...question(id), project: tasks[0]?.project ?? "engineering-hub" }));
+    (client as unknown as { demo: { tasks: Task[] } }).demo.tasks.push(a, b, c);
+    await expect(client.resolveWaiting("q1", 3, {}, csrf)).rejects.toMatchObject({ code: "answer_required" });
+    expect((await client.resolveWaiting("q1", 3, { option: 1 }, csrf)).waiting_resolved?.answer).toEqual({ option: 1, label: "Split it" });
+    expect((await client.setWaitingLevel("q2", 3, "later", csrf)).waiting_on?.level).toBe("later");
+    await expect(client.resolveWaitingMany([{ id: "q2", revision: 4, resolution: { dismiss: true } },
+      { id: "q3", revision: 9, resolution: { option: 0 } }], csrf)).rejects.toMatchObject({ code: "revision_conflict" });
+    expect((await client.getOverview()).tasks.find((task) => task.id === "q2")?.status).toBe("waiting_on_beau");
+    const done = await client.resolveWaitingMany([{ id: "q2", revision: 4, resolution: { dismiss: true, note: " Moot " } },
+      { id: "q3", revision: 3, resolution: { answer: "Ship behind a flag" } }], csrf);
+    expect(done.map((task) => task.waiting_resolved?.outcome)).toEqual(["dismissed", "answered"]);
+    expect(done[0].waiting_resolved?.note).toBe("Moot");
+    expect(resolutionBody({ answer: "  ", note: "", option: 0 })).toEqual({ option: 0 });
   });
 });
 
 describe("waiting item drafts and project counts", () => {
+  it("keys a draft to one waiting item even when options and level match", () => {
+    const a = question("t-q");
+    const b = { ...a, revision: 7, waiting_on: { ...a.waiting_on!, at: "2026-11-16T12:00:00Z" } };
+    expect(draftFor({ item: waitingItemKey(a), text: "For A" }, waitingItemKey(b))).toBe("");
+  });
   it("keys a draft to one waiting item, so a later item on the same task starts empty", () => {
     const a = waiting("decision");
     const b = { ...a, revision: 5, waiting_on: { ...a.waiting_on!, text: "Item B", at: "2026-11-16T11:00:00Z" } };

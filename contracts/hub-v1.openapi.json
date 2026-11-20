@@ -2957,6 +2957,93 @@
         }
       }
     },
+    "/api/hub/v1/tasks/resolve-waiting": {
+      "post": {
+        "summary": "Resolve Waiting Many",
+        "operationId": "resolve_waiting_many_api_hub_v1_tasks_resolve_waiting_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveWaitingMany"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskListDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/tasks/{task_id}/waiting-level": {
+      "post": {
+        "summary": "Set Waiting Level",
+        "operationId": "set_waiting_level_api_hub_v1_tasks__task_id__waiting_level_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WaitingLevel"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/tasks/{task_id}/context": {
       "post": {
         "summary": "Update Task Context",
@@ -6621,6 +6708,37 @@
               }
             ],
             "title": "Note"
+          },
+          "option": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Option"
+          },
+          "answer": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2000,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answer"
+          },
+          "dismiss": {
+            "type": "boolean",
+            "title": "Dismiss",
+            "default": false
           }
         },
         "additionalProperties": false,
@@ -6629,6 +6747,89 @@
           "expected_revision"
         ],
         "title": "ResolveWaiting"
+      },
+      "ResolveWaitingItem": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "option": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Option"
+          },
+          "answer": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2000,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answer"
+          },
+          "dismiss": {
+            "type": "boolean",
+            "title": "Dismiss",
+            "default": false
+          },
+          "task_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "title": "Task Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "task_id"
+        ],
+        "title": "ResolveWaitingItem"
+      },
+      "ResolveWaitingMany": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ResolveWaitingItem"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Items"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "ResolveWaitingMany"
       },
       "Review": {
         "properties": {
@@ -7430,6 +7631,16 @@
               }
             ]
           },
+          "waiting_retracted": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WaitingRetractedDTO"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "completion_evidence": {
             "anyOf": [
               {
@@ -7693,6 +7904,32 @@
               }
             ],
             "title": "Evidence"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "retract_reason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 500,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retract Reason"
           }
         },
         "additionalProperties": false,
@@ -7905,6 +8142,48 @@
         ],
         "title": "ValidationError"
       },
+      "WaitingAnswerDTO": {
+        "properties": {
+          "option": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Option"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "WaitingAnswerDTO"
+      },
       "WaitingItem": {
         "properties": {
           "type": {
@@ -7920,6 +8199,62 @@
             "maxLength": 300,
             "minLength": 1,
             "title": "Text"
+          },
+          "options": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/WaitingOption"
+                },
+                "type": "array",
+                "maxItems": 3,
+                "minItems": 3
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Options"
+          },
+          "recommended": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recommended"
+          },
+          "recommended_reason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 160
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recommended Reason"
+          },
+          "level": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "now",
+                  "later"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Level"
           }
         },
         "additionalProperties": false,
@@ -7929,6 +8264,30 @@
           "text"
         ],
         "title": "WaitingItem"
+      },
+      "WaitingLevel": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "now",
+              "later"
+            ],
+            "title": "Level"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "level"
+        ],
+        "title": "WaitingLevel"
       },
       "WaitingOnDTO": {
         "properties": {
@@ -7978,6 +8337,77 @@
           "at": {
             "type": "string",
             "title": "At"
+          },
+          "by_family": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "By Family"
+          },
+          "level": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "now",
+                  "later"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Level"
+          },
+          "options": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/WaitingOptionDTO"
+                },
+                "type": "array",
+                "maxItems": 3,
+                "minItems": 3
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Options"
+          },
+          "recommended": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recommended"
+          },
+          "recommended_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recommended Reason"
           }
         },
         "additionalProperties": false,
@@ -7990,6 +8420,59 @@
           "at"
         ],
         "title": "WaitingOnDTO"
+      },
+      "WaitingOption": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Label"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 160
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "title": "WaitingOption"
+      },
+      "WaitingOptionDTO": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "title": "WaitingOptionDTO"
       },
       "WaitingResolvedDTO": {
         "properties": {
@@ -8004,6 +8487,72 @@
           "text": {
             "type": "string",
             "title": "Text"
+          },
+          "asked_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Asked At"
+          },
+          "level": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "now",
+                  "later"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Level"
+          },
+          "options": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/WaitingOptionDTO"
+                },
+                "type": "array",
+                "maxItems": 3,
+                "minItems": 3
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Options"
+          },
+          "recommended": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recommended"
+          },
+          "recommended_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recommended Reason"
           },
           "by": {
             "type": "string",
@@ -8024,6 +8573,31 @@
               }
             ],
             "title": "Note"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "answered",
+                  "dismissed"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outcome"
+          },
+          "answer": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WaitingAnswerDTO"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false,
@@ -8035,6 +8609,123 @@
           "at"
         ],
         "title": "WaitingResolvedDTO"
+      },
+      "WaitingRetractedDTO": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "decision",
+              "action"
+            ],
+            "title": "Type"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "asked_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Asked At"
+          },
+          "level": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "now",
+                  "later"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Level"
+          },
+          "options": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/WaitingOptionDTO"
+                },
+                "type": "array",
+                "maxItems": 3,
+                "minItems": 3
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Options"
+          },
+          "recommended": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recommended"
+          },
+          "recommended_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recommended Reason"
+          },
+          "by": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "string",
+                "pattern": "^installation:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              }
+            ],
+            "title": "By"
+          },
+          "at": {
+            "type": "string",
+            "title": "At"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "type",
+          "text",
+          "by",
+          "at",
+          "reason"
+        ],
+        "title": "WaitingRetractedDTO"
       },
       "Withdraw": {
         "properties": {
