@@ -155,7 +155,10 @@ jobs:
           PY
       - name: Publish the write-once sha tag for the tested digest
         # A main build never moves `latest`. Promotion is the separate, hand-run
-        # hub-promote.yml workflow. `sha-<commit>` is created once and never moved.
+        # hub-promote.yml workflow. `sha-<commit>` is created once and never moved by
+        # this workflow (a test inventories every writer). The registry has no
+        # write-once lock, so this check-then-create is not atomic against a package
+        # admin writing the same tag concurrently.
         run: |
           set -eu
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]

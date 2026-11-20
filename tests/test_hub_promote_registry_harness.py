@@ -25,6 +25,7 @@ key() { echo "$REG/$(echo "$1" | tr '/:@' '___')"; }
 if [[ "$1 $2 $3" == "buildx imagetools inspect" ]]; then
   ref="$4"
   if [[ "$ref" == *:latest && -n "${STUB_LATEST_ERROR:-}" ]]; then echo "$STUB_LATEST_ERROR" >&2; exit 1; fi
+  if [[ "$ref" == *:latest && -f "$REG/latest-error.txt" ]]; then cat "$REG/latest-error.txt" >&2; exit 1; fi
   if [[ "$ref" == *:latest && -n "${STUB_VERIFY_FAIL:-}" && -f "$REG/written" ]]; then printf '"%s"\n' "$STUB_VERIFY_FAIL"; exit 0; fi
   if [[ "$ref" == *@sha256:* ]]; then
     d="${ref#*@}"; if grep -qx "$d" "$REG"/*_* 2>/dev/null; then printf '"%s"\n' "$d"; exit 0; fi
@@ -79,11 +80,12 @@ def _run(root, script, extra):
            'GITHUB_OUTPUT': str(out), 'GITHUB_STEP_SUMMARY': str(root / 'summary.md'), 'PACKAGE': PACKAGE,
            'PROMOTE_COMMIT': COMMIT, 'PROMOTE_DIGEST': NEW, 'CANDIDATE_RUN_ID': '11', 'GITHUB_RUN_ID': '22',
            'GITHUB_RUN_ATTEMPT': '1', 'GITHUB_SERVER_URL': 'https://github.com', 'GITHUB_REPOSITORY': 'o/r',
-           'PROMOTE_RETRY_DELAY_SECONDS': '0', 'INITIALIZE_LATEST': 'false', **extra}
+           'PROMOTE_RETRY_DELAY_SECONDS': '0', 'INITIALIZE_LATEST': 'false', 'GITHUB_ACTOR': 'dispatcher',
+           'APPROVED_BY': 'release owner', 'APPROVAL_REFERENCE': 'hub-decision:1234', **extra}
     return subprocess.run(['bash', '-e', '-c', script], cwd=root, env=env, capture_output=True, text=True)
 
 
-def _promote(root, **extra):
+def _promote(root, before_move=None, **extra):
     steps = _steps('hub-promote.yml', 'promote')
     previous = _run(root, steps['Read current latest and resolve the rollback target'], extra)
     result = {'previous': previous, 'receipt': None, 'move': None}
@@ -93,6 +95,8 @@ def _promote(root, **extra):
     extra = {**extra, 'PREVIOUS_DIGEST': outputs['digest'], 'PROMOTION_MODE': outputs['mode']}
     result['receipt'] = _run(root, steps['Persist the rollback receipt before moving latest'], extra)
     if result['receipt'].returncode == 0:
+        if before_move:
+            before_move(root)
         result['move'] = _run(root, steps['Move latest to the tested digest'], extra)
     return result
 
@@ -192,3 +196,42 @@ def test_sha_tag_is_created_once_and_never_moved(registry):
 def test_sha_tag_registry_error_aborts(registry):
     r = _sha_step(registry, STUB_MISSING_MSG='ERROR: failed to authorize: 401 Unauthorized')
     assert r.returncode != 0 and _read(registry, f'{PACKAGE}:sha-{COMMIT}') == 'absent'
+
+
+def test_latest_changed_between_receipt_and_write_aborts_and_keeps_receipt(registry):
+    _tag(registry, f'{PACKAGE}:latest', OLD)
+    r = _promote(registry, before_move=lambda root: _tag(root, f'{PACKAGE}:latest', OTHER))
+    assert r['move'].returncode == 1 and 'nothing was written' in r['move'].stdout
+    assert _read(registry, f'{PACKAGE}:latest') == OTHER and not (registry / 'reg' / 'written').exists()
+    assert f'"previousDigest": "{OLD}"' in _receipt(registry)
+    assert '"status": "aborted-latest-changed"' in _result(registry)
+
+
+def test_latest_unreadable_before_write_aborts(registry):
+    _tag(registry, f'{PACKAGE}:latest', OLD)
+    r = _promote(registry, before_move=lambda root: (root / 'reg' / 'latest-error.txt').write_text('ERROR: dial tcp: i/o timeout'))
+    assert r['move'].returncode == 1 and not (registry / 'reg' / 'written').exists()
+    assert '"status": "aborted-latest-changed"' in _result(registry)
+
+
+def test_receipt_records_approver_and_reference_as_unenforced(registry):
+    _tag(registry, f'{PACKAGE}:latest', OLD)
+    r = _promote(registry)
+    receipt = _receipt(registry)
+    assert r['move'].returncode == 0
+    for text in ['"approvedBy": "release owner"', '"approvalReference": "hub-decision:1234"',
+                 '"dispatchedBy": "dispatcher"', '"approvalEnforced": false']:
+        assert text in receipt
+
+
+def test_failed_read_back_says_latest_was_not_restored(registry):
+    _tag(registry, f'{PACKAGE}:latest', OLD)
+    r = _promote(registry, STUB_VERIFY_FAIL=OTHER)
+    assert 'latest was NOT restored automatically.' in r['move'].stdout
+    assert 'NOT restored automatically' in (registry / 'summary.md').read_text()
+
+
+def test_initialize_rereads_absence_before_write(registry):
+    r = _promote(registry, before_move=lambda root: _tag(root, f'{PACKAGE}:latest', OTHER),
+                 STUB_MISSING_MSG=MANIFEST_UNKNOWN, INITIALIZE_LATEST='true')
+    assert r['move'].returncode == 1 and _read(registry, f'{PACKAGE}:latest') == OTHER

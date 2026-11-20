@@ -162,7 +162,8 @@ def test_only_the_manual_main_promotion_moves_latest():
     text = (ROOT / '.github/workflows/hub-promote.yml').read_text()
     assert set(config['on']) == {'workflow_dispatch'}
     inputs = config['on']['workflow_dispatch']['inputs']
-    assert set(inputs) == {'commit', 'digest', 'initialize_latest'}
+    assert set(inputs) == {'commit', 'digest', 'initialize_latest', 'approved_by', 'approval_reference'}
+    assert inputs['approved_by']['required'] == 'true' and inputs['approval_reference']['required'] == 'true'
     assert inputs['initialize_latest']['default'] == 'false' and inputs['initialize_latest']['type'] == 'boolean'
     assert config['permissions'] == {'contents': 'read'}
     assert config['concurrency'] == {'group': 'hub-promote-latest', 'cancel-in-progress': 'false'}
@@ -195,14 +196,29 @@ def test_only_the_manual_main_promotion_moves_latest():
     assert 'initialize_latest was requested but latest already exists' in body
     assert 'inspect_digest "$PACKAGE@$PREVIOUS_DIGEST"' in body
     receipt = steps['Persist the rollback receipt before moving latest']['run']
-    for field in ['"mode"', 'previousDigest', 'newDigest', '"commit"', 'candidateRunId', 'promotionRunId', 'recordedAt']:
+    for field in ['"mode"', 'previousDigest', 'newDigest', '"commit"', 'candidateRunId', 'promotionRunId', 'recordedAt',
+                  'dispatchedBy', 'approvedBy', 'approvalReference', '"approvalEnforced": false']:
         assert field in receipt
     assert steps['Upload the rollback receipt']['with']['if-no-files-found'] == 'error'
     assert steps['Upload the promotion result']['if'] == "${{ always() && steps.receipt.outcome == 'success' }}"
     assert text.count('always()') == 1
     assert text.count('imagetools create --prefer-index=false --tag "$PACKAGE:latest"') == 1
     move = steps['Move latest to the tested digest']['run']
-    assert re.search(r'record verify-failed[\s\S]*?rollback_help\s+exit 1', move)
+    assert re.search(r'record verify-failed[\s\S]*?rollback_help[\s\S]*?exit 1', move)
+    # Fail-closed re-read of latest immediately before the single write; documented as not a CAS.
+    reread = move.index('CURRENT="$(docker buildx imagetools inspect "$PACKAGE:latest"')
+    abort = move.index('record aborted-latest-changed')
+    write = move.index('imagetools create --prefer-index=false --tag "$PACKAGE:latest"')
+    assert reread < abort < write
+    assert 'if [[ "$CURRENT" != "$PREVIOUS_DIGEST" ]]; then' in move
+    assert 'NOT an atomic compare-and-swap' in move
+    assert 'NOT an atomic compare-and-swap' in text.split(chr(10) + 'on:' + chr(10))[0]
+    assert 'latest was NOT restored automatically.' in move
+    assert 'It was NOT restored automatically' in move
+    validate = steps['Validate requested candidate']['run']
+    assert '$APPROVED_BY' in validate and '$APPROVAL_REFERENCE' in validate
+    assert job['env']['APPROVED_BY'] == '${{ inputs.approved_by }}'
+    assert 'GitHub Environment with required' in text and 'reviewers' in text
 
 
 def test_verify_runs_backend_e2e_and_pidfd_gates_once():

@@ -165,7 +165,11 @@ validate only and cannot publish. A plain restart does not pull an updated image
 
 `latest` moves only through `.github/workflows/hub-promote.yml`, run by hand from
 `main` with the candidate's full commit SHA and digest (from its hub-control run
-summary), after the release approvals. It does not rebuild. It requires the commit
+summary), the approver's name and an approval reference (a Hub task or decision
+id), after the release approvals. Approver and reference are written into the
+receipt as a record; the workflow does not enforce them. Enforcement would be a
+GitHub Environment with required reviewers, an owner repository setting this
+change does not create. It does not rebuild. It requires the commit
 on `main`, a successful main hub-control run for it, that run's checksummed
 candidate evidence, the private package, and `sha-<commit>` still naming the
 digest. It then reads the current `latest` and stops, writing nothing, unless it
@@ -173,11 +177,14 @@ resolves to a valid digest (an apparent absence is an anomaly; the
 `initialize_latest` input, default false, is only for a first-time setup and only
 on the registry's `MANIFEST_UNKNOWN` response). It writes a rollback receipt
 (previous and new digest, commit, run ids, time) to the summary and as the
-`hub-promotion-receipt-<run>-<attempt>` artifact **before** moving `latest`. If the
-write or the read-back fails, the run fails, prints the rollback command, and still
-uploads a `hub-promotion-result-<run>-<attempt>` record. Promotions are serialized
-but this is not a registry-wide lock: nobody else should write `latest` during a
-release.
+`hub-promotion-receipt-<run>-<attempt>` artifact **before** moving `latest`. Immediately before the write it re-reads `latest` and
+aborts, writing nothing, if it no longer equals the receipt's previous digest or
+cannot be read. That re-read is not an atomic compare-and-swap. If the write or the
+read-back fails, the run fails and prints the rollback command; it does **not**
+restore `latest`. It still uploads a `hub-promotion-result-<run>-<attempt>` record. Promotions are serialized
+(one concurrency group) and a test fails if any other workflow or script writes
+`latest` or a `sha-` tag, but this is not a registry-wide lock: package admins
+must not write `latest` during a release.
 
 Rollback: promote an earlier candidate's commit and digest (the previous digest is in
 the last receipt). Evidence is kept up to 90 days; for older images pin the digest
