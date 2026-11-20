@@ -38,7 +38,7 @@ from pydantic import AnyUrl
 PROFILE = "mcp-worker"
 BUS_SERVER = "agent-bus-production"
 BUS_TOOLSET = "mcp-agent-bus-production"
-OWNER_APPROVED_PRIVATE_HTTP_URL = "http://192.168.50.80:8765/mcp"
+OWNER_APPROVED_PRIVATE_HTTP_URL = "http://192.168.50.80:8770/mcp"
 READONLY_BUS_TOOLS = frozenset({"get_message"})
 COORDINATION_BUS_TOOLS = frozenset({"get_message", "claim_message", "ack_message", "send_message", "bus_info"})
 BASE_INBOX_URI = "agentbus://inbox/{}"
