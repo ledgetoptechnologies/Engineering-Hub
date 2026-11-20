@@ -437,3 +437,36 @@ def test_cli_parse_errors_do_not_echo_accidental_credential_or_runtime_values(mo
     assert output.out == ''
     assert output.err == str(service.OwnedInactiveHubError()) + '\n'
     assert 'private-canary-never-log' not in output.err
+
+
+@pytest.mark.asyncio
+async def test_owned_inactive_bound_signin_actual_startup(rig, monkeypatch):
+    from urllib.parse import parse_qs, urlsplit
+    from engineering_hub.auth import GitHubIdentityProvider
+    from engineering_hub.bound_oauth_draft import enroll_owned_bound_schema
+    enroll_owned_bound_schema(rig.pilot.repo, writers_stopped=True, backup_verified=True)
+    rig.settings = replace(rig.settings, auth_config=replace(rig.settings.auth_config,
+        human_auth_mode='github_cloudflare', github_client_id='fixture', github_client_secret='fixture',
+        beau_github_id=123, bound_access_subject='synthetic-human'))
+    async def exchange(self, code, verifier):
+        assert code == 'fixture-code' and verifier
+        return 123
+    monkeypatch.setattr(GitHubIdentityProvider, 'exchange', exchange)
+    stop, serving, addresses = await start(rig)
+    try:
+        async with connections(rig, addresses) as (agent, human):
+            login = await human.get(BASE+'/auth/login')
+            assert login.status_code == 302
+            state = parse_qs(urlsplit(login.headers['location']).query)['state'][0]
+            state_cookie=human.cookies.get('hub_session_oauth')
+            callback = await human.get(BASE+'/auth/callback', params={'state':state,'code':'fixture-code'},
+                                       headers={'Cookie':'hub_session_oauth='+state_cookie})
+            assert callback.status_code == 303
+            session_cookie=human.cookies.get('hub_session')
+            me=await human.get(BASE+'/auth/me', headers={'Cookie':'hub_session='+session_cookie})
+            assert me.status_code == 200 and me.json()['authenticated'] and me.json()['github_id'] == 123
+            assert me.json()['actor'].startswith('human:cf:')
+            assert (await agent.get(BASE+'/tasks')).status_code == 200
+    finally:
+        stop.set()
+        await asyncio.wait_for(serving,8)

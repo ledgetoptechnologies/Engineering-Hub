@@ -96,8 +96,10 @@ def _diagnostic_path(path, *, files_only=False):
             and all(part not in ('', '.', '..') for part in relative.split('/')))
 
 
-def browser_route_allowed(method, path):
+def browser_route_allowed(method, path, *, allow_bound_oauth_callback=False):
     """Closed browser surface; new backend routes are not exposed implicitly."""
+    if allow_bound_oauth_callback and method == 'GET' and path == '/api/hub/v1/auth/callback':
+        return True
     owner = '/api/hub/v1/agent-connections'
     installation = owner + '/installations/' + _UUID
     if method in {'GET', 'HEAD', 'PUT'} and path == owner + '/installation-scopes':
@@ -171,7 +173,7 @@ async def _deny(scope, receive, send, code, status):
                        headers={'Cache-Control': 'no-store'})(scope, receive, send)
 
 
-def _scope_headers(scope, *, preview_host=None):
+def _scope_headers(scope, *, preview_host=None, allow_bound_oauth_callback=False):
     path = scope.get('path', '')
     try:
         canonical = path.encode('ascii')
@@ -185,7 +187,7 @@ def _scope_headers(scope, *, preview_host=None):
     if type(query) is not bytes or len(query) > 4096 or any(c < 32 or c == 127 for c in query):
         raise _Denied('gateway_invalid_query', 400)
     preview = _is_preview(scope, preview_host)
-    if not (_preview_path(scope) if preview else browser_route_allowed(scope.get('method'), path)):
+    if not (_preview_path(scope) if preview else browser_route_allowed(scope.get('method'), path, allow_bound_oauth_callback=allow_bound_oauth_callback)):
         raise _Denied('gateway_route_forbidden', 403)
     headers = scope.get('headers', [])
     if len(headers) > 64 or sum(len(k) + len(v) for k, v in headers) > 32768:
@@ -243,7 +245,10 @@ class PrivateBrowserGateway:
     as an unprotected TCP listener; no socket or deployment is created here.
     """
     def __init__(self, core, *, agent_auth, cloudflare_config, access_verifier=None,
-                 preview_origin=None, preview_app=None):
+                 preview_origin=None, preview_app=None, allow_bound_oauth_callback=False):
+        if type(allow_bound_oauth_callback) is not bool:
+            raise ValueError('Explicit callback opt-in must be boolean')
+        self.allow_bound_oauth_callback = allow_bound_oauth_callback
         if cloudflare_config is None:
             raise ValueError('Private browser gateway requires Cloudflare Access')
         self.ingress = HubIngressMiddleware(core, mode='browser', agent_auth=agent_auth,
@@ -261,7 +266,7 @@ class PrivateBrowserGateway:
         if scope['type'] != 'http':
             raise RuntimeError('Private browser gateway has no independent lifespan')
         try:
-            headers, length = _scope_headers(scope, preview_host=self.preview_host)
+            headers, length = _scope_headers(scope, preview_host=self.preview_host, allow_bound_oauth_callback=self.allow_bound_oauth_callback)
             preview = _is_preview(scope, self.preview_host)
             body = await _bounded_body(scope, receive, length, maximum=0 if preview else 65536, timeout=15.0)
         except _Denied as error:
@@ -299,7 +304,10 @@ class PublicBrowserGateway:
     domain's recovery mechanism. SSE is streamed without buffering a full body.
     """
     def __init__(self, client, *, max_body_bytes=65536, max_response_bytes=2097152,
-                 max_concurrency=16, request_timeout=15.0, preview_origin=None):
+                 max_concurrency=16, request_timeout=15.0, preview_origin=None, allow_bound_oauth_callback=False):
+        if type(allow_bound_oauth_callback) is not bool:
+            raise ValueError('Explicit callback opt-in must be boolean')
+        self.allow_bound_oauth_callback = allow_bound_oauth_callback
         if type(client) is not httpx.AsyncClient:
             raise ValueError('Explicit caller-owned AsyncClient required')
         for value, maximum in ((max_body_bytes, 1048576), (max_response_bytes, 16777216),
@@ -337,7 +345,7 @@ class PublicBrowserGateway:
                 started = True
             await send(message)
         try:
-            headers, length = _scope_headers(scope, preview_host=self.preview_host)
+            headers, length = _scope_headers(scope, preview_host=self.preview_host, allow_bound_oauth_callback=self.allow_bound_oauth_callback)
             preview = _is_preview(scope, self.preview_host)
             if length is not None and length > self.max_body_bytes:
                 raise _Denied('gateway_body_too_large', 413)

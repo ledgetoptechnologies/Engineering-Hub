@@ -42,7 +42,7 @@ async def serve_owned_inactive_hub(settings, *, bus_paths,
     if (type(settings) is not Settings or settings.work_queue_enabled
             or settings.ingress_mode != 'combined'
             or type(settings.auth_config) is not AuthConfig
-            or settings.auth_config.human_auth_mode != 'cloudflare_access'
+            or settings.auth_config.human_auth_mode not in {'cloudflare_access', 'github_cloudflare'}
             or settings.auth_config.cloudflare_config is None
             or os.environ.get('HUB_BUS_STARTUP_CLEANUP', '0') != '0'):
         raise OwnedInactiveHubError()
