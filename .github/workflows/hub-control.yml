@@ -1,4 +1,6 @@
 name: Engineering Hub control image
+# Main builds publish an immutable, smoke-tested candidate (build-<sha>-<run>-<attempt>
+# and write-once sha-<commit>). They never move `latest`; that is hub-promote.yml.
 on:
   push:
     branches: [main]
@@ -138,37 +140,61 @@ jobs:
           python scripts/hub_unified_container_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-unified-startup.json
           python scripts/hub_settings_container_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-settings-startup.json
           python scripts/hub_protected_container_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-protected-startup.json
-      - name: Require private package and current main before latest promotion
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Require private package before publishing the candidate
         run: |
           python - <<'PY'
-          import json, os, urllib.request, urllib.error
+          import urllib.request, urllib.error
           url = 'https://ghcr.io/token?service=ghcr.io&scope=repository:ledgetoptechnologies/engineering-hub-control:pull'
           try:
               with urllib.request.urlopen(url, timeout=20):
-                  raise SystemExit('Anonymous pull token unexpectedly available; refusing promotion')
+                  raise SystemExit('Anonymous pull token unexpectedly available; refusing publication')
           except urllib.error.HTTPError as e:
               if e.code not in (401, 403):
                   raise
-          req = urllib.request.Request('https://api.github.com/repos/ledgetoptechnologies/Engineering-Hub/branches/main', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-          with urllib.request.urlopen(req, timeout=20) as r:
-              head = json.load(r)['commit']['sha']
-          if head != os.environ['GITHUB_SHA']:
-              raise SystemExit('Main advanced; refusing stale latest promotion')
-          print('Private registry and current-main gates passed')
+          print('Private registry gate passed')
           PY
-      - name: Promote only the tested registry digest and read latest back
+      - name: Publish the write-once sha tag for the tested digest
+        # A main build never moves `latest`. Promotion is the separate, hand-run
+        # hub-promote.yml workflow. `sha-<commit>` is created once and never moved.
         run: |
           set -eu
-          docker buildx imagetools create --prefer-index=false --tag "$PACKAGE:latest" "$PACKAGE@$IMAGE_DIGEST"
-          docker buildx imagetools inspect "$PACKAGE:latest" --raw > hub-latest-manifest.json
-          cmp hub-registry-manifest.json hub-latest-manifest.json
-          docker pull "$PACKAGE:latest"
-          python scripts/hub_release_smoke.py --image "$PACKAGE@$IMAGE_DIGEST" --commit "$GITHUB_SHA" > hub-latest-startup.json
-          printf 'source=%s\nimage=%s:latest\ndigest=%s\n' "$GITHUB_SHA" "$PACKAGE" "$IMAGE_DIGEST" > hub-release.txt
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          SHA_TAG="$PACKAGE:sha-$GITHUB_SHA"
+          if EXISTING="$(docker buildx imagetools inspect "$SHA_TAG" --format '{{json .Manifest.Digest}}' 2>sha-inspect-error.txt)"; then
+            EXISTING="$(printf '%s' "$EXISTING" | tr -d '"')"
+            test "$EXISTING" = "$IMAGE_DIGEST" || { echo "::error::$SHA_TAG already names $EXISTING; immutable sha tags are never moved"; exit 1; }
+          else
+            grep -qE '\bMANIFEST_UNKNOWN\b|\bmanifest unknown\b|: not found$' sha-inspect-error.txt \
+              && ! grep -qiE 'denied|unauthori[sz]ed|forbidden|toomanyrequests|timeout|refused|\b(401|403|429|5[0-9][0-9])\b' sha-inspect-error.txt \
+              || { cat sha-inspect-error.txt >&2; exit 1; }
+            docker buildx imagetools create --prefer-index=false --tag "$SHA_TAG" "$PACKAGE@$IMAGE_DIGEST"
+          fi
+          rm -f sha-inspect-error.txt
+          docker buildx imagetools inspect "$SHA_TAG" --raw > hub-sha-manifest.json
+          cmp hub-registry-manifest.json hub-sha-manifest.json
+          test "$(docker buildx imagetools inspect "$SHA_TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')" = "$IMAGE_DIGEST"
+      - name: Write candidate evidence for promotion
+        run: |
+          set -eu
+          printf 'source=%s\nimage=%s:sha-%s\ndigest=%s\nlatest=unchanged\n' "$GITHUB_SHA" "$PACKAGE" "$GITHUB_SHA" "$IMAGE_DIGEST" > hub-release.txt
+          python scripts/hub_candidate_evidence.py write hub-candidate.json
+          sha256sum hub-candidate.json hub-*-startup.json hub-registry-manifest.json > hub-candidate.sha256
+          printf 'Candidate for promotion: commit `%s`, digest `%s`. `latest` was not changed.\n' "$GITHUB_SHA" "$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload candidate evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: hub-control-candidate-${{ github.sha }}
+          path: |
+            hub-candidate.json
+            hub-candidate.sha256
+            hub-*-startup.json
+            hub-*-manifest.json
+            hub-release.txt
+          if-no-files-found: error
+          retention-days: 90
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: failure()
         with:
           name: hub-control-main-publication-evidence
           path: |

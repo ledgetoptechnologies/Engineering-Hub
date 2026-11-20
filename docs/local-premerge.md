@@ -35,5 +35,6 @@ proven, 130 Ctrl+C. `python scripts/local_premerge.py --self-test` exercises
 the timeout and Ctrl+C paths with stand-in steps (about a minute). Logs stay under
 `~/.eh-premerge/<commit>-<id>/`; `--help` lists the options.
 
-Not covered locally: GHCR push, the registry-digest re-test and `latest`
-promotion, which only the main `publish` job performs.
+Not covered locally: GHCR push, the registry-digest re-test and the write-once
+`sha-<commit>` tag, which only the main `publish` job performs. `latest` moves
+only through the hand-run `hub-promote.yml` (see docs/hub-control-deployment.md).

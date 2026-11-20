@@ -154,9 +154,35 @@ The operator Compose uses
 reference does not enforce immutable image syntax; exact registry digests and
 source revisions belong in release/rollback evidence, not this default Compose.
 The separate `.github/workflows/hub-control.yml` verifies the source, builds from
-that exact main commit, checks private authenticated registry read and isolated
-startup, then promotes the tested digest to `latest` and reads it back. PRs
+that exact main commit, runs the isolated startup checks on the local candidate and
+again on the authenticated registry digest, checks the package is private, and
+publishes only immutable tags: `build-<sha>-<run>-<attempt>` and the write-once
+`sha-<commit>` (a run fails rather than move an existing sha tag). It never moves
+`latest` and uploads `hub-control-candidate-<commit>` evidence (90 days). PRs
 validate only and cannot publish. A plain restart does not pull an updated image.
+
+### Promoting a candidate to latest
+
+`latest` moves only through `.github/workflows/hub-promote.yml`, run by hand from
+`main` with the candidate's full commit SHA and digest (from its hub-control run
+summary), after the release approvals. It does not rebuild. It requires the commit
+on `main`, a successful main hub-control run for it, that run's checksummed
+candidate evidence, the private package, and `sha-<commit>` still naming the
+digest. It then reads the current `latest` and stops, writing nothing, unless it
+resolves to a valid digest (an apparent absence is an anomaly; the
+`initialize_latest` input, default false, is only for a first-time setup and only
+on the registry's `MANIFEST_UNKNOWN` response). It writes a rollback receipt
+(previous and new digest, commit, run ids, time) to the summary and as the
+`hub-promotion-receipt-<run>-<attempt>` artifact **before** moving `latest`. If the
+write or the read-back fails, the run fails, prints the rollback command, and still
+uploads a `hub-promotion-result-<run>-<attempt>` record. Promotions are serialized
+but this is not a registry-wide lock: nobody else should write `latest` during a
+release.
+
+Rollback: promote an earlier candidate's commit and digest (the previous digest is in
+the last receipt). Evidence is kept up to 90 days; for older images pin the digest
+below. An image rollback does not prove the older image can read newer Hub state;
+keep a compatible state backup.
 
 For a deliberate installation or rollback, the operator may replace only the
 image reference in their private copy with the verified immutable release:

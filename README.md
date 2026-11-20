@@ -24,8 +24,8 @@ bus/control examples below.
 - One host mount: `/mnt/Plugins/App_Data/Engineering-Hub:/var/lib/hub`.
   Non-secret `settings.json`, Hub state and preserved bus state live below it.
   Keep credentials out of the settings file and Git.
-- Image: `ghcr.io/ledgetoptechnologies/engineering-hub-control:latest`, promoted
-  from tested `main` builds. Pull and redeploy to update; restarting does not pull.
+- Image: `ghcr.io/ledgetoptechnologies/engineering-hub-control:latest`, moved only
+  by the hand-run promotion of a tested `main` candidate. Pull and redeploy to update; restarting does not pull.
 
 Normal Hub startup does **not** enroll a host executor or enable autonomous live
 deployment. The [actual bounded staging pilot](docs/staging-pilot-acceptance-2026-10-21.md)
@@ -107,8 +107,11 @@ The live smoke test discovers the server's tools and exercises message delivery,
 ## GHCR images
 
 The current Hub image is built by `.github/workflows/hub-control.yml`. Tested
-`main` publication promotes the verified registry digest to
-`ghcr.io/ledgetoptechnologies/engineering-hub-control:latest`. Hosted checks run
+`main` publication pushes only immutable tags (`build-<sha>-<run>-<attempt>` and
+write-once `sha-<commit>`); it never moves `latest`. The separate, hand-run
+`.github/workflows/hub-promote.yml` moves
+`ghcr.io/ledgetoptechnologies/engineering-hub-control:latest` to one tested
+digest (see docs/hub-control-deployment.md). Hosted checks run
 only for pushes to `main`, or a manual Hub dispatch selecting `main`. A manual
 dispatch selecting a development branch is refused by the job condition. Pull
 requests, development-branch pushes and tag pushes do not run hosted CI; run

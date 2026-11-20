@@ -30,7 +30,8 @@
 #
 # Updates: pull_policy always checks :latest when Compose creates/updates the app.
 # A plain container restart does NOT pull a new image. Use TrueNAS Update/Redeploy
-# with image pull enabled; the main build pipeline must publish the moving tag.
+# with image pull enabled. Main builds publish immutable candidates only; :latest
+# moves only when a tested candidate is promoted by hand (hub-promote.yml).
 #
 # Removal/rollback: stop/remove ONLY this app. Preserve its engineering-hub child
 # directory and back it up/snapshot before updates. Image rollback may require a
