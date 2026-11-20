@@ -4,6 +4,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
 import socket
+import sqlite3
 import stat
 import uuid
 from contextlib import asynccontextmanager
@@ -34,7 +35,12 @@ from scripts.mcp_push_worker import (
     validate_readonly_profile_config,
     validate_url,
     _parse_args,
+    _is_network_error,
+    _is_recoverable_connection_error,
+    WorkerError,
+    _ReadinessStream,
 )
+from scripts.mcp_push_worker_status import main as status_main
 
 
 PROFILE = "mcp-worker"
@@ -95,6 +101,125 @@ def message(seq: int, message_type: str = "TASK", *, topic: str = "qa", sender: 
     }
 
 
+def test_explicit_routing_recovery_requires_pending_and_current_allowlist_once(tmp_path):
+    state = WorkerState(tmp_path / 'state.sqlite3')
+    state.set_initial_cursor(0)
+    item = message(1, topic='new-topic')
+    state.ingest_page([item], 1, identity='hermes', allowed_senders={'codex'},
+                      allowed_topics={'qa'}, allowed_hubs=set())
+    for changed in ({**item, 'status': 'acknowledged'}, {**item, 'sender': 'claude'}, item):
+        with pytest.raises(WorkerError):
+            state.recover_routing_issue(item['id'], changed, identity='hermes',
+                allowed_senders={'codex'}, allowed_topics={'qa'}, allowed_hubs=set())
+    assert len(state.routing_issues()) == 1 and state.cursor == 1
+    state.recover_routing_issue(item['id'], item, identity='hermes',
+        allowed_senders={'codex'}, allowed_topics={'new-topic'}, allowed_hubs=set())
+    assert state.queued_ids() == [item['id']] and not state.routing_issues()
+    with pytest.raises(WorkerError):
+        WorkerState(tmp_path / 'state.sqlite3').recover_routing_issue(item['id'], item,
+            identity='hermes', allowed_senders={'codex'}, allowed_topics={'new-topic'}, allowed_hubs=set())
+    assert state.queued_ids() == [item['id']] and state.cursor == 1
+
+
+@pytest.mark.parametrize('changed_seq', [True, '1', None, 2])
+def test_explicit_routing_recovery_rejects_changed_sequence_without_consuming(tmp_path, changed_seq):
+    state = WorkerState(tmp_path / 'state.sqlite3')
+    state.set_initial_cursor(0)
+    item = message(1, topic='new-topic')
+    state.ingest_page([item], 1, identity='hermes', allowed_senders={'codex'},
+                      allowed_topics={'qa'}, allowed_hubs=set())
+    with pytest.raises(WorkerError, match='sequence mismatch'):
+        state.recover_routing_issue(item['id'], {**item, 'seq': changed_seq}, identity='hermes',
+            allowed_senders={'codex'}, allowed_topics={'new-topic'}, allowed_hubs=set())
+    assert state.routing_issues()[0]['message_id'] == item['id']
+    assert not state.routing_recovered(item['id']) and state.queued_ids() == [] and state.cursor == 1
+
+
+def test_explicit_routing_recovery_preserves_diagnostic_when_queue_full(tmp_path):
+    state = WorkerState(tmp_path / 'state.sqlite3', max_queue=1)
+    state.set_initial_cursor(0)
+    diagnosed, accepted = message(1, topic='new-topic'), message(2, topic='qa')
+    state.ingest_page([diagnosed, accepted], 2, identity='hermes', allowed_senders={'codex'},
+                      allowed_topics={'qa'}, allowed_hubs=set())
+    with pytest.raises(QueueFull):
+        state.recover_routing_issue(diagnosed['id'], diagnosed, identity='hermes',
+            allowed_senders={'codex'}, allowed_topics={'new-topic'}, allowed_hubs=set())
+    assert state.queued_ids() == [accepted['id']]
+    assert state.routing_issues()[0]['message_id'] == diagnosed['id']
+    assert not state.routing_recovered(diagnosed['id']) and state.cursor == 2
+
+
+@pytest.mark.asyncio
+async def test_stream_end_closes_dispatch_gate():
+    ready = asyncio.Event()
+    ready.set()
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'chunk'
+    assert [part async for part in _ReadinessStream(Stream(), ready)] == [b'chunk']
+    assert not ready.is_set()
+
+
+@pytest.mark.asyncio
+async def test_explicit_recovery_reads_exact_message_and_restart_uses_receipt(tmp_path):
+    state = WorkerState(tmp_path / 'state.sqlite3')
+    state.set_initial_cursor(0)
+    item = message(1, topic='new-topic')
+    state.ingest_page([item], 1, identity='hermes', allowed_senders={'codex'},
+                      allowed_topics={'qa'}, allowed_hubs=set())
+    class Session:
+        calls = []
+        async def read_resource(self, uri):
+            self.calls.append(str(uri))
+            return SimpleNamespace(contents=[SimpleNamespace(text=json.dumps({'messages': [item], 'next_cursor': 1}))])
+    def worker():
+        return PushWorker(url='https://bus.example.test/mcp', token='fixture', identity='hermes',
+            state=state, runner=object(), allowed_senders={'codex'}, allowed_topics={'new-topic'},
+            allowed_hubs=set(), recover_routing_ids=(item['id'],))
+    session = Session()
+    await worker()._recover_routing(session)
+    await worker()._recover_routing(session)
+    assert session.calls == ['agentbus://inbox/hermes?after=0&limit=1']
+    assert state.queued_ids() == [item['id']] and state.routing_recovered(item['id'])
+
+
+@pytest.mark.asyncio
+async def test_disconnected_worker_finishes_active_job_but_waits_to_start_next(tmp_path):
+    state = WorkerState(tmp_path / 'state.sqlite3')
+    state.set_initial_cursor(0)
+    first, second = message(1, correlation_id='first'), message(2, correlation_id='second')
+    state.ingest_page([first, second], 2, identity='hermes', allowed_senders={'codex'},
+                      allowed_topics={'qa'}, allowed_hubs=set())
+    entered, release, second_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    class Runner:
+        async def run(self, message_id, resume_session_id=None):
+            if message_id == first['id']:
+                entered.set()
+                await release.wait()
+            else:
+                second_started.set()
+            return RunOutcome('succeeded', SESSION)
+    worker = PushWorker(url='https://bus.example.test/mcp', token='fixture', identity='hermes',
+        state=state, runner=Runner(), allowed_senders={'codex'}, allowed_topics={'qa'}, allowed_hubs=set())
+    worker.ready_once_event.set()
+    dispatcher = asyncio.create_task(worker._dispatch_queue())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        worker.ready_once_event.clear()
+        release.set()
+        for _ in range(100):
+            if state.item_status(first['id']) == 'succeeded':
+                break
+            await asyncio.sleep(.001)
+        assert state.item_status(first['id']) == 'succeeded'
+        assert state.item_status(second['id']) == 'queued' and not second_started.is_set()
+        worker.ready_once_event.set()
+        await asyncio.wait_for(second_started.wait(), 1)
+    finally:
+        dispatcher.cancel()
+        await asyncio.gather(dispatcher, return_exceptions=True)
+
+
 def test_page_queue_and_cursor_commit_together_and_dedupe(tmp_path):
     state = WorkerState(tmp_path / "state.sqlite3")
     state.set_initial_cursor(4)
@@ -125,6 +250,107 @@ def test_topics_senders_and_non_actionable_types_are_filtered(tmp_path):
                                  allowed_topics={"qa"}, allowed_hubs=set(), profile=PROFILE)
     assert accepted == [items[-1]["id"]]
     assert state.cursor == 8
+
+
+def test_unrouted_actionable_items_are_durably_reported_without_body_content(tmp_path, caplog):
+    path = tmp_path / "state.sqlite3"
+    state = WorkerState(path)
+    state.set_initial_cursor(0)
+    missing = message(1)
+    missing["body"] = {"description": "private untrusted text must not be copied"}
+    non_dict = message(2)
+    non_dict["body"] = "untrusted text"
+    ambiguous = message(3)
+    ambiguous["body"] = {"topic": "qa", "hub": "qa-hub", "description": "also untrusted"}
+    unapproved_hub = message(4)
+    unapproved_hub["body"] = {"hub": "other-hub"}
+    invalid_correlation = message(5)
+    invalid_correlation["correlation_id"] = "x" * 257
+
+    assert state.ingest_page([missing, non_dict, ambiguous, unapproved_hub, invalid_correlation], 5,
+                             identity="hermes", allowed_senders={"codex"},
+                             allowed_topics={"qa"}, allowed_hubs=set(), profile=PROFILE) == []
+    assert state.cursor == 5
+    assert state.queued_ids() == []
+    assert state.routing_issues() == [
+        {"message_id": missing["id"], "seq": 1, "reason": "missing_route"},
+        {"message_id": non_dict["id"], "seq": 2, "reason": "missing_route"},
+        {"message_id": ambiguous["id"], "seq": 3, "reason": "ambiguous_route"},
+        {"message_id": unapproved_hub["id"], "seq": 4, "reason": "route_not_allowed"},
+        {"message_id": invalid_correlation["id"], "seq": 5, "reason": "invalid_correlation"},
+    ]
+    assert state.routing_issues_dropped() == 0
+    assert "private untrusted text" not in caplog.text
+    assert all(item["message_id"] in caplog.text for item in state.routing_issues())
+    assert WorkerState(path).routing_issues() == state.routing_issues()
+
+
+def test_full_routing_issue_ledger_holds_cursor(tmp_path, monkeypatch):
+    monkeypatch.setattr("scripts.mcp_push_worker.MAX_RETAINED_ITEMS", 1)
+    state = WorkerState(tmp_path / "state.sqlite3")
+    state.set_initial_cursor(0)
+    first = message(1)
+    second = message(2)
+    first["body"] = {"description": "missing route"}
+    second["body"] = {"description": "missing route"}
+
+    assert state.ingest_page([first, second], 2, identity="hermes", allowed_senders={"codex"},
+                             allowed_topics={"qa"}, allowed_hubs=set(), profile=PROFILE) == []
+    assert state.cursor == 2
+    assert state.routing_issues() == [
+        {"message_id": second["id"], "seq": 2, "reason": "missing_route"}
+    ]
+    assert state.routing_issues_dropped() == 1
+
+
+def test_existing_routing_issue_ledger_migrates_for_invalid_correlation(tmp_path):
+    path = tmp_path / "state.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("CREATE TABLE threads (thread_key TEXT PRIMARY KEY, topic_key TEXT NOT NULL, correlation_id TEXT, sender TEXT NOT NULL, session_id TEXT, status TEXT NOT NULL, profile TEXT NOT NULL, updated_seq INTEGER NOT NULL)")
+        conn.execute("CREATE TABLE items (message_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, thread_key TEXT NOT NULL, topic_key TEXT NOT NULL, message_type TEXT NOT NULL, in_reply_to TEXT, status TEXT NOT NULL, profile TEXT NOT NULL)")
+        conn.execute("CREATE TABLE queue (message_id TEXT PRIMARY KEY REFERENCES items(message_id), seq INTEGER NOT NULL, thread_key TEXT NOT NULL, status TEXT NOT NULL)")
+        conn.execute("CREATE INDEX idx_queue_status_seq ON queue(status, seq)")
+        conn.execute("CREATE TABLE routing_issues (message_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, reason TEXT NOT NULL CHECK(reason IN ('missing_route','ambiguous_route','route_not_allowed')))")
+        conn.execute("CREATE INDEX idx_routing_issues_seq ON routing_issues(seq)")
+        conn.execute("INSERT INTO routing_issues VALUES(?,?,?)",
+                     (str(uuid.uuid4()), 1, "missing_route"))
+        conn.commit()
+
+    state = WorkerState(path)
+    old_issue = state.routing_issues()[0]
+    state.set_initial_cursor(1)
+    invalid = message(2)
+    invalid["correlation_id"] = "x" * 257
+    assert state.ingest_page([invalid], 2, identity="hermes", allowed_senders={"codex"},
+                             allowed_topics={"qa"}, allowed_hubs=set(), profile=PROFILE) == []
+    assert state.routing_issues()[0] == old_issue
+    assert state.routing_issues()[1]["reason"] == "invalid_correlation"
+
+
+def test_worker_status_cli_reads_content_free_issue_details_without_creating_state(tmp_path, capsys):
+    state_dir = tmp_path / "worker-state"
+    state_dir.mkdir()
+    state = WorkerState(state_dir / "mcp-push-worker.sqlite3")
+    state.set_initial_cursor(4)
+    item = message(5)
+    item["body"] = {"description": "private body is not in the status output"}
+    state.ingest_page([item], 5, identity="hermes", allowed_senders={"codex"},
+                      allowed_topics={"qa"}, allowed_hubs=set(), profile=PROFILE)
+
+    assert status_main(["--state-dir", str(state_dir)]) == 0
+    output = capsys.readouterr().out
+    parsed = json.loads(output)
+    assert parsed["cursor"] == 5
+    assert parsed["queued_count"] == 0
+    assert parsed["routing_issues"] == [
+        {"message_id": item["id"], "seq": 5, "reason": "missing_route"}
+    ]
+    assert "private body" not in output
+
+    missing_state = tmp_path / "missing-state"
+    assert status_main(["--state-dir", str(missing_state)]) == 2
+    assert not (missing_state / "mcp-push-worker.sqlite3").exists()
 
 
 def test_hub_optin_requires_one_exact_local_route(tmp_path):
@@ -610,6 +836,7 @@ async def test_queue_arrives_while_worker_is_busy_and_survives_shutdown(tmp_path
         worker = PushWorker(url="https://bus.example.test/mcp", token="fixture-only", identity="hermes",
                             state=state, runner=runner, allowed_senders={"codex"},
                             allowed_topics={"qa"}, allowed_hubs=set())
+        worker.ready_once_event.set()
         dispatcher = asyncio.create_task(worker._dispatch_queue())
         await asyncio.wait_for(runner.entered.wait(), timeout=1)
 
@@ -640,6 +867,7 @@ async def test_empty_queue_never_calls_model_runner(tmp_path):
         worker = PushWorker(url="https://bus.example.test/mcp", token="fixture-only", identity="hermes",
                             state=WorkerState(tmp_path / "state.sqlite3"), runner=runner,
                             allowed_senders={"codex"}, allowed_topics={"qa"}, allowed_hubs=set())
+        worker.ready_once_event.set()
         dispatcher = asyncio.create_task(worker._dispatch_queue())
         await asyncio.sleep(0.02)
         assert runner.calls == 0
@@ -685,6 +913,138 @@ async def test_only_network_failures_reconnect_with_backoff(tmp_path):
     await scenario()
 
 
+def test_exception_groups_retry_only_when_all_causes_are_network_errors():
+    network_group = ExceptionGroup("transport shutdown", [httpx.ReadError("socket closed")])
+    mixed_group = ExceptionGroup("mixed failure", [
+        httpx.ReadError("socket closed"), CapabilityError("subscription unavailable"),
+    ])
+    assert _is_network_error(network_group)
+    assert not _is_network_error(mixed_group)
+
+
+def test_only_session_scoped_mcp_404_is_recoverable():
+    stale_request = httpx.Request(
+        "POST", "https://bus.example.test/mcp", headers={"mcp-session-id": "expired"},
+    )
+    stale_session = httpx.HTTPStatusError(
+        "expired MCP session", request=stale_request,
+        response=httpx.Response(404, request=stale_request),
+    )
+    endpoint_request = httpx.Request("POST", "https://bus.example.test/mcp")
+    missing_endpoint = httpx.HTTPStatusError(
+        "missing endpoint", request=endpoint_request,
+        response=httpx.Response(404, request=endpoint_request),
+    )
+    unauthorized_request = httpx.Request(
+        "POST", "https://bus.example.test/mcp", headers={"mcp-session-id": "current"},
+    )
+    unauthorized = httpx.HTTPStatusError(
+        "invalid credentials", request=unauthorized_request,
+        response=httpx.Response(401, request=unauthorized_request),
+    )
+    wrong_endpoint_request = httpx.Request(
+        "GET", "https://bus.example.test/wrong-path", headers={"mcp-session-id": "expired"},
+    )
+    wrong_endpoint = httpx.HTTPStatusError(
+        "not the configured MCP endpoint", request=wrong_endpoint_request,
+        response=httpx.Response(404, request=wrong_endpoint_request),
+    )
+    endpoint = "https://bus.example.test/mcp"
+    assert _is_recoverable_connection_error(stale_session, expected_endpoint=endpoint)
+    assert not _is_recoverable_connection_error(missing_endpoint, expected_endpoint=endpoint)
+    assert not _is_recoverable_connection_error(unauthorized, expected_endpoint=endpoint)
+    assert not _is_recoverable_connection_error(wrong_endpoint, expected_endpoint=endpoint)
+
+
+@pytest.mark.asyncio
+async def test_active_job_survives_transient_mcp_disconnect(tmp_path):
+    finished = asyncio.Event()
+
+    class ObservedState(WorkerState):
+        def finish_job(self, job, *, outcome, session_id, expected_resume=None):
+            final = super().finish_job(job, outcome=outcome, session_id=session_id,
+                                       expected_resume=expected_resume)
+            if final == "succeeded":
+                finished.set()
+            return final
+
+    class BlockingRunner:
+        def __init__(self):
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.calls = 0
+
+        async def run(self, _message_id, resume_session_id=None):
+            self.calls += 1
+            self.entered.set()
+            await self.release.wait()
+            return RunOutcome("succeeded", SESSION)
+
+    state = ObservedState(tmp_path / "disconnect-state.sqlite3")
+    state.set_initial_cursor(0)
+    item = message(1, correlation_id="disconnect-recovery")
+    state.ingest_page([item], 1, identity="hermes", allowed_senders={"codex"},
+                      allowed_topics={"qa"}, allowed_hubs=set())
+    runner = BlockingRunner()
+
+    class DisconnectOnceWorker(PushWorker):
+        connections = 0
+
+        async def run_connection(self):
+            self.connections += 1
+            if self.connections == 1:
+                # Drop the MCP session while the independently owned queue
+                # dispatcher is waiting on an active child job.
+                self.ready_once_event.set()
+                await asyncio.wait_for(runner.entered.wait(), timeout=1)
+                raise httpx.ConnectError("fixture transient disconnect")
+            await asyncio.wait_for(runner.entered.wait(), timeout=1)
+            runner.release.set()
+            await asyncio.wait_for(finished.wait(), timeout=1)
+            self.stop_event.set()
+
+    worker = DisconnectOnceWorker(
+        url="https://bus.example.test/mcp", token="fixture-only", identity="hermes",
+        state=state, runner=runner, allowed_senders={"codex"}, allowed_topics={"qa"},
+        allowed_hubs=set(), reconnect_base_seconds=0.01,
+    )
+    await asyncio.wait_for(worker.run_forever(), timeout=2)
+    assert worker.connections == 2
+    assert runner.calls == 1
+    assert state.item_status(item["id"]) == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_queued_jobs_wait_for_first_successful_connection(tmp_path):
+    state = WorkerState(tmp_path / "not-ready-state.sqlite3")
+    state.set_initial_cursor(0)
+    item = message(1, correlation_id="not-ready")
+    state.ingest_page([item], 1, identity="hermes", allowed_senders={"codex"},
+                      allowed_topics={"qa"}, allowed_hubs=set())
+
+    class PermanentFailureWorker(PushWorker):
+        async def run_connection(self):
+            raise CapabilityError("fixture missing subscription support")
+
+    class CountingRunner:
+        calls = 0
+
+        async def run(self, *_args, **_kwargs):
+            self.calls += 1
+            return RunOutcome("succeeded", SESSION)
+
+    runner = CountingRunner()
+    worker = PermanentFailureWorker(
+        url="https://bus.example.test/mcp", token="fixture-only", identity="hermes",
+        state=state, runner=runner, allowed_senders={"codex"}, allowed_topics={"qa"},
+        allowed_hubs=set(), reconnect_base_seconds=0.01,
+    )
+    with pytest.raises(CapabilityError):
+        await worker.run_forever()
+    assert runner.calls == 0
+    assert state.item_status(item["id"]) == "queued"
+
+
 @pytest.mark.asyncio
 async def test_connector_uses_real_streamable_http_push_without_replaying_old_work(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_BUS_ALLOWED_HOSTS", "127.0.0.1:*")
@@ -728,7 +1088,7 @@ async def test_connector_uses_real_streamable_http_push_without_replaying_old_wo
                                 body={"topic": "qa", "description": "old pending fixture"},
                                 correlation_id="old-job")
         worker.url = url
-        task = asyncio.create_task(worker.run_connection())
+        task = asyncio.create_task(worker.run_forever())
         try:
             await asyncio.wait_for(worker.snapshot_done.wait(), timeout=5)
             await asyncio.wait_for(worker.initial_catchup_done.wait(), timeout=5)
@@ -763,6 +1123,197 @@ async def test_connector_uses_real_streamable_http_push_without_replaying_old_wo
     assert state.cursor == repository.sequence_for(incoming.id)
     assert state.item_status(incoming.id) == "succeeded"
     assert state.item_status(old.id) is None
+
+
+@pytest.mark.asyncio
+async def test_real_streamable_http_disconnect_reopens_stream_without_replaying_running_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_BUS_ALLOWED_HOSTS", "127.0.0.1:*")
+    db_path = tmp_path / "reconnect-bus.sqlite3"
+    audit_path = tmp_path / "reconnect-audit.jsonl"
+    app = create_app(db_path=db_path, audit_path=audit_path, auth=TEST_AUTH,
+                     push_events_operational=True)
+
+    class BlockingRunner:
+        def __init__(self):
+            self.calls = []
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def run(self, message_id, resume_session_id=None):
+            self.calls.append((message_id, resume_session_id))
+            self.entered.set()
+            await self.release.wait()
+            return RunOutcome("succeeded", SESSION)
+
+    class ObservedState(WorkerState):
+        def finish_job(self, job, *, outcome, session_id, expected_resume=None):
+            final = super().finish_job(job, outcome=outcome, session_id=session_id,
+                                       expected_resume=expected_resume)
+            if final == "succeeded":
+                finished.set()
+                if getattr(self, "second_job_id", None) == job.message_id:
+                    second_finished.set()
+            return final
+
+    class DropFirstSSE:
+        """End one real server-side MCP SSE response after a job starts."""
+        def __init__(self, wrapped_app):
+            self.wrapped_app = wrapped_app
+            self.streams = 0
+            self.session_ids = []
+            self.stream_reopened = asyncio.Event()
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") != "http" or scope.get("method") != "GET" or scope.get("path") != "/mcp":
+                await self.wrapped_app(scope, receive, send)
+                return
+            self.streams += 1
+            session_id = next(
+                (value.decode("latin1") for name, value in scope.get("headers", [])
+                 if name.lower() == b"mcp-session-id"),
+                None,
+            )
+            self.session_ids.append(session_id)
+            if self.streams > 1:
+                self.stream_reopened.set()
+                await self.wrapped_app(scope, receive, send)
+                return
+
+            response_started = asyncio.Event()
+            connection_task = asyncio.current_task()
+
+            async def watched_send(message):
+                if message.get("type") == "http.response.start":
+                    response_started.set()
+                await send(message)
+
+            async def drop_response():
+                await response_started.wait()
+                await runner.entered.wait()
+                try:
+                    await send({"type": "http.response.body", "body": b"", "more_body": False})
+                finally:
+                    connection_task.cancel()
+
+            drop_task = asyncio.create_task(drop_response())
+            try:
+                await self.wrapped_app(scope, receive, watched_send)
+            except asyncio.CancelledError:
+                # The test intentionally closes this one persistent HTTP stream.
+                raise
+            finally:
+                drop_task.cancel()
+                await asyncio.gather(drop_task, return_exceptions=True)
+
+    runner = BlockingRunner()
+    finished = asyncio.Event()
+    second_finished = asyncio.Event()
+    state = ObservedState(tmp_path / "reconnect-worker.sqlite3")
+
+    class ReconnectingWorker(PushWorker):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.connections = 0
+            self.catchups = 0
+            self.expected_cursor = None
+            self.expected_cursor_reached = asyncio.Event()
+
+        async def run_connection(self):
+            self.connections += 1
+            await super().run_connection()
+
+        async def _read_catchup(self, session):
+            await super()._read_catchup(session)
+            self.catchups += 1
+            if self.expected_cursor is not None and self.state.cursor >= self.expected_cursor:
+                self.expected_cursor_reached.set()
+
+    worker = ReconnectingWorker(
+        url="http://127.0.0.1:8765/mcp", token=TEST_AUTH.hermes_token, identity="hermes",
+        state=state, runner=runner, allowed_senders={"codex"}, allowed_topics={"qa"},
+        allowed_hubs=set(), allow_loopback_http=True, reconnect_base_seconds=0.01,
+        reconnect_max_seconds=0.05,
+    )
+    subscriptions = []
+    resubscription_complete = asyncio.Event()
+    original_subscribe = app.state.push_publisher.subscribe
+
+    async def observe_subscribe(session_id, recipient, session):
+        await original_subscribe(session_id, recipient, session)
+        subscriptions.append((session_id, recipient))
+        if len(subscriptions) >= 2:
+            resubscription_complete.set()
+
+    monkeypatch.setattr(app.state.push_publisher, "subscribe", observe_subscribe)
+    app_with_drop = DropFirstSSE(app)
+    async with _loopback_mcp(app_with_drop) as url:
+        worker.url = url
+        task = asyncio.create_task(worker.run_forever())
+        try:
+            await asyncio.wait_for(worker.ready_once_event.wait(), timeout=5)
+            incoming = app.state.repository.insert(
+                sender="codex", recipient="hermes", message_type="REQUEST",
+                body={"topic": "qa", "description": "disconnect while active"},
+                correlation_id="real-disconnect-job",
+            )
+            await asyncio.wait_for(runner.entered.wait(), timeout=5)
+            assert state.item_status(incoming.id) == "running"
+            assert state.cursor == app.state.repository.sequence_for(incoming.id)
+
+            try:
+                await asyncio.wait_for(app_with_drop.stream_reopened.wait(), timeout=5)
+            except TimeoutError as exc:
+                failure = None
+                if task.done():
+                    try:
+                        failure = type(task.exception()).__name__
+                    except asyncio.CancelledError:
+                        failure = "cancelled"
+                raise AssertionError(
+                    f"stream reopen stalled: connections={worker.connections}, "
+                    f"catchups={worker.catchups}, streams={app_with_drop.streams}, "
+                    f"subscription_failed={worker.subscription_failure_event.is_set()}, "
+                    f"task_done={task.done()}, task_failure={failure}"
+                ) from exc
+            assert app_with_drop.streams >= 2
+            assert app_with_drop.session_ids[0]
+            assert app_with_drop.session_ids[1] == app_with_drop.session_ids[0]
+            await asyncio.wait_for(resubscription_complete.wait(), timeout=5)
+            assert subscriptions[:2] == [
+                (app_with_drop.session_ids[0], "hermes"),
+                (app_with_drop.session_ids[0], "hermes"),
+            ]
+            assert runner.calls == [(incoming.id, None)]
+            assert state.item_status(incoming.id) == "running"
+            assert app.state.push_publisher.subscription_count == 1
+
+            after_reconnect = app.state.repository.insert(
+                sender="codex", recipient="hermes", message_type="REQUEST",
+                body={"topic": "qa", "description": "arrived after stream reopen"},
+                correlation_id="post-reconnect-job",
+            )
+            worker.expected_cursor = app.state.repository.sequence_for(after_reconnect.id)
+            if state.cursor >= worker.expected_cursor:
+                worker.expected_cursor_reached.set()
+            await asyncio.wait_for(worker.expected_cursor_reached.wait(), timeout=5)
+            assert state.item_status(after_reconnect.id) == "queued"
+            assert runner.calls == [(incoming.id, None)]
+
+            runner.release.set()
+            await asyncio.wait_for(finished.wait(), timeout=5)
+            state.second_job_id = after_reconnect.id
+            if state.item_status(after_reconnect.id) != "succeeded":
+                await asyncio.wait_for(second_finished.wait(), timeout=5)
+            assert state.item_status(incoming.id) == "succeeded"
+            assert state.item_status(after_reconnect.id) == "succeeded"
+            assert runner.calls == [(incoming.id, None), (after_reconnect.id, None)]
+        finally:
+            worker.stop_event.set()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5)
+            except TimeoutError:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
