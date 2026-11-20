@@ -292,3 +292,95 @@ async def test_private_socket_service_uses_same_shared_queue_and_owned_shutdown(
         await serving
     private.assert_closed(state)
     assert len(clients) == 1 and clients[0]._client.is_closed and composition.is_drained
+import os
+import subprocess
+
+
+@pytest.mark.asyncio
+async def test_unproved_shared_drain_keeps_unified_bus_and_owner_alive(shared_app, monkeypatch):
+    """Real listeners and bus, synthetic failed close; no fabricated drain."""
+    if os.environ.get('EH_UNIFIED_HOLD_CHILD') != '1':
+        env = dict(os.environ, EH_UNIFIED_HOLD_CHILD='1')
+        result = subprocess.run([sys.executable, '-m', 'pytest', '-q', '-s',
+            str(__file__) + '::test_unproved_shared_drain_keeps_unified_bus_and_owner_alive',
+            '--basetemp', '/tmp/unified-hold', '-o', 'cache_dir=/tmp/unified-hold-cache'],
+            env=env, capture_output=True, text=True, timeout=35)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert 'UNIFIED_UNPROVED_HOLD_PASSED' in result.stdout
+        return
+    state = shared_app
+    stop, task, _addresses = await start(state)
+    shared = state.core.state.shared_staging
+    seen = asyncio.Event()
+    async def unproved():
+        seen.set()
+        raise RuntimeError('synthetic close failure')
+    monkeypatch.setattr(shared, 'close', unproved)
+    stop.set()
+    await asyncio.wait_for(seen.wait(), 8)
+    for _ in range(2):
+        await asyncio.sleep(0.05)
+        task.cancel()
+        assert not task.done()
+        assert shared.is_drained is False
+        assert state.core.state.drain_handoff.state == 'held'
+        assert 'bus-stop' not in state.events
+        assert 'client-close' not in state.events and 'owner-close' not in state.events
+        state.owner.assert_active(state.settings.database)
+    print('UNIFIED_UNPROVED_HOLD_PASSED', flush=True)
+    os._exit(0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failed_resource', ['controller', 'client'])
+async def test_failed_draft_cleanup_retains_unified_owner_and_reservation(shared_app, monkeypatch, failed_resource):
+    """Real draft + transferred owner, injected lifecycle construction/close failure."""
+    import os
+    import subprocess
+    if os.environ.get('EH_DRAFT_HOLD_CHILD') != failed_resource:
+        env = dict(os.environ, EH_DRAFT_HOLD_CHILD=failed_resource)
+        result = subprocess.run([sys.executable, '-m', 'pytest', '-q', '-s',
+            str(__file__) + '::test_failed_draft_cleanup_retains_unified_owner_and_reservation[' + failed_resource + ']',
+            '--basetemp', '/tmp/draft-hold-' + failed_resource,
+            '-o', 'cache_dir=/tmp/draft-hold-cache'],
+            env=env, capture_output=True, text=True, timeout=35)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert 'FAILED_DRAFT_RETAINED' in result.stdout
+        return
+    from engineering_hub.staging_module import SharedStagingPreparationError
+    from engineering_hub.unproved_drain import UnprovedDrainError
+    state = shared_app
+    failed = asyncio.Event()
+    prepare = service.prepare_shared_staging
+    def inject(repo, **kwargs):
+        draft = prepare(repo, **kwargs)
+        async def close_fail():
+            failed.set()
+            raise RuntimeError('synthetic unproved close')
+        if failed_resource == 'controller':
+            draft.module.controller.close = close_fail
+            return draft
+        draft.module.controller = None
+        draft.module.client.aclose = close_fail
+        raise SharedStagingPreparationError(draft)
+    monkeypatch.setattr(service, 'prepare_shared_staging', inject)
+    if failed_resource == 'controller':
+        def fail_lifecycle(*args, **kwargs):
+            raise RuntimeError('synthetic lifecycle construction error')
+        monkeypatch.setattr(service, 'SharedStagingLifecycle', fail_lifecycle)
+    task = asyncio.create_task(service.serve_owned_unified_queued_pilot(
+        state.settings, state.manifest, state.client_factory,
+        **options(state, stop_event=asyncio.Event())))
+    await asyncio.wait_for(failed.wait(), 8)
+    for _ in range(2):
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        assert state.owner.close_count == 0
+        assert state.clients[0].close_count == 0
+        state.owner.assert_active(state.settings.database)
+        from engineering_hub.unproved_drain import require_no_unproved_drains
+        with pytest.raises(UnprovedDrainError):
+            require_no_unproved_drains()
+        task.cancel()
+    print('FAILED_DRAFT_RETAINED', flush=True)
+    os._exit(0)

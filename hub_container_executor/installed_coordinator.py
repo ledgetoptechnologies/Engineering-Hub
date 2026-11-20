@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -212,16 +213,82 @@ def target_allowed(config, actor, action_key, environment, target):
         and target.artifact_digest == config.manifest.candidate.image_config_id)
 
 
-async def run_installed_coordinator(config, *, reconciliation_factory=None,
-                                     session_acceptance_factory=None):
+
+
+async def run_installed_coordinator(*args, _drain_handoff=None, **kwargs):
+    from engineering_hub.unproved_drain import acquire_reservation, validate_reservation, release_reservation
+    owned = _drain_handoff is None
+    handoff = acquire_reservation() if owned else _drain_handoff
+    if not owned:
+        validate_reservation(handoff)
+    try:
+        return await _reserved_run_installed_coordinator(*args, _drain_handoff=handoff, **kwargs)
+    finally:
+        if owned:
+            release_reservation(handoff)
+
+async def _reserved_run_installed_coordinator(config, *, session_profile_path=None,
+                                     session_enrollment_path=None,
+                                     reconciliation_factory=None,
+                                     session_acceptance_factory=None, _drain_handoff=None):
+    composition = None
+    session_credential = None
+    session_actors = None
     try:
         _process()
         _require(type(config) is CoordinatorConfiguration and config.process_id == os.getpid())
         from engineering_hub.queued_pilot_service import _synchronous
-        # Fixed JSON/CLI input cannot impersonate the missing trusted operator
-        # channel. An explicit Python composition must supply that dependency.
-        _require(_synchronous(reconciliation_factory))
-        _require(session_acceptance_factory is None or _synchronous(session_acceptance_factory))
+        selected = session_profile_path is not None or session_enrollment_path is not None
+        if selected:
+            # Only this fixed-code selector can create trusted factories. Both
+            # files are protected DATA; neither can choose code or approval.
+            _require(reconciliation_factory is None and session_acceptance_factory is None
+                     and isinstance(session_profile_path, (str, Path))
+                     and isinstance(session_enrollment_path, (str, Path))
+                     and Path(session_profile_path).is_absolute()
+                     and Path(session_enrollment_path).is_absolute())
+            from engineering_hub.unified_pilot_startup import load_profile, read_protected_file
+            from engineering_hub.trusted_queued_session import (MAX_ENROLLMENT_BYTES,
+                TrustedQueuedSessionComposition, parse_enrollment)
+            profile = load_profile(session_profile_path)
+            _require(profile.manifest.digest() == config.manifest.digest()
+                     and profile.manifest.target_id == config.manifest.target_id
+                     and profile.machine_id == 'staging-pc'
+                     and profile.grace_seconds == config.stop_grace
+                     and profile.actors <= config.actors)
+            selected_paths = [Path(session_profile_path).resolve(strict=True),
+                Path(session_enrollment_path).resolve(strict=True),
+                Path(profile.ca_file).resolve(strict=True),
+                Path(profile.credential_file).resolve(strict=True)]
+            _require(len(set(selected_paths)) == len(selected_paths))
+            state_roots = [Path(config.database).parent, Path(config.coordinator_socket).parent,
+                Path(config.executor_socket).parent, Path(config.secret_root)]
+            for selected_path in selected_paths:
+                _require(all(selected_path != root and selected_path not in root.parents
+                             and root not in selected_path.parents for root in state_roots))
+            # TLS material is captured once for the identity observer. The
+            # private UDS command client uses a separate TEST executor secret.
+            session_credential = read_protected_file(profile.credential_file, maximum_bytes=4096)
+            _require('sha256:' + hashlib.sha256(session_credential).hexdigest() == profile.credential_sha256
+                     and session_credential and all(33 <= char <= 126 for char in session_credential))
+            ca = read_protected_file(profile.ca_file, maximum_bytes=1024 * 1024, private=False)
+            _require('sha256:' + hashlib.sha256(ca).hexdigest() == profile.ca_sha256)
+            enrollment = parse_enrollment(read_protected_file(Path(session_enrollment_path),
+                maximum_bytes=MAX_ENROLLMENT_BYTES))
+            composition = TrustedQueuedSessionComposition(profile=profile,
+                database=Path(config.database), enrollment=enrollment, ca_pem=ca,
+                credential=session_credential)
+            reconciliation_factory = composition.reconciliation_factory
+            session_acceptance_factory = composition.session_acceptance_factory
+            session_task_ids = profile.task_ids
+            session_actors = profile.actors
+        else:
+            # Bare JSON/CLI must remain inert. Trusted Python callers may still
+            # supply explicitly owned factories for controlled composition.
+            _require(_synchronous(reconciliation_factory))
+            _require(session_acceptance_factory is None or _synchronous(session_acceptance_factory))
+            session_task_ids = None
+            session_actors = None
         # The optional wheel can coexist with an older core having the same
         # distribution version. Deny that unsupported composition before even
         # reading TEST secrets. API presence is compatibility, not attestation
@@ -232,6 +299,8 @@ async def run_installed_coordinator(config, *, reconciliation_factory=None,
         _require(len(set(tokens.values())) == 4 and all(
             type(token) is str and token and all(33 <= ord(char) <= 126 for char in token)
             for token in tokens.values()))
+        if session_credential is not None:
+            _require(session_credential.decode('ascii') not in set(tokens.values()))
         settings = Settings(Path(config.database), AuthSettings(
             hermes_token=tokens['hermes'], codex_token=tokens['codex'], claude_token=tokens['claude'],
             allowed_ips=frozenset({'127.0.0.1'})), config.auth, work_queue_enabled=True,
@@ -242,16 +311,26 @@ async def run_installed_coordinator(config, *, reconciliation_factory=None,
             return ContainerPilotClient.for_private_unix(config.executor_socket, tokens['executor'])
 
         def policy(actor, action_key, environment, target):
-            return target_allowed(config, actor, action_key, environment, target)
+            return (target_allowed(config, actor, action_key, environment, target)
+                    and (session_actors is None or actor in session_actors)
+                    and (session_task_ids is None or target.task_id in session_task_ids))
 
         await serve_owned_queued_pilot(settings, config.manifest, fresh_client,
             action_key=ACTION, machine_id='staging-pc', target_verifier=policy,
             reconciliation_factory=reconciliation_factory,
             session_acceptance_factory=session_acceptance_factory,
             socket_path=config.coordinator_socket, supervisor_stop_grace_seconds=config.stop_grace,
-            agent_host='127.0.0.1', agent_port=config.port)
+            agent_host='127.0.0.1', agent_port=config.port, _drain_handoff=_drain_handoff)
     except Exception:
         raise InstalledCoordinatorError() from None
+    finally:
+        # The owned service drains accepted work before returning. Close the
+        # per-process gate/observer only after that drain, including failures.
+        if composition is not None:
+            try:
+                composition.close()
+            except Exception:
+                raise InstalledCoordinatorError() from None
 
 
 class _Parser(argparse.ArgumentParser):
@@ -264,11 +343,17 @@ def main(argv=None):
         parser = _Parser(description='Explicit colocated TEST pilot coordinator', allow_abbrev=False)
         parser.add_argument('operation', choices=('validate', 'serve'))
         parser.add_argument('--config', required=True, action='append')
+        parser.add_argument('--session-profile')
+        parser.add_argument('--session-enrollment')
         args = parser.parse_args(argv)
         _require(len(args.config) == 1)
+        _require((args.session_profile is None) == (args.session_enrollment is None))
+        _require(args.operation == 'serve' or args.session_profile is None)
         config = load_configuration(args.config[0])
         if args.operation == 'serve':
-            asyncio.run(run_installed_coordinator(config))
+            asyncio.run(run_installed_coordinator(config,
+                session_profile_path=args.session_profile,
+                session_enrollment_path=args.session_enrollment))
         return 0
     except KeyboardInterrupt:
         return 130
