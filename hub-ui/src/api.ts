@@ -264,6 +264,26 @@ export class HubClient {
     delete task.waiting_on;
     return structuredClone(task);
   }
+  /** Beau undoes an agent's withdrawal of its waiting question; the task waits on him again. */
+  async restoreWaiting(id: string, revision: number, csrf: string): Promise<Task> {
+    if (this.mode === "live")
+      return this.request(`/tasks/${encodeURIComponent(id)}/restore-waiting`, { expected_revision: revision }, csrf);
+    this.demoHuman(csrf);
+    const task = this.demo.tasks.find((item) => item.id === id);
+    if (!task) throw new HubApiError(404, "not_found");
+    if (task.revision !== revision) throw new HubApiError(409, "revision_conflict");
+    const record = task.waiting_withdrawn;
+    if (!record) throw new HubApiError(409, "not_withdrawn");
+    if (task.status === "withdrawn" || task.status === "done") throw new HubApiError(409, "task_closed");
+    if (task.status === "waiting_on_beau") throw new HubApiError(409, "waiting_on_beau");
+    const previous = task.status as typeof record.previous_status;
+    const at = new Date().toISOString();
+    Object.assign(task, { status: "waiting_on_beau", revision: task.revision + 1, updated_at: at,
+      waiting_on: { type: record.type, text: record.text, previous_status: previous, by: record.raised_by,
+        at: record.raised_at, restored_by: this.demoSession.actor, restored_at: at } });
+    delete task.waiting_withdrawn;
+    return structuredClone(task);
+  }
   /** Retire a superseded task or question; the server keeps it, with the reason and replacement. */
   async withdraw(
     kind: "task" | "decision",

@@ -1080,6 +1080,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     def resolve_waiting(task_id: str, payload: ResolveWaiting, request: Request):
         return repo.resolve_waiting(human(request, mutation=True), task_id, payload.expected_revision, payload.note)
 
+    @app.post('/api/hub/v1/tasks/{task_id}/restore-waiting', response_model=TaskDTO, response_model_exclude_unset=True)
+    def restore_waiting(task_id: str, payload: Revision, request: Request):
+        return repo.restore_waiting(human(request, mutation=True), task_id, payload.expected_revision)
+
     @app.post('/api/hub/v1/tasks/{task_id}/context', response_model=TaskDTO, response_model_exclude_unset=True)
     def update_task_context(task_id: str, payload: EntityContext, request: Request):
         return repo.update_context(human(request, mutation=True), 'task', task_id,

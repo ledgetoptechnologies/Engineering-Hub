@@ -2957,6 +2957,55 @@
         }
       }
     },
+    "/api/hub/v1/tasks/{task_id}/restore-waiting": {
+      "post": {
+        "summary": "Restore Waiting",
+        "operationId": "restore_waiting_api_hub_v1_tasks__task_id__restore_waiting_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Revision"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/tasks/{task_id}/context": {
       "post": {
         "summary": "Update Task Context",
@@ -7430,6 +7479,16 @@
               }
             ]
           },
+          "waiting_withdrawn": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WaitingWithdrawnDTO"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "completion_evidence": {
             "anyOf": [
               {
@@ -7978,6 +8037,45 @@
           "at": {
             "type": "string",
             "title": "At"
+          },
+          "by_family": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "By Family"
+          },
+          "restored_by": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Restored By"
+          },
+          "restored_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Restored At"
           }
         },
         "additionalProperties": false,
@@ -8035,6 +8133,124 @@
           "at"
         ],
         "title": "WaitingResolvedDTO"
+      },
+      "WaitingWithdrawnDTO": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "decision",
+              "action"
+            ],
+            "title": "Type"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "previous_status": {
+            "type": "string",
+            "enum": [
+              "assigned",
+              "claimed",
+              "in_review",
+              "verified"
+            ],
+            "title": "Previous Status"
+          },
+          "raised_by": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "string",
+                "pattern": "^installation:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              }
+            ],
+            "title": "Raised By"
+          },
+          "raised_at": {
+            "type": "string",
+            "title": "Raised At"
+          },
+          "raised_by_family": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Raised By Family"
+          },
+          "by": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "string",
+                "pattern": "^installation:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              }
+            ],
+            "title": "By"
+          },
+          "by_family": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "By Family"
+          },
+          "at": {
+            "type": "string",
+            "title": "At"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "type",
+          "text",
+          "previous_status",
+          "raised_by",
+          "raised_at",
+          "by",
+          "at",
+          "reason"
+        ],
+        "title": "WaitingWithdrawnDTO",
+        "description": "A waiting-on-Beau question its raising agent withdrew; Beau can restore it."
       },
       "Withdraw": {
         "properties": {

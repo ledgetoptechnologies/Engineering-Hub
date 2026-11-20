@@ -58,6 +58,7 @@ export interface Task extends Versioned {
   notes?: TaskNote[] | null;
   waiting_on?: WaitingItem | null;
   waiting_resolved?: (Omit<WaitingItem, "previous_status"> & { note?: string | null }) | null;
+  waiting_withdrawn?: WaitingWithdrawn | null;
   completion_evidence?: string | null;
   completed_by?: string | null;
   completed_at?: string | null;
@@ -70,6 +71,22 @@ export interface WaitingItem {
   previous_status: "assigned" | "claimed" | "in_review" | "verified";
   by: string;
   at: string;
+  by_family?: Agent | null;
+  restored_by?: string | null;
+  restored_at?: string | null;
+}
+/** A waiting question its raising agent withdrew, with the reason; Beau can restore it. */
+export interface WaitingWithdrawn {
+  type: "decision" | "action";
+  text: string;
+  previous_status: WaitingItem["previous_status"];
+  raised_by: string;
+  raised_at: string;
+  raised_by_family?: Agent | null;
+  by: string;
+  by_family?: Agent | null;
+  at: string;
+  reason: string;
 }
 export interface Decision extends Versioned {
   project: ProjectId;

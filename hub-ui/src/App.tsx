@@ -607,6 +607,8 @@ export function HubApp() {
     resolveWaiting: (task, note) => mutate(
       () => client.resolveWaiting(task.id, task.revision, note, session!.csrf_token!),
       task.waiting_on?.type === "decision" ? "Answer recorded." : "Marked done."),
+    restoreWaiting: (task) => mutate(
+      () => client.restoreWaiting(task.id, task.revision, session!.csrf_token!), "Question restored."),
     withdraw: (kind, item, reason, supersededBy) => mutate(
       () => client.withdraw(kind, item.id, item.revision, reason, supersededBy, session!.csrf_token!),
       kind === "task" ? "Task withdrawn. It is kept under Withdrawn with its history." : "Question withdrawn. It is kept under Withdrawn with its history."),

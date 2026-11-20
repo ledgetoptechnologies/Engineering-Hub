@@ -23,6 +23,8 @@ export interface Hub {
   withdraw: (kind: "task" | "decision", item: Task | Decision, reason: string, supersededBy: string | null) => Promise<boolean>;
   /** Clear a task's decision/action item (Beau only); the task returns to its earlier state. */
   resolveWaiting: (task: Task, note: string) => Promise<boolean>;
+  /** Undo an agent's withdrawal of its waiting question (Beau only); it waits on Beau again. */
+  restoreWaiting: (task: Task) => Promise<boolean>;
   clearPrivateWorkspace: () => void;
   /** Re-read the workspace snapshot (after a successful human change). */
   refresh: () => Promise<void>;

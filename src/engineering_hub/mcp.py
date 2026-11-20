@@ -199,7 +199,8 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         """Edit a task you own or review: omitted fields stay as they are; note appends a progress note.
 
         status waiting_on_beau needs waiting_type (decision or action) and waiting_text, one plain
-        sentence of what Beau must decide or do; only Beau clears it. status done is for the owner
+        sentence of what Beau must decide or do; only Beau clears it (the raising agent may withdraw
+        its own decision item with hub_entity_withdraw kind 'waiting'). status done is for the owner
         after verified, with evidence of completion. details/links/acceptance only on tasks your
         family created. Reuse a request ID only for the same update; a retry returns the first result.
         """
@@ -244,9 +245,14 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
                             superseded_by: str | None = None) -> dict:
         """Withdraw a task or decision you created that is no longer needed; nothing is deleted.
 
-        kind is 'task' or 'decision'. Only unstarted tasks (no candidate, review or run) and
+        kind is 'task', 'decision' or 'waiting'. Only unstarted tasks (no candidate, review or run) and
         unanswered, unprotected decisions qualify. Give a short reason and, if it was
         replaced, the full id of the replacement. This never answers, approves or reviews.
+        kind 'waiting' with a task id withdraws the waiting-on-Beau question your agent raised on
+        that task (decision items only; action items stay for Beau); the task returns to its
+        previous status, Beau sees the reason and can undo it. Refusals name the rule:
+        waiting_not_raised_by_you, waiting_action_needs_owner, waiting_restored_by_owner (Beau undid
+        an earlier withdrawal; it stays until he clears it), waiting_already_answered, not_waiting.
         """
         return invoke(repo.withdraw, identity(ctx), kind, entity_id, expected_revision, reason, superseded_by)
 

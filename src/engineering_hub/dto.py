@@ -70,6 +70,24 @@ class WaitingOnDTO(ResponseDTO):
     previous_status: Literal['assigned', 'claimed', 'in_review', 'verified']
     by: TaskActor
     at: str
+    by_family: AgentId | None = None
+    # Set when Beau restored an item an agent had withdrawn.
+    restored_by: HumanId | None = None
+    restored_at: str | None = None
+
+
+class WaitingWithdrawnDTO(ResponseDTO):
+    """A waiting-on-Beau question its raising agent withdrew; Beau can restore it."""
+    type: Literal['decision', 'action']
+    text: str
+    previous_status: Literal['assigned', 'claimed', 'in_review', 'verified']
+    raised_by: AgentActor
+    raised_at: str
+    raised_by_family: AgentId | None = None
+    by: AgentActor
+    by_family: AgentId | None = None
+    at: str
+    reason: str
 
 
 class WaitingResolvedDTO(ResponseDTO):
@@ -112,6 +130,7 @@ class TaskDTO(EntityDTO):
     notes: list[TaskNoteDTO] | None = None
     waiting_on: WaitingOnDTO | None = None
     waiting_resolved: WaitingResolvedDTO | None = None
+    waiting_withdrawn: WaitingWithdrawnDTO | None = None
     completion_evidence: str | None = None
     completed_by: TaskActor | None = None
     completed_at: str | None = None

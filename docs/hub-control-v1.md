@@ -92,7 +92,14 @@ park the task as `waiting_on_beau` (a `decision` or `action` item in one sentenc
 only a human clears it, via `POST /tasks/{id}/resolve-waiting`, which restores the
 previous status) or close it as `done` (a human from any open state, which also
 records the closed waiting item; the owner only after `verified`, with completion
-evidence). `hub_overview` omits long
+evidence). The agent family that raised a `decision` item may withdraw it with a
+required reason (`hub_entity_withdraw` with kind `waiting` and the task id, under
+`expected_revision`); the task returns to its previous status, never `done`, and
+`waiting_withdrawn` records who, when, why and the prior state. Another agent's or a
+human's item, an `action` item (Beau must do or approve it) and an item Beau already
+cleared are refused, each with its own error code. Beau undoes it with
+`POST /tasks/{id}/restore-waiting`; a restored item cannot be withdrawn again by an
+agent and stays until Beau clears it. `hub_overview` omits long
 backlog text (acceptance, notes, request) and gives counts; `hub_task_get` returns
 the full record.
 
