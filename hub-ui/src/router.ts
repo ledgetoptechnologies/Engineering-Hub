@@ -24,7 +24,7 @@ export type Route =
   | { page: "staging-resources" }
   | { page: "infrastructure" }
   | { page: "device"; id: string }
-  // Demo-only until the orchestration backend exists; App gates it with orchestrationEnabled().
+  // App shows an unavailable state until the orchestration backend exists.
   | { page: "orchestration" }
   | { page: "orchestration-request"; id: string };
 

@@ -151,7 +151,7 @@ type Load<T> = { state: "loading" } | { state: "loaded"; value: T } | { state: "
 /** Without a backend there is nothing to read, so it says so and fetches nothing. No sample data in any mode. */
 export function OrchestrationView({ requestId, reader }: { requestId: string | null; reader?: OrchestrationReader }) {
   const source = reader ?? (ORCHESTRATION_BACKEND_READY ? liveOrchestrationReader : null);
-  if (!source) return <EmptyState title="No orchestrations yet" />;
+  if (!source) return <EmptyState title="Orchestration is not available yet" />;
   return <OrchestrationLoader requestId={requestId} reader={source} />;
 }
 

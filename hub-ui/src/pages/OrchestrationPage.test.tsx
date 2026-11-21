@@ -13,7 +13,7 @@ describe("orchestration gate", () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     try {
       const html = renderToStaticMarkup(<OrchestrationView requestId="req-demo-viewer-refresh" />);
-      expect(html).toContain("No orchestrations yet");
+      expect(html).toContain("Orchestration is not available yet");
       expect(html).not.toContain("progressbar");
       for (const item of fixture.list.items) expect(html).not.toContain(item.title);
       expect(fetchSpy).not.toHaveBeenCalled();
