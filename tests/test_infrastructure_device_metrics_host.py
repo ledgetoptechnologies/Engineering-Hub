@@ -111,4 +111,3 @@ def test_device_api_accepts_and_returns_metrics_host(setup):
         assert saved.status_code == 200, saved.text
         assert saved.json()['metrics_host'] == 'BEAST'
         assert client.get('/api/hub/v1/infrastructure/devices/beast').json()['device']['metrics_host'] == 'BEAST'
-

@@ -404,4 +404,3 @@ async def test_more_disks_than_the_cap_keeps_the_fullest(service,monkeypatch):
     mounts=[disk['mount'] for disk in result['devices'][0]['disks']]
     assert len(mounts)==MAX_DISKS and names[-1] in mounts, 'the nearly full disk must not be cut by name'
     assert mounts==sorted(mounts)
-
