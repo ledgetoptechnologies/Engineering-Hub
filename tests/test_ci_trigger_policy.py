@@ -5,6 +5,9 @@ the actual hosted scheduler. In particular, a manual dispatch can select any
 ref, so the Hub jobs must repeat the exact main-ref/event restriction.
 """
 import re
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -28,7 +31,15 @@ def test_no_pr_or_tag_trigger_and_push_is_exact_main(name):
     config = workflow(name)
     expected = {'push'} if name == 'container.yml' else {'push', 'workflow_dispatch'}
     assert set(config['on']) == expected
-    assert config['on']['push'] == {'branches': ['main']}
+    assert config['on']['push']['branches'] == ['main']
+    if name == 'container.yml':
+        assert set(config['on']['push']['paths']) == {
+            '.github/workflows/container.yml', '.dockerignore', '.env.example', 'Dockerfile',
+            'compose.yaml', 'compose.truenas.yaml', 'docker/entrypoint.sh',
+            'pyproject.toml', 'uv.lock', 'README.md', 'src/**',
+        }
+    else:
+        assert config['on']['push'] == {'branches': ['main']}
     assert config['permissions'] == {'contents': 'read'}
 
 
@@ -39,8 +50,7 @@ def test_jobs_repeat_main_ref_and_known_event_guards():
     assert current['verify']['if'] == PUSH_OR_MANUAL_MAIN
     assert current['publish']['if'] == PUSH_OR_MANUAL_MAIN
     assert current['publish']['needs'] == 'verify'
-    assert legacy['publish']['if'] == '${{ false }}'
-    assert legacy['publish']['needs'] == 'verify'
+    assert set(legacy) == {'verify'}
 
 
 @pytest.mark.parametrize('event,ref,legacy_runs,hub_runs', [
@@ -71,7 +81,7 @@ def test_only_current_hub_can_publish_from_main():
     assert current['permissions'] == {'contents': 'read', 'packages': 'write'}
     assert current['env']['PACKAGE'] == 'ghcr.io/ledgetoptechnologies/engineering-hub-control'
     assert current['needs'] == 'verify'
-    assert workflow('container.yml')['jobs']['publish']['if'] == '${{ false }}'
+    assert set(workflow('container.yml')['jobs']) == {'verify'}
 
 
 def test_manual_package_verification_also_requires_main():
@@ -120,6 +130,44 @@ def test_image_is_built_once_and_every_check_gates_upload_and_promotion():
         registry = next(i for i, step in enumerate(steps)
                         if f'python scripts/{smoke}.py --image "$PACKAGE@$DIGEST"' in step.get('run', ''))
         assert builds[0] < local < upload == registry < promote
+
+
+@pytest.mark.parametrize('phase', ['local', 'registry'])
+@pytest.mark.parametrize('fail_first', [False, True])
+def test_smoke_pairs_join_before_release_continues(tmp_path, phase, fail_first):
+    bash = shutil.which('bash')
+    if os.name == 'nt' or not bash:
+        pytest.skip('requires POSIX Bash')
+
+    steps = workflow('hub-control.yml')['jobs']['publish']['steps']
+    step = next(step['run'] for step in steps
+                if f'> hub-{phase}-protected-startup.json' in step.get('run', ''))
+    gate = step[step.index('wait_smokes()'):]
+    mock = """
+python() {
+  case "$1" in
+    */hub_release_smoke.py)
+      if [ "$FAIL_FIRST" = yes ]; then return 7; fi ;;
+    */hub_protected_container_smoke.py) sleep 0.05 ;;
+  esac
+  printf 'done\\n'
+}
+"""
+    result = subprocess.run(
+        [bash, '-c', 'set -eu\n' + mock + gate + '\nprintf release-continued'],
+        cwd=tmp_path, capture_output=True, text=True, timeout=5,
+        env={**os.environ, 'FAIL_FIRST': 'yes' if fail_first else 'no',
+             'BUILD_IMAGE': 'local', 'PACKAGE': 'registry', 'DIGEST': 'digest', 'GITHUB_SHA': 'commit'},
+    )
+    assert (tmp_path / f'hub-{phase}-protected-startup.json').read_text() == 'done\n'
+    if fail_first:
+        assert result.returncode == 7
+        assert not (tmp_path / f'hub-{phase}-split-startup.json').exists()
+        assert result.stdout == ''
+    else:
+        assert result.returncode == 0, result.stderr
+        assert len(list(tmp_path.glob(f'hub-{phase}-*startup.json'))) == 5
+        assert result.stdout == 'release-continued'
 
 
 def _publish_runs():

@@ -121,11 +121,22 @@ jobs:
       - name: Test the exact publication candidate before upload
         run: |
           set -eu
-          python scripts/hub_release_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-startup.json
-          python scripts/hub_split_container_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-split-startup.json
-          python scripts/hub_unified_container_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-unified-startup.json
+          wait_smokes() {
+            local status=0 pid
+            for pid in "$@"; do wait "$pid" || status=$?; done
+            return "$status"
+          }
+          python scripts/hub_release_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-startup.json &
+          first=$!
+          python scripts/hub_protected_container_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-protected-startup.json &
+          second=$!
+          wait_smokes "$first" "$second"
+          python scripts/hub_split_container_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-split-startup.json &
+          first=$!
+          python scripts/hub_unified_container_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-unified-startup.json &
+          second=$!
+          wait_smokes "$first" "$second"
           python scripts/hub_settings_container_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-settings-startup.json
-          python scripts/hub_protected_container_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-protected-startup.json
       - name: Publish unique build tag and verify authenticated registry read
         run: |
           set -eu
@@ -135,11 +146,22 @@ jobs:
           DIGEST="$(python -c 'import json,re; d=json.load(open("hub-registry-descriptor.json"))["digest"]; assert re.fullmatch("sha256:[a-f0-9]{64}",d); print(d)')"
           echo "IMAGE_DIGEST=$DIGEST" >> "$GITHUB_ENV"
           docker pull "$PACKAGE@$DIGEST"
-          python scripts/hub_release_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-startup.json
-          python scripts/hub_split_container_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-split-startup.json
-          python scripts/hub_unified_container_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-unified-startup.json
+          wait_smokes() {
+            local status=0 pid
+            for pid in "$@"; do wait "$pid" || status=$?; done
+            return "$status"
+          }
+          python scripts/hub_release_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-startup.json &
+          first=$!
+          python scripts/hub_protected_container_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-protected-startup.json &
+          second=$!
+          wait_smokes "$first" "$second"
+          python scripts/hub_split_container_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-split-startup.json &
+          first=$!
+          python scripts/hub_unified_container_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-unified-startup.json &
+          second=$!
+          wait_smokes "$first" "$second"
           python scripts/hub_settings_container_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-settings-startup.json
-          python scripts/hub_protected_container_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-protected-startup.json
       - name: Require private package before publishing the candidate
         run: |
           python - <<'PY'

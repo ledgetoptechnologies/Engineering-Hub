@@ -2,8 +2,7 @@
 
 `latest` of engineering-hub-control may be written only by hub-promote.yml's
 `promote` job, and the immutable `sha-<commit>` tag only by hub-control.yml's
-`publish` job. Every other registry writer must be disabled or write a different
-tag. A new writer anywhere in workflows or scripts fails this test until it is
+`publish` job. Every other registry writer must write a different tag. A new writer anywhere in workflows or scripts fails this test until it is
 reviewed and added here.
 """
 import re
@@ -25,7 +24,6 @@ ALLOWED_JOBS = {
     ('hub-promote.yml', 'promote'): 'latest',
     ('hub-executor-publication.yml', 'publication'): 'staging-executor-* via scripts/publish_hub_executor.py',
 }
-DISABLED_JOBS = {('container.yml', 'publish')}
 ALLOWED_SCRIPTS = {'scripts/publish_hub_executor.py'}
 
 
@@ -52,15 +50,9 @@ def test_every_workflow_registry_writer_is_known():
         for job_id, job in config.get('jobs', {}).items():
             if _job_writes(job):
                 found.add((name, job_id))
-    unknown = found - set(ALLOWED_JOBS) - DISABLED_JOBS
+    unknown = found - set(ALLOWED_JOBS)
     assert not unknown, f'unreviewed registry writer(s): {sorted(unknown)}'
     assert set(ALLOWED_JOBS) <= found, 'inventory lists a writer that no longer exists; update it'
-
-
-def test_disabled_writers_stay_disabled():
-    for name, job_id in DISABLED_JOBS:
-        job = yaml.load((WORKFLOWS / name).read_text(), Loader=yaml.BaseLoader)['jobs'][job_id]
-        assert job['if'] == '${{ false }}'
 
 
 def test_only_promote_writes_latest_and_only_publish_writes_sha_tags():
