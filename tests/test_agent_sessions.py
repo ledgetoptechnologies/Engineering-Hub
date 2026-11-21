@@ -396,6 +396,11 @@ def test_session_history_quota_counts_recent_effective_end_and_recovers(env):
           'owner history is not newest-first')
     check(not {'synthetic-ancient-expiry', 'synthetic-early-revoke', 'synthetic-exact-cutoff'} & ids,
           'owner history used an incorrect effective-end boundary')
+    archived = repo.list_sessions(OWNER, row['id'], archived=True)['sessions']
+    assert {session['id'] for session in archived} == {
+        'synthetic-ancient-expiry', 'synthetic-early-revoke', 'synthetic-exact-cutoff',
+    }
+    assert all(session['state'] != 'active' for session in archived)
     clock.advance(SESSION_HISTORY_WINDOW_SECONDS + 1)
     fresh = repo.exchange(secret)
     check(fresh['session']['state'] == 'active', 'per-installation quota did not recover after its window')
