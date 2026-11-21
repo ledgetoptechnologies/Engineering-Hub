@@ -1,6 +1,6 @@
 # Discovered machine metrics
 
-This source adds schema 2 machine metrics and explicit internal-installation
+This source adds schema 3 machine metrics and explicit internal-installation
 classification. It is not evidence of an installed release, an accepted real
 Prometheus connection, or staging deployment/rollback acceptance.
 
@@ -64,7 +64,10 @@ cannot be marked internal (`installation_inactive`, 401).
 ## Metrics contract
 
 The browser endpoint `/api/hub/v1/infrastructure/metrics` and the MCP tool return
-the same schema 2 envelope: `schema_version`, `generated_at`, `source`, `devices`.
+the same schema 3 envelope: `schema_version`, `generated_at`, `source`, `devices`.
+Schema 3 adds `net_rx_bytes_per_second` and `net_tx_bytes_per_second` (node and
+windows exporters only; null otherwise). The UI accepts schemas 1–3, but older UI
+builds reject 3, so the UI and backend must ship in the same release.
 Per-PC credentials remain MCP-only; this feature does not open Hub REST to them.
 Admission is checked before upstream I/O, after it, and before returning metrics.
 
@@ -75,7 +78,9 @@ computer is off. Missing values stay null. Target discovery retains unknown
 exporters, groups by a namespaced hash of exact validated host labels, and uses
 unique fallback keys when host labels are absent. Labels are observations, not
 authority or proof of a shared physical machine. Inventory association requires
-an exact unique declared hostname; ambiguous matches remain explicit.
+an exact unique declared name; ambiguous matches remain explicit. That name is
+the device's optional `metrics_host` when set (exact, case kept, it replaces the
+hostname rather than adding to it), otherwise its hostname.
 
 Reads use only fixed PromQL and the configured origin, with no redirects,
 environment proxy routing, arbitrary queries, scheduling or scrape-URL fetches.

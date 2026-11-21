@@ -132,6 +132,24 @@ def test_missing_optional_settings_do_not_open_inventory(tmp_path):
         assert not (tmp_path / 'infrastructure').exists()
 
 
+@pytest.mark.skipif(os.name != 'posix', reason='Real private SQLite/file owner composition')
+def test_inventory_startup_failure_keeps_owner_navigation_without_exposing_data(tmp_path):
+    config = settings(tmp_path)
+    directory = tmp_path / 'infrastructure'
+    directory.mkdir(mode=0o700)
+    empty = directory / 'inventory.sqlite3'
+    empty.touch(mode=0o600)
+    app = create_app(config)
+    with TestClient(app, base_url=config.auth_config.origin) as client:
+        login(client, app, config)
+        assert app.state.infrastructure.state == 'invalid'
+        assert client.get('/api/hub/v1/overview').json()['capabilities']['infrastructure'] is True
+        assert client.get(BASE + '/devices').status_code == 503
+        agent = {'Authorization': 'Bearer test-codex'}
+        assert client.get('/api/hub/v1/overview', headers=agent).json()['capabilities']['infrastructure'] is False
+        assert empty.stat().st_size == 0
+
+
 def test_owner_metrics_navigation_does_not_require_inventory_read_grant(tmp_path):
     config = settings(tmp_path)
     operator = json.loads(config.infrastructure_config_path.read_text())
@@ -148,7 +166,8 @@ def test_owner_metrics_navigation_does_not_require_inventory_read_grant(tmp_path
 
 @pytest.mark.skipif(os.name != 'posix', reason='Actual private inventory and session composition')
 def test_composed_metrics_use_owner_session_and_authenticated_internal_agents(tmp_path, monkeypatch):
-    from engineering_hub.infrastructure_metrics import MetricsReader, QUERIES
+    from engineering_hub.infrastructure_discovery_metrics import ALL_QUERIES
+    from engineering_hub.infrastructure_metrics import MetricsReader
     from engineering_hub.infrastructure_prometheus import TARGET_PATH
     from urllib.parse import parse_qs, urlsplit
 
@@ -159,7 +178,7 @@ def test_composed_metrics_use_owner_session_and_authenticated_internal_agents(tm
     config.infrastructure_config_path.write_text(json.dumps(operator))
     calls = []
     stamp = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-    by_query = {query: (kind, key) for kind, key, query in QUERIES}
+    by_query = {query: (kind, key) for kind, key, query in ALL_QUERIES}
 
     async def fetch(reader, client, path, budget):
         calls.append(path)
@@ -189,7 +208,7 @@ def test_composed_metrics_use_owner_session_and_authenticated_internal_agents(tm
         response = client.get(BASE + '/metrics')
         assert response.status_code == 200, response.text
         result = response.json()
-        assert result['schema_version'] == 2
+        assert result['schema_version'] == 3
         assert result['source'] == {'status': 'ok', 'truncated': False, 'omitted_count': 0, 'warnings': []}
         target = result['devices'][0]
         assert target['cpu_busy_ratio'] == 0.25 and target['mem_total_bytes'] == 1024

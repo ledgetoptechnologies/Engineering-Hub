@@ -1,4 +1,4 @@
-"""The actual discovery reader must satisfy the browser's schema-2 invariants."""
+"""The actual discovery reader must satisfy the browser's schema-3 invariants."""
 
 from datetime import datetime, timezone
 import json
@@ -11,7 +11,7 @@ import pytest
 
 from engineering_hub.infrastructure import InfrastructureRegistry
 from engineering_hub.infrastructure_discovery_metrics import DiscoveryMetricsReader
-from engineering_hub.infrastructure_metrics import QUERIES
+from engineering_hub.infrastructure_discovery_metrics import ALL_QUERIES as QUERIES
 from engineering_hub.infrastructure_prometheus import PrometheusOrigin, TARGET_PATH
 from engineering_hub.infrastructure_service import InfrastructureService
 
@@ -24,7 +24,7 @@ WARNINGS = {'invalid_target', 'ambiguous_inventory', 'unknown_exporter',
 def assert_browser_contract(result):
     """Check cross-field constraints independently of the reader implementation."""
     assert set(result) == {'schema_version', 'generated_at', 'source', 'devices'}
-    assert result['schema_version'] == 2
+    assert result['schema_version'] == 3
     source, rows = result['source'], result['devices']
     assert set(source) == {'status', 'truncated', 'omitted_count', 'warnings'}
     assert source['status'] in {'ok', 'partial', 'unreachable', 'not_configured'}

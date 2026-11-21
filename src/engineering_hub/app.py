@@ -1015,7 +1015,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     @app.get("/api/hub/v1/overview", response_model=OverviewDTO, response_model_exclude_unset=True)
     async def overview(request: Request):
         principal = actor(request)
-        infrastructure_visible = False
+        # Keep the recovery page discoverable for the configured owner if inventory startup fails.
+        # Device and metric routes still enforce their existing authorization and readiness.
+        infrastructure_visible = infrastructure.state == 'invalid' and principal == metrics_owner
         if infrastructure.service is not None:
             try:
                 infrastructure.service.require(principal)

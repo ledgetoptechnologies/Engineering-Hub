@@ -15,6 +15,8 @@ export interface Maintenance {
 }
 export interface Device {
   id: string; name: string; hostname: string | null; addresses: string[]; network: string | null; vlan: number | null;
+  /** The exact Prometheus host label, when the machine reports under another name than its hostname. */
+  metrics_host: string | null;
   role: string; retired: boolean; revision: number; updated_at: string;
   observations: Observation[]; open_maintenance: Maintenance | null;
 }
@@ -76,9 +78,14 @@ export function parseMaintenance(value: unknown): Maintenance {
     resolved_at: time(row.resolved_at, true), resolved_by: row.resolved_by === null ? null : principal(row.resolved_by),
     resolution: text(row.resolution, TEXT_MAX, { multiline: true, nullable: true }) };
 }
+const DEVICE_KEYS = ["id", "name", "hostname", "addresses", "network", "vlan", "role", "retired", "revision", "updated_at",
+  "observations", "open_maintenance"];
+export const METRICS_HOST_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export function parseDevice(value: unknown): Device {
-  const row = record(value, ["id", "name", "hostname", "addresses", "network", "vlan", "role", "retired", "revision", "updated_at",
-    "observations", "open_maintenance"]);
+  // metrics_host is newer; a Hub that predates it simply has none.
+  const has = Boolean(value && typeof value === "object" && "metrics_host" in value);
+  const row = record(value, has ? [...DEVICE_KEYS, "metrics_host"] : DEVICE_KEYS);
+  if (has && row.metrics_host !== null && (typeof row.metrics_host !== "string" || !METRICS_HOST_PATTERN.test(row.metrics_host))) return invalid();
   if (typeof row.id !== "string" || !slugPattern.test(row.id)) return invalid();
   if (!Array.isArray(row.addresses) || row.addresses.length > 16 || row.addresses.some(item => typeof item !== "string" || !isIpAddress(item))) return invalid();
   if (row.vlan !== null && (!Number.isInteger(row.vlan) || (row.vlan as number) < 1 || (row.vlan as number) > 4094)) return invalid();
@@ -88,6 +95,7 @@ export function parseDevice(value: unknown): Device {
   const open = row.open_maintenance === null ? null : parseMaintenance(row.open_maintenance);
   if (open && (open.state !== "open" || open.device_id !== row.id)) return invalid();
   return { id: row.id, name: text(row.name, 100)!, hostname: row.hostname === null ? null : hostnameValue(row.hostname),
+    metrics_host: has ? row.metrics_host as string | null : null,
     addresses: row.addresses as string[], network: row.network === null ? null : networkValue(row.network), vlan: row.vlan as number | null,
     role: text(row.role, 100)!, retired: bool(row.retired), revision: revision(row.revision), updated_at: time(row.updated_at)!,
     observations, open_maintenance: open };
