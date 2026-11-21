@@ -260,6 +260,9 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
             existing=True
         except FileNotFoundError:
             existing=False
+        except PermissionError:
+            stage='database_file'
+            raise
         if existing:
             # A zero-byte file is usually a first start that stopped before its
             # schema, but its history can't be proven here, so it is never

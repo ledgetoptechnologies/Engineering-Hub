@@ -492,11 +492,19 @@ def test_populated_owner_only_database_with_execute_bit_reopens(tmp_path):
 @pytest.mark.parametrize('mode', [0o640, 0o604, 0o610, 0o601, 0o400, 0o200])
 def test_any_group_or_other_bit_or_missing_owner_rw_stays_closed(tmp_path, caplog, mode):
     settings, directory, database = _populated(tmp_path)
-    database.chmod(mode)
     before = _snapshot(directory)
-    module = compose_infrastructure(settings, state_root=tmp_path)
-    assert module.state == 'invalid' and module.service is None
-    assert 'database_file_failed' in caplog.text
+    _, original_mode, original_inode = before[database.name]
+    database.chmod(mode)
+    try:
+        module = compose_infrastructure(settings, state_root=tmp_path)
+        assert module.state == 'invalid' and module.service is None
+        assert 'database_file_failed' in caplog.text
+        after = database.lstat()
+        assert stat.S_IMODE(after.st_mode) == mode
+        assert after.st_ino == original_inode
+    finally:
+        # Restore the test fixture's readable mode before comparing its bytes.
+        database.chmod(original_mode)
     assert _snapshot(directory) == before
 
 
