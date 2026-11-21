@@ -64,6 +64,45 @@ test("sidebar pages switch without reloading or extra reads, and mark the curren
   await expect(nav(page).getByRole("link", { name: /^Plans/ })).toHaveCount(0);
 });
 
+test("the current section opens to its sub-pages, and the disclosure opens or closes any section", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/");
+  await expect(page.getByRole("heading", { level: 1 })).toContainText(/Good/);
+  const agentsToggle = nav(page).getByRole("button", { name: "Agents pages" });
+  await expect(agentsToggle).toHaveAttribute("aria-expanded", "false");
+  await expect(nav(page).getByRole("link", { name: "Installations" })).toHaveCount(0);
+  await nav(page).getByRole("link", { name: /^Agents/ }).click();
+  await expect(agentsToggle).toHaveAttribute("aria-expanded", "true");
+  await nav(page).getByRole("link", { name: "Installations" }).click();
+  await expect(page).toHaveURL(/\/agents\/installations$/);
+  await expect(page.getByRole("heading", { level: 1 })).toContainText("Installations");
+  await expect(nav(page).getByRole("link", { name: "Installations" })).toHaveAttribute("aria-current", "page");
+  await expect(nav(page).getByRole("link", { name: /^Agents/ })).not.toHaveAttribute("aria-current", "page");
+  // Keyboard: open another section without leaving this page.
+  const stagingToggle = nav(page).getByRole("button", { name: "Staging pages" });
+  await stagingToggle.focus();
+  await page.keyboard.press("Enter");
+  await expect(stagingToggle).toHaveAttribute("aria-expanded", "true");
+  await nav(page).getByRole("link", { name: "Queues & sessions" }).click();
+  await expect(page).toHaveURL(/\/staging\/queues$/);
+  await expect(page.getByRole("region", { name: "Software validation queue" })).toBeVisible();
+  await page.goBack();
+  await expect(page).toHaveURL(/\/agents\/installations$/);
+  expect(state.writes).toBe(0);
+});
+
+test("a selected project drills down to its pages in the sidebar", async ({ page }) => {
+  await fixture(page);
+  await page.goto("/#/projects/treedar/work");
+  const projects = page.getByRole("navigation", { name: "Projects" });
+  await expect(projects.getByRole("button", { name: "TreeDar pages" })).toHaveAttribute("aria-expanded", "true");
+  await expect(projects.getByRole("link", { name: "Work", exact: true })).toHaveAttribute("aria-current", "page");
+  await projects.getByRole("link", { name: "Activity", exact: true }).click();
+  await expect(page).toHaveURL(/\/projects\/treedar\/activity$/);
+  // Other projects stay collapsed.
+  await expect(projects.getByRole("button", { name: /pages$/ })).toHaveCount(1);
+});
+
 test("the inbox count and project filter show only open questions", async ({ page }) => {
   await fixture(page);
   await page.goto("/#/inbox");

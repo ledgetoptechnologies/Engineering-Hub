@@ -7,13 +7,16 @@ import { TopicRefreshBudgetExhausted, watchTopicRegistry } from "./topicEvents";
 import { NotesPanel } from "./NotesPanel";
 import { PlanningPanel } from "./PlanningPanel";
 import type { Hub } from "./hub";
-import { href, link, useRoute, type Route } from "./router";
-import { Badge, Icon, Modal, PageHeader, pretty, type IconKind } from "./ui";
+import { useRoute, type Route } from "./router";
+import { workspaceNav } from "./navModel";
+import { ProjectNav, WorkspaceNav } from "./SideNav";
+import { Badge, Icon, Modal, PageHeader, pretty } from "./ui";
 import { HomePage } from "./pages/HomePage";
 import { InboxPage, WorkPage } from "./pages/WorkPages";
 import { ProjectPage, ProjectsPage } from "./pages/ProjectPages";
 import { AgentsPage, StagingPage } from "./pages/SystemPages";
 import { InfrastructurePage } from "./pages/InfrastructurePage";
+import { OrchestrationPage } from "./pages/OrchestrationPage";
 import { acceptsAnswer, retainsAnswerDraft, openDecisions } from "./pages/decisions";
 import { isActive, parseAcceptance, waitingTasks } from "./backlog";
 import { LabelSetPage } from "./pages/LabelSets";
@@ -616,25 +619,25 @@ export function HubApp() {
   } : null;
   const waitingCount = hub ? openDecisions(hub).length + waitingTasks(hub.data.tasks).length : 0;
   const activeWork = data ? data.tasks.filter(isActive).length : 0;
-  const nav: { route: Route; label: string; icon: IconKind; count?: number; attention?: boolean }[] = [
-    { route: { page: "home" }, label: "Home", icon: "grid" },
-    { route: { page: "inbox" }, label: "Needs you", icon: "inbox", count: data ? waitingCount : undefined, attention: waitingCount > 0 },
-    { route: { page: "work" }, label: "Work", icon: "work", count: data ? activeWork : undefined },
-    { route: { page: "projects" }, label: "Projects", icon: "folder" },
-    { route: { page: "agents" }, label: "Agents", icon: "agents" },
-    { route: { page: "staging" }, label: "Staging", icon: "staging" },
-    // Global, not per-project, so it appears only when the Hub grants this caller infrastructure access.
-    ...(demo || data?.capabilities.infrastructure === true
-      ? [{ route: { page: "infrastructure" } as Route, label: "Infrastructure", icon: "network" as IconKind }] : []),
-  ];
-  const isCurrent = (target: Route) => target.page === route.page
-    || (target.page === "projects" && (route.page === "project" || route.page === "labels" || route.page === "review"))
-    || (target.page === "infrastructure" && route.page === "device");
+  const nav = workspaceNav({
+    infrastructure: demo || data?.capabilities.infrastructure === true,
+    orchestration: true,
+    waiting: data ? waitingCount : undefined, attention: waitingCount > 0,
+    activeWork: data ? activeWork : undefined,
+    deviceId: route.page === "device" ? route.id : null,
+  });
+  const subTitles: Partial<Record<Route["page"], string>> = {
+    "agent-installations": "Agents / Installations",
+    "staging-queues": "Staging / Queues & sessions",
+    "staging-resources": "Staging / Kept resources",
+    "orchestration-request": "Orchestration",
+    device: "Infrastructure",
+  };
   const pageTitle = route.page === "project" ? projectName(route.id)
     : route.page === "labels" ? `${projectName(route.project)} labeling`
     : route.page === "review" ? `${projectName(route.project)} review`
-    : route.page === "device" ? "Infrastructure"
-    : nav.find((item) => item.route.page === route.page)?.label ?? "Home";
+    : subTitles[route.page] ?? nav.find((item) => item.route.page === route.page)?.label
+      ?? nav.flatMap((item) => item.children ?? []).find((item) => item.route.page === route.page)?.label ?? "Home";
   const actions = (
     <>
       <button className="secondary" onClick={() => void refresh()} disabled={loading} aria-label="Refresh workspace">
@@ -673,30 +676,12 @@ export function HubApp() {
           <div className="workspace-label">
             WORKSPACE <span>PRIVATE</span>
           </div>
-          <nav aria-label="Workspace navigation">
-            {nav.map((item) => (
-              <a key={item.label} className={isCurrent(item.route) ? "nav-item selected" : "nav-item"}
-                href={href(item.route)} aria-current={isCurrent(item.route) ? "page" : undefined}>
-                <Icon kind={item.icon} /> {item.label}
-                {item.count !== undefined && item.count > 0 && (
-                  <span className={`nav-count ${item.attention ? "attention" : ""}`}>{item.count}</span>
-                )}
-              </a>
-            ))}
-          </nav>
+          <WorkspaceNav items={nav} route={route} />
           <div className="sidebar-section">
             PROJECTS <span>{data?.projects.filter((item) => !item.archived).length ?? "—"}</span>
           </div>
-          <nav aria-label="Projects" className="project-nav">
-            {data?.projects.filter((item) => !item.archived).map((item) => (
-              <a key={item.id} href={link(`/projects/${item.id}`)}
-                className={(route.page === "project" && route.id === item.id) || (route.page === "labels" && route.project === item.id)
-                  ? "project-link current" : "project-link"}>
-                <span className="project-square" />
-                {item.name}
-              </a>
-            )) ?? <span className="sidebar-help">Sign in to load projects.</span>}
-          </nav>
+          <ProjectNav route={route}
+            projects={data?.projects.filter((item) => !item.archived).map((item) => ({ id: item.id, name: item.name })) ?? null} />
         </div>
         <div className="sidebar-bottom">
           <div className="environment-note">
@@ -798,6 +783,7 @@ export function HubApp() {
             {route.page === "labels" && <LabelSetPage hub={hub} project={route.project} setId={route.set} actions={actions} />}
             {route.page === "review" && <ReviewPage hub={hub} project={route.project} id={route.id} actions={actions} />}
             {route.page === "agents" && <AgentsPage hub={hub} actions={actions} />}
+            {route.page === "agent-installations" && <AgentsPage hub={hub} actions={actions} view="installations" />}
             {route.page === "planning" && (
               <>
                 <PageHeader eyebrow="PLANNING" title="Plans & ideas"
@@ -806,8 +792,12 @@ export function HubApp() {
               </>
             )}
             {route.page === "staging" && <StagingPage hub={hub} actions={actions} />}
+            {route.page === "staging-queues" && <StagingPage hub={hub} actions={actions} view="queues" />}
+            {route.page === "staging-resources" && <StagingPage hub={hub} actions={actions} view="resources" />}
             {route.page === "infrastructure" && <InfrastructurePage hub={hub} actions={actions} />}
             {route.page === "device" && <InfrastructurePage hub={hub} actions={actions} deviceId={route.id} />}
+            {route.page === "orchestration" && <OrchestrationPage actions={actions} />}
+            {route.page === "orchestration-request" && <OrchestrationPage actions={actions} requestId={route.id} />}
           </div>
         )}
         <footer className="page-footer">

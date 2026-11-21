@@ -83,7 +83,7 @@ async function fixture(page: Page, options: { catalog?: boolean } = {}) {
 const panel = (page: Page) => page.getByRole("region", { name: "Installations", exact: true });
 const access = (page: Page) => page.getByRole("group", { name: "Hub access for Codex on the desk PC" });
 async function openAccess(page: Page) {
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const row = panel(page).locator(".installation-row", { hasText: "desk-pc" });
   // Session labels help name the claim's sessions.
   await row.getByRole("button", { name: "Show sessions" }).click();
@@ -95,7 +95,7 @@ async function openAccess(page: Page) {
 
 test("the Hub access section is only offered when the backend has it", async ({ page }) => {
   await fixture(page, { catalog: false });
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   await expect(panel(page).locator(".installation-row")).toHaveCount(1);
   await expect(panel(page).getByRole("button", { name: "Hub access" })).toHaveCount(0);
 });
@@ -273,7 +273,7 @@ test("an older access read that answers after a Refresh never brings back the ol
   const state = await fixture(page);
   state.grant = future();
   state.holdGrant = true;
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const row = panel(page).locator(".installation-row", { hasText: "desk-pc" });
   await row.getByRole("button", { name: "Hub access" }).click();
   await expect.poll(() => state.grantReleases.length).toBe(1);
@@ -321,13 +321,13 @@ test("the hand-over confirmation shows exact ids, and changing the target asks f
 
 test("with Hub access available, the staging note says tasks and reviews need a grant", async ({ page }) => {
   await fixture(page);
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   await expect(panel(page)).toContainText("only where you grant them under Hub access");
   await expect(panel(page)).not.toContainText("can't use Hub tasks or reviews");
 });
 
 test("without Hub access, the staging note keeps the foundation-only wording", async ({ page }) => {
   await fixture(page, { catalog: false });
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   await expect(panel(page)).toContainText("can't use Hub tasks or reviews");
 });
