@@ -94,8 +94,9 @@ jobs:
           [[ "$(jq -r '.deployment_branch_policy.custom_branch_policies == true and .deployment_branch_policy.protected_branches == false' <<<"$ENVIRONMENT")" == true ]] ||
             fail "The '$PROMOTION_ENVIRONMENT' deployment branch policy must be 'Selected branches and tags' with only main."
           BRANCHES="$(gh api "repos/$GITHUB_REPOSITORY/environments/$PROMOTION_ENVIRONMENT/deployment-branch-policies" \
-            --jq '[.branch_policies[]? | "\(.type // "branch"):\(.name)"] | sort | join(",")')" || fail "The '$PROMOTION_ENVIRONMENT' branch policies are unreadable."
-          [[ "$BRANCHES" == "branch:main" ]] || fail "The '$PROMOTION_ENVIRONMENT' deployment branch policy must allow only the branch main."
+            --jq '.total_count == 1 and (.branch_policies | length == 1 and .[0].type == "branch" and .[0].name == "main")')" ||
+            fail "The '$PROMOTION_ENVIRONMENT' branch policies are unreadable."
+          [[ "$BRANCHES" == true ]] || fail "The '$PROMOTION_ENVIRONMENT' deployment branch policy must allow only the branch main."
           HISTORY="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals")" || fail "This run's review history is unreadable."
           REVIEWS="$(jq -r --arg env "$PROMOTION_ENVIRONMENT" '[.[] | select((.environments // []) | map(.name) | index($env)) | "\(.state):\(.user.id)"] | join(",")' <<<"$HISTORY")"
           [[ "$REVIEWS" == "approved:$PINNED_APPROVER_ID" ]] || fail "This run must have exactly one approval for '$PROMOTION_ENVIRONMENT', by PROMOTION_APPROVER_ID."

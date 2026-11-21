@@ -235,7 +235,7 @@ def _run_gate(root, *, approver='148508330', environment=None, branches=None, hi
             {'type': 'User', 'reviewer': {'login': 'OwnerA', 'id': 148508330}}]}],
         'deployment_branch_policy': {'protected_branches': False, 'custom_branch_policies': True},
     }
-    branch_json = branches if branches is not None else {'branch_policies': [{'name': 'main', 'type': 'branch'}]}
+    branch_json = branches if branches is not None else {'total_count': 1, 'branch_policies': [{'name': 'main', 'type': 'branch'}]}
     approval_history = history if history is not None else [{
         'state': 'approved', 'environments': [{'name': 'image-promotion'}],
         'user': {'login': 'OwnerA', 'id': 148508330},
@@ -286,7 +286,10 @@ def _run_gate(root, *, approver='148508330', environment=None, branches=None, hi
        {'type': 'User', 'reviewer': {'login': 'OwnerA', 'id': 148508330}},
        {'type': 'User', 'reviewer': {'login': 'OwnerB', 'id': 1002}}]}],
       'deployment_branch_policy': {'protected_branches': False, 'custom_branch_policies': True}}}, 'second reviewer is refused'),
-    ({'branches': {'branch_policies': [{'name': 'main', 'type': 'branch'}, {'name': 'dev', 'type': 'branch'}]}}, 'extra branch is refused'),
+    ({'branches': {'total_count': 2, 'branch_policies': [{'name': 'main', 'type': 'branch'}, {'name': 'dev', 'type': 'branch'}]}}, 'extra branch is refused'),
+    ({'branches': {'total_count': 1, 'branch_policies': [{'name': 'main'}]}}, 'missing branch discriminator is refused'),
+    ({'branches': {'total_count': 1, 'branch_policies': [{'name': 'main', 'type': 'tag'}]}}, 'main tag is refused'),
+    ({'branches': {'total_count': 2, 'branch_policies': [{'name': 'main', 'type': 'branch'}]}}, 'incomplete policy list is refused'),
     ({'history': []}, 'missing approval is refused'),
     ({'history': [{'state': 'rejected', 'environments': [{'name': 'image-promotion'}],
                    'user': {'login': 'OwnerA', 'id': 148508330}}]}, 'rejected approval is refused'),

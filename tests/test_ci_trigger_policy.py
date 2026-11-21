@@ -186,7 +186,7 @@ def test_only_the_manual_main_promotion_moves_latest():
         '[[ "$PINNED_APPROVER_ID" == 148508330 && "$PROMOTION_APPROVER_ID" == "$PINNED_APPROVER_ID" ]]',
         '.can_admins_bypass == false',
         '[[ "$REVIEWERS" == "$PINNED_APPROVER_ID" ]]',
-        '[[ "$BRANCHES" == "branch:main" ]]',
+        '[[ "$BRANCHES" == true ]]',
         '[[ "$REVIEWS" == "approved:$PINNED_APPROVER_ID" ]]',
     ]:
         assert requirement in gate_run
