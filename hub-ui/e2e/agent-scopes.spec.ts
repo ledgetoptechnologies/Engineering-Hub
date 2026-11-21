@@ -68,7 +68,7 @@ const section = (page: Page) => page.getByRole("region", { name: "Our own agents
 
 test("nothing is pre-selected, and one Confirm marks the chosen agents as ours", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const review = section(page);
   await expect(review).toContainText("Codex on BEAST");
   for (const box of await review.getByRole("checkbox").all()) await expect(box).not.toBeChecked();
@@ -93,7 +93,7 @@ test("nothing is pre-selected, and one Confirm marks the chosen agents as ours",
 
 test("select all active skips revoked installations and can be set back to not set", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const review = section(page);
   await review.getByRole("button", { name: "Select all active" }).click();
   await review.getByRole("button", { name: "Mark 3 as our own agents…" }).click();
@@ -112,7 +112,7 @@ test("select all active skips revoked installations and can be set back to not s
 
 test("a conflict changes nothing, re-reads the list and says so", async ({ page }) => {
   const state = await fixture(page, { writeCode: "scope_revision_conflict" });
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const review = section(page);
   await review.getByRole("checkbox", { name: /Codex on BEAST/ }).check();
   await review.getByRole("button", { name: "Mark 1 as our own agents…" }).click();
@@ -124,14 +124,14 @@ test("a conflict changes nothing, re-reads the list and says so", async ({ page 
 
 test("is hidden until the Hub offers it", async ({ page }) => {
   await fixture(page, { scopesStatus: 404 });
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   await expect(page.getByRole("region", { name: "Installations", exact: true })).toContainText("Codex on BEAST");
   await expect(section(page)).toHaveCount(0);
 });
 
 test("a list read that was asked before a confirm can't overwrite what the confirm saved", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   const review = section(page);
   await expect(review).toContainText("Codex on BEAST");
   state.holdNextRead = true;
@@ -148,7 +148,7 @@ test("a list read that was asked before a confirm can't overwrite what the confi
 
 test("says when older installations were left out of the list, and only then", async ({ page }) => {
   await fixture(page, { truncated: true });
-  await page.goto("/#/agents");
+  await page.goto("/#/agents/installations");
   await expect(section(page)).toContainText("Only 4 installations are listed: active ones first, then the newest.");
   await page.unrouteAll();
   await fixture(page);
