@@ -49,6 +49,7 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
   const environmentLabel = environment ?? "configured";
   const [notice, setNotice] = useState<{ error: boolean; text: string; for: string } | null>(null);
   const [open, setOpen] = useState<string | null>(null);
+  const [archiveOpen, setArchiveOpen] = useState<string | null>(null);
   const [sessions, setSessions] = useState<Record<string, { state: "loading" | "loaded" | "failed"; items: Session[] }>>(() =>
     demo ? Object.fromEntries(Object.entries(demoAgentConnections().sessions).map(([key, value]) => [key, { state: "loaded" as const, items: value }])) : {});
   const generation = useRef(0), mounted = useRef(true);
@@ -133,7 +134,7 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
       if (current !== generation.current || !mounted.current) return;
       setItems(nextItems); setAudit(nextAudit); setReadAt(Date.now()); setNow(Date.now()); setLoad("loaded");
       // Session lists are re-read only when someone opens them again.
-      if (!keepSessions) { retireSessionReads(); setSessions({}); setOpen(null); }
+      if (!keepSessions) { retireSessionReads(); setSessions({}); setOpen(null); setArchiveOpen(null); }
     } catch (error) {
       if (current !== generation.current || !mounted.current || denied(error)) return;
       if (error instanceof HubApiError && error.status === 404 && error.code === "agent_connections_unavailable") { setLoad("unavailable"); return; }
@@ -155,28 +156,31 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
   }
   useEffect(() => { void refresh(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  async function readSessions(installation: Installation) {
-    if (open === installation.id) { setOpen(null); return; }
-    setOpen(installation.id);
-    if (demo || sessions[installation.id]?.state === "loaded") return;
-    retireSessionReads(installation.id);
-    const current = sessionReads.current[installation.id] = (sessionReads.current[installation.id] ?? 0) + 1;
-    const latest = () => mounted.current && sessionReads.current[installation.id] === current;
+  async function readSessions(installation: Installation, archived = false) {
+    const selected = archived ? archiveOpen : open;
+    const setSelected = archived ? setArchiveOpen : setOpen;
+    if (selected === installation.id) { setSelected(null); return; }
+    setSelected(installation.id);
+    const key = archived ? `${installation.id}:archive` : installation.id;
+    if (demo || sessions[key]?.state === "loaded") return;
+    retireSessionReads(key);
+    const current = sessionReads.current[key] = (sessionReads.current[key] ?? 0) + 1;
+    const latest = () => mounted.current && sessionReads.current[key] === current;
     // Same deadline as before, now owned: a newer read, a refresh or leaving the page cancels it.
     const probe = bounded();
-    sessionCalls.current[installation.id] = probe.controller;
-    setSessions(previous => ({ ...previous, [installation.id]: { state: "loading", items: [] } }));
+    sessionCalls.current[key] = probe.controller;
+    setSessions(previous => ({ ...previous, [key]: { state: "loading", items: [] } }));
     try {
-      const found = await client.sessions(installation.id, probe.controller.signal);
-      if (latest()) setSessions(previous => ({ ...previous, [installation.id]: { state: "loaded", items: found } }));
+      const found = await client.sessions(installation.id, probe.controller.signal, archived);
+      if (latest()) setSessions(previous => ({ ...previous, [key]: { state: "loaded", items: found } }));
     } catch (error) {
       if (!latest()) return;
       // Never left on "Reading sessions…": a refused read shows as failed even while sign-in is being cleared.
-      setSessions(previous => ({ ...previous, [installation.id]: { state: "failed", items: [] } }));
+      setSessions(previous => ({ ...previous, [key]: { state: "failed", items: [] } }));
       denied(error);
     } finally {
       probe.done();
-      if (sessionCalls.current[installation.id] === probe.controller) delete sessionCalls.current[installation.id];
+      if (sessionCalls.current[key] === probe.controller) delete sessionCalls.current[key];
     }
   }
   /** One change at a time; the shown record changes only to what the server returned. */
@@ -287,12 +291,18 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
                       disabled={!canChange || busy !== null} onClick={() => { setNotice(null); setDialog({ kind: "revoke", item }); }}>Decline…</button>}
                     {item.state !== "pending" && <button type="button" className="text-button" aria-expanded={open === item.id}
                       onClick={() => void readSessions(item)}>{open === item.id ? "Hide sessions" : "Show sessions"}</button>}
+                    {!demo && item.state !== "pending" && <button type="button" className="text-button"
+                      aria-expanded={archiveOpen === item.id} onClick={() => void readSessions(item, true)}>
+                      {archiveOpen === item.id ? "Hide archived sessions" : "Show archived sessions"}
+                    </button>}
                     {catalog && item.state !== "pending" && <button type="button" className="text-button" aria-expanded={access === item.id}
                       onClick={() => setAccess(previous => previous === item.id ? null : item.id)}>{access === item.id ? "Hide Hub access" : "Hub access"}</button>}
                   </div>
                 </div>
                 {access === item.id && catalog && <InstallationHubAccess key={`${item.id}:${accessEpoch}`} hub={hub} installation={item} catalog={catalog} client={grants}
                   allowed={() => allowed.current} sessions={sessions[item.id]?.items} onDenied={denied} />}
+                {archiveOpen === item.id && <SessionList installation={item} entry={sessions[`${item.id}:archive`]} now={now}
+                  archived canChange={false} busy={busy} />}
                 {open === item.id && <SessionList installation={item} entry={sessions[item.id]} now={now}
                   canChange={canChange && item.state === "active"} busy={busy}
                   onRevoke={session => { setNotice(null); setDialog({ kind: "revoke-session", item: session, installation: item }); }} />}
@@ -391,15 +401,15 @@ function ApproveDialog({ item, now, busy, canChange, error, onApprove, onClose }
   </Modal>;
 }
 
-function SessionList({ installation, entry, now, canChange, busy, onRevoke }: {
+function SessionList({ installation, entry, now, canChange, busy, onRevoke, archived = false }: {
   installation: Installation; entry: { state: "loading" | "loaded" | "failed"; items: Session[] } | undefined; now: number;
-  canChange: boolean; busy: string | null; onRevoke: (session: Session) => void;
+  canChange: boolean; busy: string | null; onRevoke?: (session: Session) => void; archived?: boolean;
 }) {
   if (!entry || entry.state === "loading") return <p role="status" className="installation-sessions">Reading sessions…</p>;
   if (entry.state === "failed") return <p role="alert" className="notice error installation-sessions">Sessions couldn't be read. Open them again to retry.</p>;
-  if (!entry.items.length) return <p className="panel-footnote installation-sessions">{installation.name} has no active sessions or sessions ended in the last 24 hours.</p>;
-  return <table className="data-table installation-sessions" aria-label={`Sessions for ${installation.name}`}>
-    <caption>Active sessions and those ended in the last 24 hours. Older records are retained for audit and claim recovery.</caption>
+  if (!entry.items.length) return <p className="panel-footnote installation-sessions">{archived ? "No archived sessions." : `${installation.name} has no active sessions or sessions ended in the last 24 hours.`}</p>;
+  return <table className="data-table installation-sessions" aria-label={`${archived ? "Archived sessions" : "Sessions"} for ${installation.name}`}>
+    <caption>{archived ? "Sessions that ended at least 24 hours ago. Showing up to 256 records." : "Active sessions and those ended in the last 24 hours."}</caption>
     <thead><tr><th scope="col">Session</th><th scope="col">State</th><th scope="col">Started</th><th scope="col">Ends</th>
       <th scope="col">Last used</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
     <tbody>{entry.items.map(session => {
@@ -411,7 +421,7 @@ function SessionList({ installation, entry, now, canChange, busy, onRevoke }: {
         <td title={exact(session.issued_at)}>{relativeAge(session.issued_at)}</td>
         <td title={exact(session.expires_at)}>{untilText(session.expires_at, now)}</td>
         <td>{session.last_used_at ? <span title={exact(session.last_used_at)}>{relativeAge(session.last_used_at)}</span> : <span className="muted">Not yet</span>}</td>
-        <td>{session.state === "active" && !ended && <button type="button" className="secondary small danger" disabled={!canChange || busy !== null}
+        <td>{onRevoke && session.state === "active" && !ended && <button type="button" className="secondary small danger" disabled={!canChange || busy !== null}
           onClick={() => onRevoke(session)}>End session…</button>}</td>
       </tr>;
     })}</tbody>

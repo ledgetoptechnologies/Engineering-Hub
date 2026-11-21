@@ -33,7 +33,7 @@ export interface AuditEvent {
 export interface AgentConnectionsClient {
   capabilities(signal: AbortSignal): Promise<Capabilities>;
   installations(signal: AbortSignal): Promise<Installation[]>;
-  sessions(installationId: string, signal: AbortSignal): Promise<Session[]>;
+  sessions(installationId: string, signal: AbortSignal, archived?: boolean): Promise<Session[]>;
   audit(signal: AbortSignal): Promise<AuditEvent[]>;
   approve(id: string, expectedRevision: number, csrf: string): Promise<Installation>;
   keepApproved(id: string, expectedRevision: number, csrf: string): Promise<Installation>;
@@ -224,7 +224,7 @@ export function httpAgentConnections(fetchImpl: typeof fetch = globalThis.fetch)
   return {
     capabilities: async signal => parseCapabilities(await ownerCall("/capabilities", read(signal), fetchImpl)),
     installations: async signal => parseInstallations(await ownerCall("/installations", read(signal), fetchImpl)),
-    sessions: async (installationId, signal) => parseSessions(await ownerCall(`/installations/${at(installationId)}/sessions`, read(signal), fetchImpl), installationId),
+    sessions: async (installationId, signal, archived) => parseSessions(await ownerCall(`/installations/${at(installationId)}/sessions${archived ? "?archived=true" : ""}`, read(signal), fetchImpl), installationId),
     audit: async signal => parseAudit(await ownerCall("/audit", read(signal), fetchImpl)),
     approve: async (installationId, expected_revision, csrf) => parseInstallation(await ownerCall(`/installations/${at(installationId)}/approve`,
       write("POST", { expected_revision, until_revoked: true }, csrf), fetchImpl)),

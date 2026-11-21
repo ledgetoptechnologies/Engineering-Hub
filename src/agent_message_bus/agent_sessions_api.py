@@ -201,8 +201,8 @@ def attach_owner_routes(app, repository, human, *, environment="staging"):
         return repository.revoke_installation(owner(request, True), installation_id, **data.model_dump())
 
     @router.get("/installations/{installation_id}/sessions")
-    def sessions(installation_id: str, request: Request):
-        return repository.list_sessions(owner(request), installation_id)
+    def sessions(installation_id: str, request: Request, archived: bool = False):
+        return repository.list_sessions(owner(request), installation_id, archived=archived)
 
     @router.post("/sessions/{session_id}/revoke")
     def revoke_session(session_id: str, data: Revision, request: Request):

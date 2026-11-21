@@ -358,14 +358,16 @@ class AgentSessionRepository:
         with self._transaction() as db:
             return self._principal(db, session_secret, self._now())
 
-    def list_sessions(self, actor, installation_id):
+    def list_sessions(self, actor, installation_id, *, archived=False):
         self._owner(actor)
         with self._transaction() as db:
             now = self._now(); cutoff = now - SESSION_HISTORY_WINDOW_SECONDS
             installation = self._installation(db, installation_id)
+            recent = 'expires_at>? AND (revoked_at IS NULL OR revoked_at>?)'
+            history_filter = f'NOT ({recent})' if archived else f'({recent})'
             return {'sessions': [self._public_session(row, installation, now) for row in db.execute(
-                'SELECT * FROM agent_sessions WHERE installation_id=? AND expires_at>? '
-                'AND (revoked_at IS NULL OR revoked_at>?) ORDER BY issued_at DESC,id LIMIT ?',
+                f'SELECT * FROM agent_sessions WHERE installation_id=? AND {history_filter} '
+                'ORDER BY issued_at DESC,id LIMIT ?',
                 (installation_id, cutoff, cutoff, MAX_SESSION_HISTORY))]}
 
     def revoke_session(self, actor, id, expected_revision):
