@@ -15,10 +15,14 @@ import inspect
 import httpx
 
 from .infrastructure_discovery import MAX_INPUT_TARGETS, normalize_targets
+from .infrastructure_metric_history import NETWORK_QUERIES, read_history
 from .infrastructure_metrics import (DEADLINE_SECONDS, QUERIES, MetricsReader,
                                      _Budget, _Exhausted, _iso)
 from .infrastructure_prometheus import PrometheusOrigin, TARGET_PATH, _need, _unique
 from .infrastructure_service import InfrastructureService
+
+
+ALL_QUERIES = QUERIES + NETWORK_QUERIES
 
 
 def _discovery_targets(raw):
@@ -45,7 +49,7 @@ class _Identity:
 
 
 class DiscoveryMetricsReader(MetricsReader):
-    """Schema 2 read-only discovery using the fixed legacy query definitions."""
+    """Schema 3 read-only discovery: the fixed legacy queries plus network rates."""
 
     def __init__(self, service, origin, *, authorize, inventory, test_transport=None, clock=None):
         _need(type(service) is InfrastructureService)
@@ -93,7 +97,7 @@ class DiscoveryMetricsReader(MetricsReader):
                     try:
                         async with asyncio.TaskGroup() as group:
                             group.create_task(fetch_targets())
-                            for kind, key, query in QUERIES:
+                            for kind, key, query in ALL_QUERIES:
                                 group.create_task(fetch_query(kind, key, query))
                     except* _Exhausted:
                         pass
@@ -102,7 +106,7 @@ class DiscoveryMetricsReader(MetricsReader):
         self._admit(actor)
         if targets is None:
             return self._envelope('unreachable', [], [], 0)
-        failed = len(results) != len(QUERIES) or any(value is None for value in results.values())
+        failed = len(results) != len(ALL_QUERIES) or any(value is None for value in results.values())
         inventory = self._inventory(actor)
         if inspect.iscoroutine(inventory):
             inventory.close()
@@ -130,13 +134,22 @@ class DiscoveryMetricsReader(MetricsReader):
                                   results, self._clock())
             device.update(row)
             device['exporter'] = exporter
+            device['net_rx_bytes_per_second'] = self._rate(results, identity, 'net_rx')
+            device['net_tx_bytes_per_second'] = self._rate(results, identity, 'net_tx')
             devices.append(device)
         self._admit(actor)
         return self._envelope('partial' if failed else 'ok', devices, warnings,
                               normalized['omitted_count'])
 
+    def _rate(self, results, identity, key):
+        value = self._single(results, identity, key) if identity.exporter in ('node', 'windows') else None
+        return value if value is None or value < 2 ** 53 else None
+
+    async def history(self, actor, host_key, span):
+        return await read_history(self, actor, host_key, span, _discovery_targets)
+
     def _envelope(self, status, devices, warnings, omitted):
-        return {'schema_version': 2, 'generated_at': _iso(self._clock()),
+        return {'schema_version': 3, 'generated_at': _iso(self._clock()),
                 'source': {'status': status, 'truncated': omitted > 0,
                            'omitted_count': omitted, 'warnings': sorted(warnings)},
                 'devices': devices}

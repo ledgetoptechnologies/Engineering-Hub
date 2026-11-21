@@ -11,7 +11,7 @@ import pytest
 
 from engineering_hub.infrastructure import InfrastructureRegistry
 from engineering_hub.infrastructure_discovery_metrics import DiscoveryMetricsReader
-from engineering_hub.infrastructure_metrics import QUERIES
+from engineering_hub.infrastructure_discovery_metrics import ALL_QUERIES as QUERIES
 from engineering_hub.infrastructure_prometheus import PrometheusOrigin, TARGET_PATH
 from engineering_hub.infrastructure_service import InfrastructureService
 from engineering_hub.repository import HubError

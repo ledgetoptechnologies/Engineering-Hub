@@ -1,18 +1,21 @@
 /**
  * Machine health from the Hub's Prometheus: CPU, memory, disks, GPUs and the busiest processes for
- * every machine it scrapes, recorded as a device or not. Read on open and on Refresh only; never
- * polled. Hidden entirely when this person can't read metrics; says so when Prometheus isn't set up.
+ * every machine it scrapes, recorded as a device or not. Read on open, on Refresh, and once a minute
+ * while the page is showing. Hidden entirely when this person can't read metrics; says so when
+ * Prometheus isn't set up.
  */
 import { useEffect, useState } from "react";
 import { HubApiError } from "../api";
 import type { Hub } from "../hub";
+import { demoMachineMetrics } from "../infrastructureDemo";
 import {
-  formatBytes, formatUptime, groupMachines, percent, readMetrics, type MachineGroup, type MachineMetrics, type MachineTarget,
+  formatBytes, formatRate, formatUptime, groupMachines, percent, quickStats, readMetrics, type MachineGroup, type MachineMetrics, type MachineTarget,
 } from "../infrastructureMetrics";
 import { href } from "../router";
 import { Badge, PanelTitle } from "../ui";
+import { MachineHistory } from "./MachineHistory";
 
-type Load = { state: "loading" } | { state: "hidden" } | { state: "failed" } | { state: "loaded"; value: MachineMetrics };
+type Load = { state: "loading" } | { state: "hidden" } | { state: "failed" } | { state: "unavailable" } | { state: "loaded"; value: MachineMetrics };
 
 const SOURCE_TEXT = {
   ok: null,
@@ -94,18 +97,25 @@ function TargetBody({ item }: { item: MachineTarget }) {
   </div>;
 }
 
-export function MachineHealth({ hub, deviceId }: { hub: Hub; deviceId?: string }) {
+const POLL_MS = 60_000;
+
+export interface MachineReading { load: Load; now: Date; refresh: () => void }
+export function useMachineMetrics(hub: Hub): MachineReading {
   const [load, setLoad] = useState<Load>({ state: "loading" });
   const [attempt, setAttempt] = useState(0);
   const [now, setNow] = useState(() => new Date());
   useEffect(() => {
-    if (hub.demo) { setLoad({ state: "hidden" }); return; }
+    const timer = window.setInterval(() => { if (document.visibilityState === "visible") setAttempt(value => value + 1); }, POLL_MS);
+    return () => window.clearInterval(timer);
+  }, []);
+  useEffect(() => {
+    if (hub.demo) { setNow(new Date()); setLoad({ state: "loaded", value: demoMachineMetrics() }); return; }
     const controller = new AbortController();
     setLoad(current => current.state === "loaded" ? current : { state: "loading" });
     readMetrics(controller.signal).then(value => {
       if (controller.signal.aborted) return;
       setNow(new Date());
-      setLoad(value === null ? { state: "hidden" } : { state: "loaded", value });
+      setLoad(value === null ? { state: "hidden" } : value === "unavailable" ? { state: "unavailable" } : { state: "loaded", value });
     }).catch(error => {
       if (controller.signal.aborted) return;
       if (error instanceof HubApiError && error.status === 401) { hub.clearPrivateWorkspace(); return; }
@@ -113,24 +123,78 @@ export function MachineHealth({ hub, deviceId }: { hub: Hub; deviceId?: string }
     });
     return () => controller.abort();
   }, [hub.demo, attempt]);
+  return { load, now, refresh: () => setAttempt(value => value + 1) };
+}
+
+/** Machines keyed by recorded device, for the numbers under each row. */
+export function machinesByDevice(reading: MachineReading): Map<string, MachineGroup> {
+  const targets = reading.load.state === "loaded" ? reading.load.value.targets : [];
+  const found = new Map<string, MachineGroup>();
+  for (const group of groupMachines(targets)) if (group.device_id && !found.has(group.device_id)) found.set(group.device_id, group);
+  return found;
+}
+
+function Stat({ label, ratio, value, detail }: { label: string; ratio?: number | null; value: string; detail?: string }) {
+  const tone = ratio === undefined || ratio === null ? "" : ratio >= 0.9 ? " high" : ratio >= 0.75 ? " warm" : "";
+  return <div className="machine-stat">
+    <span className="machine-stat-label">{label}</span>
+    <strong>{value}</strong>
+    {detail && <small>{detail}</small>}
+    {ratio !== undefined && <span className={"machine-meter-track" + tone} aria-hidden="true">{ratio !== null && <span style={{ width: `${Math.round(ratio * 100)}%` }} />}</span>}
+  </div>;
+}
+
+/** CPU, memory, storage and network at a glance. The whole strip opens the device. */
+export function MachineStrip({ group, deviceId, now }: { group: MachineGroup; deviceId: string; now: Date }) {
+  const stats = quickStats(group);
+  const link = href({ page: "device", id: deviceId });
+  if (!stats.reporting) return <a className="machine-strip quiet" href={link} aria-label="Machine stats">{statusBadge(group.targets[0], now)}</a>;
+  return <a className="machine-strip" href={link} aria-label="Machine stats">
+    <Stat label="CPU" ratio={stats.cpu} value={stats.cpu === null ? "–" : percent(stats.cpu)} />
+    <Stat label="Memory" ratio={stats.memory} value={stats.memory === null ? "–" : percent(stats.memory)} detail={stats.memory === null ? undefined : stats.memoryText} />
+    <Stat label="Storage" ratio={stats.diskRatio} value={stats.diskRatio === null ? "–" : percent(stats.diskRatio)} detail={stats.disk ? `${stats.disk.mount} · ${formatBytes(stats.disk.free_bytes)} free` : undefined} />
+    <Stat label="Network" value={stats.down === null ? "–" : `↓ ${formatRate(stats.down)}`} detail={stats.up === null ? undefined : `↑ ${formatRate(stats.up)}`} />
+  </a>;
+}
+
+function HistoryToggle({ hub, hostKey }: { hub: Hub; hostKey: string }) {
+  const [open, setOpen] = useState(false);
+  return <>
+    <button type="button" className="secondary machine-history-toggle" aria-expanded={open} onClick={() => setOpen(value => !value)}>{open ? "Hide history" : "History"}</button>
+    {open && <MachineHistory hub={hub} hostKey={hostKey} />}
+  </>;
+}
+
+/** On a device page: the name Prometheus would need to report for this device to get stats. */
+export interface DeviceMatch { id: string; name: string | null }
+
+export function MachineHealth({ hub, device, reading, shownDevices }: { hub: Hub; device?: DeviceMatch; reading: MachineReading; shownDevices?: Set<string> }) {
+  const { load, now, refresh } = reading;
+  const deviceId = device?.id;
   if (load.state === "hidden") return null;
   const metrics = load.state === "loaded" ? load.value : null;
-  const targets = metrics ? metrics.targets.filter(item => deviceId === undefined || item.device_id === deviceId) : [];
-  if (metrics && deviceId !== undefined && targets.length === 0) return null;
+  // A machine already shown under its device row isn't repeated here.
+  const targets = metrics ? metrics.targets.filter(item => deviceId !== undefined ? item.device_id === deviceId
+    : !(item.device_id && shownDevices?.has(item.device_id))) : [];
+  if (metrics && shownDevices && targets.length === 0 && metrics.source.status === "ok") return null;
+  const unmatched = Boolean(metrics && device && targets.length === 0 && (metrics.source.status === "ok" || metrics.source.status === "partial"));
   const groups = groupMachines(targets);
   const notice = metrics ? SOURCE_TEXT[metrics.source.status] : null;
   const omitted = metrics && deviceId === undefined ? omittedText(metrics) : null;
   return <section className="panel" aria-label="Machine health">
     <PanelTitle title="Machine health" count={metrics && deviceId === undefined ? groups.length : undefined}>
-      <button type="button" className="secondary" disabled={load.state === "loading"} onClick={() => setAttempt(value => value + 1)}>
+      <button type="button" className="secondary" disabled={load.state === "loading"} onClick={refresh}>
         {load.state === "loading" ? "Reading…" : "Refresh"}</button>
     </PanelTitle>
-    <p className="panel-description">Read from Prometheus when you open this page or press Refresh. Values are what the exporters last reported.</p>
     {load.state === "loading" && !metrics && <p role="status">Reading machine health…</p>}
     {load.state === "failed" && <p className="notice error" role="alert">Machine health couldn't be read. Use Refresh to try again.</p>}
+    {load.state === "unavailable" && <p className="notice" role="status">Machine stats aren't available on this Hub right now. Use Refresh to try again.</p>}
+    {unmatched && <p className="infra-empty">{device!.name
+      ? <>Prometheus isn't reporting a machine named <code>{device!.name}</code>. If it uses a different name for this device, set it under Edit as the Prometheus host.</>
+      : <>No stats yet. Record a hostname, or the name Prometheus uses for this device, under Edit.</>}</p>}
     {notice && <p className="notice" role="status">{notice}</p>}
     {omitted && <p className="notice" role="status">{omitted}</p>}
-    {metrics && targets.length === 0 && metrics.source.status !== "not_configured" && metrics.source.status !== "unreachable" &&
+    {metrics && !device && targets.length === 0 && metrics.source.status !== "not_configured" && metrics.source.status !== "unreachable" &&
       <p className="infra-empty">Prometheus isn't scraping any machines yet.</p>}
     {groups.length > 0 && <ul className="machine-list">{groups.map(group => <li key={group.key} className="machine-card">
       <MachineHead group={group} link={deviceId === undefined} />
@@ -141,6 +205,8 @@ export function MachineHealth({ hub, deviceId }: { hub: Hub; deviceId?: string }
         </div>
         {metrics?.source.status !== "unreachable" && <TargetBody item={item} />}
       </div>)}
+      {deviceId === undefined && <HistoryToggle hub={hub} hostKey={group.key} />}
     </li>)}</ul>}
+    {deviceId !== undefined && groups.map(group => <MachineHistory key={group.key} hub={hub} hostKey={group.key} />)}
   </section>;
 }

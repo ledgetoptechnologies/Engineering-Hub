@@ -67,7 +67,10 @@ class MetricsAccess:
                     if type(item) is not dict or type(item.get('id')) is not str:
                         raise ValueError()
                     if not item.get('retired', False):
-                        hostname = item.get('hostname')
+                        # An explicit Prometheus host replaces the hostname for matching;
+                        # one device never claims both names.
+                        metrics_host = item.get('metrics_host')
+                        hostname = metrics_host if type(metrics_host) is str else item.get('hostname')
                         result.append({'device_id': item['id'],
                                        'hostnames': [hostname] if type(hostname) is str else []})
                 except (ValueError, TypeError, KeyError, RecursionError):
