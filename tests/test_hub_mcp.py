@@ -161,6 +161,41 @@ def test_overview_filters_keep_active_items_and_count_the_rest(hub):
         assert call(client, "hub_overview", bad)["isError"] is True
 
 
+def test_overview_unfinished_tasks_preserves_verified_and_other_sections(hub):
+    client, repo = hub
+    human, project = 'human:123', '3d-viewer'
+    done = repo.create_task(human, project, 'Done', 'done')
+    repo.update_task(human, done['id'], done['revision'], status='done')
+    gone = repo.create_task(human, project, 'Withdrawn', 'gone')
+    repo.withdraw(human, 'task', gone['id'], gone['revision'], 'fixture')
+    verified = repo.create_task(human, project, 'Verified', 'verified', owner='claude', reviewer='codex')
+    verified = repo.claim_task('claude', verified['id'], verified['revision'])
+    verified = repo.set_candidate('claude', verified['id'], verified['revision'], 'a' * 40)
+    verified = repo.review_task('codex', verified['id'], verified['revision'], 'a' * 40, 'approve')
+    other = repo.create_task(human, 'treedar', 'Other project', 'other')
+    repo.update_task(human, other['id'], other['revision'], status='waiting_on_beau',
+                     waiting={'type': 'action', 'text': 'Check the result.'})
+    repo.create_decision(human, project, 'Unrelated choice', ['A', 'B'])
+    _seed_run(repo, project, 'succeeded')
+
+    full = call(client, 'hub_overview')['structuredContent']
+    assert call(client, 'hub_overview', {'unfinished_tasks_only': False})['structuredContent'] == full
+    active = call(client, 'hub_overview', {'active_only': True})['structuredContent']
+    assert done['id'] in {item['id'] for item in active['tasks']}
+    result = call(client, 'hub_overview', {'unfinished_tasks_only': True})['structuredContent']
+    assert {item['id']: item['status'] for item in result['tasks']} == {
+        verified['id']: 'verified', other['id']: 'waiting_on_beau'}
+    assert result['omitted'] == {'tasks': 2, 'decisions': 0, 'runs': 0}
+    assert {key: value for key, value in result.items() if key not in {'tasks', 'omitted'}} == {
+        key: value for key, value in full.items() if key != 'tasks'}
+    both = call(client, 'hub_overview', {
+        'project': project, 'active_only': True, 'unfinished_tasks_only': True})['structuredContent']
+    assert [item['id'] for item in both['tasks']] == [verified['id']]
+    assert both['omitted'] == {'tasks': 3, 'decisions': 0, 'runs': 1}
+    for invalid in ('yes', 1):
+        assert call(client, 'hub_overview', {'unfinished_tasks_only': invalid})['isError'] is True
+
+
 def test_backlog_task_create_update_and_compact_overview(hub):
     client, repo = hub
     created = call(client, "hub_task_create", {

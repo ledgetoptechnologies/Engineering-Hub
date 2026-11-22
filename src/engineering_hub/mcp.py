@@ -152,32 +152,38 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
             raise ToolError('reachability_source_unavailable') from None
 
     @registration.tool()
-    async def hub_overview(ctx: Context, active_only: StrictBool = False, project: str | None = None) -> dict:
+    async def hub_overview(ctx: Context, active_only: StrictBool = False, project: str | None = None,
+                           unfinished_tasks_only: StrictBool = False) -> dict:
         """Read shared tasks, decisions, runs and the emergency-pause state.
 
         With no arguments, everything is returned. active_only keeps tasks that
         aren't withdrawn, open decisions and runs that still hold their task
         (pending, running, held or failed); project keeps one project's tasks,
-        decisions and runs. 'omitted' counts what a filter left out, so an agent
-        knows to ask again.
+        decisions and runs. unfinished_tasks_only hides done and withdrawn tasks
+        but keeps verified tasks, which may still need delivery or closure. It
+        does not filter decisions or runs. 'omitted' counts excluded rows.
 
         Presentation only, not access control: the caller can already read every
         project, and paused, agents, autonomy and image_versions stay global.
         """
         identity(ctx)
-        if type(active_only) is not bool or (project is not None and (type(project) is not str or not project)):
+        if (type(active_only) is not bool or type(unfinished_tasks_only) is not bool
+                or (project is not None and (type(project) is not str or not project))):
             raise ToolError('invalid_overview_filter')
         tasks = [HubRepository.overview_task(task) for task in invoke(repo.list_task_views)]
         decisions, runs = invoke(repo.list_decisions), invoke(repo.list_runs)
         result = {"tasks": tasks, "decisions": decisions, "runs": runs, "paused": invoke(repo.get_paused)}
-        if active_only or project is not None:
+        if active_only or project is not None or unfinished_tasks_only:
             active = {"tasks": lambda item: item.get('status') != 'withdrawn',
                       "decisions": lambda item: item.get('status') == 'open',
                       "runs": lambda item: item.get('status') in OVERVIEW_ACTIVE_RUNS}
             omitted = {}
             for key, keep in active.items():
                 kept = [item for item in result[key]
-                        if (not active_only or keep(item)) and (project is None or item.get('project') == project)]
+                        if (not active_only or keep(item))
+                        and (project is None or item.get('project') == project)
+                        and (key != 'tasks' or not unfinished_tasks_only
+                             or item.get('status') not in {'done', 'withdrawn'})]
                 omitted[key] = len(result[key]) - len(kept)
                 result[key] = kept
             result['omitted'] = omitted
