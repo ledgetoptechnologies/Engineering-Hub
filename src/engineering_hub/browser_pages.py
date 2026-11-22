@@ -9,7 +9,7 @@ from starlette.responses import FileResponse
 _SEGMENT = r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}'
 _TABS = frozenset({'overview', 'work', 'decisions', 'notes', 'labeling', 'activity', 'plans', 'components'})
 _PAGES = frozenset({'/', '/index.html', '/inbox', '/work', '/planning', '/projects',
-                    '/notes', '/agents', '/staging', '/infrastructure'})
+                    '/notes', '/agents', '/staging', '/infrastructure', '/infrastructure/views/topology'})
 
 
 def client_page_allowed(method, path):
@@ -25,6 +25,8 @@ def client_page_allowed(method, path):
         return True
     if len(parts) == 2 and parts[0] == 'infrastructure':
         return re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', parts[1]) is not None
+    if len(parts) == 3 and parts[:2] == ['infrastructure', 'machines']:
+        return re.fullmatch(r'(?:host|target):[a-f0-9]{64}', parts[2]) is not None
     if len(parts) >= 2 and parts[0] == 'projects' and re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', parts[1]):
         return (len(parts) == 2 or len(parts) == 3 and parts[2] in _TABS
                 or len(parts) == 4 and parts[2] == 'labels'
@@ -68,5 +70,5 @@ def attach_browser_page_routes(app, *, ui_directory, human, anonymous_shell=Fals
             '/projects/{project}', '/projects/{project}/{tab}',
             '/projects/{project}/labels/{label_set}', '/notes/{note_path:path}',
             '/projects/{project}/reviews/{review_id}',
-            '/agents/topics/{topic}', '/infrastructure/{device_id}']:
+            '/agents/topics/{topic}', '/infrastructure/{device_id}', '/infrastructure/machines/{key}']:
         app.add_api_route(route, page, methods=['GET', 'HEAD'], include_in_schema=False)

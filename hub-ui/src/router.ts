@@ -126,7 +126,7 @@ export function pathOf(route: Route): string {
     case "review": return `/projects/${route.project}/reviews/${route.id}`;
     case "device": return `/infrastructure/${route.id}`;
     case "topology": return "/infrastructure/views/topology";
-    case "machine": return `/infrastructure/machines/${encodeURIComponent(route.key)}`;
+    case "machine": return machineKey.test(route.key) ? `/infrastructure/machines/${route.key}` : "/infrastructure";
     case "orchestration-request": return `/orchestration/${route.id}`;
     case "agent-installations": return "/agents/installations";
     case "staging-queues": return "/staging/queues";
