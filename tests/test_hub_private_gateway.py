@@ -557,3 +557,141 @@ async def test_real_owner_human_session_tasks_decisions_and_csrf(tmp_path, monke
                     (b'cf-access-jwt-assertion', assertion.encode())])
                 assert status(duplicate) == 401
     await run()
+
+
+TASK_ID = '1111aaaa-2222-4333-8444-00000000000b'
+WAITING_ROUTES = ('resolve-waiting', 'restore-waiting')
+
+
+def recording_receiver():
+    calls = []
+    async def core(scope, receive, send):
+        calls.append(scope)
+        await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+        await send({'type': 'http.response.body', 'body': b''})
+    config = AuthConfig('https://hub.example', human_auth_mode='cloudflare_access',
+        cloudflare_issuer='https://fixture-team.cloudflareaccess.com',
+        cloudflare_audience='fixture-hub', cloudflare_allowed_emails=('beau@example.com',))
+    return calls, PrivateBrowserGateway(core, agent_auth=AuthSettings('hermes', 'codex'),
+                                        cloudflare_config=config.cloudflare_config)
+
+
+@pytest.mark.parametrize('method,path', [
+    *[(method, f'{BASE}/tasks/{TASK_ID}/{route}') for route in WAITING_ROUTES
+      for method in ('GET', 'HEAD', 'PUT', 'PATCH', 'DELETE')],
+    *[('POST', f'{BASE}/tasks/{bad}/{route}') for route in WAITING_ROUTES for bad in (
+        'x', TASK_ID.upper(), TASK_ID[:-1], TASK_ID + '0', TASK_ID.replace('-', ''))],
+    ('POST', f'{BASE}/tasks/resolve-waiting'), ('POST', f'{BASE}/tasks/{TASK_ID}/resolve-waiting/x'),
+    ('POST', f'{BASE}/decisions/{TASK_ID}/resolve-waiting'),
+    ('POST', f'{BASE}/decisions/{TASK_ID}/restore-waiting'),
+    # Unrelated task mutations stay closed to the browser.
+    ('POST', f'{BASE}/tasks/{TASK_ID}/update'), ('POST', f'{BASE}/tasks/{TASK_ID}/claim'),
+    ('POST', f'{BASE}/tasks/{TASK_ID}/waiting-level'),
+])
+async def test_waiting_actions_are_post_with_a_task_uuid_only(method, path):
+    calls, receiver = recording_receiver()
+    result = await exchange(receiver, path, method=method)
+    assert status(result) == 403
+    assert json.loads(result[1]['body'])['detail']['code'] == 'gateway_route_forbidden'
+    assert calls == []
+
+
+@pytest.mark.parametrize('route', WAITING_ROUTES)
+async def test_waiting_actions_pass_the_route_table_but_still_need_browser_credentials(route):
+    calls, receiver = recording_receiver()
+    path = f'{BASE}/tasks/{TASK_ID}/{route}'
+    # Signed out: the route is admitted, then Access refuses before core.
+    assert status(await exchange(receiver, path, method='POST')) == 401
+    for header in [(b'authorization', b'Bearer codex'), (b'x-hub-agent', b'codex')]:
+        result = await exchange(receiver, path, method='POST', headers=[header])
+        assert status(result) == 403
+        assert json.loads(result[1]['body'])['detail']['code'] == 'browser_credentials_required'
+    assert calls == []
+
+
+async def test_real_owner_human_done_and_undo_on_waiting_tasks(tmp_path, monkeypatch):
+    private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(private.public_key()))
+    jwk.update(kid='fixture-key', alg='RS256', use='sig')
+    config = AuthConfig('https://hub.example', human_auth_mode='cloudflare_access',
+                        cloudflare_issuer='https://fixture-team.cloudflareaccess.com',
+                        cloudflare_audience='fixture-hub', cloudflare_allowed_emails=('beau@example.com',))
+    verifier = access.CloudflareAccessVerifier(config.cloudflare_config,
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={'keys': [jwk]})))
+    monkeypatch.setattr(access, 'CloudflareAccessVerifier', lambda _: verifier)
+    monkeypatch.setattr('engineering_hub.ingress.CloudflareAccessVerifier', lambda _: verifier)
+    auth = AuthSettings('test-hermes', 'test-codex', claude_token='test-claude')
+    core = create_app(Settings(tmp_path / 'hub.sqlite', auth, config))
+    repo = core.state.repository
+    now = int(time.time())
+    assertion = jwt.encode(dict(iss=config.cloudflare_issuer, aud=['fixture-hub'],
+        sub='synthetic-human', email='beau@example.com', type='app', iat=now - 1, exp=now + 300),
+        private, algorithm='RS256', headers={'kid': 'fixture-key'})
+
+    def waiting(key):
+        task = repo.claim_task('claude', repo.create_task('claude', 'engineering-hub', 'Question', key,
+                               owner='claude', reviewer='codex')['id'], 1)
+        return repo.update_task('claude', task['id'], task['revision'], status='waiting_on_beau',
+                                waiting={'type': 'decision', 'text': 'Pick one.'})
+
+    asked = waiting('gateway-asked')
+    raised = waiting('gateway-withdrawn')
+    withdrawn = repo.withdraw('claude', 'waiting', raised['id'], raised['revision'], 'Answered elsewhere')
+    done_path = f"{BASE}/tasks/{asked['id']}/resolve-waiting"
+    undo_path = f"{BASE}/tasks/{withdrawn['id']}/restore-waiting"
+    done_body = {'expected_revision': asked['revision'], 'note': 'Use A'}
+    undo_body = {'expected_revision': withdrawn['revision']}
+
+    async def run():
+        owner = PrivateBrowserGateway(core, agent_auth=auth, cloudflare_config=config.cloudflare_config)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=owner)) as private_client:
+            gateway = PublicBrowserGateway(private_client)
+            def browser():
+                return httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway),
+                                         base_url=config.origin, follow_redirects=False)
+            async with browser() as outsider:
+                # Signed out, and agent bearer tokens with or without a browser Origin.
+                for path, body in ((done_path, done_body), (undo_path, undo_body)):
+                    assert (await outsider.post(path, json=body,
+                        headers={'Origin': config.origin})).status_code == 401
+                    for token in ('test-codex', 'test-claude', 'test-hermes'):
+                        refused = await outsider.post(path, json=body, headers={
+                            'Origin': config.origin, 'Authorization': f'Bearer {token}'})
+                        assert refused.status_code == 403
+                        assert refused.json()['detail']['code'] == 'browser_credentials_required'
+            async with browser() as beau:
+                beau.headers['Cf-Access-Jwt-Assertion'] = assertion
+                assert (await beau.get(BASE + '/auth/login')).status_code == 303
+                me = (await beau.get(BASE + '/auth/me')).json()
+                assert me['authenticated'] and me['actor'].startswith('human:cf:')
+                beau.headers['Origin'] = config.origin
+                # Signed in, but a missing or wrong CSRF token is refused by the owner.
+                for path, body in ((done_path, done_body), (undo_path, undo_body)):
+                    assert (await beau.post(path, json=body)).status_code == 403
+                    assert (await beau.post(path, json=body,
+                        headers={'X-Hub-CSRF': 'incorrect'})).status_code == 403
+                    # A bearer beside a valid browser session never reaches the owner.
+                    mixed = await beau.post(path, json=body, headers={
+                        'X-Hub-CSRF': me['csrf_token'], 'Authorization': 'Bearer test-codex'})
+                    assert mixed.status_code == 403
+                    assert mixed.json()['detail']['code'] == 'browser_credentials_required'
+                assert repo.get_task(asked['id']) == asked
+                assert repo.get_task(withdrawn['id']) == withdrawn
+
+                beau.headers['X-Hub-CSRF'] = me['csrf_token']
+                done = await beau.post(done_path, json=done_body)
+                assert done.status_code == 200, done.text
+                assert done.json()['status'] == 'claimed'
+                assert done.json()['waiting_resolved']['by'] == me['actor']
+                assert done.json()['waiting_resolved']['note'] == 'Use A'
+                undo = await beau.post(undo_path, json=undo_body)
+                assert undo.status_code == 200, undo.text
+                assert undo.json()['status'] == 'waiting_on_beau'
+                assert undo.json()['waiting_on']['restored_by'] == me['actor']
+                # Other task mutations stay closed even for a signed-in owner.
+                update = await beau.post(f"{BASE}/tasks/{asked['id']}/update",
+                    json={'expected_revision': done.json()['revision'], 'note': 'x'})
+                assert update.status_code == 403
+                assert update.json()['detail']['code'] == 'gateway_route_forbidden'
+                assert repo.get_task(asked['id'])['revision'] == done.json()['revision']
+    await run()
