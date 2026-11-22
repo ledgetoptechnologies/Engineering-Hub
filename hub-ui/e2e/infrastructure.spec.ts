@@ -246,7 +246,7 @@ test("a preference left under the old unscoped key never appears in demo", async
   await page.addInitScript(() => localStorage.setItem("engineering-hub.machine-order.v1", '["lab-node"]'));
   await page.goto("/?demo=1#/infrastructure");
   const panel = healthPanel(page);
-  await expect(panel.locator(".machine-card-title").evaluateAll(nodes => nodes.map(node => node.textContent?.trim()))).resolves.toEqual([
+  await expect(panel.locator(".machine-card-title")).toHaveText([
     "build", "lab-node", "storage",
   ]);
 });
