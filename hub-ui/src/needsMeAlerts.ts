@@ -11,7 +11,11 @@ export function useNeedsMeAlerts() {
   const active = useRef<Notification | null>(null);
   const enabled = useRef(false);
   const generation = useRef(0);
+  const revisionValue = useRef(0);
+  const needsBaseline = useRef(false);
   const [state, setState] = useState<"off" | "on" | "denied" | "unavailable">("off");
+
+  const revision = useCallback(() => revisionValue.current, []);
 
   const close = useCallback(() => {
     active.current?.close();
@@ -20,23 +24,34 @@ export function useNeedsMeAlerts() {
 
   const reset = useCallback(() => {
     generation.current++;
+    revisionValue.current++;
+    needsBaseline.current = false;
     enabled.current = false;
     previous.current = null;
     close();
     setState("off");
   }, [close]);
 
-  useEffect(() => () => { generation.current++; enabled.current = false; close(); }, [close]);
+  useEffect(() => () => {
+    generation.current++;
+    revisionValue.current++;
+    enabled.current = false;
+    close();
+  }, [close]);
 
-  const toggle = useCallback(async () => {
+  const toggle = useCallback(async (isFresh: boolean) => {
     if (enabled.current) {
       generation.current++;
+      revisionValue.current++;
+      needsBaseline.current = false;
       enabled.current = false;
       close();
       setState("off");
       return;
     }
     const attempt = ++generation.current;
+    revisionValue.current++;
+    needsBaseline.current = !isFresh;
     if (!supported()) { setState("unavailable"); return; }
     try {
       const permission = Notification.permission === "default"
@@ -49,12 +64,19 @@ export function useNeedsMeAlerts() {
     }
   }, [close]);
 
-  const reconcile = useCallback((overview: Overview, allowAlert: boolean) => {
+  const reconcile = useCallback((overview: Overview, allowAlert: boolean, expectedRevision: number) => {
+    if (expectedRevision !== revisionValue.current) return;
     const ids = new Set([
       ...overview.decisions.filter(item => item.status === "open").map(item => `decision:${item.id}`),
       ...waitingTasks(overview.tasks).map(item => `task:${waitingItemKey(item)}`),
     ]);
     const before = previous.current;
+    if (needsBaseline.current) {
+      if (!allowAlert) return;
+      previous.current = ids;
+      needsBaseline.current = false;
+      return;
+    }
     previous.current = ids;
     if (!allowAlert || !before || !enabled.current || !supported()
         || Notification.permission !== "granted"
@@ -77,5 +99,5 @@ export function useNeedsMeAlerts() {
     }
   }, [close]);
 
-  return { state, reset, toggle, reconcile };
+  return { state, reset, toggle, reconcile, revision };
 }

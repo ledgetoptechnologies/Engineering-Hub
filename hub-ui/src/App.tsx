@@ -67,7 +67,7 @@ export function HubApp() {
     () => new HubClient({ mode: demo ? "demo" : "live" }),
     [demo],
   );
-  const { state: alertState, reset: resetAlerts, toggle: toggleAlerts, reconcile: reconcileAlerts } = useNeedsMeAlerts();
+  const { state: alertState, reset: resetAlerts, toggle: toggleAlerts, reconcile: reconcileAlerts, revision: alertRevision } = useNeedsMeAlerts();
   const [session, setSession] = useState<Session | null>(null);
   const [data, setData] = useState<Overview | null>(null);
   const [agents, setAgents] = useState<AgentSummary[]>([]);
@@ -148,6 +148,7 @@ export function HubApp() {
 
   const refresh = useCallback(
     async (canVerify: () => boolean = () => true, fromFeed = false) => {
+      const alertVersion = alertRevision();
       const request = ++requests.current;
       // Fence the old session synchronously, including same-actor session renewal.
       agentReader.current?.pause();
@@ -214,7 +215,7 @@ export function HubApp() {
         ]);
         if (request !== requests.current) return false;
         if (!demo && nextSession.actor?.startsWith("human:") && canVerify())
-          reconcileAlerts(overview, fromFeed && status.available);
+          reconcileAlerts(overview, fromFeed && status.available, alertVersion);
         shownActor.current = nextSession.actor ?? null;
         setData(overview);
         setAgents(overview.agents);
@@ -237,7 +238,7 @@ export function HubApp() {
         if (request === requests.current) setLoading(false);
       }
     },
-    [client, topic, demo, clearPrivateWorkspace, resetWorkspace, reconcileAlerts],
+    [client, topic, demo, clearPrivateWorkspace, resetWorkspace, reconcileAlerts, alertRevision],
   );
   useEffect(() => {
     if (demo) return;
@@ -777,7 +778,9 @@ export function HubApp() {
             {route.page === "inbox" && <InboxPage hub={hub} actions={<>{actions}
               {!demo && session?.authenticated && session.actor?.startsWith("human:") && events?.available && (
                 <>
-                  <button className="secondary" type="button" onClick={() => void toggleAlerts()}>
+                  <button className="secondary" type="button" onClick={() => void toggleAlerts(
+                    !stale && !loading && connection === "live" && events?.available === true && data !== null,
+                  )}>
                     {alertState === "on" ? "Disable browser alerts" : "Enable browser alerts"}
                   </button>
                   {alertState === "on" && <small>Alerts work while this tab stays open.</small>}
