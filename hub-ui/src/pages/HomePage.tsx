@@ -1,4 +1,4 @@
-import { actorName } from "../actors";
+import { actorName, requesterLabel } from "../actors";
 import { link } from "../router";
 import { connectionView } from "../agentStatus";
 import { ImageVersionsPanel } from "../ImageVersionsPanel";
@@ -20,9 +20,9 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
   // Decisions and task items share one list; both need Beau.
   const waiting = [
     ...decisions.map((decision) => ({ id: decision.id, title: decision.title,
-      meta: `${hub.projectName(decision.project)}${decision.protected ? " · Protected" : ""}` })),
+      meta: `${hub.projectName(decision.project)}${decision.protected ? " · Protected" : ""} · ${requesterLabel(decision.requested_by, { viewer: hub.session?.actor })}` })),
     ...items.map((task) => ({ id: task.id, title: task.waiting_on!.text,
-      meta: `${hub.projectName(task.project)} · ${waitingKind(task)} · ${task.title}` })),
+      meta: `${requesterLabel(task.waiting_on?.by, { family: task.waiting_on?.by_family, viewer: hub.session?.actor })} · ${hub.projectName(task.project)} · ${waitingKind(task)} · ${task.title}` })),
   ];
   const projects = hub.data.projects.filter((item) => !item.archived);
   const tasks = hub.data.tasks;

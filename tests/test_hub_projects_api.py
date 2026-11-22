@@ -111,7 +111,7 @@ def test_new_project_tasks_decisions_and_archive_history(hub):
     assert client.post(BASE + '/projects/landscript/archive', headers=human,
         json={'expected_revision': 1}).status_code == 200
     assert client.get(BASE + '/tasks/' + task['id']).json() == task
-    assert decision in client.get(BASE + '/decisions').json()['items']
+    assert dict(decision, requested_by='codex') in client.get(BASE + '/decisions').json()['items']
     assert client.get(BASE + '/projects/landscript').json()['archived'] is True
     assert 'landscript' not in {p['id'] for p in call(client, 'hub_project_list')['items']}
     assert 'landscript' in {p['id'] for p in call(client, 'hub_project_list', {'include_archived': True})['items']}

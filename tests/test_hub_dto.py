@@ -96,10 +96,11 @@ def test_rest_overview_and_lists_preserve_exact_source_shapes(hub):
         assert_exact(OverviewDTO, overview)
         assert overview['tasks'] == repo.list_task_views()
         assert [{k: v for k, v in item.items() if k != 'state_since'} for item in overview['tasks']] == repo.list_tasks()
-        assert overview['decisions'] == [decision]
+        decision_view = dict(decision, requested_by='hermes')
+        assert overview['decisions'] == [decision_view]
         assert overview['runs'] == [run]
         assert overview['autonomy'] == {'configured': False, 'state': 'disabled', 'running': False, 'receipts': []}
-        for path, expected in [('tasks', repo.list_task_views()), ('decisions', [decision]), ('runs', [run])]:
+        for path, expected in [('tasks', repo.list_task_views()), ('decisions', [decision_view]), ('runs', [run])]:
             assert client.get(PREFIX + '/' + path, headers=HEADERS).json() == {'items': expected}
         assert client.get(PREFIX + '/tasks/' + task['id'], headers=HEADERS).json() == repo.get_task(task['id'])
 

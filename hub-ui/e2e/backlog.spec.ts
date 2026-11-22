@@ -36,6 +36,28 @@ async function fixture(page: Page, tasks: Task[]) {
   return { overview, state };
 }
 
+test("Needs you names the original requester, not the task owner", async ({ page }) => {
+  const task = waitingTask("Which region?", "2026-11-16T10:00:00Z", 3);
+  const { overview, state } = await fixture(page, [{ ...task, owner: "codex" }]);
+  const question = overview.decisions.find((item) => item.status === "open")!;
+  const requested = { ...question, requested_by: "hermes" };
+  overview.decisions = [requested, { ...question, id: "11111111-2222-4333-8444-0000000000c1", title: "Legacy question" }];
+  await page.goto("/#/");
+  const preview = page.getByRole("region", { name: "Needs you" });
+  await expect(preview.getByRole("link", { name: /Which region\?/ })).toContainText("Requested by Claude");
+  await expect(preview.getByRole("link", { name: new RegExp(question.title) })).toContainText("Requested by Hermes");
+  await page.goto("/#/inbox");
+  await expect(page.locator("form.waiting-item")).toContainText("Requested by Claude");
+  await expect(page.locator("form.waiting-item")).not.toContainText("Codex");
+  const card = page.locator("form").filter({ has: page.getByRole("heading", { name: question.title, exact: true }) });
+  await expect(card).toContainText("Requested by Hermes");
+  await card.getByRole("button", { name: "Open full view" }).click();
+  await expect(page.getByRole("dialog")).toContainText("Requested by Hermes");
+  await page.keyboard.press("Escape");
+  await expect(page.locator("form").filter({ hasText: "Legacy question" })).toContainText("Requester not recorded");
+  expect(state.posts).toEqual([]);
+});
+
 test("a draft written for one waiting item is not sent as the answer to the next item on the same task", async ({ page }) => {
   const { overview, state } = await fixture(page, [waitingTask("Item A: which domain?", "2026-11-16T10:00:00+00:00", 3)]);
   await page.goto("/#/inbox");

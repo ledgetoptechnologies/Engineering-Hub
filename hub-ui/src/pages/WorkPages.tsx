@@ -8,7 +8,7 @@ import { TaskTable } from "./tasks";
 import { WithdrawnList } from "./Withdraw";
 import { ownershipRows, UNCLAIMED, WorkOwnership } from "./WorkOwnership";
 import { draftFor, type ItemDraft, WORK_FILTERS, waitingItemKey, waitingKind, waitingTasks, withdrawnWaitingTasks } from "../backlog";
-import { actorName } from "../actors";
+import { actorName, requesterLabel } from "../actors";
 import { statusLabel } from "./tasks";
 
 /** One task item Beau must clear: an action he marks Done, or a decision he answers in the note. */
@@ -27,7 +27,7 @@ export function WaitingItemCard({ hub, task }: { hub: Hub; task: Task }) {
     }}>
       <Badge tone="amber">{waitingKind(task)}</Badge>
       <strong>{task.waiting_on?.text}</strong>
-      <small><a className="project-chip" href={link(`/projects/${task.project}`)}>{hub.projectName(task.project)}</a> · {task.title}</small>
+      <small><a className="project-chip" href={link(`/projects/${task.project}`)}>{hub.projectName(task.project)}</a> · {task.title} · {requesterLabel(task.waiting_on?.by, { family: task.waiting_on?.by_family, viewer: hub.session?.actor })}</small>
       <label className="field">
         <span className="sr-only">{decision ? "Your answer" : "Note (optional)"}</span>
         <textarea rows={2} maxLength={2000} value={note} onChange={(event) => setNote(event.target.value)}

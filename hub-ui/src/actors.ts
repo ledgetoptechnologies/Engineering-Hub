@@ -43,6 +43,10 @@ export function actorName(actor: string, context: ActorContext = {}): string {
   return actor;
 }
 
+/** Do not substitute the current owner when the original requester is missing. */
+export const requesterLabel = (actor: string | null | undefined, context: ActorContext = {}) =>
+  actor ? `Requested by ${actorName(actor, context)}` : "Requester not recorded";
+
 /** Avatar class and initial: the family's colour and letter, or a neutral "?" when unknown. */
 export function actorAvatar(actor: string | null | undefined, family?: string | null): { className: string; letter: string } {
   const known = actorFamily(actor, family);

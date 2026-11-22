@@ -96,6 +96,7 @@ export interface Decision extends Versioned {
   status: "open" | "answered" | "withdrawn";
   answer: string | null;
   answered_by?: string;
+  requested_by?: string | null;
   /** True only when the server accepts a typed answer instead of one of the options. */
   allow_text?: boolean;
   /** Present on withdrawn records only: superseded work kept for history. */

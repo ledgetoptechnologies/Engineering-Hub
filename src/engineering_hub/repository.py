@@ -820,6 +820,20 @@ class HubRepository:
     def list_decisions(self):
         return self._list('decision')
 
+    def list_decision_views(self):
+        # Read the original authenticated creator, not the last editor or answerer.
+        # One batched read covers old decisions without rewriting stored records.
+        with self._connection() as db:
+            rows = db.execute("""WITH creation AS (
+                SELECT entity_id, MIN(sequence) AS sequence FROM hub_audit
+                WHERE action='decision.created' AND revision=1 GROUP BY entity_id
+            )
+            SELECT e.data, a.actor FROM hub_entities e
+            LEFT JOIN creation c ON c.entity_id=e.id
+            LEFT JOIN hub_audit a ON a.sequence=c.sequence
+            WHERE e.kind='decision' ORDER BY e.rowid""")
+            return [dict(json.loads(row['data']), requested_by=row['actor']) for row in rows]
+
     @staticmethod
     def _open_work_job(db, task_id):
         """A queued, claimed or held work-queue job still owns this task; terminal ones don't."""

@@ -4758,6 +4758,30 @@
             ],
             "title": "Answered By"
           },
+          "requested_by": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "string",
+                "pattern": "^installation:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              {
+                "type": "string",
+                "pattern": "^human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested By"
+          },
           "details": {
             "anyOf": [
               {
