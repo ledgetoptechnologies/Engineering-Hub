@@ -149,6 +149,8 @@ def browser_route_allowed(method, path):
         r'/api/hub/v1/interactive-reviews/' + _UUID + '/answers', path) is not None or re.fullmatch(
         r'/api/hub/v1/decisions/' + _UUID + '/answer', path) is not None
         or re.fullmatch(r'/api/hub/v1/(?:tasks|decisions)/' + _UUID + '/(?:context|withdraw)', path) is not None
+        # Beau's Inbox Done and Undo; both handlers are human-session only.
+        or re.fullmatch(r'/api/hub/v1/tasks/' + _UUID + '/(?:resolve-waiting|restore-waiting)', path) is not None
         or path == '/api/hub/v1/projects'
         or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + '/components', path) is not None
         or re.fullmatch(r'/api/hub/v1/components/' + _UUID + '/retire', path) is not None
