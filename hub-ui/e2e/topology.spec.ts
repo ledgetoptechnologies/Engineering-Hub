@@ -1,6 +1,17 @@
 import { expect, test } from "@playwright/test";
 import { audit, blocking } from "./audit";
 
+test("opens Topology from Infrastructure and returns to the overview", async ({ page }) => {
+  await page.goto("/?demo=1#/infrastructure");
+  await page.getByRole("link", { name: "Topology", exact: true }).click();
+  await expect(page).toHaveURL(/\/infrastructure\/views\/topology\?demo=1$/);
+  await expect(page.getByRole("heading", { name: "Topology.", exact: true })).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Topology.", exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "Back to Infrastructure", exact: true }).click();
+  await expect(page).toHaveURL(/\/infrastructure\?demo=1$/);
+});
+
 const registered = () => ({ items: [
   { id: "build-pc", name: "Build PC", hostname: "build.example.test", addresses: ["192.0.2.20"], network: "192.0.2.0/24", vlan: 20,
     metrics_host: null, role: "Staging builds", retired: false, revision: 1, updated_at: "2026-11-01T12:00:00Z",

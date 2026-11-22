@@ -95,6 +95,7 @@ function DeviceListPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }
     </PageHeader>
     <section className="panel infra" aria-label="Devices">
       <PanelTitle title="Devices" count={list ? shown.length : undefined}>
+        {list && <a href={href({ page: "topology" })}>Topology</a>}
         {canEdit && <button type="button" className="secondary" onClick={() => setCreating(true)}>Add device</button>}
         <button type="button" className="secondary" disabled={load.state === "loading"} onClick={refresh}>
           {load.state === "loading" ? "Reading…" : "Refresh"}</button>

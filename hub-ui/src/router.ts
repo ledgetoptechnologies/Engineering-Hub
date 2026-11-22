@@ -23,6 +23,7 @@ export type Route =
   | { page: "staging-queues" }
   | { page: "staging-resources" }
   | { page: "infrastructure" }
+  | { page: "topology" }
   | { page: "device"; id: string }
   // App shows an unavailable state until the orchestration backend exists.
   | { page: "orchestration" }
@@ -92,6 +93,7 @@ export function parseRoute(value: string): Route {
       return parts.length === 2 && requestId.test(parts[1]) ? { page: "orchestration-request", id: parts[1] } : { page: "orchestration" };
     case "infrastructure":
       if (parts.length === 1) return { page: "infrastructure" };
+      if (parts.length === 3 && parts[1] === "views" && parts[2] === "topology") return { page: "topology" };
       return parts.length === 2 && projectId.test(parts[1]) ? { page: "device", id: parts[1] } : { page: "infrastructure" };
     case "projects": {
       if (parts.length === 1 || !projectId.test(parts[1])) return { page: "projects" };
@@ -115,6 +117,7 @@ export function pathOf(route: Route): string {
     case "labels": return `/projects/${route.project}/labels/${route.set}`;
     case "review": return `/projects/${route.project}/reviews/${route.id}`;
     case "device": return `/infrastructure/${route.id}`;
+    case "topology": return "/infrastructure/views/topology";
     case "orchestration-request": return `/orchestration/${route.id}`;
     case "agent-installations": return "/agents/installations";
     case "staging-queues": return "/staging/queues";

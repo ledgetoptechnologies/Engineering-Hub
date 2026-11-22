@@ -17,6 +17,7 @@ import { InboxPage, WorkPage } from "./pages/WorkPages";
 import { ProjectPage, ProjectsPage } from "./pages/ProjectPages";
 import { AgentsPage, StagingPage } from "./pages/SystemPages";
 import { InfrastructurePage } from "./pages/InfrastructurePage";
+import { TopologyPage } from "./pages/TopologyPage";
 import { OrchestrationPage } from "./pages/OrchestrationPage";
 import { acceptsAnswer, retainsAnswerDraft, openDecisions } from "./pages/decisions";
 import { isActive, parseAcceptance, waitingTasks } from "./backlog";
@@ -814,6 +815,7 @@ export function HubApp() {
             {route.page === "staging-queues" && <StagingPage hub={hub} actions={actions} view="queues" />}
             {route.page === "staging-resources" && <StagingPage hub={hub} actions={actions} view="resources" />}
             {route.page === "infrastructure" && <InfrastructurePage hub={hub} actions={actions} />}
+            {route.page === "topology" && <TopologyPage hub={hub} actions={actions} />}
             {route.page === "device" && <InfrastructurePage hub={hub} actions={actions} deviceId={route.id} />}
             {route.page === "orchestration" && <OrchestrationPage actions={actions} />}
             {route.page === "orchestration-request" && <OrchestrationPage actions={actions} requestId={route.id} />}

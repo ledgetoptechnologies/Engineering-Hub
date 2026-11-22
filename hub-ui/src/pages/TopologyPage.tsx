@@ -65,6 +65,7 @@ export function TopologyPage({ hub, actions }: { hub: Hub; actions: React.ReactN
       subtitle="Declared subnets and the devices recorded on each one. This view is read-only; nothing here scans or changes a network.">
       {actions}
     </PageHeader>
+    <p className="infra-back"><a href={href({ page: "infrastructure" })}>Back to Infrastructure</a></p>
     {load.state === "unavailable" ? <section className="panel"><p>{UNAVAILABLE}</p></section> :
       <section className="panel topology" aria-label="Topology">
         <PanelTitle title="Registered device topology" count={deviceCount}>
