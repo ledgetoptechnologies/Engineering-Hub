@@ -16,7 +16,8 @@ export function stateAge(task: Task): string {
 }
 
 export const statusLabel = (task: Task) => task.status === "verified" ? "Review passed"
-  : task.status === "waiting_on_beau" ? "Waiting on Beau" : pretty(task.status);
+  : task.status === "waiting_on_beau" ? "Waiting on Beau"
+  : task.status === "assigned" ? (task.owner ? "Assigned · not started" : "Unassigned") : pretty(task.status);
 export const statusTone = (task: Task) =>
   task.status === "verified" || task.status === "done" ? "forest"
     : task.status === "in_review" || task.status === "waiting_on_beau" ? "amber" : "neutral";
