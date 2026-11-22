@@ -1,0 +1,27 @@
+.topology-source, .topology-count, .topology-coverage { margin: 0; color: var(--ink-2); font-size: 13px; }
+.topology-source { padding: 10px 12px; border-left: 3px solid var(--line); background: var(--surface); }
+.topology-count { margin-top: 10px; }
+.topology-coverage { margin-top: 12px; color: var(--ink-3); }
+.topology-filter { display: grid; gap: 5px; max-width: 560px; margin: 14px 0; font-size: 13px; font-weight: 600; }
+.topology-filter input { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); font: inherit; font-weight: 400; }
+.topology-filter input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.topology-groups { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 360px), 1fr)); gap: 12px; align-items: start; }
+.topology-group { min-width: 0; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: var(--surface); }
+.topology-group-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--line); padding-bottom: 8px; }
+.topology-group-head h3 { min-width: 0; margin: 0; font-size: 15px; overflow-wrap: anywhere; }
+.topology-group-head span { flex: none; color: var(--ink-3); font-size: 12px; }
+.topology-devices { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.topology-device { min-width: 0; display: grid; gap: 7px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.topology-device:last-child { border-bottom: 0; padding-bottom: 0; }
+.topology-device.retired { opacity: .78; }
+.topology-device-main { display: grid; gap: 3px; min-width: 0; }
+.topology-device-main a { width: fit-content; max-width: 100%; color: inherit; font-weight: 650; text-decoration-thickness: 1px; text-underline-offset: 3px; overflow-wrap: anywhere; }
+.topology-device-main span { color: var(--ink-3); font-size: 12px; overflow-wrap: anywhere; }
+.topology-device-facts, .topology-device-checks { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; font-size: 12px; }
+.topology-device-facts > span:first-child { overflow-wrap: anywhere; }
+.topology-device-checks .badge { max-width: 100%; white-space: normal; }
+.topology-device-checks .badge .dot { flex: none; }
+@media (max-width: 520px) {
+  .topology { padding-left: 12px; padding-right: 12px; }
+  .topology-group { padding: 10px; }
+}

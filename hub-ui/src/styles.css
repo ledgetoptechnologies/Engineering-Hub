@@ -4125,10 +4125,35 @@ dialog.modal-full .modal-head h2 { font-size: 19px; line-height: 1.3; }
 .infra-text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .infra-history { margin: 20px 0 8px; }
 .infra-journal { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
-.machine-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr)); }
-.machine-card { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: var(--surface); display: grid; gap: 12px; align-content: start; min-width: 0; }
+.machine-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); }
+.machine-card { border: 1px solid var(--line); border-radius: 8px; padding: 0; background: var(--surface); min-width: 0; overflow: hidden; }
+.machine-card:hover { border-color: #bac3d7; }
+.machine-card-link { display: grid; gap: 10px; height: 100%; min-width: 0; padding: 12px; color: inherit; text-decoration: none; border-radius: inherit; }
+.machine-card-link:focus-visible { position: relative; z-index: 1; outline: 3px solid var(--accent); outline-offset: -3px; }
 .machine-card-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .machine-card-head strong { margin-right: auto; }
+.machine-card-title { min-width: 0; overflow-wrap: anywhere; }
+.machine-card-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.machine-card-meta:empty { display: none; }
+.machine-card-exporters { color: var(--muted); font-size: 12px; }
+.machine-card-warning { color: var(--ink-3); font-size: 12px; }
+.machine-card-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.machine-card-stat { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 3px 8px; min-width: 0; padding-top: 7px; border-top: 1px solid var(--line); }
+.machine-card-stat > span:first-child { color: var(--muted); font-size: 12px; }
+.machine-card-stat strong { min-width: 0; color: var(--ink); font-size: 13px; font-variant-numeric: tabular-nums; text-align: right; overflow-wrap: anywhere; }
+.machine-card-meter { grid-column: 1 / -1; height: 4px; overflow: hidden; border-radius: 999px; background: var(--line); }
+.machine-card-meter i { display: block; height: 100%; background: var(--forest); }
+.machine-card-meter.warm i, .machine-card-meter.high i { background: var(--amber); }
+.machine-card-cta { justify-self: end; color: var(--forest); font-size: 12px; font-weight: 600; }
+.machine-card-detail { display: grid; gap: 12px; align-content: start; padding: 12px; }
+.machine-order-control { position: relative; font-size: 13px; }
+.machine-order-control summary { min-height: 36px; display: flex; align-items: center; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink-2); cursor: pointer; }
+.machine-order-control summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.machine-order-control form { position: absolute; z-index: 5; top: calc(100% + 6px); right: 0; width: min(360px, calc(100vw - 32px)); padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: 0 8px 24px rgb(15 23 42 / 16%); }
+.machine-order-control textarea { width: 100%; max-width: 100%; resize: vertical; }
+.machine-order-control form > small { display: block; margin: 4px 0 10px; color: var(--muted); }
+.machine-current-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.machine-history-panel > .history { margin-top: 0; }
 .machine-section { display: grid; gap: 8px; }
 .machine-section + .machine-section { border-top: 1px solid var(--line); padding-top: 10px; }
 .machine-section-head { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; align-items: center; font-weight: 600; }
@@ -4348,21 +4373,10 @@ button.text-button.danger { color: #a3402f; }
     padding: 10px 12px;
   }
 }
-/* Machine stats under each device, and history charts. */
+/* Machine health cards and history charts. */
 :root { --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #c98500; }
 :root[data-theme="dark"] { --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500; }
-.machine-strip { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; padding-top: 10px;
-  border-top: 1px solid var(--line); color: inherit; text-decoration: none; }
-.machine-strip:hover .machine-stat-label { color: var(--ink-2); }
-.machine-strip.quiet { display: flex; }
-.machine-stat { display: grid; grid-template-columns: auto 1fr; column-gap: 8px; row-gap: 3px; align-items: baseline; min-width: 0; }
-.machine-stat-label { font-size: 12px; color: var(--muted); }
-.machine-stat strong { font-size: 15px; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
-.machine-stat small { grid-column: 1 / -1; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.machine-stat .machine-meter-track { grid-column: 1 / -1; display: block; height: 4px; }
-.machine-history-toggle { justify-self: start; }
 .history { display: grid; gap: 12px; margin-top: 14px; min-width: 0; }
-.machine-card .history { grid-column: 1 / -1; margin-top: 0; }
 .history-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
 .history-ranges { display: flex; gap: 6px; }
 .history-grid-layout { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); }
@@ -4389,7 +4403,7 @@ button.text-button.danger { color: #a3402f; }
 .history-legend { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--ink-2); }
 .history-legend li { display: flex; align-items: center; gap: 6px; }
 .history-swatch { width: 12px; height: 3px; border-radius: 2px; background: var(--series); }
-@media (max-width: 640px) { .machine-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
 /* Grid items size to their content by default; charts measure their box, so the box must be able to shrink. */
 .infra-detail { grid-template-columns: minmax(0, 1fr); }
 .infra-detail > .panel { min-width: 0; }

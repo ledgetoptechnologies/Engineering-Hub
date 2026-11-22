@@ -23,14 +23,14 @@ function devices(base = Date.now()) {
 }
 const list = (caps = { device_write: true, maintenance_write: true }, base = Date.now()) => ({ status: 200, body: { items: devices(base), capabilities: caps } });
 
-interface Options { capability?: boolean; list?: Reply[]; detail?: Reply[]; writes?: Reply[]; metrics?: Reply[] }
+interface Options { actor?: string; capability?: boolean; list?: Reply[]; detail?: Reply[]; writes?: Reply[]; metrics?: Reply[] }
 async function fixture(page: Page, options: Options = {}) {
   const state = { lists: 0, details: 0, metrics: 0, writes: [] as { method: string; path: string; body: unknown; csrf: string | null }[] };
   await page.route("**/api/hub/v1/**", async (route) => {
     const request = route.request(), url = new URL(request.url()), path = url.pathname;
     const respond = (body: unknown, code = 200) => route.fulfill({ status: code, contentType: "application/json", body: JSON.stringify(body) });
     const play = (reply: Reply) => reply === "abort" ? route.abort() : respond(reply.body, reply.status);
-    if (path.endsWith("/auth/me")) return respond({ authenticated: true, actor: human, github_id: null,
+    if (path.endsWith("/auth/me")) return respond({ authenticated: true, actor: options.actor ?? human, github_id: null,
       auth_provider: "cloudflare_access", email: "operator@example.test", csrf_token: "fixture-csrf" });
     if (path.endsWith("/overview")) {
       const overview = createDemoOverview(new Date());
@@ -242,6 +242,15 @@ test("demo mode reads nothing and offers no changes", async ({ page }) => {
   expect(reads).toBe(0);
 });
 
+test("a preference left under the old unscoped key never appears in demo", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("engineering-hub.machine-order.v1", '["lab-node"]'));
+  await page.goto("/?demo=1#/infrastructure");
+  const panel = healthPanel(page);
+  await expect(panel.locator(".machine-card-title")).toHaveText([
+    "build", "lab-node", "storage",
+  ]);
+});
+
 test("fits a phone screen, list and device page", async ({ page }) => {
   await fixture(page);
   await page.setViewportSize({ width: 375, height: 812 });
@@ -259,24 +268,32 @@ const metrics = (change: (value: any) => void = () => {}) => {
 };
 
 test("machine health groups each machine's exporters, says what's missing and reads only when asked", async ({ page }) => {
-  const state = await fixture(page, { metrics: [metrics()] });
+  const state = await fixture(page, { metrics: [metrics(value => {
+    for (const item of value.devices) if (["desk-pc", "gpu-box"].includes(item.device_id)) item.device_id = "build-pc";
+  })] });
   await page.goto("/#/infrastructure");
   const panel = healthPanel(page);
   const gpuBox = panel.getByRole("listitem").filter({ hasText: "gpu-box" });
   await expect(gpuBox).toContainText("Linux");
   await expect(gpuBox).toContainText("GPUs");
-  await expect(gpuBox).toContainText("GPU 0 · Synthetic GPU A");
   await expect(gpuBox).toContainText("not reported");
-  await expect(gpuBox.getByRole("meter", { name: "CPU" })).toHaveAttribute("aria-valuenow", "50");
+  await expect(gpuBox).toContainText("50%");
   const desk = panel.getByRole("listitem").filter({ hasText: "desk" });
-  await expect(desk.getByRole("row", { name: /msedge/ })).toContainText("57");
-  await expect(desk).toContainText("329 GB free of 3.6 TB");
+  await expect(desk).toContainText("25%");
   await expect(panel.getByRole("listitem").filter({ hasText: "field-pi" })).toContainText("Out of date");
   await expect(panel.getByRole("listitem").filter({ hasText: "old-box" })).toContainText("Not a recognized exporter");
+  expect(state.metrics).toBe(1);
+  await page.waitForTimeout(500);
   expect(state.metrics).toBe(1);
   await panel.getByRole("button", { name: "Refresh" }).click();
   await expect.poll(() => state.metrics).toBe(2);
   expect(state.writes).toEqual([]);
+  await gpuBox.getByRole("link").click();
+  await expect(page).toHaveURL(/\/infrastructure\/build-pc$/);
+  const details = healthPanel(page);
+  await expect(details).toContainText("GPU 0 · Synthetic GPU A");
+  await expect(details.getByRole("row", { name: /msedge/ })).toContainText("57");
+  await expect(details).toContainText("329 GB free of 3.6 TB");
 });
 
 test("an unreachable source is unknown, never down, and shows no stale readings", async ({ page }) => {
@@ -301,16 +318,13 @@ test("discovered machines show without mappings, flag unregistered and ambiguous
   await page.goto("/#/infrastructure");
   const panel = healthPanel(page);
   const cards = panel.getByRole("listitem");
-  await expect(cards).toHaveCount(2);
-  await expect(panel).not.toContainText("demo-workstation");
-  const strip = devicesPanel(page).getByRole("link", { name: "Machine stats" });
-  await expect(strip).toHaveAttribute("href", "/infrastructure/build-pc");
-  await expect(strip).toContainText("25%");
-  await expect(strip).toContainText("Memory");
+  await expect(cards).toHaveCount(3);
+  const matched = cards.filter({ hasText: "demo-workstation" });
+  await expect(matched.getByRole("link")).toHaveAttribute("href", "/infrastructure/build-pc");
   await expect(cards.filter({ hasText: "192.0.2.11:9000" })).toContainText("Not in devices");
   await expect(cards.filter({ hasText: "192.0.2.11:9000" })).toContainText("Not a recognized exporter");
   await expect(cards.filter({ hasText: "duplicate-demo" })).toContainText("Matches more than one device");
-  await expect(cards.filter({ hasText: "duplicate-demo" }).getByRole("link")).toHaveCount(0);
+  await expect(cards.filter({ hasText: "duplicate-demo" }).getByRole("link")).toHaveAttribute("href", /\/infrastructure\/machines\//);
   await page.setViewportSize({ width: 375, height: 812 });
   expect(blocking(await audit(page, "page", 375))).toEqual([]);
 });
@@ -348,6 +362,51 @@ test("machine health shows even when the device list is refused, and stays hidde
   await expect(page.getByText("Infrastructure isn't available to you on this Hub.")).toBeVisible();
   await expect(healthPanel(page)).toHaveCount(0);
   await expect(page.locator("body")).not.toContainText("192.0.2.");
+});
+
+test("metrics-only matched and orphaned groups keep opaque details and history without Inventory reads", async ({ page }) => {
+  const refused = { status: 403, body: { detail: { code: "infrastructure_forbidden" } } };
+  const state = await fixture(page, { list: [refused], detail: [refused], metrics: [discovered("discovered", value => {
+    value.devices[0].device_id = value.devices[1].device_id = "build-pc";
+    Object.assign(value.devices[0], { up: true, state: "fresh", last_scrape: new Date().toISOString(), cpu_busy_ratio: 0.25 });
+  })] });
+  const historyReads: string[] = [];
+  await page.route("**/api/hub/v1/infrastructure/metrics/history**", route => {
+    const url = new URL(route.request().url());
+    const host = url.searchParams.get("host") ?? "";
+    const range = url.searchParams.get("range") ?? "";
+    historyReads.push(`${host}|${range}`);
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ schema_version: 1,
+      generated_at: new Date().toISOString(), host_key: host, range, step_seconds: 30, source: { status: "ok" },
+      series: [{ key: "cpu", label: null, unit: "ratio", points: [[1000, 0.2], [1030, 0.6]] }] }) });
+  });
+
+  await page.goto("/#/infrastructure");
+  const panel = healthPanel(page);
+  await expect(page.getByText("Infrastructure isn't available to you on this Hub.")).toBeVisible();
+  const matched = panel.getByRole("listitem").filter({ hasText: "demo-workstation" });
+  const matchedLink = matched.getByRole("link");
+  await expect(matchedLink).toHaveAttribute("href", /\/infrastructure\/machines\//);
+  await expect(matchedLink).not.toHaveAttribute("href", "/infrastructure/build-pc");
+  await matchedLink.click();
+  await expect(page).toHaveURL(/\/infrastructure\/machines\//);
+  await expect(page.getByRole("heading", { name: "demo-workstation" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Current readings" })).toContainText("25%");
+  await expect(page.getByRole("img", { name: /^CPU:/ })).toBeVisible();
+  await expect.poll(() => historyReads.length).toBe(1);
+
+  await page.goBack();
+  const orphan = panel.getByRole("listitem").filter({ hasText: "192.0.2.11:9000" });
+  await expect(orphan).toContainText("Not in devices");
+  const orphanLink = orphan.getByRole("link");
+  await expect(orphanLink).toHaveAttribute("href", /\/infrastructure\/machines\//);
+  await orphanLink.click();
+  await expect(page).toHaveURL(/\/infrastructure\/machines\//);
+  await expect(page.getByRole("heading", { name: "192.0.2.11:9000" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Current readings" })).toContainText("Not a recognized exporter");
+  await expect(page.getByRole("link", { name: /Machine health/ })).toBeVisible();
+  await expect.poll(() => historyReads.length).toBe(2);
+  expect(state.details).toBe(0);
 });
 
 test("machine health stays hidden without metrics access, and says so when not set up or unavailable", async ({ page }) => {
@@ -415,12 +474,14 @@ test("a device page shows only that device's machine health", async ({ page }) =
 test("a current failed scrape says so; an old one is only out of date", async ({ page }) => {
   await fixture(page, { metrics: [metrics(value => {
     Object.assign(value.devices[1], { state: "fresh", last_scrape: new Date(Date.now() - 20_000).toISOString() });
+    for (const item of value.devices) if (item.device_id === "gpu-box") item.device_id = "build-pc";
     value.devices[2].gpus = [];
   })] });
   await page.goto("/#/infrastructure");
   const panel = healthPanel(page);
   await expect(panel.getByRole("listitem").filter({ hasText: "field-pi" })).toContainText("Scrape failing");
-  await expect(panel.getByRole("listitem").filter({ hasText: "gpu-box" })).toContainText("No GPU readings came back.");
+  await panel.getByRole("listitem").filter({ hasText: "gpu-box" }).getByRole("link").click();
+  await expect(healthPanel(page)).toContainText("No GPU readings came back.");
 });
 
 test("a device page says when Prometheus has no matching machine, and the editor sets the Prometheus host", async ({ page }) => {
@@ -437,4 +498,126 @@ test("a device page says when Prometheus has no matching machine, and the editor
   await form.getByRole("button", { name: "Save changes" }).click();
   await expect.poll(() => state.writes.length).toBe(1);
   expect(state.writes[0].body).toMatchObject({ hostname: "build.example.test", metrics_host: "BUILD-PC" });
+});
+
+function prioritizedMetrics() {
+  const value = JSON.parse(JSON.stringify(discoveredFixture.cases.discovered));
+  const names = ["Main PC", "Cluster PC", "Hermes", "Staging", "Sync Pi", "DNS", "Zeta"];
+  const template = value.devices[0];
+  value.devices = names.map((name, index) => {
+    const row = JSON.parse(JSON.stringify(template));
+    const suffix = (index + 1).toString(16).padStart(64, "0");
+    Object.assign(row, {
+      host_key: `host:${suffix}`, host_label: name, association: index === 0 ? "matched" : "unregistered",
+      device_id: index === 0 ? "build-pc" : null, probe_id: null, job: "node", instance: `machine-${index}:9100`,
+      exporter: "node", labels: { host: name }, up: true, last_scrape: new Date().toISOString(), state: "fresh",
+      cpu_busy_ratio: 0.25, mem_total_bytes: 1000, mem_available_bytes: 500, disks: [], gpus: [], top_processes: [],
+    });
+    return row;
+  });
+  value.source.warnings = [];
+  return value;
+}
+
+test("prioritizes compact machine cards and drills into device and discovered-machine charts without overview history reads", async ({ page }) => {
+  const state = await fixture(page, { metrics: [{ status: 200, body: prioritizedMetrics() }] });
+  const historyReads: string[] = [];
+  await page.route("**/api/hub/v1/infrastructure/metrics/history**", route => {
+    const url = new URL(route.request().url());
+    const host = url.searchParams.get("host") ?? "";
+    const range = url.searchParams.get("range") ?? "";
+    historyReads.push(`${host}|${range}`);
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ schema_version: 1,
+      generated_at: new Date().toISOString(), host_key: host, range, step_seconds: 30, source: { status: "ok" },
+      series: [{ key: "cpu", label: null, unit: "ratio", points: [[1000, 0.2], [1030, null], [1060, 0.6]] }] }) });
+  });
+
+  await page.goto("/#/infrastructure");
+  const panel = healthPanel(page);
+  const cards = panel.getByRole("listitem");
+  await expect(cards).toHaveCount(7);
+  await expect(panel.locator(".machine-card-title").evaluateAll(nodes => nodes.map(node => node.textContent?.trim()))).resolves.toEqual([
+    "Main PC", "Cluster PC", "Hermes", "Staging", "Sync Pi", "DNS", "Zeta",
+  ]);
+  await expect(cards.first()).toContainText("25%");
+  await expect(cards.filter({ hasText: "Cluster PC" }).getByRole("link")).toHaveCount(1);
+  await expect.poll(() => state.metrics).toBe(1);
+  await page.waitForTimeout(200);
+  expect(historyReads).toEqual([]);
+
+  const main = panel.getByRole("link", { name: /Main PC/ });
+  await main.focus();
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveURL(/\/infrastructure\/build-pc$/);
+  await expect(page.getByRole("img", { name: /^CPU:/ })).toBeVisible();
+  expect(historyReads).toHaveLength(1);
+  await page.goBack();
+  await expect(panel.locator(".machine-card-title").first()).toHaveText("Main PC");
+
+  const discovered = panel.getByRole("link", { name: /Cluster PC/ });
+  const direct = await discovered.getAttribute("href");
+  expect(direct).toContain("/infrastructure/machines/");
+  await page.goto(new URL(direct!, page.url()).href);
+  await expect(page.getByRole("heading", { name: "Cluster PC" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Current readings" }).getByRole("meter", { name: "Memory" })).toHaveAttribute("aria-valuenow", "50");
+  await expect(page.getByRole("img", { name: /^CPU:/ })).toBeVisible();
+  await expect(page.getByRole("link", { name: /Machine health/ })).toBeVisible();
+  expect(historyReads.at(-1)).toContain("|24h");
+  await page.getByRole("link", { name: /Machine health/ }).click();
+  await expect(page).toHaveURL(/\/infrastructure$/);
+
+  await page.setViewportSize({ width: 375, height: 812 });
+  expect(blocking(await audit(page, "page", 375))).toEqual([]);
+});
+
+test("machine order preferences stay browser-local and reorder by exact normalized display alias", async ({ page }) => {
+  await fixture(page, { metrics: [{ status: 200, body: prioritizedMetrics() }] });
+  await page.goto("/#/infrastructure");
+  const panel = healthPanel(page);
+  await panel.getByText("Customize order", { exact: true }).click();
+  const order = panel.getByLabel("Priority machine names");
+  await order.fill("DNS\nmain-pc");
+  await panel.getByRole("button", { name: "Save order" }).click();
+  await expect(panel.locator(".machine-card-title").evaluateAll(nodes => nodes.map(node => node.textContent?.trim()))).resolves.toEqual([
+    "DNS", "Main PC", "Cluster PC", "Hermes", "Staging", "Sync Pi", "Zeta",
+  ]);
+  const stored = await page.evaluate(actor => localStorage.getItem(`engineering-hub.machine-order.v1.live.${encodeURIComponent(actor)}`), human);
+  expect(stored).toBe('["dns","main pc"]');
+  expect(stored).not.toContain("host:");
+  expect(await page.evaluate(() => localStorage.getItem("engineering-hub.machine-order.v1"))).toBeNull();
+  await page.reload();
+  await expect(healthPanel(page).locator(".machine-card-title").first()).toHaveText("DNS");
+});
+
+test("machine-order preferences persist separately for each live actor", async ({ page }) => {
+  const actorA = human;
+  const actorB = `human:cf:${"f".repeat(64)}`;
+  await fixture(page, { actor: actorA, metrics: [{ status: 200, body: prioritizedMetrics() }] });
+  await page.goto("/#/infrastructure");
+  let panel = healthPanel(page);
+  await panel.getByText("Customize order", { exact: true }).click();
+  let order = panel.getByLabel("Priority machine names");
+  await order.fill("DNS\nmain-pc");
+  await panel.getByRole("button", { name: "Save order" }).click();
+  await expect(panel.locator(".machine-card-title").first()).toHaveText("DNS");
+
+  await page.unrouteAll();
+  await fixture(page, { actor: actorB, metrics: [{ status: 200, body: prioritizedMetrics() }] });
+  await page.reload();
+  panel = healthPanel(page);
+  await panel.getByText("Customize order", { exact: true }).click();
+  order = panel.getByLabel("Priority machine names");
+  await expect(order).toHaveValue("main pc\ncluster pc\nhermes\nstaging\nsync pi\ndns");
+  await order.fill("Zeta\nCluster PC");
+  await panel.getByRole("button", { name: "Save order" }).click();
+  await expect(panel.locator(".machine-card-title").first()).toHaveText("Zeta");
+
+  await page.unrouteAll();
+  await fixture(page, { actor: actorA, metrics: [{ status: 200, body: prioritizedMetrics() }] });
+  await page.reload();
+  panel = healthPanel(page);
+  await panel.getByText("Customize order", { exact: true }).click();
+  order = panel.getByLabel("Priority machine names");
+  await expect(order).toHaveValue("dns\nmain pc");
+  await expect(panel.locator(".machine-card-title").first()).toHaveText("DNS");
 });

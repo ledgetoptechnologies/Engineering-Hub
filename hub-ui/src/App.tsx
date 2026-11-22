@@ -17,6 +17,7 @@ import { InboxPage, WorkPage } from "./pages/WorkPages";
 import { ProjectPage, ProjectsPage } from "./pages/ProjectPages";
 import { AgentsPage, StagingPage } from "./pages/SystemPages";
 import { InfrastructurePage } from "./pages/InfrastructurePage";
+import { TopologyPage } from "./pages/TopologyPage";
 import { OrchestrationPage } from "./pages/OrchestrationPage";
 import { acceptsAnswer, retainsAnswerDraft, openDecisions } from "./pages/decisions";
 import { isActive, parseAcceptance, waitingTasks } from "./backlog";
@@ -638,6 +639,7 @@ export function HubApp() {
     "staging-resources": "Staging / Kept resources",
     "orchestration-request": "Orchestration",
     device: "Infrastructure",
+    machine: "Infrastructure / Machine health",
   };
   const pageTitle = route.page === "project" ? projectName(route.id)
     : route.page === "labels" ? `${projectName(route.project)} labeling`
@@ -773,7 +775,8 @@ export function HubApp() {
             : route.page === "labels" ? `labels-${route.project}-${route.set}`
             // A different review, project or signed-in person is a fresh page with no state carried over.
             : route.page === "review" ? `review-${route.project}-${route.id}-${session?.actor ?? ""}`
-            : route.page === "device" ? `device-${route.id}-${session?.actor ?? ""}` : route.page}>
+            : route.page === "device" ? `device-${route.id}-${session?.actor ?? ""}`
+            : route.page === "machine" ? `machine-${route.key}-${session?.actor ?? ""}` : route.page}>
             {route.page === "home" && <HomePage hub={hub} actions={actions} />}
             {route.page === "inbox" && <InboxPage hub={hub} actions={<>{actions}
               {!demo && session?.authenticated && session.actor?.startsWith("human:") && events?.available && (
@@ -814,7 +817,9 @@ export function HubApp() {
             {route.page === "staging-queues" && <StagingPage hub={hub} actions={actions} view="queues" />}
             {route.page === "staging-resources" && <StagingPage hub={hub} actions={actions} view="resources" />}
             {route.page === "infrastructure" && <InfrastructurePage hub={hub} actions={actions} />}
+            {route.page === "topology" && <TopologyPage hub={hub} actions={actions} />}
             {route.page === "device" && <InfrastructurePage hub={hub} actions={actions} deviceId={route.id} />}
+            {route.page === "machine" && <InfrastructurePage hub={hub} actions={actions} machineKey={route.key} />}
             {route.page === "orchestration" && <OrchestrationPage actions={actions} />}
             {route.page === "orchestration-request" && <OrchestrationPage actions={actions} requestId={route.id} />}
           </div>

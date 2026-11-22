@@ -82,6 +82,12 @@ describe("section sub-page routes", () => {
     const routes: Route[] = [{ page: "agent-installations" }, { page: "staging-queues" }, { page: "staging-resources" }];
     for (const route of routes) expect(parseRoute(pathOf(route))).toEqual(route);
   });
+  it("round-trips discovered machine routes using an encoded opaque history key", () => {
+    const key = `host:${"a".repeat(64)}`;
+    const path = `/infrastructure/machines/${encodeURIComponent(key)}`;
+    expect(parseRoute(path)).toEqual({ page: "machine", key });
+    expect(parseRoute("/infrastructure/machines/not-a-host-key")).toEqual({ page: "infrastructure" });
+  });
   // Every address that worked before the sidebar gained sub-pages still lands on the same place, or on the sub-page that now holds it.
   it.each([
     ["/agents", { page: "agents" }],

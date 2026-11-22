@@ -75,6 +75,23 @@ everything, so the page must not rely on "any signed-in person".
   inside it) and VLAN (1 to 4094) before saving. The server stays the authority. The VLAN is never
   guessed from an address.
 
+## Machine health cards and drill-down
+
+The Machine health overview shows one compact, keyboard-focusable card per discovered metrics group,
+including machines not yet associated with an inventory device. Its default display-name priority is
+Main PC, Cluster PC, Hermes, Staging, Sync Pi and DNS; matching is exact after case and common
+punctuation normalization, and all other names follow alphabetically. **Customize order** saves only
+normalized display names in this browser, scoped to the live human actor; demo preferences are separate.
+It does not save host keys, change inventory associations, or affect another actor or demo.
+
+The overview reads current metrics only; it does not fetch history. When the device list was read,
+a matched card opens the inventory-device detail page and its current history charts. If Inventory
+read has not been established but metrics are permitted, matched and discovered-only cards instead
+open a direct detail route using the opaque metrics key; it shows only available readings and history
+without an Inventory read, device details or a new grant. A link whose target is no longer in the
+current response says its status is unknown. Existing metrics and history endpoints/data bindings are
+reused; no API or access grant is added.
+
 ## Activation
 
 The optional module remains disabled until the owner supplies explicit infrastructure settings.

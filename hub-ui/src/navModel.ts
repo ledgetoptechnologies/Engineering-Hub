@@ -58,6 +58,7 @@ export function navKey(route: Route): string {
     case "staging-queues": return "staging/queues";
     case "staging-resources": return "staging/resources";
     case "device": return "infrastructure/device";
+    case "machine": return "infrastructure";
     default: return "";
   }
 }
