@@ -174,12 +174,19 @@ def test_two_sinks_concurrent_intent_only_one_commit(owned):
     sinks = [OwnedSessionAcceptanceAudit(owned.repo) for _ in range(2)]
     def attempt(sink):
         try:
-            return sink(owned.record)
-        except SessionAcceptanceAuditError:
-            return False
+            return sink(owned.record), ()
+        except SessionAcceptanceAuditError as error:
+            causes = []
+            cause = error
+            while cause is not None:
+                code = cause.sqlite_errorcode if isinstance(cause, sqlite3.Error) and hasattr(cause, 'sqlite_errorcode') else None
+                causes.append((type(cause).__name__, code))
+                cause = cause.__cause__
+            return False, tuple(causes)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        assert sorted(pool.map(attempt, sinks)) == [False, True]
-    assert len(rows(owned.path)) == 1
+        attempts = list(pool.map(attempt, sinks))
+    committed = len(rows(owned.path))
+    assert (sorted(ok for ok, _ in attempts), committed) == ([False, True], 1), attempts
 
 
 @pytest.mark.parametrize('synchronous', [0, 1])

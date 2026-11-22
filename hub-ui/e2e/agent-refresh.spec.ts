@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type Response } from "@playwright/test";
 import { createDemoOverview, createDemoTopic } from "../src/mocks";
 
 const NOW = Date.parse("2026-10-27T12:00:00Z");
@@ -60,8 +60,12 @@ async function visibility(page: Page, value: "visible" | "hidden") {
     document.dispatchEvent(new Event("visibilitychange")); }, value);
 }
 test("quiet workspace refreshes only connection evidence and stays current across multiple TTLs", async ({ page }) => {
-  const s = await fixture(page); await page.goto("/#/agents");
+  const s = await fixture(page);
+  const initialTopics = page.waitForResponse((response: Response) =>
+    new URL(response.url()).pathname === "/api/hub/v1/topics" && response.request().method() === "GET" && response.ok());
+  await page.goto("/#/agents");
   await expect(rows(page).getByText("Hub stream observed", { exact: true })).toHaveCount(3);
+  await initialTopics;
   const baseline = [...s.reads];
   for (let i = 1; i <= 5; i++) {
     await page.clock.runFor(15_000);
