@@ -4,6 +4,7 @@ import { HubApiError, HubClient } from "./api";
 import { applyAgentObservations } from "./agentObservations";
 import { watchAgentObservations } from "./nativeAgentRefresh";
 import { TopicRefreshBudgetExhausted, watchTopicRegistry } from "./topicEvents";
+import { useNeedsMeAlerts } from "./needsMeAlerts";
 import { NotesPanel } from "./NotesPanel";
 import { PlanningPanel } from "./PlanningPanel";
 import type { Hub } from "./hub";
@@ -66,6 +67,7 @@ export function HubApp() {
     () => new HubClient({ mode: demo ? "demo" : "live" }),
     [demo],
   );
+  const { state: alertState, reset: resetAlerts, toggle: toggleAlerts, reconcile: reconcileAlerts } = useNeedsMeAlerts();
   const [session, setSession] = useState<Session | null>(null);
   const [data, setData] = useState<Overview | null>(null);
   const [agents, setAgents] = useState<AgentSummary[]>([]);
@@ -110,6 +112,7 @@ export function HubApp() {
   const workspaceEpoch = useRef(0);
   /** Drop every private record, cached snapshot, dialog and pending action, and fence late topic/agent reads. */
   const resetWorkspace = useCallback(() => {
+    resetAlerts();
     agentReader.current?.pause();
     topicReads.current++;
     workspaceEpoch.current++;
@@ -135,7 +138,7 @@ export function HubApp() {
     // Clear the editable draft without changing the applied topic: changing it
     // would trigger another refresh and could immediately undo fail-closed UI.
     setTopicDraft("");
-  }, []);
+  }, [resetAlerts]);
   const clearPrivateWorkspace = useCallback(() => {
     // Also fence late reads from a request whose identity is no longer valid.
     requests.current++;
@@ -144,7 +147,7 @@ export function HubApp() {
   }, [resetWorkspace]);
 
   const refresh = useCallback(
-    async (canVerify: () => boolean = () => true) => {
+    async (canVerify: () => boolean = () => true, fromFeed = false) => {
       const request = ++requests.current;
       // Fence the old session synchronously, including same-actor session renewal.
       agentReader.current?.pause();
@@ -210,6 +213,8 @@ export function HubApp() {
           client.getEventsStatus(),
         ]);
         if (request !== requests.current) return false;
+        if (!demo && nextSession.actor?.startsWith("human:") && canVerify())
+          reconcileAlerts(overview, fromFeed && status.available);
         shownActor.current = nextSession.actor ?? null;
         setData(overview);
         setAgents(overview.agents);
@@ -232,7 +237,7 @@ export function HubApp() {
         if (request === requests.current) setLoading(false);
       }
     },
-    [client, topic, demo, clearPrivateWorkspace, resetWorkspace],
+    [client, topic, demo, clearPrivateWorkspace, resetWorkspace, reconcileAlerts],
   );
   useEffect(() => {
     if (demo) return;
@@ -324,7 +329,7 @@ export function HubApp() {
           const expected = generation;
           const current = () =>
             active && connected && generation === expected && !dirty;
-          const ok = await refresh(current);
+          const ok = await refresh(current, true);
           if (current() && ok) {
             setConnection("live");
             setStale(false);
@@ -769,7 +774,18 @@ export function HubApp() {
             : route.page === "review" ? `review-${route.project}-${route.id}-${session?.actor ?? ""}`
             : route.page === "device" ? `device-${route.id}-${session?.actor ?? ""}` : route.page}>
             {route.page === "home" && <HomePage hub={hub} actions={actions} />}
-            {route.page === "inbox" && <InboxPage hub={hub} actions={actions} />}
+            {route.page === "inbox" && <InboxPage hub={hub} actions={<>{actions}
+              {!demo && session?.authenticated && session.actor?.startsWith("human:") && events?.available && (
+                <>
+                  <button className="secondary" type="button" onClick={() => void toggleAlerts()}>
+                    {alertState === "on" ? "Disable browser alerts" : "Enable browser alerts"}
+                  </button>
+                  {alertState === "on" && <small>Alerts work while this tab stays open.</small>}
+                  {alertState === "denied" && <small>Allow notifications in your browser settings to use alerts.</small>}
+                  {alertState === "unavailable" && <small>This browser cannot show Engineering Hub alerts.</small>}
+                </>
+              )}
+            </>} />}
             {route.page === "work" && <WorkPage hub={hub} actions={actions} />}
             {route.page === "projects" && <ProjectsPage hub={hub} actions={actions} />}
             {route.page === "project" && <ProjectPage hub={hub} id={route.id} tab={route.tab} actions={actions} notesProps={notesProps} />}

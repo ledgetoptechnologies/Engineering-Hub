@@ -702,6 +702,39 @@ test("live task creation uses browser session, same-origin request and CSRF with
   }
 });
 
+test("Needs Me browser alerts opt in and announce fresh background items once without private text", async ({ page }) => {
+  await controllableEvents(page);
+  await page.addInitScript(() => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" });
+    const captured: unknown[] = [];
+    Object.assign(window, { __needsMeAlerts: captured, Notification: class {
+      static permission = "default";
+      static async requestPermission() { this.permission = "granted"; return this.permission; }
+      constructor(title: string, options: NotificationOptions) { captured.push({ title, options }); }
+      close() {}
+    } });
+  });
+  const mock = await mockLive(page, { events: true });
+  await page.goto("/#/inbox");
+  await page.getByRole("button", { name: "Enable browser alerts" }).click();
+  await expect(page.getByRole("button", { name: "Disable browser alerts" })).toBeVisible();
+  const alerts = () => page.evaluate(() => (window as any).__needsMeAlerts);
+  expect(await alerts()).toEqual([]);
+  const original = mock.overview.decisions.find((item) => item.status === "open")!;
+  mock.overview.decisions.push({ ...original, id: "fresh-private-item", title: "Private decision text" });
+  await emit(page, "invalidate");
+  await expect(page.getByRole("heading", { name: "Private decision text", exact: true })).toBeVisible();
+  await expect.poll(alerts).toEqual([{
+    title: "Engineering Hub needs your attention",
+    options: { body: "Open Engineering Hub to view your inbox.", tag: "engineering-hub-needs-me" },
+  }]);
+  const reads = mock.reads();
+  await emit(page, "invalidate");
+  await expect.poll(mock.reads).toBeGreaterThan(reads);
+  await expect(page.getByText("Event feed connected", { exact: true })).toBeVisible();
+  expect(await alerts()).toHaveLength(1);
+});
+
 test("SSE invalidation refetches, loss marks routes stale and disables mutations without polling", async ({
   page,
 }) => {
