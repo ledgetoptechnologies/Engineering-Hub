@@ -57,9 +57,9 @@ jobs:
           # of adding ~6.5 minutes afterwards. Both must pass.
           (cd hub-ui && npm run test:e2e > "$RUNNER_TEMP/e2e.log" 2>&1) &
           e2e_pid=$!
-          responsiveness_test=test_slow_valid_observations_leave_shared_event_loop_responsive
+          responsiveness_test=tests/test_hub_queued_pilot_async.py::test_slow_valid_observations_leave_shared_event_loop_responsive
           pytest_status=0
-          uv run --locked python -W default -m pytest -q -k "not $responsiveness_test" || pytest_status=$?
+          uv run --locked python -W default -m pytest -q --deselect="$responsiveness_test" || pytest_status=$?
           e2e_status=0
           wait "$e2e_pid" || e2e_status=$?
           echo "::group::Dashboard end-to-end output"
@@ -67,7 +67,7 @@ jobs:
           echo "::endgroup::"
           # Measure cadence without the competing browser process; keep the same test and limit.
           responsiveness_status=0
-          uv run --locked python -W default -m pytest -q "tests/test_hub_queued_pilot_async.py::$responsiveness_test" || responsiveness_status=$?
+          uv run --locked python -W default -m pytest -q "$responsiveness_test" || responsiveness_status=$?
           echo "pytest exit $pytest_status; Playwright exit $e2e_status; responsiveness exit $responsiveness_status"
           [ "$pytest_status" -eq 0 ] && [ "$e2e_status" -eq 0 ] && [ "$responsiveness_status" -eq 0 ]
       - name: Preserve responsiveness evidence on success and failure
