@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { MachineGroup } from "./infrastructureMetrics";
-import { DEFAULT_MACHINE_ORDER, normalizeMachineName, readMachineOrder, sortMachineGroups, writeMachineOrder } from "./machineOrder";
+import { DEFAULT_MACHINE_ORDER, MACHINE_ORDER_STORAGE_KEY, machineOrderStorageKey, normalizeMachineName, readMachineOrder, sortMachineGroups, writeMachineOrder } from "./machineOrder";
 
 const group = (title: string, key = title): MachineGroup => ({
   key, title, labels: {}, targets: [], device_id: null, unregistered: true, ambiguous: false,
@@ -33,11 +33,33 @@ describe("browser-local machine order", () => {
     expect(ordered.map(item => item.title)).toEqual(["Main PC", "Cluster-PC", "Hermes", "DNS", "Zeta"]);
   });
 
-  it("stores only normalized names and falls back safely for invalid browser storage", () => {
+  it("stores only normalized names and falls back safely for invalid actor storage", () => {
     const local = storage();
-    writeMachineOrder(["DNS", "main-pc", "DNS", ""], local);
-    expect(readMachineOrder(local)).toEqual(["dns", "main pc"]);
-    local.setItem("engineering-hub.machine-order.v1", "not json");
-    expect(readMachineOrder(local)).toEqual(DEFAULT_MACHINE_ORDER);
+    const actor = { mode: "live" as const, actor: "human:cf:actor-a" };
+    writeMachineOrder(["DNS", "main-pc", "DNS", ""], actor, local);
+    expect(readMachineOrder(actor, local)).toEqual(["dns", "main pc"]);
+    local.setItem(machineOrderStorageKey(actor)!, "not json");
+    expect(readMachineOrder(actor, local)).toEqual(DEFAULT_MACHINE_ORDER);
+  });
+
+  it("isolates demo and actor preferences from legacy and other actors", () => {
+    const local = storage();
+    const demo = { mode: "demo" } as const;
+    const actorA = { mode: "live" as const, actor: "human:cf:actor-a" };
+    const actorB = { mode: "live" as const, actor: "human:cf:actor-b" };
+    local.setItem(MACHINE_ORDER_STORAGE_KEY, '["lab-node"]');
+
+    expect(readMachineOrder(demo, local)).toEqual(DEFAULT_MACHINE_ORDER);
+    expect(readMachineOrder(actorA, local)).toEqual(DEFAULT_MACHINE_ORDER);
+    writeMachineOrder(["lab-node"], demo, local);
+    writeMachineOrder(["DNS"], actorA, local);
+    writeMachineOrder(["Zeta"], actorB, local);
+    expect(readMachineOrder(demo, local)).toEqual(["lab node"]);
+    expect(readMachineOrder(actorA, local)).toEqual(["dns"]);
+    expect(readMachineOrder(actorB, local)).toEqual(["zeta"]);
+
+    const priorLength = local.length;
+    writeMachineOrder(["private machine"], { mode: "live", actor: null }, local);
+    expect(local.length).toBe(priorLength);
   });
 });

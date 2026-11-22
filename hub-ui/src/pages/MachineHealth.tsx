@@ -14,7 +14,7 @@ import {
 } from "../infrastructureMetrics";
 import { href } from "../router";
 import { Badge, PageHeader, PanelTitle } from "../ui";
-import { DEFAULT_MACHINE_ORDER, normalizeMachineOrder, readMachineOrder, sortMachineGroups, writeMachineOrder } from "../machineOrder";
+import { DEFAULT_MACHINE_ORDER, machineOrderStorageKey, normalizeMachineOrder, readMachineOrder, sortMachineGroups, writeMachineOrder, type MachineOrderScope } from "../machineOrder";
 import { MachineHistory } from "./MachineHistory";
 
 type Load = { state: "loading" } | { state: "hidden" } | { state: "failed" } | { state: "unavailable" } | { state: "loaded"; value: MachineMetrics };
@@ -155,9 +155,9 @@ function CardStat({ label, value, ratio }: { label: string; value: string; ratio
   </div>;
 }
 
-function MachineCard({ group }: { group: MachineGroup }) {
+function MachineCard({ group, inventoryReadAvailable }: { group: MachineGroup; inventoryReadAvailable: boolean }) {
   const stats = quickStats(group);
-  const destination = group.device_id
+  const destination = inventoryReadAvailable && group.device_id
     ? href({ page: "device", id: group.device_id })
     : href({ page: "machine", key: group.key });
   const exporters = [...new Set(group.targets.map(item => item.exporter ? EXPORTER_TEXT[item.exporter] : `Unknown · ${item.job}`))];
@@ -188,21 +188,21 @@ function MachineCard({ group }: { group: MachineGroup }) {
   </li>;
 }
 
-function MachineOrderControl({ order, onSave }: { order: string[]; onSave: (value: string[]) => void }) {
+function MachineOrderControl({ order, scope, onSave }: { order: string[]; scope: MachineOrderScope; onSave: (value: string[]) => void }) {
   const [draft, setDraft] = useState(order.join("\n"));
   const [saved, setSaved] = useState(false);
   useEffect(() => setDraft(order.join("\n")), [order]);
   const save = (event: FormEvent) => {
     event.preventDefault();
     const next = normalizeMachineOrder(draft.split(/\r?\n/));
-    writeMachineOrder(next);
+    writeMachineOrder(next, scope);
     onSave(next);
     setDraft(next.join("\n"));
     setSaved(true);
   };
   const reset = () => {
     const next = [...DEFAULT_MACHINE_ORDER];
-    writeMachineOrder(next);
+    writeMachineOrder(next, scope);
     onSave(next);
     setDraft(next.join("\n"));
     setSaved(false);
@@ -226,10 +226,15 @@ function MachineOrderControl({ order, onSave }: { order: string[]; onSave: (valu
 /** On a device page: the name Prometheus would need to report for this device to get stats. */
 export interface DeviceMatch { id: string; name: string | null }
 
-export function MachineHealth({ hub, device, reading }: { hub: Hub; device?: DeviceMatch; reading: MachineReading }) {
+export function MachineHealth({ hub, device, reading, inventoryReadAvailable = true }: {
+  hub: Hub; device?: DeviceMatch; reading: MachineReading; inventoryReadAvailable?: boolean;
+}) {
   const { load, now, refresh } = reading;
   const deviceId = device?.id;
-  const [order, setOrder] = useState(() => readMachineOrder());
+  const orderScope: MachineOrderScope = hub.demo ? { mode: "demo" } : { mode: "live", actor: hub.session?.actor ?? null };
+  const scopeKey = machineOrderStorageKey(orderScope) ?? "live-anonymous";
+  const [savedOrder, setSavedOrder] = useState(() => ({ scopeKey, order: readMachineOrder(orderScope) }));
+  const order = savedOrder.scopeKey === scopeKey ? savedOrder.order : readMachineOrder(orderScope);
   if (load.state === "hidden") return null;
   const metrics = load.state === "loaded" ? load.value : null;
   const targets = metrics ? metrics.targets.filter(item => deviceId !== undefined ? item.device_id === deviceId : true) : [];
@@ -244,10 +249,10 @@ export function MachineHealth({ hub, device, reading }: { hub: Hub; device?: Dev
   const groups = groupMachines(targets);
   const notice = metrics ? SOURCE_TEXT[metrics.source.status] : null;
   const omitted = metrics && deviceId === undefined ? omittedText(metrics) : null;
-  const onOrder = (next: string[]) => setOrder(next);
+  const onOrder = (next: string[]) => setSavedOrder({ scopeKey, order: next });
   return <section className="panel" aria-label="Machine health">
     <PanelTitle title="Machine health" count={metrics && deviceId === undefined ? groups.length : undefined}>
-      {deviceId === undefined && <MachineOrderControl order={order} onSave={onOrder} />}
+      {deviceId === undefined && <MachineOrderControl key={scopeKey} order={order} scope={orderScope} onSave={onOrder} />}
       <button type="button" className="secondary" disabled={load.state === "loading"} onClick={refresh}>
         {load.state === "loading" ? "Reading…" : "Refresh"}</button>
     </PanelTitle>
@@ -259,7 +264,7 @@ export function MachineHealth({ hub, device, reading }: { hub: Hub; device?: Dev
     {metrics && deviceId === undefined && targets.length === 0 && metrics.source.status !== "not_configured" && metrics.source.status !== "unreachable" &&
       <p className="infra-empty">Prometheus isn't scraping any machines yet.</p>}
     {deviceId === undefined && groups.length > 0 && <ul className="machine-list">
-      {sortMachineGroups(groups, order).map(group => <MachineCard key={group.key} group={group} />)}
+      {sortMachineGroups(groups, order).map(group => <MachineCard key={group.key} group={group} inventoryReadAvailable={inventoryReadAvailable} />)}
     </ul>}
     {deviceId !== undefined && groups.length > 0 && <ul className="machine-list">{groups.map(group => <li key={group.key} className="machine-card machine-card-detail">
       <MachineHead group={group} />

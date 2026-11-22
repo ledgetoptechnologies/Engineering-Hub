@@ -80,7 +80,7 @@ function DeviceListPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }
   const [creating, setCreating] = useState(false);
   const [load, refresh] = useRead<DeviceList>(hub, signal => client.list(signal, retired), [client, retired, hub.data]);
   // Machine health has its own admission: someone refused the device list may still read metrics, and it hides itself otherwise.
-  if (load.state === "unavailable") return <Unavailable actions={actions}><MachineHealth hub={hub} reading={reading} /></Unavailable>;
+  if (load.state === "unavailable") return <Unavailable actions={actions}><MachineHealth hub={hub} reading={reading} inventoryReadAvailable={false} /></Unavailable>;
   const list = load.state === "loaded" ? load.value : null;
   const shown = (list?.items ?? []).filter(device => filter === "all" ? true
     : filter === "maintenance" ? device.open_maintenance !== null : needsAttention(device, now));
@@ -119,7 +119,7 @@ function DeviceListPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }
         {shown.map(device => <DeviceRow key={device.id} device={device} now={now} self={hub.session?.actor ?? null} />)}
       </ul>}
     </section>
-    <MachineHealth hub={hub} reading={reading} />
+    <MachineHealth hub={hub} reading={reading} inventoryReadAvailable={load.state === "loaded"} />
   </>;
 }
 

@@ -1,6 +1,8 @@
 import type { MachineGroup } from "./infrastructureMetrics";
 
 export const MACHINE_ORDER_STORAGE_KEY = "engineering-hub.machine-order.v1";
+export const MACHINE_ORDER_DEMO_STORAGE_KEY = `${MACHINE_ORDER_STORAGE_KEY}.demo`;
+export type MachineOrderScope = { mode: "demo" } | { mode: "live"; actor: string | null };
 export const DEFAULT_MACHINE_ORDER = ["main pc", "cluster pc", "hermes", "staging", "sync pi", "dns"] as const;
 const MAX_NAMES = 50;
 const MAX_NAME_LENGTH = 100;
@@ -32,10 +34,17 @@ export function sortMachineGroups(groups: MachineGroup[], order: readonly string
     || a.key.localeCompare(b.key));
 }
 
-export function readMachineOrder(storage?: Pick<Storage, "getItem">): string[] {
+export function machineOrderStorageKey(scope: MachineOrderScope): string | null {
+  if (scope.mode === "demo") return MACHINE_ORDER_DEMO_STORAGE_KEY;
+  return scope.actor ? `${MACHINE_ORDER_STORAGE_KEY}.live.${encodeURIComponent(scope.actor)}` : null;
+}
+
+export function readMachineOrder(scope: MachineOrderScope, storage?: Pick<Storage, "getItem">): string[] {
   try {
+    const key = machineOrderStorageKey(scope);
+    if (!key) return [...DEFAULT_MACHINE_ORDER];
     const local = storage ?? (typeof window === "undefined" ? undefined : window.localStorage);
-    const raw = local?.getItem(MACHINE_ORDER_STORAGE_KEY);
+    const raw = local?.getItem(key);
     if (raw === undefined || raw === null) return [...DEFAULT_MACHINE_ORDER];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed) || parsed.length > MAX_NAMES || parsed.some(value => typeof value !== "string" || value.length > MAX_NAME_LENGTH))
@@ -44,9 +53,11 @@ export function readMachineOrder(storage?: Pick<Storage, "getItem">): string[] {
   } catch { return [...DEFAULT_MACHINE_ORDER]; }
 }
 
-export function writeMachineOrder(order: string[], storage?: Pick<Storage, "setItem">): void {
+export function writeMachineOrder(order: string[], scope: MachineOrderScope, storage?: Pick<Storage, "setItem">): void {
   try {
+    const key = machineOrderStorageKey(scope);
+    if (!key) return;
     const local = storage ?? (typeof window === "undefined" ? undefined : window.localStorage);
-    local?.setItem(MACHINE_ORDER_STORAGE_KEY, JSON.stringify(normalizedNames(order)));
+    local?.setItem(key, JSON.stringify(normalizedNames(order)));
   } catch { /* Browser storage can be disabled; ordering still works for this page session. */ }
 }
