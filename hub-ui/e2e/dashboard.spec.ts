@@ -702,6 +702,104 @@ test("live task creation uses browser session, same-origin request and CSRF with
   }
 });
 
+test("Needs Me browser alerts opt in and announce fresh background items once without private text", async ({ page }) => {
+  await controllableEvents(page);
+  await page.addInitScript(() => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" });
+    const captured: unknown[] = [];
+    Object.assign(window, { __needsMeAlerts: captured, Notification: class {
+      static permission = "default";
+      static async requestPermission() { this.permission = "granted"; return this.permission; }
+      constructor(title: string, options: NotificationOptions) { captured.push({ title, options }); }
+      close() {}
+    } });
+  });
+  const mock = await mockLive(page, { events: true });
+  await page.goto("/#/inbox");
+  await expect(page.getByText("Snapshot unverified", { exact: true })).toBeVisible();
+  await emit(page, "invalidate");
+  await expect(page.getByText("Event feed connected", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Enable browser alerts" }).click();
+  await expect(page.getByRole("button", { name: "Disable browser alerts" })).toBeVisible();
+  const alerts = () => page.evaluate(() => (window as any).__needsMeAlerts);
+  expect(await alerts()).toEqual([]);
+  const original = mock.overview.decisions.find((item) => item.status === "open")!;
+  mock.overview.decisions.push({ ...original, id: "fresh-private-item", title: "Private decision text" });
+  await emit(page, "invalidate");
+  await expect(page.getByRole("heading", { name: "Private decision text", exact: true })).toBeVisible();
+  await expect.poll(alerts).toEqual([{
+    title: "Engineering Hub needs your attention",
+    options: { body: "Open Engineering Hub to view your inbox.", tag: "engineering-hub-needs-me" },
+  }]);
+  const reads = mock.reads();
+  await emit(page, "invalidate");
+  await expect.poll(mock.reads).toBeGreaterThan(reads);
+  await expect(page.getByText("Event feed connected", { exact: true })).toBeVisible();
+  expect(await alerts()).toHaveLength(1);
+});
+
+for (const deferredPermission of [false, true] as const) {
+  test(`stale opt-in baselines reconnect items (${deferredPermission ? "permission pending" : "permission granted"})`, async ({ page }: { page: Page }) => {
+    await controllableEvents(page);
+    await page.addInitScript((delayPermission) => {
+      Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" });
+      const captured: unknown[] = [];
+      Object.assign(window, { __needsMeAlerts: captured, Notification: class {
+        static permission = "default";
+        static requestPermission() {
+          if (!delayPermission) {
+            this.permission = "granted";
+            return Promise.resolve("granted" as NotificationPermission);
+          }
+          return new Promise<NotificationPermission>((resolve) => {
+            (window as any).__resolveNotificationPermission = () => {
+              this.permission = "granted";
+              resolve("granted");
+            };
+          });
+        }
+        constructor(title: string, options: NotificationOptions) { captured.push({ title, options }); }
+        close() {}
+      } });
+    }, deferredPermission);
+    const mock = await mockLive(page, { events: true });
+    await page.goto("/#/inbox");
+    await expect(page.getByText("Snapshot unverified", { exact: true })).toBeVisible();
+    await emit(page, "invalidate");
+    await expect(page.getByText("Event feed connected", { exact: true })).toBeVisible();
+    const alerts = () => page.evaluate(() => (window as any).__needsMeAlerts);
+    const original = mock.overview.decisions.find((item) => item.status === "open")!;
+
+    await emit(page, "error");
+    await expect(page.getByText("Snapshot unverified", { exact: true })).toBeVisible();
+    mock.overview.decisions.push({ ...original, id: "opened-while-offline", title: "Already open before opt-in" });
+    await page.getByRole("button", { name: "Enable browser alerts" }).click();
+    if (deferredPermission)
+      await expect.poll(() => page.evaluate(() => typeof (window as any).__resolveNotificationPermission)).toBe("function");
+    else await expect(page.getByRole("button", { name: "Disable browser alerts" })).toBeVisible();
+
+    await emit(page, "open");
+    await emit(page, "invalidate");
+    await expect(page.getByRole("heading", { name: "Already open before opt-in", exact: true })).toBeVisible();
+    expect(await alerts()).toEqual([]);
+    if (deferredPermission) {
+      await page.evaluate(() => (window as any).__resolveNotificationPermission());
+      await expect(page.getByRole("button", { name: "Disable browser alerts" })).toBeVisible();
+    }
+
+    mock.overview.decisions.push({ ...original, id: "opened-after-baseline", title: "New live item" });
+    await emit(page, "invalidate");
+    await expect.poll(alerts).toEqual([{
+      title: "Engineering Hub needs your attention",
+      options: { body: "Open Engineering Hub to view your inbox.", tag: "engineering-hub-needs-me" },
+    }]);
+    const reads = mock.reads();
+    await emit(page, "invalidate");
+    await expect.poll(mock.reads).toBeGreaterThan(reads);
+    expect(await alerts()).toHaveLength(1);
+  });
+}
+
 test("SSE invalidation refetches, loss marks routes stale and disables mutations without polling", async ({
   page,
 }) => {
