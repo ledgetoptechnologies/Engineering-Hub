@@ -336,3 +336,293 @@ def test_transport_construction_failure_releases_inventory_owner(tmp_path, monke
     ('GET', '/infrastructure/synthetic-pc/extra', False)])
 def test_gateway_surface_is_closed(method, path, expected):
     assert browser_route_allowed(method, path) is expected
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='Real Inventory and agent-session ownership')
+@pytest.mark.asyncio
+@pytest.mark.parametrize('operator_grant', ['absent', 'omitted', 'read_only', 'granted'])
+async def test_cloudflare_inventory_owner_override_through_signed_gateways(tmp_path, monkeypatch, operator_grant):
+    import base64
+    import hashlib
+    import time
+    from urllib.parse import parse_qs, urlsplit
+
+    import httpx
+    import jwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    from agent_message_bus.agent_sessions_config import AgentSessionsConfig
+    from agent_message_bus.app import create_app as create_bus
+    from engineering_hub import cloudflare_access as access
+    from engineering_hub.infrastructure_discovery_metrics import ALL_QUERIES
+    from engineering_hub.infrastructure_metrics import MetricsReader
+    from engineering_hub.infrastructure_prometheus import TARGET_PATH
+    from engineering_hub.private_gateway import PrivateBrowserGateway, PublicBrowserGateway
+
+    origin = 'https://hub.test'
+    issuer = 'https://fixture.cloudflareaccess.com'
+    audience = 'fixture-infrastructure'
+    owner_email = 'owner@example.test'
+    project_email = 'project@example.test'
+    agent_owner_email = 'agent-owner@example.test'
+    _cloudflare_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv('HUB_CF_ACCESS_ALLOWED_EMAILS', ','.join((owner_email, project_email, agent_owner_email)))
+
+    def cloudflare_actor(subject):
+        binding = '\0'.join((issuer, audience, subject))
+        return 'human:cf:' + hashlib.sha256(binding.encode()).hexdigest()
+
+    browser_owner = cloudflare_actor('inventory-owner')
+    session_owner = cloudflare_actor('legacy-agent-owner')
+    monkeypatch.setenv('HUB_INFRASTRUCTURE_OWNER', browser_owner)
+    agent_auth = AuthSettings('test-hermes', 'test-codex', claude_token='test-claude',
+                              allowed_ips=frozenset({'127.0.0.1'}))
+    settings = replace(Settings.from_env(), agent_auth=agent_auth)
+    if operator_grant != 'absent':
+        assert settings.infrastructure_config_path is not None
+        grants = {
+            'omitted': [(session_owner, ['read'])],
+            'read_only': [(browser_owner, ['read'])],
+            'granted': [(browser_owner, ['read', 'metrics_read', 'device_write'])],
+        }[operator_grant]
+        settings.infrastructure_config_path.write_text(json.dumps({
+            'schema_version': 1, 'enabled': True,
+            'principals': [{'kind': 'human', 'identity': identity, 'capabilities': capabilities}
+                           for identity, capabilities in grants],
+            'prometheus': {'address': '192.0.2.20', 'port': 9090},
+        }))
+        settings.infrastructure_config_path.chmod(0o600)
+    session_config = AgentSessionsConfig(tmp_path / 'agent-sessions.sqlite3', session_owner,
+                                         origin, environment='staging')
+    transport_security = TransportSecuritySettings(allowed_hosts=['hub.test'],
+                                                    allowed_origins=[origin])
+    bus = create_bus(db_path=tmp_path / 'bus.sqlite3', audit_path=tmp_path / 'audit.jsonl',
+        file_root=tmp_path / 'files', auth=agent_auth, startup_cleanup=False,
+        push_events_operational=False, transport_security_settings=transport_security,
+        agent_sessions_config=session_config)
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    from jwt.algorithms import RSAAlgorithm
+    jwk = json.loads(RSAAlgorithm.to_jwk(private_key.public_key()))
+    jwk.update(kid='fixture-key', alg='RS256', use='sig')
+    def signing_keys(request):
+        assert str(request.url) == issuer + '/cdn-cgi/access/certs'
+        assert 'authorization' not in request.headers
+        return httpx.Response(200, json={'keys': [jwk]})
+    cloudflare_config = settings.auth_config.cloudflare_config
+    assert cloudflare_config is not None
+    verifier = access.CloudflareAccessVerifier(cloudflare_config,
+        transport=httpx.MockTransport(signing_keys))
+    monkeypatch.setattr(access, 'CloudflareAccessVerifier', lambda _: verifier)
+    monkeypatch.setattr('engineering_hub.ingress.CloudflareAccessVerifier', lambda _: verifier)
+    app = create_app(settings, bus_app=bus)
+    assert bus.state.agent_sessions.owner == session_owner
+    assert app.state.infrastructure.state == 'ready'
+    assert app.state.installation_scopes.sessions.owner == session_owner
+
+    def assertion(subject, email):
+        now = int(time.time())
+        return jwt.encode({'iss': issuer, 'aud': [audience], 'sub': subject,
+            'email': email, 'type': 'app', 'iat': now - 1, 'exp': now + 300},
+            private_key, algorithm='RS256', headers={'kid': 'fixture-key'})
+
+    def installation_token(name, kind):
+        credential = 'ehi_' + base64.urlsafe_b64encode(hashlib.sha256(name.encode()).digest()).decode().rstrip('=')
+        row = bus.state.agent_sessions.request_enrollment('codex', name, 'synthetic-host',
+            hashlib.sha256(credential.encode()).hexdigest())
+        bus.state.agent_sessions.approve(session_owner, row['id'], row['revision'], until_revoked=True)
+        app.state.installation_scopes.set(session_owner, row['id'], 0, kind)
+        return bus.state.agent_sessions.exchange(credential)['token']
+
+    internal_token = installation_token('internal-metrics-fixture', 'internal')
+    project_only_token = installation_token('project-metrics-fixture', 'project_only')
+    calls = []
+    stamp = datetime.now(timezone.utc).isoformat()
+    by_query = {query: (kind, key) for kind, key, query in ALL_QUERIES}
+    async def synthetic_prometheus(reader, client, path, budget):
+        calls.append(path)
+        if path == TARGET_PATH:
+            return json.dumps({'status': 'success', 'data': {'activeTargets': [{
+                'labels': {'job': 'node', 'instance': '192.0.2.1:9100', 'host': '192.0.2.1'},
+                'health': 'up', 'lastScrape': stamp, 'scrapeInterval': '1m'}]}}).encode()
+        query = parse_qs(urlsplit(path).query)['query'][0]
+        kind, key = by_query[query]
+        value = {'cpu': '0.25', 'mem_total': '1024', 'mem_available': '256', 'uptime': '42'}.get(key) if kind == 'node' else None
+        series = [] if value is None else [{'metric': {'job': 'node', 'instance': '192.0.2.1:9100'},
+                                            'value': [0, value]}]
+        return json.dumps({'status': 'success', 'data': {'resultType': 'vector', 'result': series}}).encode()
+    monkeypatch.setattr(MetricsReader, '_get', synthetic_prometheus)
+
+    async with app.router.lifespan_context(app):
+        private = PrivateBrowserGateway(app, agent_auth=agent_auth,
+                                        cloudflare_config=cloudflare_config)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=private), base_url=origin) as private_client:
+            gateway = PublicBrowserGateway(private_client)
+
+            async def sign_in(subject: str, email: str) -> tuple[httpx.AsyncClient, dict]:
+                client = httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway), base_url=origin,
+                    headers={'Cf-Access-Jwt-Assertion': assertion(subject, email)}, follow_redirects=False)
+                boot = await client.post('/api/hub/v1/auth/bootstrap', headers={'Origin': origin})
+                assert boot.status_code == 200, boot.text
+                me = await client.get('/api/hub/v1/auth/me')
+                assert me.status_code == 200 and me.json()['authenticated'] is True
+                return client, me.json()
+
+            owner, owner_me = await sign_in('inventory-owner', owner_email)
+            assert owner_me['actor'] == browser_owner
+            owner_headers = {'Origin': origin, 'X-Hub-CSRF': owner_me['csrf_token']}
+            overview = await owner.get('/api/hub/v1/overview')
+            assert overview.status_code == 200
+            if operator_grant in {'omitted', 'read_only'}:
+                assert overview.json()['capabilities']['infrastructure'] is (operator_grant == 'read_only')
+                for path in ('metrics', 'metrics/history'):
+                    denied = await owner.get('/api/hub/v1/infrastructure/' + path)
+                    assert denied.status_code == 403, denied.text
+                assert calls == []
+                await owner.aclose()
+                return
+            assert overview.json()['capabilities']['infrastructure'] is True
+            saved = await owner.put('/api/hub/v1/infrastructure/devices/synthetic-pc', headers=owner_headers,
+                json={'name': 'Synthetic PC', 'hostname': 'pc.example.test', 'metrics_host': '192.0.2.1',
+                      'addresses': ['192.0.2.1'], 'network': '192.0.2.0/24', 'vlan': None,
+                      'role': 'Fixture', 'retired': False, 'expected_revision': 0})
+            assert saved.status_code == 200, saved.text
+            metrics = await owner.get('/api/hub/v1/infrastructure/metrics')
+            assert metrics.status_code == 200, metrics.text
+            assert metrics.json()['schema_version'] == 3
+            assert metrics.json()['source']['status'] == 'ok'
+            assert metrics.json()['devices'][0]['device_id'] == 'synthetic-pc'
+            assert metrics.json()['devices'][0]['cpu_busy_ratio'] == 0.25
+            assert len(calls) == 1 + len(by_query)
+
+            # A future project-only Access user and the prior agent-session
+            # owner are authenticated humans, but neither is the Inventory owner.
+            project_only, project_me = await sign_in('future-project-user', project_email)
+            old_owner, old_owner_me = await sign_in('legacy-agent-owner', agent_owner_email)
+            assert project_me['actor'] != browser_owner and old_owner_me['actor'] == session_owner
+            for client in (project_only, old_owner):
+                projects = await client.get('/api/hub/v1/projects')
+                other_overview = await client.get('/api/hub/v1/overview')
+                other_metrics = await client.get('/api/hub/v1/infrastructure/metrics')
+                assert projects.status_code == 200
+                assert other_overview.json()['capabilities']['infrastructure'] is False
+                assert other_metrics.status_code == 403
+                await client.aclose()
+
+            # The override is browser-only: legacy family bearers and the old
+            # session owner's explicitly classified installations retain their authority.
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as agents:
+                assert (await agents.get('/api/hub/v1/infrastructure/metrics',
+                    headers={'Authorization': 'Bearer test-hermes'})).status_code == 200
+                assert (await agents.get('/api/hub/v1/infrastructure/metrics',
+                    headers={'Authorization': 'Bearer ' + internal_token})).status_code == 200
+                assert (await agents.get('/api/hub/v1/infrastructure/metrics',
+                    headers={'Authorization': 'Bearer ' + project_only_token})).status_code == 403
+            await owner.aclose()
+
+    with sqlite3.connect(session_config.database) as db:
+        assert db.execute('SELECT owner FROM session_owner WHERE singleton=1').fetchone()[0] == session_owner
+    # Reopening the same persisted session ledger remains pinned to its original owner.
+    restarted_bus = create_bus(db_path=tmp_path / 'bus.sqlite3', audit_path=tmp_path / 'audit.jsonl',
+        file_root=tmp_path / 'files', auth=agent_auth, startup_cleanup=False,
+        push_events_operational=False, transport_security_settings=transport_security,
+        agent_sessions_config=session_config)
+    assert restarted_bus.state.agent_sessions.owner == session_owner
+
+    # Invalid operator config leaves recovery navigation with only the explicit
+    # browser Inventory owner, without opening data or changing agent ownership.
+    recovery_root = tmp_path / 'recovery'
+    recovery_root.mkdir(mode=0o700)
+    recovery_config = recovery_root / 'infrastructure.json'
+    recovery_config.write_bytes(b'not-json')
+    recovery_config.chmod(0o600)
+    recovery_settings = replace(settings, database=recovery_root / 'hub.sqlite3',
+        infrastructure_config_path=recovery_config, infrastructure_default_path=recovery_config,
+        staging_config_path=recovery_root / 'staging-service.json')
+    recovery_bus = create_bus(db_path=recovery_root / 'bus.sqlite3',
+        audit_path=recovery_root / 'audit.jsonl', file_root=recovery_root / 'files',
+        auth=agent_auth, startup_cleanup=False, push_events_operational=False,
+        transport_security_settings=transport_security, agent_sessions_config=session_config)
+    recovery_app = create_app(recovery_settings, bus_app=recovery_bus)
+    assert recovery_app.state.infrastructure.state == 'invalid'
+    async with recovery_app.router.lifespan_context(recovery_app):
+        private = PrivateBrowserGateway(recovery_app, agent_auth=agent_auth,
+                                        cloudflare_config=cloudflare_config)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=private), base_url=origin) as private_client:
+            gateway = PublicBrowserGateway(private_client)
+            async def recovery_sign_in(subject: str, email: str) -> httpx.AsyncClient:
+                client = httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway), base_url=origin,
+                    headers={'Cf-Access-Jwt-Assertion': assertion(subject, email)}, follow_redirects=False)
+                boot = await client.post('/api/hub/v1/auth/bootstrap', headers={'Origin': origin})
+                assert boot.status_code == 200, boot.text
+                return client
+
+            recovery_owner = await recovery_sign_in('inventory-owner', owner_email)
+            recovery_metrics = await recovery_owner.get('/api/hub/v1/infrastructure/metrics')
+            recovery_overview = await recovery_owner.get('/api/hub/v1/overview')
+            assert recovery_overview.json()['capabilities']['infrastructure'] is True
+            assert recovery_metrics.status_code == 503
+            old_session_owner = await recovery_sign_in('legacy-agent-owner', agent_owner_email)
+            assert (await old_session_owner.get('/api/hub/v1/overview')).json()['capabilities']['infrastructure'] is False
+            await recovery_owner.aclose()
+            await old_session_owner.aclose()
+    assert not (recovery_root / 'infrastructure').exists()
+
+
+def _cloudflare_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv('HUB_DB', str(tmp_path / 'hub.sqlite3'))
+    monkeypatch.setenv('HUB_BASE_URL', 'https://hub.test')
+    monkeypatch.setenv('HUB_HUMAN_AUTH_MODE', 'cloudflare_access')
+    monkeypatch.setenv('HUB_CF_ACCESS_ISSUER', 'https://fixture.cloudflareaccess.com')
+    monkeypatch.setenv('HUB_CF_ACCESS_AUDIENCE', 'fixture-infrastructure')
+    monkeypatch.setenv('HUB_CF_ACCESS_ALLOWED_EMAILS', 'owner@example.test,project@example.test')
+    monkeypatch.setenv('HERMES_TOKEN', 'test-hermes')
+    monkeypatch.setenv('CODEX_TOKEN', 'test-codex')
+    monkeypatch.setenv('CLAUDE_TOKEN', 'test-claude')
+    monkeypatch.delenv('AGENT_BUS_DB', raising=False)
+
+
+def test_settings_reads_exact_cloudflare_infrastructure_owner(monkeypatch, tmp_path):
+    _cloudflare_environment(monkeypatch, tmp_path)
+    owner = 'human:cf:' + 'a' * 64
+    monkeypatch.setenv('HUB_INFRASTRUCTURE_OWNER', owner)
+
+    config = Settings.from_env()
+
+    assert getattr(config, 'infrastructure_browser_owner', None) == owner
+    with pytest.raises(ValueError, match='HUB_INFRASTRUCTURE_OWNER'):
+        replace(config, infrastructure_browser_owner='human:42')
+
+
+def test_settings_without_override_preserves_existing_selection(monkeypatch, tmp_path):
+    _cloudflare_environment(monkeypatch, tmp_path)
+    monkeypatch.delenv('HUB_INFRASTRUCTURE_OWNER', raising=False)
+
+    config = Settings.from_env()
+
+    assert config.infrastructure_browser_owner is None
+
+
+@pytest.mark.parametrize('owner', [
+    '', 'owner@example.test', 'human:42', 'human:cf:abc',
+    'human:cf:' + 'A' * 64, 'human:cf:' + 'a' * 64 + ' ',
+])
+def test_settings_rejects_malformed_cloudflare_infrastructure_owner(monkeypatch, tmp_path, owner):
+    _cloudflare_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv('HUB_INFRASTRUCTURE_OWNER', owner)
+
+    with pytest.raises(ValueError, match='HUB_INFRASTRUCTURE_OWNER'):
+        Settings.from_env()
+
+
+def test_settings_rejects_cloudflare_infrastructure_owner_in_github_mode(monkeypatch, tmp_path):
+    _cloudflare_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv('HUB_HUMAN_AUTH_MODE', 'github')
+    monkeypatch.delenv('HUB_CF_ACCESS_ISSUER', raising=False)
+    monkeypatch.delenv('HUB_CF_ACCESS_AUDIENCE', raising=False)
+    monkeypatch.delenv('HUB_CF_ACCESS_ALLOWED_EMAILS', raising=False)
+    monkeypatch.setenv('HUB_INFRASTRUCTURE_OWNER', 'human:cf:' + 'a' * 64)
+
+    with pytest.raises(ValueError, match='HUB_INFRASTRUCTURE_OWNER'):
+        Settings.from_env()

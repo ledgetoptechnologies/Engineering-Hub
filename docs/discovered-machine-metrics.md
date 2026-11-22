@@ -7,13 +7,23 @@ Prometheus connection, or staging deployment/rollback acceptance.
 ## Setup and access
 
 When no operator `infrastructure.json` exists and no explicit settings path was
-selected, the app uses its configured connection owner (or explicit GitHub owner)
-to initialize the ordinary inventory in its existing state directory. The owner
-gets the Infrastructure page without creating a settings file. Legacy internal
-agents get inventory reads, not automatic write permissions. An existing settings
-file takes precedence, including `enabled: false`.
-Without either a configured connection owner or an explicit GitHub owner, this
-automatic setup stays disabled. Browser metrics also require a known owner.
+selected, the app selects its browser Inventory owner in this order:
+
+1. Optional `HUB_INFRASTRUCTURE_OWNER` when Cloudflare Access is the human auth mode.
+   Set the exact actor reported by the authenticated `/api/hub/v1/auth/me` response,
+   in the form `human:cf:<64 lowercase hex characters>`; never use an email or an
+   Access allowlist as the Inventory owner.
+2. The existing configured agent-session owner, if present.
+3. The explicit GitHub owner in GitHub auth mode, if configured.
+
+The override supplies default Inventory grants only when the operator file is
+absent. It does not change `HUB_AGENT_SESSIONS_OWNER`, installation-scope authority,
+or grants in an existing `infrastructure.json`; that file always takes precedence,
+including `enabled: false`. With no override, existing owner selection is unchanged.
+Without an eligible selected owner, automatic setup stays disabled. Browser metrics
+require an exact selected owner. When using the override, a valid operator file
+must explicitly grant that actor `metrics_read` to enable current metrics or history;
+the generated defaults include that grant when there is no operator file.
 
 Discovery needs one trusted literal-IP Prometheus origin. The optional settings
 object accepts `{"address":"192.0.2.80","port":9090}` without a target mapping
