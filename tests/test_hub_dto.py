@@ -11,7 +11,7 @@ from engineering_hub.auth import AuthConfig
 from engineering_hub.autonomy import StagingRuntime
 from engineering_hub.dispatcher import StagingDispatcher
 from engineering_hub.dto import (
-    AutonomyDTO, DecisionDTO, OverviewDTO, PauseDTO, RunDTO, TaskDTO,
+    AutonomyDTO, DecisionDTO, DecisionListDTO, OverviewDTO, PauseDTO, RunDTO, TaskDTO,
 )
 from engineering_hub.fixture_workflow import FixtureTarget, FixtureWorkflow
 from engineering_hub.repository import HubRepository
@@ -96,13 +96,21 @@ def test_rest_overview_and_lists_preserve_exact_source_shapes(hub):
         assert_exact(OverviewDTO, overview)
         assert overview['tasks'] == repo.list_task_views()
         assert [{k: v for k, v in item.items() if k != 'state_since'} for item in overview['tasks']] == repo.list_tasks()
-        decision_view = dict(decision, requested_by='hermes')
-        assert overview['decisions'] == [decision_view]
+        assert overview['decisions'] == [decision]
         assert overview['runs'] == [run]
         assert overview['autonomy'] == {'configured': False, 'state': 'disabled', 'running': False, 'receipts': []}
-        for path, expected in [('tasks', repo.list_task_views()), ('decisions', [decision_view]), ('runs', [run])]:
+        for path, expected in [('tasks', repo.list_task_views()), ('decisions', [decision]), ('runs', [run])]:
             assert client.get(PREFIX + '/' + path, headers=HEADERS).json() == {'items': expected}
         assert client.get(PREFIX + '/tasks/' + task['id'], headers=HEADERS).json() == repo.get_task(task['id'])
+        session = app.state.sessions.create_session(42)
+        client.cookies.set(settings.auth_config.cookie_name, session['cookie_token'])
+        human_overview = client.get(PREFIX + '/overview').json()
+        human_decisions = client.get(PREFIX + '/decisions').json()
+        assert_exact(OverviewDTO, human_overview)
+        assert_exact(DecisionListDTO, human_decisions)
+        decision_view = dict(decision, requested_by='hermes')
+        assert human_overview['decisions'] == [decision_view]
+        assert human_decisions == {'items': [decision_view]}
 
 
 def test_openapi_response_objects_reference_closed_typed_schemas(hub):
