@@ -36,6 +36,40 @@ async function fixture(page: Page, tasks: Task[]) {
   return { overview, state };
 }
 
+test("Needs you and decision views name a paired requester family without guessing legacy identities", async ({ page }) => {
+  const installation = "installation:00000000-0000-4000-8000-000000000001";
+  const display = "Requested by Claude on install 00000000";
+  const task = waitingTask("Which region?", "2026-11-16T10:00:00Z", 3);
+  task.waiting_on = { ...task.waiting_on!, by: installation, by_family: "claude" };
+  const { overview, state } = await fixture(page, [{ ...task, owner: "codex" }]);
+  const question = { ...overview.decisions.find((item) => item.status === "open")!, project: "engineering-hub" };
+  const requested = { ...question, requested_by: installation, requested_by_family: "claude" as const };
+  const answered = { ...question, id: "11111111-2222-4333-8444-0000000000c2", title: "Answered paired question",
+    status: "answered" as const, answer: "A", answered_by: human, updated_at: "2026-11-17T10:00:00Z",
+    requested_by: installation, requested_by_family: "claude" as const };
+  const unknown = { ...question, id: "11111111-2222-4333-8444-0000000000c1", title: "Legacy question", requested_by: installation };
+  overview.decisions = [requested, unknown, answered];
+  await page.goto("/#/");
+  const preview = page.getByRole("region", { name: "Needs you" });
+  await expect(preview.getByRole("link", { name: /Which region\?/ })).toContainText(display);
+  await expect(preview.getByRole("link", { name: new RegExp(question.title) })).toContainText(display);
+  await expect(page.locator(".recent-answers")).toContainText(display);
+  await page.goto("/#/inbox");
+  await expect(page.locator("form.waiting-item")).toContainText(display);
+  await expect(page.locator("form.waiting-item")).not.toContainText("Codex");
+  const card = page.locator("form").filter({ has: page.getByRole("heading", { name: question.title, exact: true }) });
+  await expect(card).toContainText(display);
+  await card.getByRole("button", { name: "Open full view" }).click();
+  await expect(page.getByRole("dialog")).toContainText(display);
+  await page.keyboard.press("Escape");
+  await expect(page.locator("form").filter({ hasText: "Legacy question" })).toContainText("Requested by Install 00000000");
+  await page.goto("/#/projects/engineering-hub/decisions");
+  const projectCard = page.locator("form").filter({ has: page.getByRole("heading", { name: question.title, exact: true }) });
+  await expect(projectCard).toContainText(display);
+  await expect(page.locator("form").filter({ hasText: "Legacy question" })).toContainText("Requested by Install 00000000");
+  expect(state.posts).toEqual([]);
+});
+
 test("a draft written for one waiting item is not sent as the answer to the next item on the same task", async ({ page }) => {
   const { overview, state } = await fixture(page, [waitingTask("Item A: which domain?", "2026-11-16T10:00:00+00:00", 3)]);
   await page.goto("/#/inbox");

@@ -56,6 +56,32 @@ def claim_candidate(client, item):
     return response.json()
 
 
+def test_decision_overview_attributes_existing_question_to_original_requester(hub):
+    client, app, settings = hub
+    with app.state.repository._connection() as db:
+        assert not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_session_provenance'").fetchone()
+    payload = {"project": "3d-viewer", "title": "Which view?", "options": ["A", "B"]}
+    response = client.post(BASE + "/decisions", headers=agent_headers("claude"), json=payload)
+    assert response.status_code == 201
+    question = response.json()
+    for route, key in (("/overview", "decisions"), ("/decisions", "items")):
+        result = client.get(BASE + route, headers=agent_headers("codex"))
+        assert result.status_code == 200
+        assert next(item for item in result.json()[key] if item["id"] == question["id"]) == question
+    assert client.get(BASE + "/overview").status_code == 401
+    headers = human_headers(client, app, settings)
+    response = client.post(f"{BASE}/decisions/{question['id']}/answer", headers=headers,
+                           json={"expected_revision": question['revision'], "answer": "A"})
+    assert response.status_code == 200
+    for route, key in (("/overview", "decisions"), ("/decisions", "items")):
+        result = client.get(BASE + route)
+        assert result.status_code == 200
+        decision = next(item for item in result.json()[key] if item['id'] == question['id'])
+        assert decision['requested_by'] == 'claude'
+        assert 'requested_by_family' not in decision
+        assert decision['answered_by'] == 'human:42'
+
+
 def test_overview_requires_identity_and_has_explicit_unknown_readiness(hub):
     client, _, _ = hub
     assert client.get(BASE + "/overview").status_code == 401
@@ -259,7 +285,7 @@ def test_reopened_app_preserves_tasks_decisions_sessions_and_pause(hub):
         assert response.status_code == 200
         # The overview adds the audited state_since; it must survive a reopen.
         assert response.json()["tasks"] == [dict(item, state_since=item["updated_at"])]
-        assert response.json()["decisions"] == [decision]
+        assert response.json()["decisions"] == [dict(decision, requested_by="codex")]
         assert response.json()["paused"] is True
         assert reopened.get(BASE + "/auth/me").json()["actor"] == "human:42"
     assert len(reopened_app.state.repository.list_audit()) == 3

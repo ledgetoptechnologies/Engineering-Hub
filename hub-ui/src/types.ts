@@ -96,6 +96,9 @@ export interface Decision extends Versioned {
   status: "open" | "answered" | "withdrawn";
   answer: string | null;
   answered_by?: string;
+  requested_by?: string | null;
+  /** Recorded family from the authenticated creation audit for paired installations. */
+  requested_by_family?: Agent | null;
   /** True only when the server accepts a typed answer instead of one of the options. */
   allow_text?: boolean;
   /** Present on withdrawn records only: superseded work kept for history. */

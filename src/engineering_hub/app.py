@@ -1031,7 +1031,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 except (HubError, HTTPException):
                     pass
         return {"paused": repo.get_paused(), "projects": projects(),
-                "tasks": repo.list_task_views(), "decisions": repo.list_decisions(),
+                "tasks": repo.list_task_views(),
+                "decisions": repo.list_decision_views() if principal.startswith("human:") else repo.list_decisions(),
                 "runs": repo.list_runs(), "agents": await agents_for(), "autonomy": autonomy_for(),
                 "image_versions": image_versions_for(notes_repository),
                 "capabilities": {"production": False, "host_dispatch": False,
@@ -1116,8 +1117,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
 
     @app.get("/api/hub/v1/decisions", response_model=DecisionListDTO, response_model_exclude_unset=True)
     def list_decisions(request: Request):
-        actor(request)
-        return {"items": repo.list_decisions()}
+        principal = actor(request)
+        return {"items": repo.list_decision_views() if principal.startswith("human:") else repo.list_decisions()}
 
     @app.post("/api/hub/v1/decisions", status_code=201, response_model=DecisionDTO, response_model_exclude_unset=True)
     def create_decision(payload: NewDecision, request: Request):
