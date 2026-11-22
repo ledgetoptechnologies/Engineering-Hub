@@ -2,8 +2,9 @@
 
 Legacy family bearers are authenticated internal credentials. Per-PC bearers
 need an explicit owner-managed internal classification; connection approval
-alone is insufficient. Browser reads belong to the configured connection owner.
-No project grants, request labels or Prometheus data establish this authority.
+alone is insufficient. Browser Inventory reads belong to the separately
+configured Inventory owner; installation scopes remain bound to the agent-session
+owner. No project grants, request labels or Prometheus data establish authority.
 """
 import json
 
@@ -20,15 +21,21 @@ from .repository import AGENTS, HubError
 
 
 class MetricsAccess:
-    def __init__(self, service, auth, human, *, owner=None, scopes=None, connection_config=None):
+    def __init__(self, service, auth, human, *, owner=None, agent_owner=None,
+                 scopes=None, connection_config=None):
         if type(service) is not InfrastructureService or type(auth) is not AuthSettings or not callable(human):
             raise TypeError('explicit_metrics_admission_required')
         if scopes is not None and type(scopes) is not InstallationScopeRepository:
             raise TypeError('explicit_installation_scopes_required')
-        if scopes is not None and owner != scopes.sessions.owner:
-            raise ValueError('metrics_owner_mismatch')
+        if agent_owner is not None and (type(agent_owner) is not str or scopes is None):
+            raise ValueError('metrics_session_owner_mismatch')
+        if scopes is not None:
+            session_owner = owner if agent_owner is None else agent_owner
+            if type(session_owner) is not str or session_owner != scopes.sessions.owner:
+                raise ValueError('metrics_session_owner_mismatch')
         self.service, self.auth, self.human = service, auth, human
-        self.owner, self.scopes, self.connection_config = owner, scopes, connection_config
+        self.owner, self.agent_owner = owner, agent_owner
+        self.scopes, self.connection_config = scopes, connection_config
 
     def authorize(self, request):
         if not isinstance(request, Request):

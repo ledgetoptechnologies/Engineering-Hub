@@ -61,12 +61,19 @@ class Settings:
     staging_config_path: Path | None = None
     infrastructure_config_path: Path | None = None
     infrastructure_default_path: Path | None = None
+    infrastructure_browser_owner: str | None = None
 
     def __post_init__(self):
         if type(self.require_owned_ledger) is not bool:
             raise ValueError('Explicit owned-ledger flag required')
         if self.infrastructure_default_path is not None and not isinstance(self.infrastructure_default_path, Path):
             raise ValueError('Infrastructure default path must be a Path')
+        if self.infrastructure_browser_owner is not None and (
+                type(self.infrastructure_browser_owner) is not str
+                or self.auth_config.human_auth_mode != 'cloudflare_access'
+                or self.auth_config.cloudflare_config is None
+                or re.fullmatch(r'human:cf:[0-9a-f]{64}', self.infrastructure_browser_owner) is None):
+            raise ValueError('HUB_INFRASTRUCTURE_OWNER must be an exact Cloudflare human actor')
         if self.require_owned_ledger:
             from .protected_layout import database_path
             if self.database != database_path():
@@ -144,7 +151,8 @@ class Settings:
                    infrastructure_config_path=(deployment.state_root / 'infrastructure.json'
                                         if deployment is not None else path.parent / 'infrastructure.json'),
                    infrastructure_default_path=(deployment.state_root / 'infrastructure.json'
-                                        if deployment is not None else path.parent / 'infrastructure.json'))
+                                        if deployment is not None else path.parent / 'infrastructure.json'),
+                   infrastructure_browser_owner=os.environ.get('HUB_INFRASTRUCTURE_OWNER'))
 
 
 class Input(BaseModel):
@@ -529,14 +537,21 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 'id': '00000000-0000-0000-0000-000000000000', 'revision': 0,
                 'updated_at': datetime.now(timezone.utc).isoformat()})
 
-    metrics_owner = (connection_service.owner if connection_service is not None else
-                     'human:' + str(settings.auth_config.beau_github_id)
-                     if settings.auth_config.human_auth_mode == 'github'
-                     and settings.auth_config.beau_github_id is not None else None)
+    # One selected Inventory browser owner drives default grants, sidebar,
+    # metrics and recovery navigation. Agent-session ownership stays independent.
+    if settings.infrastructure_browser_owner is not None:
+        inventory_browser_owner = settings.infrastructure_browser_owner
+    elif connection_service is not None:
+        inventory_browser_owner = connection_service.owner
+    elif (settings.auth_config.human_auth_mode == 'github'
+            and settings.auth_config.beau_github_id is not None):
+        inventory_browser_owner = 'human:' + str(settings.auth_config.beau_github_id)
+    else:
+        inventory_browser_owner = None
     infrastructure = compose_infrastructure(
         settings.infrastructure_config_path or Path(settings.database).parent / 'infrastructure.json',
         state_root=Path(settings.database).parent, on_change=infrastructure_changed,
-        default_owner=metrics_owner if (settings.infrastructure_config_path is None
+        default_owner=inventory_browser_owner if (settings.infrastructure_config_path is None
                                         or settings.infrastructure_config_path == settings.infrastructure_default_path) else None)
     metrics_access = None
 
@@ -774,7 +789,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         from .infrastructure_metrics_access import MetricsAccess, register_metrics_tool
         from .infrastructure_discovery_metrics import DiscoveryMetricsReader
         metrics_access = MetricsAccess(infrastructure.service, settings.agent_auth, human,
-            owner=metrics_owner,
+            owner=inventory_browser_owner,
+            agent_owner=connection_service.owner if connection_service is not None else None,
             scopes=installation_scopes, connection_config=connection_config)
         infrastructure.metrics = DiscoveryMetricsReader(infrastructure.service,
             infrastructure.prometheus_origin, authorize=metrics_access.authorize,
@@ -1017,7 +1033,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         principal = actor(request)
         # Keep the recovery page discoverable for the configured owner if inventory startup fails.
         # Device and metric routes still enforce their existing authorization and readiness.
-        infrastructure_visible = infrastructure.state == 'invalid' and principal == metrics_owner
+        infrastructure_visible = (infrastructure.state == 'invalid'
+                                  and principal == inventory_browser_owner)
         if infrastructure.service is not None:
             try:
                 infrastructure.service.require(principal)

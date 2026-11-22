@@ -54,6 +54,29 @@ def test_explicit_app_defaults_need_no_file_and_preserve_operator_disable(tmp_pa
 
 
 @POSIX
+def test_explicit_inventory_grants_are_not_widened_by_browser_owner_default(tmp_path):
+    owner = 'human:cf:' + 'a' * 64
+    explicit_config = config()
+    explicit_config['principals'] = []
+    path = write(tmp_path / 'explicit.json', explicit_config)
+    explicit_state = tmp_path / 'explicit-state'
+    explicit_state.mkdir(mode=0o700)
+    module = compose_infrastructure(path, state_root=explicit_state, default_owner=owner)
+    assert module.state == 'ready' and module.service is not None
+    with pytest.raises(HubError, match='forbidden'):
+        module.service.require(owner)
+    module.close()
+
+    disabled_state = tmp_path / 'disabled-state'
+    disabled_state.mkdir(mode=0o700)
+    disabled = compose_infrastructure(write(tmp_path / 'disabled-override.json', config(False)),
+        state_root=disabled_state, default_owner=owner)
+    assert disabled.state == 'disabled' and disabled.service is None
+    disabled.close()
+    assert not (disabled_state / 'infrastructure').exists()
+
+
+@POSIX
 def test_prometheus_origin_without_mapping_list_is_valid(tmp_path):
     value = config()
     value['prometheus'] = {'address': '192.0.2.80', 'port': 9090}
