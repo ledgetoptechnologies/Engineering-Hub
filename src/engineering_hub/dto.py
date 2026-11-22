@@ -160,6 +160,7 @@ class DecisionDTO(EntityDTO):
     execution_authorization: Literal[False]
     answered_by: HumanId | None = None
     requested_by: WithdrawnBy | None = None
+    requested_by_family: AgentId | None = None
     details: str | None = None
     links: list[ContextLinkDTO] | None = None
     allow_text: bool = False

@@ -79,7 +79,7 @@ function QuestionView({ hub, decision, draft, setDraft, focus, onClose }: {
         <div className="question-side">
           <div className="item-overline">
             <a className="project-chip" href={link(`/projects/${decision.project}`)}>{hub.projectName(decision.project)}</a>
-            <span>{requesterLabel(decision.requested_by, { viewer: hub.session?.actor })}</span>
+            <span>{requesterLabel(decision.requested_by, { family: decision.requested_by_family, viewer: hub.session?.actor })}</span>
           <span>REV {decision.revision}</span>
           </div>
           {context?.summary.trim() && <div className="item-summary"><Markdown source={context.summary} /></div>}
@@ -107,7 +107,7 @@ function DecisionForm({ hub, decision, draft, setDraft, onOpenFull, onWithdraw, 
       {!full && <>
         <div className="item-overline">
           <a className="project-chip" href={link(`/projects/${decision.project}`)}>{hub.projectName(decision.project)}</a>
-          <span>{requesterLabel(decision.requested_by, { viewer: hub.session?.actor })}</span>
+          <span>{requesterLabel(decision.requested_by, { family: decision.requested_by_family, viewer: hub.session?.actor })}</span>
           <span>REV {decision.revision}</span>
           {onOpenFull && <button type="button" className="link-button open-full" onClick={() => onOpenFull()}>Open full view</button>}
         </div>
@@ -177,7 +177,7 @@ export function RecentAnswers({ hub, decisions }: { hub: Hub; decisions: Decisio
         <div className="recent-answer" key={decision.id}>
           <strong>{decision.title}</strong>
           <small>
-            {hub.projectName(decision.project)} · {requesterLabel(decision.requested_by, { viewer: hub.session?.actor })} · Answered{" "}
+            {hub.projectName(decision.project)} · {requesterLabel(decision.requested_by, { family: decision.requested_by_family, viewer: hub.session?.actor })} · Answered{" "}
             {answeredBy(decision.answered_by, hub.session?.actor)}{" "}
             {observationTime(decision.updated_at) ?? ""}
           </small>

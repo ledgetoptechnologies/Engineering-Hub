@@ -824,15 +824,33 @@ class HubRepository:
         # Read the original authenticated creator, not the last editor or answerer.
         # One batched read covers old decisions without rewriting stored records.
         with self._connection() as db:
-            rows = db.execute("""WITH creation AS (
+            has_provenance = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_session_provenance'"
+            ).fetchone() is not None
+            family = 'p.family AS creator_family' if has_provenance else 'NULL AS creator_family'
+            provenance_join = ("LEFT JOIN hub_session_provenance p ON p.audit_sequence=a.sequence "
+                               "AND a.actor='installation:' || p.installation_id") if has_provenance else ''
+            rows = db.execute(f"""WITH creation AS (
                 SELECT entity_id, MIN(sequence) AS sequence FROM hub_audit
                 WHERE action='decision.created' AND revision=1 GROUP BY entity_id
             )
-            SELECT e.data, a.actor FROM hub_entities e
+            SELECT e.data, a.actor, {family} FROM hub_entities e
             LEFT JOIN creation c ON c.entity_id=e.id
             LEFT JOIN hub_audit a ON a.sequence=c.sequence
+            {provenance_join}
             WHERE e.kind='decision' ORDER BY e.rowid""")
-            return [dict(json.loads(row['data']), requested_by=row['actor']) for row in rows]
+            result = []
+            for row in rows:
+                item = dict(json.loads(row['data']), requested_by=row['actor'])
+                # This family exists only as a projection of the creation audit's
+                # paired installation evidence; never trust a stored/legacy value.
+                item.pop('requested_by_family', None)
+                # Legacy, absent, mismatched, and unknown evidence remains explicitly
+                # unknown; never infer it from another record.
+                if row['creator_family'] in AGENTS:
+                    item['requested_by_family'] = row['creator_family']
+                result.append(item)
+            return result
 
     @staticmethod
     def _open_work_job(db, task_id):

@@ -118,6 +118,9 @@ def test_openapi_response_objects_reference_closed_typed_schemas(hub):
         assert operation['responses']['200']['content']['application/json']['schema'] == {'$ref': '#/components/schemas/' + name}
         assert schema['components']['schemas'][name]['additionalProperties'] is False
     components = schema['components']['schemas']
+    decision_family = components['DecisionDTO']['properties']['requested_by_family']
+    assert decision_family['anyOf'][0]['enum'] == ['hermes', 'codex', 'claude']
+    assert 'requested_by_family' not in components['DecisionDTO']['required']
     assert components['TaskListDTO']['properties']['items']['items']['$ref'].endswith('/TaskDTO')
     assert components['RunDTO']['properties']['events']['items']['$ref'].endswith('/RunEventDTO')
     for name in ['TaskDTO', 'ReviewDTO', 'DecisionDTO', 'RunDTO', 'RunEventDTO', 'CapabilitiesDTO', 'DispatchReceiptDTO']:

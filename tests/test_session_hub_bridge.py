@@ -20,6 +20,8 @@ from engineering_hub.components import ProjectComponentRepository
 from engineering_hub.projects import ProjectRepository
 from engineering_hub.repository import HubRepository, HubError
 from engineering_hub.session_hub_bridge import SessionHubBridge, CAPABILITIES, TOOLS
+from engineering_hub.app import Settings, create_app
+from engineering_hub.auth import AuthConfig
 from engineering_hub import planning
 
 
@@ -113,6 +115,38 @@ def test_explicit_grants_cas_scope_and_no_implicit_capabilities(env):
     assert env.bridge.grant_get(OWNER, installation)['state'] == 'inactive'
 
 
+def test_paired_decision_projection_uses_audited_creator_family_in_all_rest_views(env):
+    installation_id, token, _ = pair(env, 'decision-requester', 'claude', caps=('decision.request',))
+    question = call(env, token, 'hub_decision_request', lambda actor:
+        env.repo.create_decision(actor, PROJECT, 'Select a fixture', ['A', 'B']))
+    actor = 'installation:' + installation_id
+    with env.repo._connection() as db:
+        audit = db.execute("SELECT sequence, actor FROM hub_audit WHERE entity_id=? AND action='decision.created'",
+                           (question['id'],)).fetchone()
+        provenance = db.execute('SELECT installation_id,session_id,family FROM hub_session_provenance WHERE audit_sequence=?',
+                                (audit['sequence'],)).fetchone()
+    assert audit['actor'] == actor
+    assert provenance['installation_id'] == installation_id
+    assert provenance['session_id']
+    assert provenance['family'] == 'claude'
+    assert 'requested_by_family' not in env.repo.list_decisions()[0]
+    answered = env.repo.answer_decision('human:42', question['id'], question['revision'], 'A')
+    assert answered['answered_by'] == 'human:42'
+
+    settings = Settings(Path(env.repo.path), AuthSettings('test-hermes', 'test-codex', claude_token='test-claude'),
+                        AuthConfig('https://hub.test', beau_github_id=42))
+    app = create_app(settings, repository=env.repo)
+    with TestClient(app, base_url='https://hub.test') as client:
+        for route, key in (('/overview', 'decisions'), ('/decisions', 'items')):
+            response = client.get('/api/hub/v1' + route, headers={'Authorization': 'Bearer test-codex'})
+            assert response.status_code == 200, response.text
+            projected = next(item for item in response.json()[key] if item['id'] == question['id'])
+            assert projected['requested_by'] == actor
+            assert projected.get('requested_by_family') == 'claude'
+            assert projected['answered_by'] == 'human:42'
+            assert projected['execution_authorization'] is False
+
+
 @pytest.mark.parametrize('projects,caps', [([], ['task.propose']), ([PROJECT], []), (['*'], ['task.propose']),
     ([PROJECT], ['*']), ([PROJECT, PROJECT], ['task.propose']), ([PROJECT], ['task.propose', 'task.propose'])])
 def test_reject_wildcard_empty_duplicate_grants(env, projects, caps):
@@ -145,6 +179,34 @@ def test_separate_pc_idempotency_exact_session_claim_and_family_review(env):
     assert len(rows) == 5 and all(row['session_id'] for row in rows)
     with pytest.raises(HubError, match='forbidden'):
         env.repo.claim_task(first['proposed_by'], second['id'], 1)
+
+
+def test_decision_projection_keeps_missing_or_unknown_creator_family_unknown(env):
+    legacy = env.repo.create_decision('hermes', PROJECT, 'Legacy requester', ['A', 'B'])
+    with env.repo._transaction() as db:
+        stored = db.execute('SELECT data FROM hub_entities WHERE id=?', (legacy['id'],)).fetchone()
+        data = json.loads(stored['data'])
+        data['requested_by_family'] = 'claude'
+        db.execute('UPDATE hub_entities SET data=? WHERE id=?',
+                   (json.dumps(data, sort_keys=True, separators=(',', ':')), legacy['id']))
+    legacy_view = next(item for item in env.repo.list_decision_views() if item['id'] == legacy['id'])
+    assert legacy_view['requested_by'] == 'hermes'
+    assert 'requested_by_family' not in legacy_view
+
+    installation_id, token, _ = pair(env, 'unknown-family-requester', 'claude', caps=('decision.request',))
+    paired = call(env, token, 'hub_decision_request', lambda actor:
+        env.repo.create_decision(actor, PROJECT, 'Corrupt provenance fixture', ['A', 'B']))
+    with env.repo._transaction() as db:
+        audit = db.execute("SELECT sequence FROM hub_audit WHERE entity_id=? AND action='decision.created'",
+                           (paired['id'],)).fetchone()
+        provenance = db.execute('SELECT installation_id,session_id,grant_revision,capability '
+                                'FROM hub_session_provenance WHERE audit_sequence=?', (audit['sequence'],)).fetchone()
+        assert provenance['installation_id'] == installation_id and provenance['session_id']
+        assert provenance['capability'] == 'decision.request'
+        db.execute("UPDATE hub_session_provenance SET family='unknown' WHERE audit_sequence=?", (audit['sequence'],))
+    paired_view = next(item for item in env.repo.list_decision_views() if item['id'] == paired['id'])
+    assert paired_view['requested_by'] == 'installation:' + installation_id
+    assert 'requested_by_family' not in paired_view
 
 
 def test_component_scope_cas_references_and_own_withdrawal(env):

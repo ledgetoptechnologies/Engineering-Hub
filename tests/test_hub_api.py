@@ -58,6 +58,8 @@ def claim_candidate(client, item):
 
 def test_decision_overview_attributes_existing_question_to_original_requester(hub):
     client, app, settings = hub
+    with app.state.repository._connection() as db:
+        assert not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_session_provenance'").fetchone()
     payload = {"project": "3d-viewer", "title": "Which view?", "options": ["A", "B"]}
     response = client.post(BASE + "/decisions", headers=agent_headers("claude"), json=payload)
     assert response.status_code == 201
@@ -72,6 +74,7 @@ def test_decision_overview_attributes_existing_question_to_original_requester(hu
         assert result.status_code == 200
         decision = next(item for item in result.json()[key] if item['id'] == question['id'])
         assert decision['requested_by'] == 'claude'
+        assert 'requested_by_family' not in decision
         assert decision['answered_by'] == 'human:42'
 
 

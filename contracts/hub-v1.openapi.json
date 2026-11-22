@@ -4782,6 +4782,22 @@
             ],
             "title": "Requested By"
           },
+          "requested_by_family": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested By Family"
+          },
           "details": {
             "anyOf": [
               {
