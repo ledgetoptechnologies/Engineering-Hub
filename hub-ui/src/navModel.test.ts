@@ -22,7 +22,8 @@ describe("workspace sections", () => {
     const all = ids(workspaceNav({ ...base, infrastructure: true, orchestration: true, deviceId: "x" }));
     const routes: Route[] = [{ page: "home" }, { page: "inbox" }, { page: "work" }, { page: "orchestration" },
       { page: "orchestration-request", id: "r" }, { page: "agents" }, { page: "agent-installations" }, { page: "staging" },
-      { page: "staging-queues" }, { page: "staging-resources" }, { page: "infrastructure" }, { page: "device", id: "x" }];
+      { page: "staging-queues" }, { page: "staging-resources" }, { page: "infrastructure" }, { page: "device", id: "x" },
+      { page: "machine", key: `host:${"a".repeat(64)}` }];
     for (const route of routes) expect(all).toContain(navKey(route));
   });
   it("puts project pages in the Projects section and leaves notes and planning outside every section", () => {

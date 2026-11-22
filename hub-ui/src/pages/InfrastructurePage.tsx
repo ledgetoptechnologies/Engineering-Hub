@@ -15,8 +15,7 @@ import {
 } from "../infrastructureModel";
 import { href, navigate, registerRouteLeaveGuard } from "../router";
 import { Badge, PageHeader, PanelTitle } from "../ui";
-import { MachineHealth, MachineStrip, machinesByDevice, useMachineMetrics } from "./MachineHealth";
-import type { MachineGroup } from "../infrastructureMetrics";
+import { MachineDetailPage, MachineHealth, useMachineMetrics } from "./MachineHealth";
 
 type Load<T> = { state: "loading" } | { state: "loaded"; value: T } | { state: "failed"; message: string } | { state: "unavailable" };
 type Filter = "all" | "attention" | "maintenance";
@@ -59,7 +58,8 @@ function useRead<T>(hub: Hub, read: (signal: AbortSignal) => Promise<T>, deps: u
   return [load, () => setAttempt(value => value + 1)];
 }
 
-export function InfrastructurePage({ hub, actions, deviceId }: { hub: Hub; actions: React.ReactNode; deviceId?: string }) {
+export function InfrastructurePage({ hub, actions, deviceId, machineKey }: { hub: Hub; actions: React.ReactNode; deviceId?: string; machineKey?: string }) {
+  if (machineKey) return <MachineDetailPage hub={hub} actions={actions} machineKey={machineKey} />;
   return deviceId ? <DevicePage hub={hub} actions={actions} id={deviceId} /> : <DeviceListPage hub={hub} actions={actions} />;
 }
 
@@ -75,7 +75,6 @@ function DeviceListPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }
   const client = useClient(hub);
   const now = useNow();
   const reading = useMachineMetrics(hub);
-  const machines = machinesByDevice(reading);
   const [retired, setRetired] = useState(false);
   const [filter, setFilter] = useState<Filter>("all");
   const [creating, setCreating] = useState(false);
@@ -117,14 +116,14 @@ function DeviceListPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }
       {list && list.items.length === 0 && <p className="infra-empty">No devices are recorded yet.</p>}
       {list && list.items.length > 0 && shown.length === 0 && <p className="infra-empty">No devices match this filter.</p>}
       {shown.length > 0 && <ul className="infra-list">
-        {shown.map(device => <DeviceRow key={device.id} device={device} now={now} self={hub.session?.actor ?? null} machine={machines.get(device.id)} />)}
+        {shown.map(device => <DeviceRow key={device.id} device={device} now={now} self={hub.session?.actor ?? null} />)}
       </ul>}
     </section>
-    <MachineHealth hub={hub} reading={reading} shownDevices={new Set((list?.items ?? []).map(device => device.id))} />
+    <MachineHealth hub={hub} reading={reading} />
   </>;
 }
 
-function DeviceRow({ device, now, self, machine }: { device: Device; now: Date; self: string | null; machine?: MachineGroup }) {
+function DeviceRow({ device, now, self }: { device: Device; now: Date; self: string | null }) {
   const maintenance = device.open_maintenance ? maintenanceView(device.open_maintenance, now, self) : null;
   return <li className={device.retired ? "infra-row retired" : "infra-row"}>
     <a className="infra-row-main" href={href({ page: "device", id: device.id })}>
@@ -141,7 +140,6 @@ function DeviceRow({ device, now, self, machine }: { device: Device; now: Date; 
         return <Badge key={item.probe_id} tone={view.tone}>{view.label}: {view.line}</Badge>; })}
       {maintenance && <span className={maintenance.overdue ? "infra-maintenance overdue" : "infra-maintenance"}>Maintenance: {maintenance.line}</span>}
     </div>
-    {machine && <MachineStrip group={machine} deviceId={device.id} now={now} />}
   </li>;
 }
 

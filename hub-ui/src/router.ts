@@ -25,6 +25,7 @@ export type Route =
   | { page: "infrastructure" }
   | { page: "topology" }
   | { page: "device"; id: string }
+  | { page: "machine"; key: string }
   // App shows an unavailable state until the orchestration backend exists.
   | { page: "orchestration" }
   | { page: "orchestration-request"; id: string };
@@ -32,6 +33,7 @@ export type Route =
 const projectId = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const setId = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const requestId = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+const machineKey = /^(?:host|target):[a-f0-9]{64}$/;
 const reviewId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 // Section anchors from the single-page dashboard keep working as links.
 const legacy: Record<string, Route> = {
@@ -92,6 +94,12 @@ export function parseRoute(value: string): Route {
       if (parts.length === 1) return { page: "orchestration" };
       return parts.length === 2 && requestId.test(parts[1]) ? { page: "orchestration-request", id: parts[1] } : { page: "orchestration" };
     case "infrastructure":
+      if (parts.length === 3 && parts[1] === "machines") {
+        try {
+          const key = decodeURIComponent(parts[2]);
+          return machineKey.test(key) ? { page: "machine", key } : { page: "infrastructure" };
+        } catch { return { page: "infrastructure" }; }
+      }
       if (parts.length === 1) return { page: "infrastructure" };
       if (parts.length === 3 && parts[1] === "views" && parts[2] === "topology") return { page: "topology" };
       return parts.length === 2 && projectId.test(parts[1]) ? { page: "device", id: parts[1] } : { page: "infrastructure" };
@@ -118,6 +126,7 @@ export function pathOf(route: Route): string {
     case "review": return `/projects/${route.project}/reviews/${route.id}`;
     case "device": return `/infrastructure/${route.id}`;
     case "topology": return "/infrastructure/views/topology";
+    case "machine": return `/infrastructure/machines/${encodeURIComponent(route.key)}`;
     case "orchestration-request": return `/orchestration/${route.id}`;
     case "agent-installations": return "/agents/installations";
     case "staging-queues": return "/staging/queues";

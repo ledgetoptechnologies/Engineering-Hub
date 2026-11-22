@@ -5,6 +5,7 @@
  * Prometheus isn't set up.
  */
 import { useEffect, useState } from "react";
+import type { FormEvent, ReactNode } from "react";
 import { HubApiError } from "../api";
 import type { Hub } from "../hub";
 import { demoMachineMetrics } from "../infrastructureDemo";
@@ -12,7 +13,8 @@ import {
   formatBytes, formatRate, formatUptime, groupMachines, percent, quickStats, readMetrics, type MachineGroup, type MachineMetrics, type MachineTarget,
 } from "../infrastructureMetrics";
 import { href } from "../router";
-import { Badge, PanelTitle } from "../ui";
+import { Badge, PageHeader, PanelTitle } from "../ui";
+import { DEFAULT_MACHINE_ORDER, normalizeMachineOrder, readMachineOrder, sortMachineGroups, writeMachineOrder } from "../machineOrder";
 import { MachineHistory } from "./MachineHistory";
 
 type Load = { state: "loading" } | { state: "hidden" } | { state: "failed" } | { state: "unavailable" } | { state: "loaded"; value: MachineMetrics };
@@ -31,9 +33,9 @@ function omittedText(metrics: MachineMetrics): string | null {
   if (warnings.includes("series_truncated")) parts.push("Some machines reported more disks, GPUs or programs than are listed.");
   return parts.length ? parts.join(" ") : null;
 }
-function MachineHead({ group, link }: { group: MachineGroup; link: boolean }) {
+function MachineHead({ group }: { group: MachineGroup }) {
   return <div className="machine-card-head">
-    <strong>{link && group.device_id ? <a href={href({ page: "device", id: group.device_id })}>{group.title}</a> : group.title}</strong>
+    <strong>{group.title}</strong>
     {group.labels.role && <span className="infra-chip">{group.labels.role}</span>}
     {group.labels.env && <span className="infra-chip">{group.labels.env}</span>}
     {group.unregistered && <Badge tone="neutral">Not in devices</Badge>}
@@ -42,13 +44,17 @@ function MachineHead({ group, link }: { group: MachineGroup; link: boolean }) {
 }
 const EXPORTER_TEXT = { node: "Linux", windows: "Windows", nvidia: "GPUs" } as const;
 
-function statusBadge(item: MachineTarget, now: Date) {
+function statusView(item: MachineTarget, now: Date): { text: string; tone: "forest" | "amber" | "neutral" } {
   const seen = item.last_scrape ? ` · ${ago(item.last_scrape, now)}` : "";
-  if (item.state === "unknown" || item.up === null) return <Badge tone="neutral">Unknown</Badge>;
+  if (item.state === "unknown" || item.up === null) return { text: "Unknown", tone: "neutral" };
   // An old result, failed or not, says nothing about now.
-  if (item.state === "stale") return <Badge tone="amber">Out of date{seen}</Badge>;
-  if (!item.up) return <Badge tone="amber">Scrape failing{seen}</Badge>;
-  return <Badge tone="forest">Reporting{seen}</Badge>;
+  if (item.state === "stale") return { text: `Out of date${seen}`, tone: "amber" };
+  if (!item.up) return { text: `Scrape failing${seen}`, tone: "amber" };
+  return { text: `Reporting${seen}`, tone: "forest" };
+}
+function statusBadge(item: MachineTarget, now: Date) {
+  const view = statusView(item, now);
+  return <Badge tone={view.tone}>{view.text}</Badge>;
 }
 function ago(value: string, now: Date): string {
   const seconds = Math.max(0, Math.round((now.getTime() - Date.parse(value)) / 1000));
@@ -126,78 +132,137 @@ export function useMachineMetrics(hub: Hub): MachineReading {
   return { load, now, refresh: () => setAttempt(value => value + 1) };
 }
 
-/** Machines keyed by recorded device, for the numbers under each row. */
-export function machinesByDevice(reading: MachineReading): Map<string, MachineGroup> {
-  const targets = reading.load.state === "loaded" ? reading.load.value.targets : [];
-  const found = new Map<string, MachineGroup>();
-  for (const group of groupMachines(targets)) if (group.device_id && !found.has(group.device_id)) found.set(group.device_id, group);
-  return found;
+function GroupStatus({ group }: { group: MachineGroup }) {
+  const reporting = group.targets.filter(item => item.state === "fresh" && item.up === true).length;
+  const failures = group.targets.some(item => item.state === "fresh" && item.up === false);
+  const stale = group.targets.some(item => item.state === "stale");
+  if (reporting) return <Badge tone={failures || stale ? "amber" : "forest"}>
+    {reporting === group.targets.length ? `${reporting} ${reporting === 1 ? "exporter" : "exporters"} reporting`
+      : `${reporting} of ${group.targets.length} exporters reporting`}
+  </Badge>;
+  if (stale) return <Badge tone="amber">Out of date</Badge>;
+  if (failures) return <Badge tone="amber">Scrape failing</Badge>;
+  return <Badge tone="neutral">Unknown</Badge>;
 }
 
-function Stat({ label, ratio, value, detail }: { label: string; ratio?: number | null; value: string; detail?: string }) {
-  const tone = ratio === undefined || ratio === null ? "" : ratio >= 0.9 ? " high" : ratio >= 0.75 ? " warm" : "";
-  return <div className="machine-stat">
-    <span className="machine-stat-label">{label}</span>
-    <strong>{value}</strong>
-    {detail && <small>{detail}</small>}
-    {ratio !== undefined && <span className={"machine-meter-track" + tone} aria-hidden="true">{ratio !== null && <span style={{ width: `${Math.round(ratio * 100)}%` }} />}</span>}
+function CardStat({ label, value, ratio }: { label: string; value: string; ratio?: number | null }) {
+  const tone = ratio === null || ratio === undefined ? "" : ratio >= 0.9 ? " high" : ratio >= 0.75 ? " warm" : "";
+  return <div className="machine-card-stat">
+    <span>{label}</span><strong>{value}</strong>
+    {ratio !== undefined && <span className={`machine-card-meter${tone}`} aria-hidden="true">
+      {ratio !== null && <i style={{ width: `${Math.round(ratio * 100)}%` }} />}
+    </span>}
   </div>;
 }
 
-/** CPU, memory, storage and network at a glance. The whole strip opens the device. */
-export function MachineStrip({ group, deviceId, now }: { group: MachineGroup; deviceId: string; now: Date }) {
+function MachineCard({ group }: { group: MachineGroup }) {
   const stats = quickStats(group);
-  const link = href({ page: "device", id: deviceId });
-  if (!stats.reporting) return <a className="machine-strip quiet" href={link} aria-label="Machine stats">{statusBadge(group.targets[0], now)}</a>;
-  return <a className="machine-strip" href={link} aria-label="Machine stats">
-    <Stat label="CPU" ratio={stats.cpu} value={stats.cpu === null ? "–" : percent(stats.cpu)} />
-    <Stat label="Memory" ratio={stats.memory} value={stats.memory === null ? "–" : percent(stats.memory)} detail={stats.memory === null ? undefined : stats.memoryText} />
-    <Stat label="Storage" ratio={stats.diskRatio} value={stats.diskRatio === null ? "–" : percent(stats.diskRatio)} detail={stats.disk ? `${stats.disk.mount} · ${formatBytes(stats.disk.free_bytes)} free` : undefined} />
-    <Stat label="Network" value={stats.down === null ? "–" : `↓ ${formatRate(stats.down)}`} detail={stats.up === null ? undefined : `↑ ${formatRate(stats.up)}`} />
-  </a>;
+  const destination = group.device_id
+    ? href({ page: "device", id: group.device_id })
+    : href({ page: "machine", key: group.key });
+  const exporters = [...new Set(group.targets.map(item => item.exporter ? EXPORTER_TEXT[item.exporter] : `Unknown · ${item.job}`))];
+  const network = stats.down === null && stats.up === null ? "not reported"
+    : `↓ ${formatRate(stats.down)} · ↑ ${formatRate(stats.up)}`;
+  return <li className="machine-card">
+    <a className="machine-card-link" href={destination} aria-label={`View ${group.title} machine details`}>
+      <div className="machine-card-head">
+        <strong className="machine-card-title">{group.title}</strong>
+        <GroupStatus group={group} />
+      </div>
+      <div className="machine-card-meta">
+        {group.labels.role && <span className="infra-chip">{group.labels.role}</span>}
+        {group.labels.env && <span className="infra-chip">{group.labels.env}</span>}
+        {group.unregistered && <Badge tone="neutral">Not in devices</Badge>}
+        {group.ambiguous && <Badge tone="amber">Matches more than one device</Badge>}
+        {group.targets.some(item => item.exporter === null) && <span className="machine-card-warning">Not a recognized exporter</span>}
+      </div>
+      <div className="machine-card-exporters">{exporters.join(" · ")}</div>
+      <div className="machine-card-stats">
+        <CardStat label="CPU" value={percent(stats.cpu)} ratio={stats.cpu} />
+        <CardStat label="Memory" value={stats.memory === null ? "not reported" : percent(stats.memory)} ratio={stats.memory} />
+        <CardStat label="Storage" value={stats.diskRatio === null ? "not reported" : percent(stats.diskRatio)} ratio={stats.diskRatio} />
+        <CardStat label="Network" value={network} />
+      </div>
+      <span className="machine-card-cta">View details <span aria-hidden="true">→</span></span>
+    </a>
+  </li>;
 }
 
-function HistoryToggle({ hub, hostKey }: { hub: Hub; hostKey: string }) {
-  const [open, setOpen] = useState(false);
-  return <>
-    <button type="button" className="secondary machine-history-toggle" aria-expanded={open} onClick={() => setOpen(value => !value)}>{open ? "Hide history" : "History"}</button>
-    {open && <MachineHistory hub={hub} hostKey={hostKey} />}
-  </>;
+function MachineOrderControl({ order, onSave }: { order: string[]; onSave: (value: string[]) => void }) {
+  const [draft, setDraft] = useState(order.join("\n"));
+  const [saved, setSaved] = useState(false);
+  useEffect(() => setDraft(order.join("\n")), [order]);
+  const save = (event: FormEvent) => {
+    event.preventDefault();
+    const next = normalizeMachineOrder(draft.split(/\r?\n/));
+    writeMachineOrder(next);
+    onSave(next);
+    setDraft(next.join("\n"));
+    setSaved(true);
+  };
+  const reset = () => {
+    const next = [...DEFAULT_MACHINE_ORDER];
+    writeMachineOrder(next);
+    onSave(next);
+    setDraft(next.join("\n"));
+    setSaved(false);
+  };
+  return <details className="machine-order-control">
+    <summary>Customize order</summary>
+    <form onSubmit={save}>
+      <label className="field"><span className="field-label">Priority machine names</span>
+        <textarea rows={4} value={draft} onChange={event => { setDraft(event.target.value); setSaved(false); }} />
+      </label>
+      <small>One exact display name per line. Matching ignores case and common punctuation; other machines follow alphabetically. Stored in this browser only.</small>
+      <div className="button-row">
+        <button type="submit" className="secondary">Save order</button>
+        <button type="button" className="secondary" onClick={reset}>Reset</button>
+        {saved && <span role="status">Order saved in this browser.</span>}
+      </div>
+    </form>
+  </details>;
 }
 
 /** On a device page: the name Prometheus would need to report for this device to get stats. */
 export interface DeviceMatch { id: string; name: string | null }
 
-export function MachineHealth({ hub, device, reading, shownDevices }: { hub: Hub; device?: DeviceMatch; reading: MachineReading; shownDevices?: Set<string> }) {
+export function MachineHealth({ hub, device, reading }: { hub: Hub; device?: DeviceMatch; reading: MachineReading }) {
   const { load, now, refresh } = reading;
   const deviceId = device?.id;
+  const [order, setOrder] = useState(() => readMachineOrder());
   if (load.state === "hidden") return null;
   const metrics = load.state === "loaded" ? load.value : null;
-  // A machine already shown under its device row isn't repeated here.
-  const targets = metrics ? metrics.targets.filter(item => deviceId !== undefined ? item.device_id === deviceId
-    : !(item.device_id && shownDevices?.has(item.device_id))) : [];
-  if (metrics && shownDevices && targets.length === 0 && metrics.source.status === "ok") return null;
-  const unmatched = Boolean(metrics && device && targets.length === 0 && (metrics.source.status === "ok" || metrics.source.status === "partial"));
+  const targets = metrics ? metrics.targets.filter(item => deviceId !== undefined ? item.device_id === deviceId : true) : [];
+  if (metrics && device && targets.length === 0 && (metrics.source.status === "ok" || metrics.source.status === "partial")) {
+    return <section className="panel" aria-label="Machine health">
+      <PanelTitle title="Machine health"><button type="button" className="secondary" disabled={load.state === "loading"} onClick={refresh}>Refresh</button></PanelTitle>
+      <p className="infra-empty">{device.name
+        ? <>Prometheus isn't reporting a machine named <code>{device.name}</code>. If it uses a different name for this device, set it under Edit as the Prometheus host.</>
+        : <>No stats yet. Record a hostname, or the name Prometheus uses for this device, under Edit.</>}</p>
+    </section>;
+  }
   const groups = groupMachines(targets);
   const notice = metrics ? SOURCE_TEXT[metrics.source.status] : null;
   const omitted = metrics && deviceId === undefined ? omittedText(metrics) : null;
+  const onOrder = (next: string[]) => setOrder(next);
   return <section className="panel" aria-label="Machine health">
     <PanelTitle title="Machine health" count={metrics && deviceId === undefined ? groups.length : undefined}>
+      {deviceId === undefined && <MachineOrderControl order={order} onSave={onOrder} />}
       <button type="button" className="secondary" disabled={load.state === "loading"} onClick={refresh}>
         {load.state === "loading" ? "Reading…" : "Refresh"}</button>
     </PanelTitle>
     {load.state === "loading" && !metrics && <p role="status">Reading machine health…</p>}
     {load.state === "failed" && <p className="notice error" role="alert">Machine health couldn't be read. Use Refresh to try again.</p>}
     {load.state === "unavailable" && <p className="notice" role="status">Machine stats aren't available on this Hub right now. Use Refresh to try again.</p>}
-    {unmatched && <p className="infra-empty">{device!.name
-      ? <>Prometheus isn't reporting a machine named <code>{device!.name}</code>. If it uses a different name for this device, set it under Edit as the Prometheus host.</>
-      : <>No stats yet. Record a hostname, or the name Prometheus uses for this device, under Edit.</>}</p>}
     {notice && <p className="notice" role="status">{notice}</p>}
     {omitted && <p className="notice" role="status">{omitted}</p>}
-    {metrics && !device && targets.length === 0 && metrics.source.status !== "not_configured" && metrics.source.status !== "unreachable" &&
+    {metrics && deviceId === undefined && targets.length === 0 && metrics.source.status !== "not_configured" && metrics.source.status !== "unreachable" &&
       <p className="infra-empty">Prometheus isn't scraping any machines yet.</p>}
-    {groups.length > 0 && <ul className="machine-list">{groups.map(group => <li key={group.key} className="machine-card">
-      <MachineHead group={group} link={deviceId === undefined} />
+    {deviceId === undefined && groups.length > 0 && <ul className="machine-list">
+      {sortMachineGroups(groups, order).map(group => <MachineCard key={group.key} group={group} />)}
+    </ul>}
+    {deviceId !== undefined && groups.length > 0 && <ul className="machine-list">{groups.map(group => <li key={group.key} className="machine-card machine-card-detail">
+      <MachineHead group={group} />
       {group.targets.map(item => <div key={`${item.job}\n${item.instance}`} className="machine-section">
         <div className="machine-section-head">
           <span>{item.exporter ? EXPORTER_TEXT[item.exporter] : item.job} <small><code>{item.instance}</code></small></span>
@@ -205,8 +270,46 @@ export function MachineHealth({ hub, device, reading, shownDevices }: { hub: Hub
         </div>
         {metrics?.source.status !== "unreachable" && <TargetBody item={item} />}
       </div>)}
-      {deviceId === undefined && <HistoryToggle hub={hub} hostKey={group.key} />}
+      <MachineHistory hub={hub} hostKey={group.key} />
     </li>)}</ul>}
-    {deviceId !== undefined && groups.map(group => <MachineHistory key={group.key} hub={hub} hostKey={group.key} />)}
   </section>;
+}
+
+export function MachineDetailPage({ hub, actions, machineKey }: { hub: Hub; actions: ReactNode; machineKey: string }) {
+  const reading = useMachineMetrics(hub);
+  const { load } = reading;
+  const metrics = load.state === "loaded" ? load.value : null;
+  const group = metrics ? groupMachines(metrics.targets).find(item => item.key === machineKey) : undefined;
+  return <>
+    <PageHeader eyebrow="INFRASTRUCTURE / MACHINE HEALTH" title={group?.title ?? "Machine health"}
+      subtitle={group ? "Current Prometheus readings and history. Missing values remain not reported." : undefined}>{actions}</PageHeader>
+    <p className="infra-back"><a href={href({ page: "infrastructure" })}>← Machine health</a></p>
+    {load.state === "loading" && <p role="status">Reading machine health…</p>}
+    {load.state === "hidden" && <p className="notice" role="status">Machine stats aren't available to you on this Hub.</p>}
+    {load.state === "failed" && <p className="notice error" role="alert">Machine health couldn't be read. Return to Machine health and try Refresh.</p>}
+    {load.state === "unavailable" && <p className="notice" role="status">Machine stats aren't available on this Hub right now.</p>}
+    {load.state === "loaded" && !group && <p className="notice" role="status">No current target matches this machine link. Its status is unknown.</p>}
+    {group && metrics && <div className="infra-detail">
+      <section className="panel" aria-label="Current readings">
+        <PanelTitle title="Current readings" />
+        <p className="panel-description">Values from the Hub's current Prometheus response. Missing fields are not reported, not zero.</p>
+        <div className="machine-current-tags">
+          {group.labels.role && <span className="infra-chip">{group.labels.role}</span>}
+          {group.labels.env && <span className="infra-chip">{group.labels.env}</span>}
+          {group.unregistered && <Badge tone="neutral">Not in devices</Badge>}
+          {group.ambiguous && <Badge tone="amber">Matches more than one device</Badge>}
+        </div>
+        {group.targets.map(item => <div key={`${item.job}\n${item.instance}`} className="machine-section">
+          <div className="machine-section-head">
+            <span>{item.exporter ? EXPORTER_TEXT[item.exporter] : item.job} <small><code>{item.instance}</code></small></span>
+            {statusBadge(item, reading.now)}
+          </div>
+          {metrics.source.status !== "unreachable" && <TargetBody item={item} />}
+        </div>)}
+      </section>
+      <section className="panel machine-history-panel" aria-label="Machine history">
+        <MachineHistory hub={hub} hostKey={group.key} />
+      </section>
+    </div>}
+  </>;
 }
