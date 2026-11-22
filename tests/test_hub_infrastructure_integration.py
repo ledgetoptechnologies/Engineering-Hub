@@ -340,7 +340,8 @@ def test_gateway_surface_is_closed(method, path, expected):
 
 @pytest.mark.skipif(os.name != 'posix', reason='Real Inventory and agent-session ownership')
 @pytest.mark.asyncio
-async def test_cloudflare_inventory_owner_override_through_signed_gateways(tmp_path, monkeypatch):
+@pytest.mark.parametrize('operator_grant', ['absent', 'omitted', 'read_only', 'granted'])
+async def test_cloudflare_inventory_owner_override_through_signed_gateways(tmp_path, monkeypatch, operator_grant):
     import base64
     import hashlib
     import time
@@ -378,6 +379,20 @@ async def test_cloudflare_inventory_owner_override_through_signed_gateways(tmp_p
     agent_auth = AuthSettings('test-hermes', 'test-codex', claude_token='test-claude',
                               allowed_ips=frozenset({'127.0.0.1'}))
     settings = replace(Settings.from_env(), agent_auth=agent_auth)
+    if operator_grant != 'absent':
+        assert settings.infrastructure_config_path is not None
+        grants = {
+            'omitted': [(session_owner, ['read'])],
+            'read_only': [(browser_owner, ['read'])],
+            'granted': [(browser_owner, ['read', 'metrics_read', 'device_write'])],
+        }[operator_grant]
+        settings.infrastructure_config_path.write_text(json.dumps({
+            'schema_version': 1, 'enabled': True,
+            'principals': [{'kind': 'human', 'identity': identity, 'capabilities': capabilities}
+                           for identity, capabilities in grants],
+            'prometheus': {'address': '192.0.2.20', 'port': 9090},
+        }))
+        settings.infrastructure_config_path.chmod(0o600)
     session_config = AgentSessionsConfig(tmp_path / 'agent-sessions.sqlite3', session_owner,
                                          origin, environment='staging')
     transport_security = TransportSecuritySettings(allowed_hosts=['hub.test'],
@@ -459,6 +474,14 @@ async def test_cloudflare_inventory_owner_override_through_signed_gateways(tmp_p
             owner_headers = {'Origin': origin, 'X-Hub-CSRF': owner_me['csrf_token']}
             overview = await owner.get('/api/hub/v1/overview')
             assert overview.status_code == 200
+            if operator_grant in {'omitted', 'read_only'}:
+                assert overview.json()['capabilities']['infrastructure'] is (operator_grant == 'read_only')
+                for path in ('metrics', 'metrics/history'):
+                    denied = await owner.get('/api/hub/v1/infrastructure/' + path)
+                    assert denied.status_code == 403, denied.text
+                assert calls == []
+                await owner.aclose()
+                return
             assert overview.json()['capabilities']['infrastructure'] is True
             saved = await owner.put('/api/hub/v1/infrastructure/devices/synthetic-pc', headers=owner_headers,
                 json={'name': 'Synthetic PC', 'hostname': 'pc.example.test', 'metrics_host': '192.0.2.1',

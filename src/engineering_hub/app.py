@@ -791,6 +791,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         metrics_access = MetricsAccess(infrastructure.service, settings.agent_auth, human,
             owner=inventory_browser_owner,
             agent_owner=connection_service.owner if connection_service is not None else None,
+            require_browser_grant=settings.infrastructure_browser_owner is not None,
             scopes=installation_scopes, connection_config=connection_config)
         infrastructure.metrics = DiscoveryMetricsReader(infrastructure.service,
             infrastructure.prometheus_origin, authorize=metrics_access.authorize,

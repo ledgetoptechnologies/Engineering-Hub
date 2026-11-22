@@ -21,7 +21,9 @@ absent. It does not change `HUB_AGENT_SESSIONS_OWNER`, installation-scope author
 or grants in an existing `infrastructure.json`; that file always takes precedence,
 including `enabled: false`. With no override, existing owner selection is unchanged.
 Without an eligible selected owner, automatic setup stays disabled. Browser metrics
-also require an exact selected owner.
+require an exact selected owner. When using the override, a valid operator file
+must explicitly grant that actor `metrics_read` to enable current metrics or history;
+the generated defaults include that grant when there is no operator file.
 
 Discovery needs one trusted literal-IP Prometheus origin. The optional settings
 object accepts `{"address":"192.0.2.80","port":9090}` without a target mapping
