@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { CLOCK_SKEW_MS, ownershipRows, UNCLAIMED } from "./pages/WorkOwnership";
+
+it("counts waiting work separately from independent review", () => {
+  const [row] = ownershipRows([task({ owner: "codex", status: "waiting_on_beau" }), task({ owner: "codex", status: "in_review" })], now);
+  expect(row).toMatchObject({ waitingOnBeau: 1, inReview: 1, open: 2 });
+});
 import type { Task } from "./types";
 
 const now = Date.parse("2026-10-30T12:00:00Z");

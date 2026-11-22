@@ -1,7 +1,7 @@
 /**
  * Who's on what: open tasks grouped by their recorded owner. Built only from the task list the
- * Hub already returns, so it shows ownership and task state, never reviewer assignment or check
- * results (tasks don't carry them). Each paired installation is its own owner, not its family.
+ * Hub already returns. Counts show recorded states, not active execution or test results.
+ * Each paired installation is its own owner, not its family.
  */
 import { relativeAge } from "../dashboardText";
 import type { Hub } from "../hub";
@@ -21,6 +21,7 @@ export interface OwnerRow {
   notStarted: number;
   working: number;
   inReview: number;
+  waitingOnBeau: number;
   /** Passed review within the last seven days, by when the task entered that state. */
   passedRecently: number;
   /** Earliest valid state time among open tasks, at most CLOCK_SKEW_MS ahead of now; null when there is none. */
@@ -41,7 +42,7 @@ export function ownershipRows(tasks: Task[], now = Date.now()): OwnerRow[] {
     let row = rows.get(key);
     if (!row) {
       row = { key, owner: task.owner, family: task.owner_family ?? null, notStarted: 0, working: 0, inReview: 0,
-        passedRecently: 0, oldestOpenSince: null, open: 0 };
+        waitingOnBeau: 0, passedRecently: 0, oldestOpenSince: null, open: 0 };
       rows.set(key, row);
     }
     // A time more than CLOCK_SKEW_MS in the future can't be how long something has waited, so it
@@ -54,7 +55,8 @@ export function ownershipRows(tasks: Task[], now = Date.now()): OwnerRow[] {
     }
     if (task.status === "assigned") row.notStarted++;
     else if (task.status === "claimed") row.working++;
-    else row.inReview++;
+    else if (task.status === "in_review") row.inReview++;
+    else if (task.status === "waiting_on_beau") row.waitingOnBeau++;
     row.open++;
     const oldest = stamp(row.oldestOpenSince);
     if (since !== null && (oldest === null || since < oldest)) row.oldestOpenSince = task.state_since!;
@@ -82,7 +84,8 @@ export function WorkOwnership({ hub, rows, selected, onSelect }: {
           const avatar = actorAvatar(row.owner, row.family);
           const age = relativeAge(row.oldestOpenSince);
           const counts = [
-            row.working && `${row.working} working`,
+            row.working && `${row.working} claimed`,
+            row.waitingOnBeau && `${row.waitingOnBeau} waiting on Beau`,
             row.inReview && `${row.inReview} in review`,
             row.notStarted && `${row.notStarted} not started`,
             row.passedRecently && `${row.passedRecently} passed review in the last 7 days`,
@@ -101,8 +104,8 @@ export function WorkOwnership({ hub, rows, selected, onSelect }: {
         })}
       </ul>
       <p className="panel-footnote">Counts come from each task's recorded owner and state. "Passed review in the last 7 days" uses when
-        a task entered that state; tasks without a valid recorded time aren't counted there. This summary doesn't show who is
-        assigned to review or any test results; tasks don't track those. A recorded review appears on the task itself.</p>
+        a task entered that state; tasks without a valid recorded time aren't counted there. A claim does not prove someone is
+        currently working. Named reviewers and recorded reviews appear on the task itself.</p>
     </section>
   );
 }

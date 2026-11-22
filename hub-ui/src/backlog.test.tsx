@@ -43,6 +43,11 @@ describe("backlog helpers", () => {
     expect(WORK_FILTERS).toContain("waiting_on_beau");
     expect(WORK_FILTERS).toContain("done");
   });
+  it("distinguishes ownerless and named assignments from claimed work", () => {
+    expect(statusLabel({ ...base, status: "assigned", owner: null })).toBe("Unassigned");
+    expect(statusLabel({ ...base, status: "assigned" })).toBe("Assigned · not started");
+    expect(statusLabel(base)).toBe("Claimed");
+  });
   it("labels the new states", () => {
     expect(statusLabel(waiting("action"))).toBe("Waiting on Beau");
     expect(statusTone(waiting("action"))).toBe("amber");
