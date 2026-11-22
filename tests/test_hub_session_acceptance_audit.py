@@ -170,16 +170,45 @@ def test_stored_intent_must_remain_exact_typed_canonical_record(owned, corruptio
         assert db.execute('SELECT count(*) FROM ' + TABLE).fetchone()[0] == 1
 
 
+def _audit_error_codes(error):
+    causes = []
+    for _ in range(8):
+        if error is None:
+            break
+        code = getattr(error, 'sqlite_errorcode', None) if isinstance(error, sqlite3.Error) else None
+        causes.append((type(error).__name__, code if type(code) is int else None))
+        error = error.__cause__ if error.__cause__ is not None else error.__context__
+    return tuple(causes)
+
+
+def test_audit_diagnostics_recover_masked_sqlite_code():
+    locked = sqlite3.OperationalError('private fixture detail')
+    locked.sqlite_errorcode = sqlite3.SQLITE_BUSY
+    with pytest.raises(SessionAcceptanceAuditError) as caught:
+        try:
+            try:
+                raise locked
+            except sqlite3.Error:
+                raise RuntimeError('private wrapper detail') from None
+        except RuntimeError:
+            raise SessionAcceptanceAuditError() from None
+    assert _audit_error_codes(caught.value) == (
+        ('SessionAcceptanceAuditError', None), ('RuntimeError', None),
+        ('OperationalError', sqlite3.SQLITE_BUSY),
+    )
+
+
 def test_two_sinks_concurrent_intent_only_one_commit(owned):
     sinks = [OwnedSessionAcceptanceAudit(owned.repo) for _ in range(2)]
     def attempt(sink):
         try:
-            return sink(owned.record)
-        except SessionAcceptanceAuditError:
-            return False
+            return sink(owned.record), ()
+        except SessionAcceptanceAuditError as error:
+            return False, _audit_error_codes(error)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        assert sorted(pool.map(attempt, sinks)) == [False, True]
-    assert len(rows(owned.path)) == 1
+        attempts = list(pool.map(attempt, sinks))
+    committed = len(rows(owned.path))
+    assert (sorted(ok for ok, _ in attempts), committed) == ([False, True], 1), attempts
 
 
 @pytest.mark.parametrize('synchronous', [0, 1])
