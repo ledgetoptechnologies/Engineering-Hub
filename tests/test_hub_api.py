@@ -64,6 +64,10 @@ def test_decision_overview_attributes_existing_question_to_original_requester(hu
     response = client.post(BASE + "/decisions", headers=agent_headers("claude"), json=payload)
     assert response.status_code == 201
     question = response.json()
+    for route, key in (("/overview", "decisions"), ("/decisions", "items")):
+        result = client.get(BASE + route, headers=agent_headers("codex"))
+        assert result.status_code == 200
+        assert next(item for item in result.json()[key] if item["id"] == question["id"]) == question
     assert client.get(BASE + "/overview").status_code == 401
     headers = human_headers(client, app, settings)
     response = client.post(f"{BASE}/decisions/{question['id']}/answer", headers=headers,

@@ -137,8 +137,10 @@ def test_paired_decision_projection_uses_audited_creator_family_in_all_rest_view
                         AuthConfig('https://hub.test', beau_github_id=42))
     app = create_app(settings, repository=env.repo)
     with TestClient(app, base_url='https://hub.test') as client:
+        session = app.state.sessions.create_session(42)
+        client.cookies.set(settings.auth_config.cookie_name, session['cookie_token'])
         for route, key in (('/overview', 'decisions'), ('/decisions', 'items')):
-            response = client.get('/api/hub/v1' + route, headers={'Authorization': 'Bearer test-codex'})
+            response = client.get('/api/hub/v1' + route)
             assert response.status_code == 200, response.text
             projected = next(item for item in response.json()[key] if item['id'] == question['id'])
             assert projected['requested_by'] == actor
