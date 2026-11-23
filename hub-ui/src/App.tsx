@@ -70,6 +70,7 @@ export function HubApp() {
   );
   const { state: alertState, reset: resetAlerts, toggle: toggleAlerts, reconcile: reconcileAlerts, revision: alertRevision } = useNeedsMeAlerts();
   const [session, setSession] = useState<Session | null>(null);
+  const [inventoryReader, setInventoryReader] = useState<string | null>(null);
   const [data, setData] = useState<Overview | null>(null);
   const [agents, setAgents] = useState<AgentSummary[]>([]);
   const [peers, setPeers] = useState<TopicSnapshot | null>(null);
@@ -114,6 +115,7 @@ export function HubApp() {
   /** Drop every private record, cached snapshot, dialog and pending action, and fence late topic/agent reads. */
   const resetWorkspace = useCallback(() => {
     resetAlerts();
+    setInventoryReader(null);
     agentReader.current?.pause();
     topicReads.current++;
     workspaceEpoch.current++;
@@ -606,8 +608,13 @@ export function HubApp() {
   }
 
   const route = useRoute();
+  const infrastructureRoute = route.page === "infrastructure" || route.page === "device" || route.page === "machine" ? route : null;
   const [menuOpen, setMenuOpen] = useState(false);
   useEffect(() => setMenuOpen(false), [route]);
+  const inventoryActor = session?.authenticated ? session.actor : null;
+  const onInventoryAccess = useCallback((available: boolean) => {
+    setInventoryReader(available ? inventoryActor : null);
+  }, [inventoryActor]);
   const hub: Hub | null = data ? {
     demo, session, data, agents, stale, loading, writable, connection, projectName, decisionChoices,
     chooseAnswer: (decision: Decision, answer: string) =>
@@ -775,8 +782,7 @@ export function HubApp() {
             : route.page === "labels" ? `labels-${route.project}-${route.set}`
             // A different review, project or signed-in person is a fresh page with no state carried over.
             : route.page === "review" ? `review-${route.project}-${route.id}-${session?.actor ?? ""}`
-            : route.page === "device" ? `device-${route.id}-${session?.actor ?? ""}`
-            : route.page === "machine" ? `machine-${route.key}-${session?.actor ?? ""}` : route.page}>
+            : infrastructureRoute ? `infrastructure-${session?.actor ?? ""}` : route.page}>
             {route.page === "home" && <HomePage hub={hub} actions={actions} />}
             {route.page === "inbox" && <InboxPage hub={hub} actions={<>{actions}
               {!demo && session?.authenticated && session.actor?.startsWith("human:") && events?.available && (
@@ -816,10 +822,10 @@ export function HubApp() {
             {route.page === "staging" && <StagingPage hub={hub} actions={actions} />}
             {route.page === "staging-queues" && <StagingPage hub={hub} actions={actions} view="queues" />}
             {route.page === "staging-resources" && <StagingPage hub={hub} actions={actions} view="resources" />}
-            {route.page === "infrastructure" && <InfrastructurePage hub={hub} actions={actions} />}
+            {infrastructureRoute &&
+              <InfrastructurePage hub={hub} actions={actions} route={infrastructureRoute} onInventoryAccess={onInventoryAccess}
+                inventoryReadAvailable={demo || (data?.capabilities.infrastructure === true && !!inventoryActor && inventoryReader === inventoryActor)} />}
             {route.page === "topology" && <TopologyPage hub={hub} actions={actions} />}
-            {route.page === "device" && <InfrastructurePage hub={hub} actions={actions} deviceId={route.id} />}
-            {route.page === "machine" && <InfrastructurePage hub={hub} actions={actions} machineKey={route.key} />}
             {route.page === "orchestration" && <OrchestrationPage actions={actions} />}
             {route.page === "orchestration-request" && <OrchestrationPage actions={actions} requestId={route.id} />}
           </div>

@@ -140,7 +140,9 @@ async def test_http_and_registered_mcp_tool_return_same_envelope(setup):
         owner = {'X-Fixture-Human': OWNER}
         key = 'host:' + 'a' * 64
         assert client.get(history, params={'host': key, 'range': '1h'}, headers=owner).json()['source'] == {'status': 'not_configured'}
-        assert client.get(history, params={'host': key, 'range': '1h'}, headers={'X-Fixture-Human': 'human:other'}).status_code == 403
+        month = client.get(history, params={'host': key, 'range': '30d'}, headers=owner)
+        assert month.status_code == 200 and month.json()['range'] == '30d' and month.json()['step_seconds'] == 21600
+        assert client.get(history, params={'host': key, 'range': '30d'}, headers={'X-Fixture-Human': 'human:other'}).status_code == 403
         for extra in ({'host': key}, {'host': key, 'range': '1h', 'query': 'up'}):
             with pytest.raises(HubError, match='invalid_infrastructure_filter'):
                 client.get(history, params=extra, headers=owner)

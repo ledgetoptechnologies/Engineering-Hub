@@ -1,6 +1,6 @@
 """Fixed-range history for one discovered machine, read on demand from Prometheus.
 
-The browser names only an opaque host key and one of four fixed ranges. The key
+The browser names only an opaque host key and a fixed range. The key
 is matched against Prometheus's own active targets, and the job and instance
 used in the queries come from that list, never from the request. Nothing is
 stored, scheduled or cached. Missing samples stay null so a gap reads as a gap.
@@ -23,10 +23,12 @@ from .repository import HubError
 SCHEMA_VERSION = 1
 # Range name -> (seconds shown, seconds between points, rate window).
 RANGES = {'1h': (3600, 30, '5m'), '6h': (21600, 180, '5m'),
-          '24h': (86400, 720, '12m'), '7d': (604800, 3600, '1h')}
+          '24h': (86400, 720, '12m'), '7d': (604800, 3600, '1h'),
+          '30d': (2592000, 21600, '1h')}
 MAX_TARGETS_PER_HOST = 4
 MAX_RESULT_SERIES = 32
-_HOST_KEY = re.compile(r'(?:host|target):[0-9a-f]{64}')
+HOST_KEY_PATTERN = r'^(?:host|target):[0-9a-f]{64}$'
+_HOST_KEY = re.compile(HOST_KEY_PATTERN)
 _NODE_NIC = 'device!~"lo|veth.*|docker.*|br-.*|virbr.*|vnet.*|tap.*|cali.*|flannel.*|cni.*"'
 _WINDOWS_NIC = 'nic!~".*[Ll]oopback.*"'
 _WINDOWS_DISK = 'volume=~"[A-Z]:"'
@@ -119,7 +121,9 @@ async def read_history(reader, actor, host_key, span, targets_parser):
     if reader.origin is None:
         return _envelope(reader, host_key, span, 'not_configured')
     seconds, step, window = RANGES[span]
-    end = int(reader._clock().timestamp()) // step * step
+    # A coarse lookback still ends within the last hour, rather than up to six hours ago.
+    anchor = min(step, 3600)
+    end = int(reader._clock().timestamp()) // anchor * anchor
     start = end - seconds
     budget = _Budget()
     targets = None

@@ -174,7 +174,8 @@ describe("network rates and history", () => {
   });
   it("keeps gaps in history and rejects anything outside the contract", () => {
     expect(parseHistory(history()).series[0].points[1]).toEqual([130, null]);
-    expect(() => parseHistory(history({ range: "30d" }))).toThrow();
+    expect(parseHistory(history({ range: "30d" })).range).toBe("30d");
+    expect(() => parseHistory(history({ range: "31d" }))).toThrow();
     expect(() => parseHistory(history({ extra: 1 }))).toThrow();
     expect(() => parseHistory(history({ series: [{ key: "cpu", label: null, unit: "ratio", points: [[100, 1.5]] }] }))).toThrow();
     expect(() => parseHistory(history({ series: [{ key: "gpu", label: null, unit: "ratio", points: [[100, 0.5]] }] }))).toThrow();
@@ -186,8 +187,12 @@ describe("network rates and history", () => {
     const refused = vi.fn(async () => new Response("{}", { status: 403 }));
     await expect(readHistory(hostKey, "1h", new AbortController().signal, refused as unknown as typeof fetch)).resolves.toBeNull();
   });
+  it.each([{ host_key: `host:${"b".repeat(64)}` }, { range: "6h" }])("rejects an envelope for another selection: %o", async (wrong) => {
+    const fetchImpl: typeof fetch = async () => json(history(wrong));
+    await expect(readHistory(hostKey, "1h", new AbortController().signal, fetchImpl)).rejects.toThrow("invalid_infrastructure_metrics");
+  });
   it("offers only the ranges the Hub serves, and formats a missing rate as not reported", () => {
-    expect(HISTORY_RANGES).toEqual(["1h", "6h", "24h", "7d"]);
+    expect(HISTORY_RANGES).toEqual(["1h", "6h", "24h", "7d", "30d"]);
     expect(formatRate(null)).toBe("not reported");
     expect(formatRate(2048)).toBe("2.0 KB/s");
   });
