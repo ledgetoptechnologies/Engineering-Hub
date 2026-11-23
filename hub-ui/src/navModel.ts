@@ -36,7 +36,10 @@ export function workspaceNav(options: NavOptions): NavItem[] {
       children: options.orchestration ? [{ id: "work/orchestration", route: { page: "orchestration" }, label: "Orchestration" }] : [] },
     { id: "projects", route: { page: "projects" }, label: "Projects", icon: "folder" },
     { id: "agents", route: { page: "agents" }, label: "Agents", icon: "agents",
-      children: [{ id: "agents/installations", route: { page: "agent-installations" }, label: "Installations" }] },
+      children: [
+        { id: "agents/map", route: { page: "agent-map" }, label: "Map" },
+        { id: "agents/installations", route: { page: "agent-installations" }, label: "Installations" },
+      ] },
     { id: "staging", route: { page: "staging" }, label: "Staging", icon: "staging",
       children: [
         { id: "staging/queues", route: { page: "staging-queues" }, label: "Queues & sessions" },
@@ -55,6 +58,7 @@ export function navKey(route: Route): string {
     case "orchestration": case "orchestration-request": return "work/orchestration";
     case "project": case "labels": case "review": return "projects/project";
     case "agent-installations": return "agents/installations";
+    case "agent-map": return "agents/map";
     case "staging-queues": return "staging/queues";
     case "staging-resources": return "staging/resources";
     case "device": return "infrastructure/device";

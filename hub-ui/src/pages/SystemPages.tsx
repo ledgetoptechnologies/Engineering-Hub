@@ -47,8 +47,7 @@ function HubConnectionRow({ agent, stale }: { agent: AgentSummary; stale: boolea
 function AgentInstallationsPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   return (
     <>
-      <PageHeader eyebrow="AGENTS / INSTALLATIONS" title="Installations"
-        subtitle="Each agent installation, its sessions and its Hub access. No passwords or tokens are shown here.">
+      <PageHeader eyebrow="AGENTS / INSTALLATIONS" title="Installations">
         {actions}
       </PageHeader>
       <div id="agents" className="agents-page">
@@ -89,8 +88,7 @@ function AgentsOverview({ hub, actions }: { hub: Hub; actions: React.ReactNode }
   const connected = hub.agents.filter((agent) => connectionView(agent, !demo && stale).connected).length;
   return (
     <>
-      <PageHeader eyebrow="AGENTS" title="Agents"
-        subtitle="Recent Hub stream observations and reachability on a specific conversation topic. These are checked separately.">
+      <PageHeader eyebrow="AGENTS" title="Agents">
         {actions}
       </PageHeader>
       <div id="agents" className="agents-page">
@@ -103,9 +101,6 @@ function AgentsOverview({ hub, actions }: { hub: Hub; actions: React.ReactNode }
         retained stream. An upstream connection may still accept writes after the agent stops listening. This does not prove
         client receipt, listening, or work. Stale means recent stream activity is missing; it doesn't prove the agent is
         offline. Topic readiness is checked separately.
-      </p>
-      <p className="panel-footnote">
-        Agent installations, their sessions and Hub access are under <a className="text-link" href={link("/agents/installations")}>Installations</a>.
       </p>
       <section className="panel agents-panel" id="topics">
         <PanelTitle title="Topics" count={topics.length} />
@@ -203,8 +198,7 @@ export function StagingPage({ hub, actions, view = "overview" }: {
   const { data } = hub;
   if (view === "queues") return (
     <>
-      <PageHeader eyebrow="STAGING / QUEUES & SESSIONS" title="Queues & sessions"
-        subtitle="The shared staging queue, staging session review and the software validation queue. Software only.">
+      <PageHeader eyebrow="STAGING / QUEUES & SESSIONS" title="Queues & sessions">
         {actions}
       </PageHeader>
       <div className="staging-layout single">
@@ -224,8 +218,7 @@ export function StagingPage({ hub, actions, view = "overview" }: {
   );
   if (view === "resources") return (
     <>
-      <PageHeader eyebrow="STAGING / KEPT RESOURCES" title="Kept resources"
-        subtitle="What is kept on staging, held jobs and clean-up. Software only.">
+      <PageHeader eyebrow="STAGING / KEPT RESOURCES" title="Kept resources">
         {actions}
       </PageHeader>
       <div className="staging-layout single">
@@ -238,8 +231,7 @@ export function StagingPage({ hub, actions, view = "overview" }: {
   );
   return (
     <>
-      <PageHeader eyebrow="STAGING" title="Staging"
-        subtitle="Staging targets, the emergency pause, execution evidence and what is running on the staging PC. Software only.">
+      <PageHeader eyebrow="STAGING" title="Staging">
         {actions}
       </PageHeader>
       <div className="staging-layout">

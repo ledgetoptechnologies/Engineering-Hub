@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -37,6 +40,39 @@ def test_closed_client_paths(path):
     assert client_page_allowed('HEAD', path)
     assert browser_route_allowed('GET', path)
     assert not client_page_allowed('POST', path)
+
+
+def test_agents_map_serves_only_the_exact_authenticated_shell(tmp_path):
+    packaged_directory = os.environ.get('HUB_TEST_PACKAGED_UI_DIRECTORY')
+    ui_directory = Path(packaged_directory) if packaged_directory else tmp_path
+    index = ui_directory / 'index.html'
+    if ui_directory == tmp_path:
+        index.write_text('<!doctype html><title>Fixture Hub</title><div id="root"></div>', encoding='utf-8')
+    app = FastAPI()
+
+    def human(request):
+        if request.headers.get('x-fixture-session') != 'yes':
+            raise HTTPException(401)
+
+    attach_browser_page_routes(app, ui_directory=ui_directory, human=human, anonymous_shell=True)
+    app.mount('/', StaticFiles(directory=ui_directory, html=True))
+    path = '/agents/map'
+    headers = {'x-fixture-session': 'yes'}
+    near_matches = (path + '/', path + '/extra', '/agents/Map', '/agents/%6dap', '/agents/maps')
+    with TestClient(app, follow_redirects=False) as client:
+        for method in ('GET', 'HEAD'):
+            assert browser_route_allowed(method, path)
+            assert client.request(method, path).status_code == 401
+            response = client.request(method, path, headers=headers)
+            assert response.status_code == 200
+            assert response.headers['content-type'].startswith('text/html')
+            assert response.headers['cache-control'] == 'no-store'
+            assert response.content == (index.read_bytes() if method == 'GET' else b'')
+        for near_match in near_matches:
+            assert not browser_route_allowed('GET', near_match)
+            assert client.get(near_match, headers=headers).status_code == 404
+        assert not browser_route_allowed('POST', path)
+        assert client.post(path, headers=headers).status_code == 405
 
 
 @pytest.mark.parametrize('path', ['/api/hub/v1/tasks', '/assets/main.js', '/settings.json',

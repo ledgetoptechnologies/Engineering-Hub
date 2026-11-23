@@ -9,7 +9,8 @@ from starlette.responses import FileResponse
 _SEGMENT = r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}'
 _TABS = frozenset({'overview', 'work', 'decisions', 'notes', 'labeling', 'activity', 'plans', 'components'})
 _PAGES = frozenset({'/', '/index.html', '/inbox', '/work', '/planning', '/projects',
-                    '/notes', '/agents', '/staging', '/infrastructure', '/infrastructure/views/topology'})
+                    '/notes', '/agents', '/agents/map', '/staging', '/infrastructure',
+                    '/infrastructure/views/topology'})
 
 
 def client_page_allowed(method, path):

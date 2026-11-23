@@ -15,6 +15,7 @@ from typing import Any
 STATUSES = {"pending", "claimed", "acknowledged", "rejected"}
 AGENTS = {"hermes", "codex", "claude"}
 PRIORITIES = {"low", "normal", "high", "urgent"}
+ROUTING_ACTIVITY_SCAN_LIMIT = 5000
 MAX_CORRELATED_HOPS = 6
 SEND_FINGERPRINT_VERSION = 1
 CLIENT_REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", re.ASCII)
@@ -405,6 +406,40 @@ class MessageRepository:
                 sql += " AND lower(message_type) IN ('task', 'request')"
             rows = conn.execute(sql + " ORDER BY created_at LIMIT ?", (*params, limit)).fetchall()
             return [self._from_row(row) for row in rows]
+
+    def routing_activity(self, *, since: str, open_limit: int = 100,
+                         scan_limit: int = ROUTING_ACTIVITY_SCAN_LIMIT) -> dict[str, Any]:
+        """Family-routed ``messages`` only, not installation ``session_messages``.
+
+        Read metadata (including only body.topic from message bodies). The open
+        and recent group inputs are capped independently of the open list.
+        """
+        scan_limit = min(max(1, int(scan_limit)), ROUTING_ACTIVITY_SCAN_LIMIT)
+        topic = ("CASE WHEN json_valid(body_json) AND json_type(body_json, '$.topic') = 'text' "
+                 "THEN json_extract(body_json, '$.topic') END")
+        with self._connection() as conn:
+            # connect() uses autocommit; pin all counts and rows to one read snapshot.
+            conn.execute("BEGIN")
+            open_counts = conn.execute(
+                f"SELECT recipient, {topic} AS topic, status, COUNT(*) AS total, MIN(created_at) AS oldest "
+                "FROM (SELECT recipient, status, created_at, body_json FROM messages "
+                "WHERE status IN ('pending', 'claimed') ORDER BY created_at, id LIMIT ?) "
+                "GROUP BY recipient, topic, status", (scan_limit,)).fetchall()
+            open_total = conn.execute("SELECT COUNT(*) FROM messages WHERE status IN ('pending', 'claimed')").fetchone()[0]
+            aggregates_truncated = open_total > scan_limit or conn.execute(
+                "SELECT 1 FROM messages WHERE created_at >= ? LIMIT 1 OFFSET ?", (since, scan_limit)
+            ).fetchone() is not None
+            links = conn.execute(
+                f"SELECT sender, recipient, {topic} AS topic, COUNT(*) AS total, MAX(created_at) AS latest "
+                "FROM (SELECT sender, recipient, created_at, body_json FROM messages WHERE created_at >= ? "
+                "ORDER BY created_at DESC, id DESC LIMIT ?) GROUP BY sender, recipient, topic", (since, scan_limit)).fetchall()
+            waiting = conn.execute(
+                f"SELECT id, sender, recipient, message_type, priority, status, created_at, {topic} AS topic "
+                "FROM messages WHERE status IN ('pending', 'claimed') ORDER BY created_at, id LIMIT ?",
+                (min(max(1, int(open_limit)), 100),)).fetchall()
+        return {"open_counts": [dict(row) for row in open_counts], "links": [dict(row) for row in links],
+                "open": [dict(row) for row in waiting], "open_total": open_total,
+                "aggregates_truncated": aggregates_truncated}
 
     @staticmethod
     def _delivery_head(conn: sqlite3.Connection) -> int:

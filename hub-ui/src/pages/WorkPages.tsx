@@ -79,8 +79,7 @@ export function InboxPage({ hub, actions }: { hub: Hub; actions: React.ReactNode
   const projectsWithItems = hub.data.projects.filter((item) => count(item.id) > 0);
   return (
     <>
-      <PageHeader eyebrow="INBOX" title="Needs you"
-        subtitle="Questions that need a human, kept in one place.">{actions}</PageHeader>
+      <PageHeader eyebrow="INBOX" title="Needs you">{actions}</PageHeader>
       <div className="filter-bar" role="group" aria-label="Filter by project">
         <button className={project === "all" ? "chip selected" : "chip"} onClick={() => setProject("all")}>
           All <span>{all.length + allItems.length}</span>
@@ -131,8 +130,7 @@ export function WorkPage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
     && (!needle || task.title.toLowerCase().includes(needle)));
   return (
     <>
-      <PageHeader eyebrow="WORK" title="Work in motion"
-        subtitle="Every task: who owns it, what it's waiting on, and how long it's been there.">{actions}</PageHeader>
+      <PageHeader eyebrow="WORK" title="Work in motion">{actions}</PageHeader>
       <div className="filter-bar">
         <label className="search-field">
           <span className="sr-only">Search tasks</span>
@@ -157,7 +155,6 @@ export function WorkPage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
       <WorkOwnership hub={hub} rows={owners} selected={owner} onSelect={setOwner} />
       <section className="panel work" id="work">
         <PanelTitle title="Work in motion" count={tasks.length} />
-        <p className="panel-description">An owner, an exact candidate, and a separate reviewer.</p>
         <TaskTable hub={hub} tasks={tasks} empty={needle || status !== "all" || owner !== "all" ? "No tasks match these filters." : "No assigned work for this project."} />
         <WithdrawnList hub={hub} kind="task" project={project === "all" ? undefined : project} />
       </section>

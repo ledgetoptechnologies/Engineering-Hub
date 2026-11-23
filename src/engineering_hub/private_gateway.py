@@ -32,7 +32,7 @@ _GET = frozenset({
     '/', '/index.html', '/hub.svg', '/favicon.ico',
     '/api/hub/v1/auth/login', '/api/hub/v1/auth/me',
     *('/api/hub/v1/' + name for name in (
-        'overview', 'projects', 'agents', 'tasks', 'decisions', 'runs', 'image-versions',
+        'overview', 'projects', 'agents', 'agents/activity', 'tasks', 'decisions', 'runs', 'image-versions',
         'autonomy', 'events', 'events/status', 'work/status', 'work/jobs', 'notes', 'notes/document',
         'planning', 'planning/document', 'activity', 'label-sets', 'topics', 'interactive-reviews',
         'staging/session-reconciliation', 'staging/status', 'staging/runtime', 'staging/resources',

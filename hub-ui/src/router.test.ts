@@ -73,6 +73,7 @@ describe("section sub-page routes", () => {
   it.each([
     ["/agents/installations", { page: "agent-installations" }],
     ["#/agents/installations", { page: "agent-installations" }],
+    ["/agents/map", { page: "agent-map" }],
     ["/staging/queues", { page: "staging-queues" }],
     ["#/staging/resources", { page: "staging-resources" }],
   ])("parses %s", (value, route) => {

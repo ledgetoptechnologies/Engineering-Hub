@@ -22,6 +22,7 @@ export type Route =
   | { page: "planning" }
   | { page: "agents" }
   | { page: "agent-installations" }
+  | { page: "agent-map" }
   | { page: "staging" }
   | { page: "staging-queues" }
   | { page: "staging-resources" }
@@ -86,7 +87,8 @@ export function parseRoute(value: string): Route {
     case "notes": return { page: "notes" };
     case "planning": return { page: "planning" };
     case "agents":
-      return parts.length === 2 && parts[1] === "installations" ? { page: "agent-installations" } : { page: "agents" };
+      return parts.length === 2 && parts[1] === "installations" ? { page: "agent-installations" }
+        : parts.length === 2 && parts[1] === "map" ? { page: "agent-map" } : { page: "agents" };
     case "staging":
       if (parts.length === 2 && parts[1] === "queues") return { page: "staging-queues" };
       if (parts.length === 2 && parts[1] === "resources") return { page: "staging-resources" };
@@ -136,6 +138,7 @@ export function pathOf(route: Route): string {
     case "machine": return isHistoryHostKey(route.key) ? `/infrastructure/machines/${route.key}` : "/infrastructure";
     case "orchestration-request": return `/orchestration/${route.id}`;
     case "agent-installations": return "/agents/installations";
+    case "agent-map": return "/agents/map";
     case "staging-queues": return "/staging/queues";
     case "staging-resources": return "/staging/resources";
     default: return `/${route.page}`;
