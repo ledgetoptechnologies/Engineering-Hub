@@ -292,8 +292,9 @@ def test_both_recognised_absence_forms_initialize(registry):
 
 # Forward move in hub-latest-writer.yml, called after a verified main push
 # (Project-Alpha style, forward only), and how it interleaves with a manual rollback.
-# The hub-latest-writer concurrency group runs writes one at a time; these tests run
-# the real write steps in each order that group can produce.
+# The hub-latest-writer concurrency group runs writes one at a time and, with
+# `queue: max`, keeps every pending write instead of replacing it. These tests run
+# the real write steps in each order that queue can produce.
 
 MID = 'sha256:' + 'd' * 64
 
@@ -510,12 +511,38 @@ def test_rollback_that_runs_first_then_forward_move_only_moves_forward(history):
 
 
 def test_rollback_alone_when_its_competing_forward_move_was_cancelled(history):
-    # A pending forward move replaced by the rollback in the writer group never runs;
-    # the rollback applies from its receipt, and the main run's candidate stays
-    # promotable because promotion looks at its successful publish job.
+    # A forward move cancelled before it ran (a full queue, or a person) never writes;
+    # the rollback applies from its receipt, the main run's latest-confirm job
+    # reports it, and its candidate stays promotable through its publish job.
     root, c = history
     _candidate(root, c['base'], OLD)
     _candidate(root, c['head'], MID)
     _tag(root, f'{PACKAGE}:latest', MID)
     r = _rollback_write(root, _rollback_receipt(root, c['base'], OLD))
     assert r.returncode == 0 and _read(root, f'{PACKAGE}:latest') == OLD
+
+
+@pytest.mark.parametrize('order', ['rollback-first', 'forward-first'])
+def test_queued_rollback_and_forward_move_both_run_and_never_move_backwards(history, order):
+    # With `queue: max` neither write is dropped: both run, one after the other, in
+    # whichever order the queue releases them. A rollback queued first applies and is
+    # then moved forward; a rollback whose receipt predates the forward move refuses
+    # and fails loudly. Either way the forward move never moves latest backwards and
+    # nothing is written silently.
+    root, c = history
+    _candidate(root, c['base'], OLD)
+    _candidate(root, c['head'], MID)
+    _candidate(root, c['tip'], NEW)
+    _tag(root, f'{PACKAGE}:latest', MID)
+    receipt = _rollback_receipt(root, c['base'], OLD)
+    runs = {}
+    sequence = ['rollback', 'forward'] if order == 'rollback-first' else ['forward', 'rollback']
+    for write in sequence:
+        runs[write] = _rollback_write(root, receipt) if write == 'rollback' else _forward(root, c['tip'])
+    assert runs['forward'].returncode == 0
+    assert _read(root, f'{PACKAGE}:latest') == NEW
+    if order == 'rollback-first':
+        assert runs['rollback'].returncode == 0 and '"status": "promoted"' in _result(root)
+        assert '"status": "moved"' in _forward_result(root) and f'"previousDigest": "{OLD}"' in _forward_result(root)
+    else:
+        assert runs['rollback'].returncode == 1 and '"status": "aborted-latest-changed"' in _result(root)

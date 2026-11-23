@@ -14,13 +14,15 @@ name: Promote Engineering Hub control candidate to latest
 # Exclusion: the write itself is hub-latest-writer.yml, the single writer of
 # `latest` that hub-control.yml also uses, serialized in its `hub-latest-writer`
 # concurrency group (a test fails if another writer appears). The
-# `hub-promote-latest` group stops two promotions overlapping. Neither is a
-# registry-wide lock: a package admin could still write the tag, so the writer
-# re-reads `latest` immediately before writing and aborts if it no longer equals
-# this run's receipt. That re-read narrows the window but is
-# NOT an atomic compare-and-swap. If a forward move from a main push replaces
-# this run's pending write, the `confirm` job fails the run: check `latest` and
-# run it again.
+# `hub-promote-latest` group stops two promotions overlapping. Both groups use
+# `queue: max`, so a later promotion or main-push forward move waits instead of
+# cancelling a pending one. Neither is a registry-wide lock: a package admin
+# could still write the tag, so the writer re-reads `latest` immediately before
+# writing and aborts if it no longer equals this run's receipt. That re-read
+# narrows the window but is
+# NOT an atomic compare-and-swap. If the write is cancelled (a full queue or a
+# person) or fails, the `confirm` job fails the run: check `latest` and run it
+# again.
 on:
   workflow_dispatch:
     inputs:
@@ -48,8 +50,9 @@ on:
 permissions:
   contents: read
 concurrency:
+  # Manual admission queues (up to 100 pending) instead of replacing a pending run.
   group: hub-promote-latest
-  cancel-in-progress: false
+  queue: max
 jobs:
   promote:
     if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
@@ -252,8 +255,10 @@ jobs:
       digest: ${{ inputs.digest }}
       expected_previous: ${{ needs.promote.outputs.previous }}
   confirm:
-    # Fails the run loudly unless the write ran and succeeded. A pending write is
-    # cancelled when a main-push forward move queues behind it in hub-latest-writer.
+    # Fails the run loudly unless the write ran and succeeded: a write cancelled
+    # because the hub-latest-writer queue was full (100 pending), cancelled by a
+    # person, skipped or failed. Its always-run condition keeps it running when the
+    # run itself is cancelled after the promote job has finished.
     needs: [promote, write]
     if: ${{ always() && needs.promote.result == 'success' }}
     runs-on: ubuntu-latest
@@ -269,9 +274,9 @@ jobs:
             echo 'latest write completed; see the write job summary'
             exit 0
           fi
-          printf 'latest was NOT changed by this run: the write job was %s.\n' "$WRITE_RESULT" >> "$GITHUB_STEP_SUMMARY"
+          printf 'This promotion did NOT complete: the write job was %s. Check latest before anything else.\n' "$WRITE_RESULT" >> "$GITHUB_STEP_SUMMARY"
           if [[ "$WRITE_RESULT" == cancelled ]]; then
-            echo '::error::the latest write was cancelled before it ran, normally because a main-push forward move took the hub-latest-writer slot. latest may have moved since the receipt: check it, then run this promotion again.'
+            echo '::error::the latest write was cancelled: the hub-latest-writer queue was full (100 pending) or someone cancelled the run. If it was cancelled while writing, latest may have changed. Check latest, then run this promotion again.'
           else
             echo "::error::the latest write did not succeed ($WRITE_RESULT); see the write job log. Check latest, then run this promotion again if needed."
           fi

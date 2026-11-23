@@ -216,7 +216,12 @@ def test_latest_is_a_separate_job_so_the_candidate_stays_promotable():
     assert latest['with'] == {'mode': 'forward', 'commit': '${{ github.sha }}',
                               'digest': '${{ needs.publish.outputs.digest }}'}
     assert latest['permissions'] == {'contents': 'read', 'packages': 'write'}
-    assert set(jobs) == {'verify', 'publish', 'latest'}
+    assert set(jobs) == {'verify', 'publish', 'latest', 'latest-confirm'}
+    confirm = jobs['latest-confirm']
+    assert confirm['needs'] == ['publish', 'latest']
+    assert confirm['if'] == ("${{ always() && needs.publish.result == 'success' && github.ref == 'refs/heads/main' "
+                             "&& github.event_name == 'push' }}")
+    assert confirm['steps'][0]['env'] == {'LATEST_RESULT': '${{ needs.latest.result }}'}
     # hub-promote accepts a run whose publish job succeeded, whatever happened to `latest`.
     find = {s.get('name'): s for s in workflow('hub-promote.yml')['jobs']['promote']['steps']}[
         'Find the successful main build run for the commit']['run']
@@ -233,7 +238,9 @@ def test_one_serialized_writer_for_forward_moves_and_manual_promotion():
     assert set(writer['jobs']) == {'write'}
     job = writer['jobs']['write']
     # One repository-wide group; a running write is never cancelled.
-    assert job['concurrency'] == {'group': 'hub-latest-writer', 'cancel-in-progress': 'false'}
+    # A bounded, non-replacing queue (GitHub: up to 100 pending, FIFO; cannot be
+    # combined with cancel-in-progress, whose default false is what this needs).
+    assert job['concurrency'] == {'group': 'hub-latest-writer', 'queue': 'max'}
     assert job['if'] == ("${{ github.ref == 'refs/heads/main' && ((inputs.mode == 'forward' && github.event_name == 'push') "
                          "|| (inputs.mode == 'promote' && github.event_name == 'workflow_dispatch')) }}")
     assert job['permissions'] == {'contents': 'read', 'packages': 'write'}
@@ -251,7 +258,7 @@ def test_one_serialized_writer_for_forward_moves_and_manual_promotion():
     assert steps['Check out history for the forward-only check']['with']['fetch-depth'] == '0'
     assert all('${{' not in step.get('run', '') for step in job['steps'])
     text = (ROOT / '.github/workflows/hub-latest-writer.yml').read_text()
-    for documented in ['CANCELS the job already pending', 'confirm', 'NOT an atomic compare-and-swap']:
+    for documented in ['queue: max', 'up to 100 jobs wait', 'queue is full', 'latest-confirm', 'NOT an atomic compare-and-swap']:
         assert documented in text
 
 
@@ -298,7 +305,8 @@ def test_only_the_manual_main_promotion_moves_latest():
     assert inputs['approved_by']['required'] == 'true' and inputs['approval_reference']['required'] == 'true'
     assert inputs['initialize_latest']['default'] == 'false' and inputs['initialize_latest']['type'] == 'boolean'
     assert config['permissions'] == {'contents': 'read'}
-    assert config['concurrency'] == {'group': 'hub-promote-latest', 'cancel-in-progress': 'false'}
+    # Manual admission queues instead of replacing a pending promotion.
+    assert config['concurrency'] == {'group': 'hub-promote-latest', 'queue': 'max'}
     assert set(config['jobs']) == {'promote', 'write', 'confirm'}
     job = config['jobs']['promote']
     assert job['if'] == "${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}"
@@ -385,9 +393,37 @@ def test_a_cancelled_or_failed_manual_write_fails_the_promotion_loudly(tmp_path,
     assert run.returncode == code
     if code:
         assert '::error::' in run.stdout and 'run this promotion again' in run.stdout
-        assert f'latest was NOT changed by this run: the write job was {result}.' in summary.read_text()
+        assert f'This promotion did NOT complete: the write job was {result}.' in summary.read_text()
     if result == 'cancelled':
-        assert 'hub-latest-writer slot' in run.stdout
+        assert 'queue was full (100 pending) or someone cancelled the run' in run.stdout
+
+
+@pytest.mark.parametrize('result,code', [('success', 0), ('cancelled', 1), ('failure', 1), ('skipped', 1)])
+def test_an_incomplete_forward_move_fails_the_main_run_loudly(tmp_path, result, code):
+    bash = shutil.which('bash')
+    if os.name == 'nt' or not bash:
+        pytest.skip('requires POSIX Bash')
+    step = workflow('hub-control.yml')['jobs']['latest-confirm']['steps'][0]
+    summary = tmp_path / 'summary.md'
+    run = subprocess.run([bash, '-c', step['run']], capture_output=True, text=True, timeout=5,
+                         env={**os.environ, 'LATEST_RESULT': result, 'GITHUB_STEP_SUMMARY': str(summary)})
+    assert run.returncode == code
+    if code:
+        assert '::error::' in run.stdout and 'promote this candidate by hand' in run.stdout
+        assert f'the latest job was {result}. The candidate stays promotable' in summary.read_text()
+    if result == 'cancelled':
+        assert 'queue was full (100 pending) or someone cancelled the run' in run.stdout
+
+
+def test_no_queue_is_combined_with_cancel_in_progress():
+    # GitHub rejects `queue: max` together with cancel-in-progress.
+    for path in sorted((ROOT / '.github/workflows').glob('*.yml')):
+        config = workflow(path.name)
+        groups = [config.get('concurrency')] + [job.get('concurrency') for job in config.get('jobs', {}).values()]
+        for group in groups:
+            if isinstance(group, dict) and group.get('queue') == 'max':
+                assert 'cancel-in-progress' not in group, path.name
+                assert set(group) == {'group', 'queue'}, path.name
 
 
 def test_verify_runs_backend_e2e_and_pidfd_gates_once():

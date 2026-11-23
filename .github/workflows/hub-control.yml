@@ -255,3 +255,30 @@ jobs:
       mode: forward
       commit: ${{ github.sha }}
       digest: ${{ needs.publish.outputs.digest }}
+  latest-confirm:
+    # Reports a forward move that did not complete: the hub-latest-writer queue was
+    # full (100 pending), someone cancelled it, or it failed. The candidate stays
+    # promotable by hand (hub-promote.yml accepts the successful `publish` job), and
+    # the next main push moves `latest` forward.
+    needs: [publish, latest]
+    if: ${{ always() && needs.publish.result == 'success' && github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the forward move to have run
+        shell: bash
+        env:
+          LATEST_RESULT: ${{ needs.latest.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$LATEST_RESULT" == success ]]; then
+            echo 'forward move completed; see the latest job summary'
+            exit 0
+          fi
+          printf 'latest was not moved to this candidate: the latest job was %s. The candidate stays promotable with hub-promote.yml.\n' "$LATEST_RESULT" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$LATEST_RESULT" == cancelled ]]; then
+            echo '::error::the forward move was cancelled: the hub-latest-writer queue was full (100 pending) or someone cancelled the run. If it was cancelled while writing, latest may have changed. Check latest; promote this candidate by hand or let the next main push move it.'
+          else
+            echo "::error::the forward move did not succeed ($LATEST_RESULT); see the latest job log. Check latest; promote this candidate by hand if needed."
+          fi
+          exit 1

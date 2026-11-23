@@ -174,11 +174,19 @@ Only `.github/workflows/hub-latest-writer.yml` writes `latest`. Both the main-pu
 move and the manual promotion call it, and its job runs in one repository-wide
 concurrency group, `hub-latest-writer`, that never cancels a running write, so
 two writes never overlap and each decides from what `latest` is inside its slot.
-GitHub keeps at most one pending job per group and a newly queued one cancels the
-job already pending. So a pending main-push move replaced by a manual promotion
-is skipped (the next main push moves `latest` on), and a pending manual promotion
-replaced by a main-push move is cancelled and its `confirm` job fails the run,
-saying to check `latest` and run it again.
+The group uses `queue: max`: instead of GitHub's default, where a newly queued
+job cancels the one already pending, up to 100 writes wait and run in turn
+(first in, first out, though GitHub does not guarantee the order). So a
+main-push move never drops a queued rollback, and the reverse. Whatever the order,
+each write applies its own rule when it runs: a forward move never moves `latest`
+backwards, and a manual promotion writes only if `latest` still equals its
+receipt. A rollback queued ahead of a forward move applies and is then moved
+forward (revert on `main` to keep it); one whose receipt predates the forward move
+refuses and fails. A write that never runs is reported: if the queue is full
+GitHub cancels the newcomer, and a person may cancel a run. hub-promote's
+`confirm` job and hub-control's `latest-confirm` job then fail their run, saying
+to check `latest` and what to do next. Manual promotions also queue
+(`hub-promote-latest`, `queue: max`) instead of replacing each other.
 
 The main-push move is forward only. It checks that `sha-<commit>` still names
 the digest, reads the current `latest` and that image's
@@ -226,7 +234,7 @@ cannot be read, so a rollback never silently overwrites a main-push move that ra
 in between. That re-read is not an atomic compare-and-swap. If the write or the
 read-back fails, the run fails and prints the rollback command; it does **not**
 restore `latest`. It still uploads a `hub-promotion-result-<run>-<attempt>` record. Promotions are serialized
-(one concurrency group), every `latest` write is serialized in `hub-latest-writer`,
+(one queued concurrency group), every `latest` write is serialized in `hub-latest-writer`,
 and a test fails if anything but that writer's two write steps writes `latest`, or
 anything but the main build writes a `sha-` tag. This is not a registry-wide
 lock: package admins must not write `latest` during a release.

@@ -99,12 +99,12 @@ def test_exactly_two_latest_writers_and_only_publish_writes_sha_tags():
 
 def test_latest_writer_and_sha_writer_are_serialized():
     promote = yaml.load((WORKFLOWS / 'hub-promote.yml').read_text(), Loader=yaml.BaseLoader)
-    assert promote['concurrency'] == {'group': 'hub-promote-latest', 'cancel-in-progress': 'false'}
+    assert promote['concurrency'] == {'group': 'hub-promote-latest', 'queue': 'max'}
     control = yaml.load((WORKFLOWS / 'hub-control.yml').read_text(), Loader=yaml.BaseLoader)
     assert control['concurrency']['cancel-in-progress'] == 'false'
     assert control['concurrency']['group'] == 'hub-control-${{ github.ref }}'
     writer = yaml.load((WORKFLOWS / 'hub-latest-writer.yml').read_text(), Loader=yaml.BaseLoader)
-    assert writer['jobs']['write']['concurrency'] == {'group': 'hub-latest-writer', 'cancel-in-progress': 'false'}
+    assert writer['jobs']['write']['concurrency'] == {'group': 'hub-latest-writer', 'queue': 'max'}
     executor = yaml.load((WORKFLOWS / 'hub-executor-publication.yml').read_text(), Loader=yaml.BaseLoader)
     assert executor['concurrency']['group'] == 'hub-executor-publication'
 

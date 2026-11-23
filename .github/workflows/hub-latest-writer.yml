@@ -5,27 +5,31 @@ name: Move Engineering Hub control latest
 # A test fails if anything else writes `latest`.
 #
 # Serialization: the `write` job is in the repository-wide `hub-latest-writer`
-# concurrency group with cancel-in-progress false, so a running write is never
-# interrupted and two writes never overlap. Each write reads `latest` inside
-# that slot, so a decision and its write cannot interleave with another caller's
-# (package admins writing by hand are still outside it, hence the re-read just
-# before every write, which is NOT an atomic compare-and-swap).
+# concurrency group, so two writes never overlap and a running write is never
+# interrupted. Each write reads `latest` inside that slot, so a decision and its
+# write cannot interleave with another caller's (package admins writing by hand
+# are still outside it, hence the re-read just before every write, which is NOT
+# an atomic compare-and-swap).
 #
-# Pending behaviour: GitHub keeps one running and at most one pending job per
-# group; a newly queued job CANCELS the job already pending. Main builds are
-# serialized by their own workflow group and manual promotions by theirs, so
-# the only replacement is between the two callers:
-#   - a pending forward move replaced by a manual promotion: the forward move is
-#     cancelled and the manual choice runs. The main run's `publish` job is still
-#     successful, so that candidate stays promotable by hand, and the next main
-#     push moves `latest` forward from wherever the manual promotion left it;
-#   - a pending manual promotion replaced by a forward move: the promotion is
-#     cancelled and hub-promote.yml's `confirm` job fails the run loudly, telling
-#     the operator to check `latest` and run it again.
-# Either way the rules hold when the surviving write runs: a forward move only
-# ever moves `latest` to a descendant of the commit it names, and a manual
-# promotion writes only if `latest` still equals the digest in its receipt, so a
-# rollback never silently overwrites a newer forward move.
+# Queue: `queue: max`. GitHub's default (`single`) keeps one pending job per
+# group and a newly queued job cancels the pending one, so a main-push forward
+# move could silently drop a queued rollback. With `max`, up to 100 jobs wait
+# and each runs in turn, first in first out (GitHub notes the order is not
+# guaranteed). `queue: max` cannot be combined with cancel-in-progress, so that
+# key is omitted (its default, false, is what this needs). Every write still
+# runs its own rules when its turn comes:
+#   - a forward move only moves `latest` to a descendant of the commit it names
+#     then, so whatever order the queue runs in, it never moves `latest` back;
+#   - a manual promotion writes only if `latest` still equals the digest in its
+#     receipt. A rollback queued ahead of a forward move runs and is then moved
+#     forward by it (a rollback holds until the next main push; revert on main to
+#     keep one). A rollback whose receipt was taken before a forward move landed
+#     refuses, writes nothing and fails its run, so it never overwrites a newer
+#     move unseen.
+# A write that never runs is reported, never silent: when the queue is full (more
+# than 100 pending) GitHub cancels the newcomer, and a person may cancel a run.
+# hub-promote.yml's `confirm` job and hub-control.yml's `latest-confirm` job fail
+# their run with what happened and what to do.
 on:
   workflow_call:
     inputs:
@@ -56,7 +60,7 @@ jobs:
     timeout-minutes: 20
     concurrency:
       group: hub-latest-writer
-      cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       packages: write
