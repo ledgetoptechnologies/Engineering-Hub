@@ -31,7 +31,7 @@ class PullRequest:
     head: str
     state: str  # OPEN, MERGED or CLOSED.
     paths: frozenset[str] | None = None  # Exact PR head vs target base; None means unknown.
-    comparable: bool = True  # Only compare PRs targeting this sweep’s base.
+    comparable: bool = True  # PR targets the base selected for this sweep.
 
 
 @dataclass(frozen=True)
@@ -55,8 +55,9 @@ def owner_hint(branch):
 
 
 def _landed(branch, prs):
-    """Squash merges leave the head off main, so a merged PR must match the exact head."""
-    return branch.merged or any(pr.state == 'MERGED' and pr.head == branch.head for pr in prs)
+    """Squash merges require evidence for both the exact head and selected base."""
+    return branch.merged or any(pr.state == 'MERGED' and pr.comparable and pr.head == branch.head
+                                for pr in prs)
 
 
 def sweep(*, now, branches, prs, worktrees, stale_days=STALE_DAYS):
@@ -76,9 +77,13 @@ def sweep(*, now, branches, prs, worktrees, stale_days=STALE_DAYS):
             findings.append(Finding('merged_not_deleted', branch.name, owner,
                                     'Work is on the default branch; the branch can be cleaned up.'))
         elif any(pr.head == branch.head for pr in mine):
-            numbers = ', '.join(f'#{pr.number}' for pr in mine if pr.head == branch.head)
-            findings.append(Finding('closed_pr_branch', branch.name, owner,
-                                    f'{numbers} closed without merging; keep with a reason or delete.'))
+            if any(pr.state == 'MERGED' and pr.head == branch.head for pr in mine):
+                continue  # Merged into another base, but not known to have landed here.
+            numbers = ', '.join(f'#{pr.number}' for pr in mine
+                                if pr.state == 'CLOSED' and pr.head == branch.head)
+            if numbers:
+                findings.append(Finding('closed_pr_branch', branch.name, owner,
+                                        f'{numbers} closed without merging; keep with a reason or delete.'))
         elif branch.committed_at < cutoff:
             age = (now - branch.committed_at).days
             findings.append(Finding('no_pr_stale', branch.name, owner,

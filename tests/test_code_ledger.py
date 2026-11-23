@@ -29,6 +29,15 @@ def test_squash_merge_needs_the_exact_head():
     assert kinds(run([Branch('codex/x', 'a', FRESH)], [PullRequest(1, 'codex/x', 'a', 'MERGED')])) == ['merged_not_deleted']
 
 
+def test_merge_into_unlanded_parent_is_not_default_branch_cleanup_evidence():
+    branch = Branch('codex/stack-child', 'a', OLD)
+    pr = PullRequest(1, branch.name, branch.head, 'MERGED', comparable=False)
+    tree = Worktree('C:/stack-child', branch.name)
+    assert run([branch], [pr], [tree]) == []
+    reachable = Branch(branch.name, branch.head, OLD, merged=True)
+    assert kinds(run([reachable], [pr], [tree])) == ['merged_not_deleted', 'worktree_merged']
+
+
 def test_commits_after_a_merged_pr_are_not_reported_as_landed():
     # New work on a reused branch must not be offered for deletion.
     assert run([Branch('codex/x', 'b', FRESH)], [PullRequest(1, 'codex/x', 'a', 'MERGED')]) == []
