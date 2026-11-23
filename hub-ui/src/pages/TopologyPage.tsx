@@ -19,17 +19,15 @@ function useClient(hub: Hub): InfrastructureClient {
 
 function useDeviceList(hub: Hub, client: InfrastructureClient): [Load<DeviceList>, () => void] {
   const [load, setLoad] = useState<Load<DeviceList>>({ state: "loading" });
-  const [attempt, refresh] = useInfrastructureRefresh(!hub.demo && load.state !== "unavailable");
+  const [attempt, refresh, runRead] = useInfrastructureRefresh(!hub.demo && load.state !== "unavailable");
   const read = useRef(client.list);
   read.current = client.list;
   useEffect(() => {
-    const controller = new AbortController();
     setLoad(current => current.state === "loaded" ? current : { state: "loading" });
     // Include retired entries: this view is a complete picture of registered Inventory records.
-    read.current(controller.signal, true).then(value => {
-      if (!controller.signal.aborted) setLoad({ state: "loaded", value });
-    }).catch(error => {
-      if (controller.signal.aborted) return;
+    return runRead(signal => read.current(signal, true), value => {
+      setLoad({ state: "loaded", value });
+    }, error => {
       if (error instanceof HubApiError && error.status === 401) { hub.clearPrivateWorkspace(); return; }
       if (inventoryUnavailable(error)) {
         setLoad({ state: "unavailable" }); return;
@@ -37,8 +35,7 @@ function useDeviceList(hub: Hub, client: InfrastructureClient): [Load<DeviceList
       setLoad(current => current.state === "loaded" && transientRefreshError(error)
         ? { ...current, refreshFailed: true } : { state: "failed", message: "The Hub's registered devices couldn't be read. Use Refresh to try again." });
     });
-    return () => controller.abort();
-  }, [client, hub.clearPrivateWorkspace, hub.data, attempt]);
+  }, [client, hub.clearPrivateWorkspace, hub.data, attempt, runRead]);
   return [load, refresh];
 }
 

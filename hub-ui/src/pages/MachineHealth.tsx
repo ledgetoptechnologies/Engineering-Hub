@@ -98,24 +98,20 @@ function TargetBody({ item }: { item: MachineTarget }) {
 export interface MachineReading { load: Load; now: Date; refresh: () => void }
 export function useMachineMetrics(hub: Hub): MachineReading {
   const [load, setLoad] = useState<Load>({ state: "loading" });
-  const [attempt, refresh] = useInfrastructureRefresh(!hub.demo && load.state !== "hidden");
+  const [attempt, refresh, runRead] = useInfrastructureRefresh(!hub.demo && load.state !== "hidden");
   const [now, setNow] = useState(() => new Date());
   useEffect(() => {
     if (hub.demo) { setNow(new Date()); setLoad({ state: "loaded", value: demoMachineMetrics() }); return; }
-    const controller = new AbortController();
     setLoad(current => current.state === "loaded" ? current : { state: "loading" });
-    readMetrics(controller.signal).then(value => {
-      if (controller.signal.aborted) return;
+    return runRead(signal => readMetrics(signal), value => {
       setNow(new Date());
       setLoad(current => value === "unavailable" && current.state === "loaded" ? { ...current, refreshFailed: true } : value === null ? { state: "hidden" } : value === "unavailable" ? { state: "unavailable" } : { state: "loaded", value });
-    }).catch(error => {
-      if (controller.signal.aborted) return;
+    }, error => {
       if (error instanceof HubApiError && error.status === 401) { hub.clearPrivateWorkspace(); return; }
       setLoad(current => current.state === "loaded" && transientRefreshError(error)
         ? { ...current, refreshFailed: true } : { state: "failed" });
     });
-    return () => controller.abort();
-  }, [hub.demo, attempt]);
+  }, [hub.demo, attempt, runRead]);
   return { load, now, refresh };
 }
 

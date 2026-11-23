@@ -38,15 +38,13 @@ function useClient(hub: Hub): InfrastructureClient {
 }
 function useRead<T>(hub: Hub, read: (signal: AbortSignal) => Promise<T>, deps: unknown[], autoRefresh: boolean): [Load<T>, () => void] {
   const [load, setLoad] = useState<Load<T>>({ state: "loading" });
-  const [attempt, refresh] = useInfrastructureRefresh(autoRefresh && !hub.demo && load.state !== "unavailable");
+  const [attempt, refresh, runRead] = useInfrastructureRefresh(autoRefresh && !hub.demo && load.state !== "unavailable");
   const reader = useRef(read); reader.current = read;
   useEffect(() => {
-    const controller = new AbortController();
     setLoad(current => current.state === "loaded" ? current : { state: "loading" });
-    reader.current(controller.signal).then(value => {
-      if (!controller.signal.aborted) setLoad({ state: "loaded", value });
-    }).catch(error => {
-      if (controller.signal.aborted) return;
+    return runRead(signal => reader.current(signal), value => {
+      setLoad({ state: "loaded", value });
+    }, error => {
       if (error instanceof HubApiError && error.status === 401) { hub.clearPrivateWorkspace(); return; }
       if (inventoryUnavailable(error)) {
         setLoad({ state: "unavailable" }); return;
@@ -55,8 +53,7 @@ function useRead<T>(hub: Hub, read: (signal: AbortSignal) => Promise<T>, deps: u
         ? { ...current, refreshFailed: true } : { state: "failed", message: error instanceof HubApiError && error.code === "device_not_found"
         ? "This device isn't in the Hub's inventory." : "The Hub's infrastructure list couldn't be read. Use Refresh to try again." });
     });
-    return () => controller.abort();
-  }, [...deps, attempt]);
+  }, [...deps, attempt, runRead]);
   return [load, refresh];
 }
 

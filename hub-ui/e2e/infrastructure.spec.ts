@@ -592,16 +592,48 @@ test("new Prometheus targets appear on the next refresh without reloading Infras
   expect(state.metrics).toBe(2);
 });
 
+test("a deferred manual read survives a poll tick, times out and recovers", async ({ page }) => {
+  await page.clock.install();
+  await fixture(page);
+  let reads = 0;
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  await page.route("**/api/hub/v1/infrastructure/devices*", async route => {
+    if (++reads === 2) await held;
+    await route.fulfill({ json: list().body });
+  });
+  try {
+    await page.goto("/#/infrastructure");
+    const panel = devicesPanel(page);
+    await expect(panel.getByRole("link", { name: "Build PC" })).toBeVisible();
+    await page.clock.runFor(25_000);
+    await panel.getByRole("button", { name: "Refresh" }).click();
+    await expect.poll(() => reads).toBe(2);
+    await page.clock.runFor(6_000);
+    expect(reads).toBe(2);
+    const notice = panel.getByText("Couldn't refresh device list. Showing the last reading.");
+    await expect(notice).toHaveCount(0);
+    await page.clock.runFor(10_000);
+    await expect(notice).toBeVisible();
+    await expect(panel.getByRole("link", { name: "Build PC" })).toBeVisible();
+    await page.clock.runFor(20_000);
+    await expect(notice).toHaveCount(0);
+    expect(reads).toBe(3);
+  } finally { release(); }
+});
+
 test("visible registered device details, current readings and charts refresh every 30 seconds", async ({ page }) => {
   await page.clock.install();
   const metrics = { status: 200, body: prioritizedMetrics() };
-  const state = await fixture(page, { metrics: [metrics, { status: 503, body: {} }, metrics] });
+  const disabled = { status: 503, body: { detail: { code: "infrastructure_not_configured" } } };
+  const state = await fixture(page, { metrics: [metrics, { status: 503, body: {} }, metrics, metrics, disabled] });
   const historyReads: string[] = [];
   await page.route("**/api/hub/v1/infrastructure/metrics/history**", async route => {
     const { searchParams } = new URL(route.request().url());
     const host = searchParams.get("host"), range = searchParams.get("range");
     historyReads.push(`${host}|${range}`);
     if (historyReads.length === 2) return route.fulfill({ status: 503, json: {} });
+    if (historyReads.length === 4) return route.fulfill({ status: disabled.status, json: disabled.body });
     await route.fulfill({ json: { schema_version: 1, generated_at: new Date().toISOString(), host_key: host, range,
       step_seconds: 3600, source: { status: "ok" }, series: [{ key: "cpu", label: null, unit: "ratio",
         points: historyReads.length === 1 ? [[3600, 0.2], [7200, 0.6]] : [[10800, 0.8]] }] } });
@@ -623,6 +655,14 @@ test("visible registered device details, current readings and charts refresh eve
   expect(state.metrics).toBe(3);
   expect(historyReads).toEqual(Array(3).fill(`host:${"1".padStart(64, "0")}|7d`));
   await expect(page.getByRole("combobox", { name: "Time range" })).toHaveValue("7d");
+  await page.clock.runFor(30_000);
+  await expect(chart).toHaveCount(0);
+  await expect(page.getByText("History isn't available for this machine.")).toBeVisible();
+  await page.clock.runFor(30_000);
+  await expect(page.getByRole("region", { name: "Machine history" })).toHaveCount(0);
+  await page.clock.runFor(30_000);
+  expect(historyReads).toHaveLength(4);
+  expect(state.metrics).toBe(5);
 });
 
 test("registered and discovered pages share graphs-first controls and keep the range through switching, reload and Back", async ({ page }) => {

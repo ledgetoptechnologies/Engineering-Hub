@@ -140,21 +140,18 @@ function bySeries(series: HistorySeries[], key: HistorySeries["key"]) { return s
 
 export function MachineHistory({ hub, hostKey, range }: { hub: Hub; hostKey: string; range: HistoryRange }) {
   const [load, setLoad] = useState<Load>({ state: "loading" });
-  const [attempt, refresh] = useInfrastructureRefresh(!hub.demo && load.state !== "gone");
+  const [attempt, refresh, runRead] = useInfrastructureRefresh(!hub.demo && load.state !== "gone");
   useEffect(() => {
     if (hub.demo) { setLoad({ state: "loaded", value: demoMachineHistory(hostKey, range) }); return; }
-    const controller = new AbortController();
     setLoad(current => current.state === "loaded" ? current : { state: "loading" });
-    readHistory(hostKey, range, controller.signal).then(value => {
-      if (!controller.signal.aborted) setLoad(current => value === "unavailable" && current.state === "loaded" ? { ...current, refreshFailed: true } : value === null ? { state: "gone" } : value === "unavailable" ? { state: "unavailable" } : { state: "loaded", value });
-    }).catch(error => {
-      if (controller.signal.aborted) return;
+    return runRead(signal => readHistory(hostKey, range, signal), value => {
+      setLoad(current => value === "unavailable" && current.state === "loaded" ? { ...current, refreshFailed: true } : value === null ? { state: "gone" } : value === "unavailable" ? { state: "unavailable" } : { state: "loaded", value });
+    }, error => {
       if (error instanceof HubApiError && error.status === 401) { hub.clearPrivateWorkspace(); return; }
       setLoad(current => current.state === "loaded" && transientRefreshError(error)
         ? { ...current, refreshFailed: true } : { state: "failed" });
     });
-    return () => controller.abort();
-  }, [hub.demo, hostKey, range, attempt]);
+  }, [hub.demo, hostKey, range, attempt, runRead]);
   const data = load.state === "loaded" ? load.value : null;
   const { charts, hasSamples } = useMemo(() => {
     const series = data?.series.filter(item => item.points.some(([, value]) => value !== null)) ?? [];
