@@ -28,6 +28,7 @@ services:
       HUB_INGRESS_MODE: combined
       HUB_WORK_QUEUE_ENABLED: "0"
       HUB_BUS_STARTUP_CLEANUP: "0"
+      # Explicit off switch: keeps the registry off even if the env file sets HUB_REGISTRY_ORIGIN.
       HUB_REGISTRY_ENABLED: "0"
       HUB_REGISTRY_EVENTS_ENABLED: "0"
       HUB_AGENT_SESSIONS_MODE: "${STAGING_SESSIONS_MODE:-disabled}"
