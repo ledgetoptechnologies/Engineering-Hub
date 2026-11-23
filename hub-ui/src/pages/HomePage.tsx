@@ -5,6 +5,7 @@ import { ImageVersionsPanel } from "../ImageVersionsPanel";
 import type { Hub } from "../hub";
 import { Badge, Icon, PageHeader, names } from "../ui";
 import { answeredDecisions, openDecisions, RecentAnswers } from "./decisions";
+import { reviewPassedNote } from "../dashboardText";
 import { statusLabel, statusTone } from "./tasks";
 import { isActive, waitingKind, waitingTasks } from "../backlog";
 import { DayBars, StageBar, StageLegend, dailyCounts } from "../charts";
@@ -43,7 +44,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
         <a className="kpi" href={link("/work")}>
           <span className="kpi-label"><Icon kind="work" size={16} /> Work in motion</span>
           <strong>{active.length}</strong>
-          <span className="kpi-note">{passed} review passed</span>
+          <span className="kpi-note">{reviewPassedNote(passed)}</span>
         </a>
         <a className="kpi" href={link("/agents")}>
           <span className="kpi-label"><Icon kind="agents" size={16} /> Agent streams observed</span>
