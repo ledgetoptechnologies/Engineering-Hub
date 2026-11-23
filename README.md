@@ -113,7 +113,8 @@ write-once `sha-<commit>`), then, on a `main` push, moves
 `ghcr.io/ledgetoptechnologies/engineering-hub-control:latest` forward to that
 exact digest in the same run, as Project-Alpha does. It never moves `latest` to
 an older commit. The hand-run `.github/workflows/hub-promote.yml` remains the
-manual path for rollback (see docs/hub-control-deployment.md). Hosted checks run
+manual path for rollback. Both write through `.github/workflows/hub-latest-writer.yml`,
+one serialized writer (see docs/hub-control-deployment.md). Hosted checks run
 only for pushes to `main`, or a manual Hub dispatch selecting `main`. A manual
 dispatch selecting a development branch is refused by the job condition. Pull
 requests, development-branch pushes and tag pushes do not run hosted CI; run

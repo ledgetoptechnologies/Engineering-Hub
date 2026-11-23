@@ -1,8 +1,11 @@
 name: Engineering Hub control image
 # Main builds publish an immutable, smoke-tested candidate (build-<sha>-<run>-<attempt>
-# and write-once sha-<commit>). A main push then moves `latest` to that exact digest
-# in the same run (Project-Alpha style), forward only. hub-promote.yml is the
-# manual path for rollback or for promoting a manually dispatched candidate.
+# and write-once sha-<commit>). On a main push the separate `latest` job then moves
+# `latest` to that exact digest in the same run (Project-Alpha style), forward
+# only, through hub-latest-writer.yml: the single, serialized writer that
+# hub-promote.yml (manual promotion and rollback) also uses. The `latest` job is
+# separate so its failure or cancellation never changes the `publish` job's
+# success, which is what makes a candidate promotable by hand.
 on:
   push:
     branches: [main]
@@ -90,6 +93,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.registry.outputs.digest }}
     env:
       PACKAGE: ghcr.io/ledgetoptechnologies/engineering-hub-control
       BUILD_IMAGE: ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -97,9 +102,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
-          # Full history so the latest step can prove the current latest commit is
-          # an ancestor of this build (git merge-base --is-ancestor).
-          fetch-depth: 0
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -147,6 +149,7 @@ jobs:
           wait_smokes "$first" "$second"
           python scripts/hub_settings_container_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-settings-startup.json
       - name: Publish unique build tag and verify authenticated registry read
+        id: registry
         run: |
           set -eu
           docker push "$BUILD_IMAGE"
@@ -154,6 +157,7 @@ jobs:
           docker buildx imagetools inspect "$BUILD_IMAGE" --format '{{json .Manifest}}' > hub-registry-descriptor.json
           DIGEST="$(python -c 'import json,re; d=json.load(open("hub-registry-descriptor.json"))["digest"]; assert re.fullmatch("sha256:[a-f0-9]{64}",d); print(d)')"
           echo "IMAGE_DIGEST=$DIGEST" >> "$GITHUB_ENV"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           docker pull "$PACKAGE@$DIGEST"
           wait_smokes() {
             local status=0 pid
@@ -226,143 +230,6 @@ jobs:
             hub-release.txt
           if-no-files-found: error
           retention-days: 90
-      - name: Move latest forward to the tested digest
-        id: latest
-        # Project-Alpha style: a verified main push moves `latest` to the exact digest
-        # it just built, smoke-tested (locally and from the registry) and tagged with
-        # its commit, in this same run. A manual dispatch publishes the candidate only;
-        # promote it with hub-promote.yml. Forward only: `latest` moves only when the
-        # commit it names now is an ancestor of (or equal to) this commit, so a re-run
-        # of an older commit never moves it back. hub-promote.yml is the manual
-        # rollback path; the next main push moves `latest` forward again, so revert on
-        # main to keep a rollback. The re-read immediately before the write narrows the
-        # window for another writer (hub-promote.yml or a package admin) but is NOT an
-        # atomic compare-and-swap; the registry offers none. Main runs are serialized
-        # by this workflow's concurrency group, and a test allows only this step and
-        # hub-promote.yml to write `latest`.
-        if: ${{ github.event_name == 'push' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          PREVIOUS_DIGEST=unread
-          PREVIOUS_COMMIT=unknown
-          record() {
-            printf '{"status": "%s", "previousDigest": "%s", "previousCommit": "%s", "newDigest": "%s", "commit": "%s", "runId": "%s", "runAttempt": "%s", "latestAfter": "%s", "recordedAt": "%s"}\n' \
-              "$1" "$PREVIOUS_DIGEST" "$PREVIOUS_COMMIT" "$IMAGE_DIGEST" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$2" \
-              "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > hub-latest-result.json
-          }
-          summary() {
-            {
-              printf '### latest\n\n- Result: %s\n' "$1"
-              printf -- '- Commit: `%s`\n- Digest: `%s`\n' "$GITHUB_SHA" "$IMAGE_DIGEST"
-              printf -- '- Previous latest: `%s` (commit `%s`)\n' "$PREVIOUS_DIGEST" "$PREVIOUS_COMMIT"
-              printf -- '- Manual rollback: hub-promote.yml with an earlier candidate commit and digest.\n'
-            } >> "$GITHUB_STEP_SUMMARY"
-          }
-          rollback_help() {
-            echo "latest was NOT restored automatically. To roll back, run hub-promote.yml with the earlier"
-            echo "candidate's commit $PREVIOUS_COMMIT and digest $PREVIOUS_DIGEST, or (package admin):"
-            echo "  docker buildx imagetools create --prefer-index=false --tag $PACKAGE:latest $PACKAGE@$PREVIOUS_DIGEST"
-          }
-          read_latest() {
-            local attempt out
-            for attempt in 1 2 3; do
-              if out="$(docker buildx imagetools inspect "$PACKAGE:latest" --format '{{json .Manifest.Digest}}' 2>"$RUNNER_TEMP/latest-error.txt")"; then
-                out="$(printf '%s' "$out" | tr -d '"')"
-                [[ "$out" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
-                printf '%s' "$out"
-                return 0
-              fi
-              cat "$RUNNER_TEMP/latest-error.txt" >&2
-              [[ "$attempt" == 3 ]] || sleep "${LATEST_RETRY_DELAY_SECONDS:-5}"
-            done
-            return 1
-          }
-          record started unknown
-          # A missing latest is never created here (first-time setup is hub-promote.yml
-          # with initialize_latest). An unreadable or malformed latest writes nothing.
-          if ! PREVIOUS_DIGEST="$(read_latest)"; then
-            PREVIOUS_DIGEST=unreadable
-            record aborted-latest-unreadable unknown
-            summary 'not moved: the current latest could not be read'
-            echo '::error::cannot read the current latest; nothing was written'
-            exit 1
-          fi
-          if [[ "$PREVIOUS_DIGEST" == "$IMAGE_DIGEST" ]]; then
-            PREVIOUS_COMMIT="$GITHUB_SHA"
-            record already-current "$IMAGE_DIGEST"
-            summary 'unchanged: latest already names this digest'
-            exit 0
-          fi
-          # The commit latest names now, from the image's OCI revision label.
-          docker pull --quiet "$PACKAGE@$PREVIOUS_DIGEST" > /dev/null \
-            && PREVIOUS_COMMIT="$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$PACKAGE@$PREVIOUS_DIGEST")" \
-            || PREVIOUS_COMMIT=unreadable
-          if [[ ! "$PREVIOUS_COMMIT" =~ ^[0-9a-f]{40}$ ]] || ! git cat-file -e "$PREVIOUS_COMMIT^{commit}" 2>/dev/null; then
-            record aborted-previous-commit-unknown "$PREVIOUS_DIGEST"
-            summary 'not moved: the commit of the current latest is not in this repository'
-            echo "::error::current latest $PREVIOUS_DIGEST has revision '$PREVIOUS_COMMIT', which is not a commit here; nothing was written. Use hub-promote.yml."
-            exit 1
-          fi
-          # Forward only. is-ancestor exits 0 (ancestor or equal), 1 (not an ancestor), else error.
-          ancestry=0
-          git merge-base --is-ancestor "$PREVIOUS_COMMIT" "$GITHUB_SHA" || ancestry=$?
-          if [[ "$ancestry" == 1 ]]; then
-            record skipped-not-newer "$PREVIOUS_DIGEST"
-            summary 'not moved: latest names a commit that is not an ancestor of this one'
-            echo "::notice::latest names $PREVIOUS_COMMIT, which is not an ancestor of $GITHUB_SHA; latest left unchanged"
-            exit 0
-          fi
-          if [[ "$ancestry" != 0 ]]; then
-            record aborted-ancestry-error "$PREVIOUS_DIGEST"
-            summary 'not moved: the ancestry check failed'
-            echo '::error::git merge-base failed; nothing was written'
-            exit 1
-          fi
-          # Fail-closed re-read immediately before the write: latest must still be
-          # exactly what was read above. This is NOT an atomic compare-and-swap.
-          CURRENT="$(read_latest)" || CURRENT=unreadable
-          if [[ "$CURRENT" == unreadable ]]; then
-            record aborted-latest-unreadable unknown
-            summary 'not moved: latest could not be re-read before the write'
-            echo '::error::latest could not be re-read before the write; nothing was written'
-            exit 1
-          fi
-          if [[ "$CURRENT" != "$PREVIOUS_DIGEST" ]]; then
-            # Another writer (normally a manual hub-promote.yml run) changed latest.
-            # Its choice stands; this candidate stays promotable by hand.
-            record skipped-latest-changed "$CURRENT"
-            summary "not moved: latest changed to \`$CURRENT\` before the write"
-            echo "::warning::latest changed before the write (read: $PREVIOUS_DIGEST, now: $CURRENT); nothing was written"
-            exit 0
-          fi
-          docker buildx imagetools create --prefer-index=false --tag "$PACKAGE:latest" "$PACKAGE@$IMAGE_DIGEST" || {
-            record write-failed unknown
-            summary 'FAILED: the write to latest failed; its state is unknown'
-            echo '::error::moving latest failed; its state is unknown'
-            rollback_help
-            exit 1
-          }
-          AFTER="$(read_latest)" || AFTER=unreadable
-          if [[ "$AFTER" != "$IMAGE_DIGEST" ]]; then
-            record verify-failed "$AFTER"
-            summary "FAILED: latest could not be confirmed as this digest (read: \`$AFTER\`); it was NOT restored automatically"
-            echo "::error::latest could not be confirmed as $IMAGE_DIGEST (read: $AFTER)"
-            rollback_help
-            exit 1
-          fi
-          record moved "$AFTER"
-          summary 'moved: latest now names this digest'
-      - name: Upload the latest result
-        if: ${{ always() && steps.latest.outcome != 'skipped' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: hub-control-latest-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: hub-latest-result.json
-          if-no-files-found: warn
-          retention-days: 90
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
@@ -371,3 +238,20 @@ jobs:
             hub-*-startup.json
             hub-*-manifest.json
             hub-release.txt
+  latest:
+    # Project-Alpha style: a verified main push moves `latest` to the exact digest
+    # `publish` just built, smoke-tested and tagged sha-<commit>, in this same run.
+    # A manual dispatch publishes the candidate only; promote it with hub-promote.yml.
+    # A separate job, so a failed or cancelled tag move leaves `publish` (and so the
+    # candidate's promotability) successful. The write itself happens only in
+    # hub-latest-writer.yml, serialized with hub-promote.yml in one concurrency group.
+    needs: publish
+    if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/hub-latest-writer.yml
+    with:
+      mode: forward
+      commit: ${{ github.sha }}
+      digest: ${{ needs.publish.outputs.digest }}

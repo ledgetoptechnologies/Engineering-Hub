@@ -1,0 +1,297 @@
+name: Move Engineering Hub control latest
+# The single, serialized writer of engineering-hub-control:latest. Two callers:
+#   - hub-control.yml `latest` job, mode `forward`, after a verified main push;
+#   - hub-promote.yml `write` job, mode `promote`, a manual promotion or rollback.
+# A test fails if anything else writes `latest`.
+#
+# Serialization: the `write` job is in the repository-wide `hub-latest-writer`
+# concurrency group with cancel-in-progress false, so a running write is never
+# interrupted and two writes never overlap. Each write reads `latest` inside
+# that slot, so a decision and its write cannot interleave with another caller's
+# (package admins writing by hand are still outside it, hence the re-read just
+# before every write, which is NOT an atomic compare-and-swap).
+#
+# Pending behaviour: GitHub keeps one running and at most one pending job per
+# group; a newly queued job CANCELS the job already pending. Main builds are
+# serialized by their own workflow group and manual promotions by theirs, so
+# the only replacement is between the two callers:
+#   - a pending forward move replaced by a manual promotion: the forward move is
+#     cancelled and the manual choice runs. The main run's `publish` job is still
+#     successful, so that candidate stays promotable by hand, and the next main
+#     push moves `latest` forward from wherever the manual promotion left it;
+#   - a pending manual promotion replaced by a forward move: the promotion is
+#     cancelled and hub-promote.yml's `confirm` job fails the run loudly, telling
+#     the operator to check `latest` and run it again.
+# Either way the rules hold when the surviving write runs: a forward move only
+# ever moves `latest` to a descendant of the commit it names, and a manual
+# promotion writes only if `latest` still equals the digest in its receipt, so a
+# rollback never silently overwrites a newer forward move.
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: forward (verified main push) or promote (manual promotion or rollback)
+        type: string
+        required: true
+      commit:
+        description: Full 40-character main commit of the tested candidate
+        type: string
+        required: true
+      digest:
+        description: The candidate's image digest (sha256:...)
+        type: string
+        required: true
+      expected_previous:
+        description: promote only. The previous digest (or `absent`) recorded in the rollback receipt
+        type: string
+        required: false
+        default: ''
+permissions:
+  contents: read
+jobs:
+  write:
+    # The caller decides; this repeats the main-ref and event rule per mode.
+    if: ${{ github.ref == 'refs/heads/main' && ((inputs.mode == 'forward' && github.event_name == 'push') || (inputs.mode == 'promote' && github.event_name == 'workflow_dispatch')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: hub-latest-writer
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PACKAGE: ghcr.io/ledgetoptechnologies/engineering-hub-control
+      WRITER_MODE: ${{ inputs.mode }}
+      TARGET_COMMIT: ${{ inputs.commit }}
+      TARGET_DIGEST: ${{ inputs.digest }}
+      EXPECTED_PREVIOUS: ${{ inputs.expected_previous }}
+    steps:
+      - name: Validate the requested write
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$WRITER_MODE" == forward || "$WRITER_MODE" == promote ]] || { echo '::error::mode must be forward or promote'; exit 1; }
+          [[ "$TARGET_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::commit must be a full lowercase 40-character SHA'; exit 1; }
+          [[ "$TARGET_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo '::error::digest must be sha256:<64 hex>'; exit 1; }
+          if [[ "$WRITER_MODE" == forward ]]; then
+            [[ -z "$EXPECTED_PREVIOUS" ]] || { echo '::error::expected_previous is for promote only'; exit 1; }
+          else
+            [[ "$EXPECTED_PREVIOUS" == absent || "$EXPECTED_PREVIOUS" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo '::error::expected_previous must be absent or sha256:<64 hex>'; exit 1; }
+          fi
+      - name: Check out history for the forward-only check
+        if: ${{ inputs.mode == 'forward' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Move latest forward to the tested digest
+        id: forward
+        if: ${{ inputs.mode == 'forward' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREVIOUS_DIGEST=unread
+          PREVIOUS_COMMIT=unknown
+          record() {
+            printf '{"status": "%s", "previousDigest": "%s", "previousCommit": "%s", "newDigest": "%s", "commit": "%s", "runId": "%s", "runAttempt": "%s", "latestAfter": "%s", "recordedAt": "%s"}\n' \
+              "$1" "$PREVIOUS_DIGEST" "$PREVIOUS_COMMIT" "$TARGET_DIGEST" "$TARGET_COMMIT" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$2" \
+              "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > hub-latest-result.json
+          }
+          summary() {
+            {
+              printf '### latest\n\n- Result: %s\n' "$1"
+              printf -- '- Commit: `%s`\n- Digest: `%s`\n' "$TARGET_COMMIT" "$TARGET_DIGEST"
+              printf -- '- Previous latest: `%s` (commit `%s`)\n' "$PREVIOUS_DIGEST" "$PREVIOUS_COMMIT"
+              printf -- '- Manual rollback: hub-promote.yml with an earlier candidate commit and digest.\n'
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+          fail() { record "$1" "$2"; summary "$3"; echo "::error::$4"; exit 1; }
+          rollback_help() {
+            echo "latest was NOT restored automatically. To roll back, run hub-promote.yml with the earlier"
+            echo "candidate's commit $PREVIOUS_COMMIT and digest $PREVIOUS_DIGEST, or (package admin):"
+            echo "  docker buildx imagetools create --prefer-index=false --tag $PACKAGE:latest $PACKAGE@$PREVIOUS_DIGEST"
+          }
+          read_digest() {
+            local ref="$1" attempt out
+            for attempt in 1 2 3; do
+              if out="$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest.Digest}}' 2>"$RUNNER_TEMP/inspect-error.txt")"; then
+                out="$(printf '%s' "$out" | tr -d '"')"
+                [[ "$out" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+                printf '%s' "$out"
+                return 0
+              fi
+              cat "$RUNNER_TEMP/inspect-error.txt" >&2
+              [[ "$attempt" == 3 ]] || sleep "${LATEST_RETRY_DELAY_SECONDS:-5}"
+            done
+            return 1
+          }
+          record started unknown
+          # Still the tested candidate: its write-once commit tag must name this digest.
+          CANDIDATE="$(read_digest "$PACKAGE:sha-$TARGET_COMMIT")" || CANDIDATE=unreadable
+          [[ "$CANDIDATE" == "$TARGET_DIGEST" ]] || fail aborted-not-candidate unknown \
+            'not moved: the commit tag does not name this digest' "the commit tag names $CANDIDATE, not $TARGET_DIGEST; nothing was written"
+          # A missing latest is never created here (first-time setup is hub-promote.yml
+          # with initialize_latest). An unreadable or malformed latest writes nothing.
+          if ! PREVIOUS_DIGEST="$(read_digest "$PACKAGE:latest")"; then
+            PREVIOUS_DIGEST=unreadable
+            fail aborted-latest-unreadable unknown 'not moved: the current latest could not be read' \
+              'cannot read the current latest; nothing was written'
+          fi
+          if [[ "$PREVIOUS_DIGEST" == "$TARGET_DIGEST" ]]; then
+            PREVIOUS_COMMIT="$TARGET_COMMIT"
+            record already-current "$TARGET_DIGEST"
+            summary 'unchanged: latest already names this digest'
+            exit 0
+          fi
+          # The commit latest names now, from the image's OCI revision label.
+          docker pull --quiet "$PACKAGE@$PREVIOUS_DIGEST" > /dev/null \
+            && PREVIOUS_COMMIT="$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$PACKAGE@$PREVIOUS_DIGEST")" \
+            || PREVIOUS_COMMIT=unreadable
+          if [[ ! "$PREVIOUS_COMMIT" =~ ^[0-9a-f]{40}$ ]] || ! git cat-file -e "$PREVIOUS_COMMIT^{commit}" 2>/dev/null; then
+            fail aborted-previous-commit-unknown "$PREVIOUS_DIGEST" 'not moved: the commit of the current latest is not in this repository' \
+              "current latest $PREVIOUS_DIGEST has revision '$PREVIOUS_COMMIT', which is not a commit here; nothing was written. Use hub-promote.yml."
+          fi
+          # Forward only. is-ancestor exits 0 (ancestor or equal), 1 (not an ancestor), else error.
+          forward=0
+          git merge-base --is-ancestor "$PREVIOUS_COMMIT" "$TARGET_COMMIT" || forward=$?
+          if [[ "$forward" == 1 ]]; then
+            behind=0
+            git merge-base --is-ancestor "$TARGET_COMMIT" "$PREVIOUS_COMMIT" || behind=$?
+            if [[ "$behind" == 0 ]]; then
+              # An older build finishing late: latest already names a newer commit.
+              record skipped-older-build "$PREVIOUS_DIGEST"
+              summary 'not moved: latest already names a newer commit'
+              echo "::warning::latest names $PREVIOUS_COMMIT, which is newer than $TARGET_COMMIT; latest left unchanged"
+              exit 0
+            fi
+            [[ "$behind" != 1 ]] || fail aborted-diverged "$PREVIOUS_DIGEST" 'not moved: latest names a commit on another line of history' \
+              "latest names $PREVIOUS_COMMIT, which has diverged from $TARGET_COMMIT; nothing was written. Use hub-promote.yml."
+            forward=error
+          fi
+          [[ "$forward" == 0 ]] || fail aborted-ancestry-error "$PREVIOUS_DIGEST" 'not moved: the ancestry check failed' \
+            'git merge-base failed; nothing was written'
+          # Fail-closed re-read immediately before the write. Other callers are already
+          # excluded by the hub-latest-writer group; this catches a hand write by a
+          # package admin. It is NOT an atomic compare-and-swap.
+          CURRENT="$(read_digest "$PACKAGE:latest")" || CURRENT=unreadable
+          [[ "$CURRENT" == "$PREVIOUS_DIGEST" ]] || fail aborted-latest-changed "$CURRENT" \
+            "not moved: latest changed to \`$CURRENT\` before the write" "latest changed or could not be re-read before the write (read: $PREVIOUS_DIGEST, now: $CURRENT); nothing was written"
+          docker buildx imagetools create --prefer-index=false --tag "$PACKAGE:latest" "$PACKAGE@$TARGET_DIGEST" || {
+            record write-failed unknown
+            summary 'FAILED: the write to latest failed; its state is unknown'
+            echo '::error::moving latest failed; its state is unknown'
+            rollback_help
+            exit 1
+          }
+          AFTER="$(read_digest "$PACKAGE:latest")" || AFTER=unreadable
+          if [[ "$AFTER" != "$TARGET_DIGEST" ]]; then
+            record verify-failed "$AFTER"
+            summary "FAILED: latest could not be confirmed as this digest (read: \`$AFTER\`); it was NOT restored automatically"
+            echo "::error::latest could not be confirmed as $TARGET_DIGEST (read: $AFTER)"
+            rollback_help
+            exit 1
+          fi
+          record moved "$AFTER"
+          summary 'moved: latest now names this digest'
+      - name: Upload the forward result
+        if: ${{ always() && steps.forward.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: hub-control-latest-${{ inputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: hub-latest-result.json
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Move latest to the tested digest
+        id: move
+        if: ${{ inputs.mode == 'promote' }}
+        shell: bash
+        env:
+          PROMOTE_COMMIT: ${{ inputs.commit }}
+          PROMOTE_DIGEST: ${{ inputs.digest }}
+          PREVIOUS_DIGEST: ${{ inputs.expected_previous }}
+        run: |
+          set -euo pipefail
+          RESULT="$RUNNER_TEMP/hub-promotion-result/hub-promotion-result.json"
+          mkdir -p "$(dirname "$RESULT")"
+          record() { printf '{"status": "%s", "previousDigest": "%s", "newDigest": "%s", "commit": "%s", "latestAfter": "%s"}\n' "$1" "$PREVIOUS_DIGEST" "$PROMOTE_DIGEST" "$PROMOTE_COMMIT" "$2" > "$RESULT"; }
+          rollback_help() {
+            echo "latest was NOT restored automatically."
+            if [[ "$PREVIOUS_DIGEST" == absent ]]; then
+              echo "No latest existed before this promotion; repoint or remove latest by hand if needed."
+            else
+              echo "To roll back, run this workflow with the earlier candidate's commit and digest $PREVIOUS_DIGEST, or (package admin):"
+              echo "  docker buildx imagetools create --prefer-index=false --tag $PACKAGE:latest $PACKAGE@$PREVIOUS_DIGEST"
+            fi
+          }
+          # Absence is accepted only when the whole error output is exactly one of the
+          # recognised registry responses for the exact requested tag reference
+          # (registry/repository:tag). Any other wording, reference, digest form,
+          # extra line or extra text is unknown and aborts.
+          manifest_unknown_only() {
+            local file="$1" ref="$2" line
+            [[ "$ref" =~ ^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+:[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$ ]] || return 1
+            [[ "$(wc -l < "$file")" -le 1 && "$(grep -c . "$file")" == 1 ]] || return 1
+            line="$(tr -d '\r\n' < "$file")"
+            [[ "$line" == "ERROR: $ref: MANIFEST_UNKNOWN: manifest unknown" \
+              || "$line" == "ERROR: $ref: MANIFEST_UNKNOWN: manifest unknown; map[Tag:${ref##*:}]" ]]
+          }
+          record started unknown
+          # Fail-closed re-read immediately before the write: latest must still be
+          # exactly what the receipt recorded. This narrows the window for another
+          # writer but is NOT an atomic compare-and-swap; the registry offers none.
+          CURRENT=unreadable
+          for attempt in 1 2 3; do
+            if CURRENT="$(docker buildx imagetools inspect "$PACKAGE:latest" --format '{{json .Manifest.Digest}}' 2>"$RUNNER_TEMP/reread-error.txt")"; then
+              CURRENT="$(printf '%s' "$CURRENT" | tr -d '"')"
+              break
+            fi
+            if [[ "$PREVIOUS_DIGEST" == absent ]] && manifest_unknown_only "$RUNNER_TEMP/reread-error.txt" "$PACKAGE:latest"; then
+              CURRENT=absent
+              break
+            fi
+            CURRENT=unreadable
+            [[ "$attempt" == 3 ]] || sleep "${PROMOTE_RETRY_DELAY_SECONDS:-5}"
+          done
+          if [[ "$CURRENT" != "$PREVIOUS_DIGEST" ]]; then
+            record aborted-latest-changed "$CURRENT"
+            echo "::error::latest changed or could not be re-read before the write (receipt: $PREVIOUS_DIGEST, now: $CURRENT); nothing was written"
+            exit 1
+          fi
+          if [[ "$PREVIOUS_DIGEST" != "$PROMOTE_DIGEST" ]]; then
+            docker buildx imagetools create --prefer-index=false --tag "$PACKAGE:latest" "$PACKAGE@$PROMOTE_DIGEST" || {
+              record write-failed unknown; echo '::error::moving latest failed; its state is unknown'; rollback_help; exit 1; }
+          fi
+          PROMOTED_DIGEST=unreadable
+          for attempt in 1 2 3; do
+            if PROMOTED_DIGEST="$(docker buildx imagetools inspect "$PACKAGE:latest" --format '{{json .Manifest.Digest}}')"; then
+              PROMOTED_DIGEST="$(printf '%s' "$PROMOTED_DIGEST" | tr -d '"')"
+              break
+            fi
+            PROMOTED_DIGEST=unreadable
+            [[ "$attempt" == 3 ]] || sleep "${PROMOTE_RETRY_DELAY_SECONDS:-5}"
+          done
+          if [[ "$PROMOTED_DIGEST" != "$PROMOTE_DIGEST" ]]; then
+            record verify-failed "$PROMOTED_DIGEST"
+            echo "::error::latest could not be confirmed as $PROMOTE_DIGEST (read: $PROMOTED_DIGEST). latest was NOT restored; see the rollback command below."
+            rollback_help
+            printf 'Read-back FAILED: `latest` could not be confirmed as `%s`. It was NOT restored automatically; the rollback command is in the job log.\n' "$PROMOTE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          record promoted "$PROMOTED_DIGEST"
+          printf 'Promoted `%s:latest` to `%s` (previous `%s`)\n' "$PACKAGE" "$PROMOTE_DIGEST" "$PREVIOUS_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the promotion result
+        if: ${{ always() && steps.move.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: hub-promotion-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hub-promotion-result/hub-promotion-result.json
+          if-no-files-found: warn
+          retention-days: 90

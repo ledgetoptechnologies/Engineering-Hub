@@ -2,7 +2,7 @@
 
 ``write`` runs at the end of a successful main publish job in hub-control.yml
 and records which commit, digest and run produced the tested candidate. It is
-written before that run's own forward-only `latest` step, so it describes the
+written before that run's separate forward-only `latest` job, so it describes the
 candidate only; the `latest` outcome is a separate hub-latest-result.json.
 ``verify`` runs in hub-promote.yml before `latest` is moved and refuses any
 evidence that does not describe exactly the requested main candidate.

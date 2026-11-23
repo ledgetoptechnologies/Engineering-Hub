@@ -103,7 +103,9 @@ def _promote(root, before_move=None, **extra):
     if result['receipt'].returncode == 0:
         if before_move:
             before_move(root)
-        result['move'] = _run(root, steps['Move latest to the tested digest'], extra)
+        # The guarded write runs in the shared, serialized writer workflow.
+        move = _steps('hub-latest-writer.yml', 'write')['Move latest to the tested digest']
+        result['move'] = _run(root, move, extra)
     return result
 
 
@@ -288,7 +290,13 @@ def test_both_recognised_absence_forms_initialize(registry):
     assert r['move'].returncode == 0 and _read(registry, f'{PACKAGE}:latest') == NEW
 
 
-# Main-push `latest` step in hub-control.yml (Project-Alpha style, forward only).
+# Forward move in hub-latest-writer.yml, called after a verified main push
+# (Project-Alpha style, forward only), and how it interleaves with a manual rollback.
+# The hub-latest-writer concurrency group runs writes one at a time; these tests run
+# the real write steps in each order that group can produce.
+
+MID = 'sha256:' + 'd' * 64
+
 
 def _git(root, *args):
     return subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', *args], cwd=root,
@@ -297,41 +305,46 @@ def _git(root, *args):
 
 @pytest.fixture
 def history(registry):
-    """A tiny repository: base <- head on main, and side branching from base."""
+    """A tiny repository: base <- head <- tip on main, and side branching from base."""
     _git(registry, 'init', '-q', '-b', 'main')
-    _git(registry, 'commit', '-q', '--allow-empty', '-m', 'base')
-    base = _git(registry, 'rev-parse', 'HEAD')
-    _git(registry, 'commit', '-q', '--allow-empty', '-m', 'head')
-    head = _git(registry, 'rev-parse', 'HEAD')
-    _git(registry, 'checkout', '-q', '-b', 'side', base)
+    commits = {}
+    for name in ('base', 'head', 'tip'):
+        _git(registry, 'commit', '-q', '--allow-empty', '-m', name)
+        commits[name] = _git(registry, 'rev-parse', 'HEAD')
+    _git(registry, 'checkout', '-q', '-b', 'side', commits['base'])
     _git(registry, 'commit', '-q', '--allow-empty', '-m', 'side')
-    side = _git(registry, 'rev-parse', 'HEAD')
+    commits['side'] = _git(registry, 'rev-parse', 'HEAD')
     _git(registry, 'checkout', '-q', 'main')
-    return registry, {'base': base, 'head': head, 'side': side}
+    return registry, commits
 
 
-def _label(root, digest, commit):
+def _candidate(root, commit, digest):
+    """A published candidate: write-once commit tag and the image's revision label."""
+    _tag(root, f'{PACKAGE}:sha-{commit}', digest)
     (root / 'reg' / f'label-{digest.split(":", 1)[1]}').write_text(commit + '\n')
 
 
-def _main_latest(root, commit, digest=NEW, **extra):
-    step = _steps('hub-control.yml', 'publish')['Move latest forward to the tested digest']
-    return _run(root, step, {'GITHUB_SHA': commit, 'IMAGE_DIGEST': digest, 'LATEST_RETRY_DELAY_SECONDS': '0', **extra})
+def _forward(root, commit, digest=NEW, **extra):
+    step = _steps('hub-latest-writer.yml', 'write')['Move latest forward to the tested digest']
+    (root / 'reg' / 'written').unlink(missing_ok=True)
+    return _run(root, step, {'TARGET_COMMIT': commit, 'TARGET_DIGEST': digest, 'LATEST_RETRY_DELAY_SECONDS': '0',
+                             **extra})
 
 
-def _latest_result(root):
+def _forward_result(root):
     path = root / 'hub-latest-result.json'
     return path.read_text() if path.exists() else ''
 
 
-def test_main_push_moves_latest_forward_and_summarises(history):
+def test_forward_move_and_summary(history):
     root, c = history
+    _candidate(root, c['base'], OLD)
+    _candidate(root, c['head'], NEW)
     _tag(root, f'{PACKAGE}:latest', OLD)
-    _label(root, OLD, c['base'])
-    r = _main_latest(root, c['head'])
+    r = _forward(root, c['head'])
     assert r.returncode == 0, r.stderr
     assert _read(root, f'{PACKAGE}:latest') == NEW
-    result = _latest_result(root)
+    result = _forward_result(root)
     assert '"status": "moved"' in result and f'"previousDigest": "{OLD}"' in result
     assert f'"previousCommit": "{c["base"]}"' in result and f'"commit": "{c["head"]}"' in result
     summary = (root / 'summary.md').read_text()
@@ -339,74 +352,170 @@ def test_main_push_moves_latest_forward_and_summarises(history):
         assert text in summary
 
 
-@pytest.mark.parametrize('current,build', [('head', 'base'), ('side', 'head')])
-def test_main_push_never_moves_latest_to_a_non_descendant(history, current, build):
+def test_an_older_build_finishing_late_never_moves_latest_back(history):
     root, c = history
+    _candidate(root, c['base'], NEW)
+    _candidate(root, c['head'], OLD)
     _tag(root, f'{PACKAGE}:latest', OLD)
-    _label(root, OLD, c[current])
-    r = _main_latest(root, c[build])
+    r = _forward(root, c['base'])
     assert r.returncode == 0, r.stderr
     assert _read(root, f'{PACKAGE}:latest') == OLD and not (root / 'reg' / 'written').exists()
-    assert '"status": "skipped-not-newer"' in _latest_result(root)
+    assert '"status": "skipped-older-build"' in _forward_result(root) and '::warning::' in r.stdout
 
 
-def test_main_push_rerun_of_same_digest_is_a_no_op(history):
+def test_diverged_latest_is_refused(history):
     root, c = history
-    _tag(root, f'{PACKAGE}:latest', NEW)
-    r = _main_latest(root, c['head'])
-    assert r.returncode == 0 and not (root / 'reg' / 'written').exists()
-    assert '"status": "already-current"' in _latest_result(root)
-
-
-def test_main_push_aborts_when_latest_is_missing_or_unreadable(history):
-    root, c = history
-    r = _main_latest(root, c['head'], STUB_MISSING_MSG=MANIFEST_UNKNOWN)
-    assert r.returncode == 1 and _read(root, f'{PACKAGE}:latest') == 'absent'
-    assert '"status": "aborted-latest-unreadable"' in _latest_result(root)
+    _candidate(root, c['side'], OLD)
+    _candidate(root, c['head'], NEW)
     _tag(root, f'{PACKAGE}:latest', OLD)
-    r = _main_latest(root, c['head'], STUB_LATEST_ERROR='ERROR: dial tcp: i/o timeout')
+    r = _forward(root, c['head'])
+    assert r.returncode == 1 and _read(root, f'{PACKAGE}:latest') == OLD
+    assert '"status": "aborted-diverged"' in _forward_result(root)
+
+
+def test_digest_not_named_by_the_commit_tag_is_refused(history):
+    root, c = history
+    _candidate(root, c['base'], OLD)
+    _candidate(root, c['head'], OTHER)
+    _tag(root, f'{PACKAGE}:latest', OLD)
+    r = _forward(root, c['head'], NEW)
+    assert r.returncode == 1 and _read(root, f'{PACKAGE}:latest') == OLD
+    assert '"status": "aborted-not-candidate"' in _forward_result(root)
+
+
+def test_forward_rerun_of_same_digest_is_a_no_op(history):
+    root, c = history
+    _candidate(root, c['head'], NEW)
+    _tag(root, f'{PACKAGE}:latest', NEW)
+    r = _forward(root, c['head'])
+    assert r.returncode == 0 and not (root / 'reg' / 'written').exists()
+    assert '"status": "already-current"' in _forward_result(root)
+
+
+def test_forward_aborts_when_latest_is_missing_or_unreadable(history):
+    root, c = history
+    _candidate(root, c['head'], NEW)
+    r = _forward(root, c['head'], STUB_MISSING_MSG=MANIFEST_UNKNOWN)
+    assert r.returncode == 1 and _read(root, f'{PACKAGE}:latest') == 'absent'
+    assert '"status": "aborted-latest-unreadable"' in _forward_result(root)
+    _tag(root, f'{PACKAGE}:latest', OLD)
+    r = _forward(root, c['head'], STUB_LATEST_ERROR='ERROR: dial tcp: i/o timeout')
     assert r.returncode == 1 and _read(root, f'{PACKAGE}:latest') == OLD
     assert not (root / 'reg' / 'written').exists()
 
 
 @pytest.mark.parametrize('label', [None, 'f' * 40, 'not-a-commit'])
-def test_main_push_aborts_when_latest_commit_is_unknown(history, label):
+def test_forward_aborts_when_latest_commit_is_unknown(history, label):
     root, c = history
+    _candidate(root, c['head'], NEW)
     _tag(root, f'{PACKAGE}:latest', OLD)
     if label:
-        _label(root, OLD, label)
-    r = _main_latest(root, c['head'])
+        (root / 'reg' / f'label-{OLD.split(":", 1)[1]}').write_text(label + '\n')
+    r = _forward(root, c['head'])
     assert r.returncode == 1 and _read(root, f'{PACKAGE}:latest') == OLD
-    assert '"status": "aborted-previous-commit-unknown"' in _latest_result(root)
+    assert '"status": "aborted-previous-commit-unknown"' in _forward_result(root)
 
 
-def test_main_push_aborts_when_previous_image_cannot_be_pulled(history):
+def test_forward_aborts_when_previous_image_cannot_be_pulled(history):
     root, c = history
+    _candidate(root, c['base'], OLD)
+    _candidate(root, c['head'], NEW)
     _tag(root, f'{PACKAGE}:latest', OLD)
-    _label(root, OLD, c['base'])
     (root / 'reg' / 'pull-fail').touch()
-    r = _main_latest(root, c['head'])
+    r = _forward(root, c['head'])
     assert r.returncode == 1 and _read(root, f'{PACKAGE}:latest') == OLD
-    assert '"status": "aborted-previous-commit-unknown"' in _latest_result(root)
+    assert '"status": "aborted-previous-commit-unknown"' in _forward_result(root)
 
 
-def test_main_push_leaves_latest_to_a_concurrent_writer(history):
+def test_forward_aborts_when_a_hand_write_lands_before_the_write(history):
     root, c = history
+    _candidate(root, c['base'], OLD)
+    _candidate(root, c['head'], NEW)
     _tag(root, f'{PACKAGE}:latest', OLD)
-    _label(root, OLD, c['base'])
     (root / 'reg' / 'latest-swap').write_text(OTHER + '\n')
-    r = _main_latest(root, c['head'])
-    assert r.returncode == 0 and 'nothing was written' in r.stdout
+    r = _forward(root, c['head'])
+    assert r.returncode == 1 and 'nothing was written' in r.stdout
     assert _read(root, f'{PACKAGE}:latest') == OTHER and not (root / 'reg' / 'written').exists()
-    assert '"status": "skipped-latest-changed"' in _latest_result(root)
+    assert '"status": "aborted-latest-changed"' in _forward_result(root)
 
 
-def test_main_push_failed_read_back_is_reported_not_restored(history):
+def test_forward_failed_read_back_is_reported_not_restored(history):
     root, c = history
+    _candidate(root, c['base'], OLD)
+    _candidate(root, c['head'], NEW)
     _tag(root, f'{PACKAGE}:latest', OLD)
-    _label(root, OLD, c['base'])
-    r = _main_latest(root, c['head'], STUB_VERIFY_FAIL=OTHER)
+    r = _forward(root, c['head'], STUB_VERIFY_FAIL=OTHER)
     assert r.returncode == 1 and 'latest was NOT restored automatically.' in r.stdout
     assert f'--tag {PACKAGE}:latest {PACKAGE}@{OLD}' in r.stdout
-    assert '"status": "verify-failed"' in _latest_result(root)
+    assert '"status": "verify-failed"' in _forward_result(root)
     assert 'NOT restored automatically' in (root / 'summary.md').read_text()
+
+
+def _rollback_receipt(root, target_commit, target_digest):
+    """hub-promote.yml's promote job: read latest and persist the receipt (unserialized)."""
+    steps = _steps('hub-promote.yml', 'promote')
+    extra = {'PROMOTE_COMMIT': target_commit, 'PROMOTE_DIGEST': target_digest}
+    previous = _run(root, steps['Read current latest and resolve the rollback target'], extra)
+    assert previous.returncode == 0, previous.stderr
+    outputs = dict(line.split('=', 1) for line in (root / 'github_output').read_text().splitlines())
+    extra = {**extra, 'PREVIOUS_DIGEST': outputs['digest'], 'PROMOTION_MODE': outputs['mode']}
+    assert _run(root, steps['Persist the rollback receipt before moving latest'], extra).returncode == 0
+    return extra
+
+
+def _rollback_write(root, extra):
+    """hub-latest-writer.yml in promote mode, inside the serialized group."""
+    (root / 'reg' / 'written').unlink(missing_ok=True)
+    return _run(root, _steps('hub-latest-writer.yml', 'write')['Move latest to the tested digest'], extra)
+
+
+def test_competing_forward_move_wins_over_a_rollback_queued_behind_it(history):
+    # latest is at `head`. An operator starts a rollback to `base` (receipt: latest == MID).
+    # A main push of `tip` reaches the writer first and moves latest forward. The
+    # rollback's write then finds latest changed and refuses: it never silently
+    # overwrites the newer forward move, and its run fails so the operator sees it.
+    root, c = history
+    _candidate(root, c['base'], OLD)
+    _candidate(root, c['head'], MID)
+    _candidate(root, c['tip'], NEW)
+    _tag(root, f'{PACKAGE}:latest', MID)
+    receipt = _rollback_receipt(root, c['base'], OLD)
+    assert _forward(root, c['tip']).returncode == 0
+    assert _read(root, f'{PACKAGE}:latest') == NEW
+    r = _rollback_write(root, receipt)
+    assert r.returncode == 1 and 'nothing was written' in r.stdout
+    assert _read(root, f'{PACKAGE}:latest') == NEW
+    assert '"status": "aborted-latest-changed"' in _result(root)
+
+
+def test_rollback_that_runs_first_then_forward_move_only_moves_forward(history):
+    # The rollback gets the writer first and moves latest back to `base`. The queued
+    # forward move of `tip` then runs: `base` is an ancestor, so latest moves forward
+    # (a rollback holds until the next main push). A late build of `head` never moves
+    # latest back behind `tip`.
+    root, c = history
+    _candidate(root, c['base'], OLD)
+    _candidate(root, c['head'], MID)
+    _candidate(root, c['tip'], NEW)
+    _tag(root, f'{PACKAGE}:latest', MID)
+    receipt = _rollback_receipt(root, c['base'], OLD)
+    r = _rollback_write(root, receipt)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _read(root, f'{PACKAGE}:latest') == OLD
+    assert _forward(root, c['tip']).returncode == 0
+    assert _read(root, f'{PACKAGE}:latest') == NEW
+    late = _forward(root, c['head'], MID)
+    assert late.returncode == 0 and _read(root, f'{PACKAGE}:latest') == NEW
+    assert '"status": "skipped-older-build"' in _forward_result(root)
+
+
+def test_rollback_alone_when_its_competing_forward_move_was_cancelled(history):
+    # A pending forward move replaced by the rollback in the writer group never runs;
+    # the rollback applies from its receipt, and the main run's candidate stays
+    # promotable because promotion looks at its successful publish job.
+    root, c = history
+    _candidate(root, c['base'], OLD)
+    _candidate(root, c['head'], MID)
+    _tag(root, f'{PACKAGE}:latest', MID)
+    r = _rollback_write(root, _rollback_receipt(root, c['base'], OLD))
+    assert r.returncode == 0 and _read(root, f'{PACKAGE}:latest') == OLD

@@ -166,19 +166,39 @@ publish. A plain restart does not pull an updated image.
 Like Project-Alpha, a push to `main` moves `latest` in the same run, after every
 check above has passed, to the exact digest it just built and tagged
 `sha-<commit>`. A manual dispatch of hub-control publishes the candidate only.
-The step is forward only: it reads the current `latest`, reads that image's
-`org.opencontainers.image.revision` label, and moves `latest` only when that
-commit is an ancestor of (or equal to) the new one (`git merge-base
---is-ancestor`). A re-run of an older commit leaves `latest` alone. It stops,
-writing nothing, if `latest` is missing or unreadable or names a commit this
-repository does not know (use the manual promotion below in those cases).
-Immediately before the write it re-reads `latest`; if another writer changed it
-in the meantime, the run leaves it as that writer set it, with a warning, and the
-candidate stays promotable by hand. As with promotion, that re-read is not an
-atomic compare-and-swap. If the write or its read-back fails, the run fails and
-prints the rollback command; it does not restore `latest`. The run summary shows
-the commit, the digest and the previous `latest` (digest and commit), and a
-`hub-control-latest-<commit>-<run>-<attempt>` artifact records the result.
+The move is hub-control's separate `latest` job, so a failed or cancelled move
+never changes the `publish` job's success; manual promotion accepts any main run
+whose `publish` job succeeded, so the candidate always stays promotable by hand.
+
+Only `.github/workflows/hub-latest-writer.yml` writes `latest`. Both the main-push
+move and the manual promotion call it, and its job runs in one repository-wide
+concurrency group, `hub-latest-writer`, that never cancels a running write, so
+two writes never overlap and each decides from what `latest` is inside its slot.
+GitHub keeps at most one pending job per group and a newly queued one cancels the
+job already pending. So a pending main-push move replaced by a manual promotion
+is skipped (the next main push moves `latest` on), and a pending manual promotion
+replaced by a main-push move is cancelled and its `confirm` job fails the run,
+saying to check `latest` and run it again.
+
+The main-push move is forward only. It checks that `sha-<commit>` still names
+the digest, reads the current `latest` and that image's
+`org.opencontainers.image.revision` label, and then:
+
+- moves `latest` when that commit is an ancestor of (or equal to) the new one
+  (`git merge-base --is-ancestor`);
+- leaves it with a warning when `latest` already names a newer commit (an older
+  build finishing late);
+- fails, writing nothing, when the two have diverged, or `latest` is missing or
+  unreadable, or names a commit this repository does not know (use the manual
+  promotion below in those cases).
+
+Immediately before the write it re-reads `latest` and fails, writing nothing, if
+it changed (only a hand write by a package admin can do that inside the group);
+the re-read is not an atomic compare-and-swap. If the write or its read-back
+fails, the run fails and prints the rollback command; it does not restore
+`latest`. The summary shows the commit, the digest and the previous `latest`
+(digest and commit), and a `hub-control-latest-<commit>-<run>-<attempt>`
+artifact records the result.
 
 ### Promoting a candidate or rolling back by hand
 
@@ -192,20 +212,22 @@ id), after the release approvals. Approver and reference are written into the
 receipt as a record; the workflow does not enforce them. Enforcement would be a
 GitHub Environment with required reviewers, an owner repository setting this
 change does not create. It does not rebuild. It requires the commit
-on `main`, a successful main hub-control run for it, that run's checksummed
+on `main`, a main hub-control run for it whose `publish` job succeeded, that run's checksummed
 candidate evidence, the private package, and `sha-<commit>` still naming the
 digest. It then reads the current `latest` and stops, writing nothing, unless it
 resolves to a valid digest (an apparent absence is an anomaly; the
 `initialize_latest` input, default false, is only for a first-time setup and only
 on the registry's `MANIFEST_UNKNOWN` response). It writes a rollback receipt
 (previous and new digest, commit, run ids, time) to the summary and as the
-`hub-promotion-receipt-<run>-<attempt>` artifact **before** moving `latest`. Immediately before the write it re-reads `latest` and
+`hub-promotion-receipt-<run>-<attempt>` artifact **before** moving `latest`. The write
+is its `write` job, in the shared writer above. Immediately before the write it re-reads `latest` and
 aborts, writing nothing, if it no longer equals the receipt's previous digest or
-cannot be read. That re-read is not an atomic compare-and-swap. If the write or the
+cannot be read, so a rollback never silently overwrites a main-push move that ran
+in between. That re-read is not an atomic compare-and-swap. If the write or the
 read-back fails, the run fails and prints the rollback command; it does **not**
 restore `latest`. It still uploads a `hub-promotion-result-<run>-<attempt>` record. Promotions are serialized
-(one concurrency group), main builds are serialized by theirs, and a test fails
-if anything other than the main-push step and this workflow writes `latest`, or
+(one concurrency group), every `latest` write is serialized in `hub-latest-writer`,
+and a test fails if anything but that writer's two write steps writes `latest`, or
 anything but the main build writes a `sha-` tag. This is not a registry-wide
 lock: package admins must not write `latest` during a release.
 
