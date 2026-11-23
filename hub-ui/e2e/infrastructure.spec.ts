@@ -540,6 +540,24 @@ function prioritizedMetrics() {
   return value;
 }
 
+test("new Prometheus targets appear on the next refresh without reloading Infrastructure", async ({ page }) => {
+  await page.clock.install();
+  const expanded = prioritizedMetrics();
+  expanded.devices[1].host_label = "New monitoring host";
+  const initial = { ...expanded, devices: [expanded.devices[0]] };
+  const state = await fixture(page, { metrics: [{ status: 200, body: initial }, { status: 200, body: expanded }] });
+  await page.goto("/#/infrastructure");
+  const panel = page.getByRole("region", { name: "Machine health" });
+  await expect(panel.getByRole("link", { name: /Main PC/ })).toBeVisible();
+  const added = panel.getByRole("link", { name: /New monitoring host/ });
+  await expect(added).toHaveCount(0);
+  expect(state.metrics).toBe(1);
+  await page.clock.runFor(60_000);
+  await expect(added).toBeVisible();
+  await expect(added).toHaveAttribute("href", /\/infrastructure\/machines\//);
+  expect(state.metrics).toBe(2);
+});
+
 test("registered and discovered pages share graphs-first controls and keep the range through switching, reload and Back", async ({ page }) => {
   const state = await fixture(page, { metrics: [{ status: 200, body: prioritizedMetrics() }] });
   const historyReads: string[] = [];
