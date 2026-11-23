@@ -121,7 +121,7 @@ test("a check goes out of date by this browser's clock even while hidden and not
 
 test("not allowed, not set up and an older Hub all show the same plain message", async ({ page }) => {
   for (const reply of [{ status: 403, body: { detail: { code: "infrastructure_forbidden" } } },
-    { status: 503, body: { detail: { code: "infrastructure_disabled" } } },
+    { status: 503, body: { detail: { code: "infrastructure_not_configured" } } },
     { status: 403, body: { detail: { code: "gateway_route_forbidden" } } }]) {
     await page.unrouteAll();
     await fixture(page, { list: [reply] });
@@ -159,7 +159,7 @@ test("a temporary detail outage preserves the maintenance draft and polling reco
   const state = await fixture(page, { detail: [{ status: 200, body: detail },
     { status: 503, body: { detail: { code: "infrastructure_unavailable" } } },
     { status: 200, body: { ...detail, device: { ...device, name: "Camera hub recovered" } } },
-    { status: 403, body: { detail: { code: "gateway_route_forbidden" } } }] });
+    { status: 503, body: { detail: { code: "infrastructure_not_configured" } } }] });
   await page.goto("/#/infrastructure/camera-hub");
   const reason = page.getByRole("form", { name: "Record maintenance" }).getByLabel("Reason");
   await reason.fill("Unsaved maintenance note");
@@ -173,6 +173,8 @@ test("a temporary detail outage preserves the maintenance draft and polling reco
   await expect(reason).toHaveValue("Unsaved maintenance note");
   await page.clock.runFor(30_000);
   await expect(reason).toHaveCount(0);
+  await expect(page.getByText("Infrastructure isn't available to you on this Hub.")).toBeVisible();
+  await page.clock.runFor(30_000);
   expect(state.details).toBe(4);
 });
 
