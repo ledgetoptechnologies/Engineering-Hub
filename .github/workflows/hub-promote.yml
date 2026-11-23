@@ -1,21 +1,25 @@
 name: Promote Engineering Hub control candidate to latest
-# Manual, main-only promotion. hub-control.yml builds, smoke-tests and publishes
-# every main candidate as an immutable digest with a write-once `sha-<commit>`
-# tag. This workflow moves `latest` to one of those tested digests and nothing
-# else moves it. It does not rebuild or deploy. Rollback is a promotion of an
-# older candidate.
+# Manual, main-only promotion and rollback. hub-control.yml builds, smoke-tests
+# and publishes every main candidate as an immutable digest with a write-once
+# `sha-<commit>` tag, and on a main push moves `latest` forward to that digest in
+# the same run (Project-Alpha style). This workflow is the manual path: it moves
+# `latest` to any tested candidate, including an older one, which is how a
+# rollback is done. It does not rebuild or deploy. The next main push moves
+# `latest` forward again, so a rollback that must hold needs a revert on main.
 #
 # Approval: the approved_by and approval_reference inputs are written into the
 # rollback receipt as a RECORD of who authorized the promotion. They do not
 # enforce anything. The enforcing mechanism is a GitHub Environment with required
 # reviewers, which is an owner repository setting and is not created here.
 #
-# Exclusion: this is the only workflow that writes `latest` (a test fails if
-# another writer appears). The `hub-promote-latest` concurrency group stops two
-# promotions overlapping. Neither is a registry-wide lock: a package admin or an
-# older in-flight run could still write the tag, so the job re-reads `latest`
-# immediately before writing and aborts if it changed. That re-read narrows the
-# window but is NOT an atomic compare-and-swap.
+# Exclusion: only this job and hub-control.yml's verified main-push `publish` step
+# write `latest` (a test fails if another writer appears). The
+# `hub-promote-latest` concurrency group stops two promotions overlapping; main
+# builds are serialized by their own group. Neither is a registry-wide lock: a
+# main build, a package admin or an older in-flight run could still write the
+# tag, so both writers re-read `latest` immediately before writing and abort if
+# it changed. That re-read narrows the window but is
+# NOT an atomic compare-and-swap.
 on:
   workflow_dispatch:
     inputs:

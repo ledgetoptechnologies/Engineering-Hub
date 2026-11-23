@@ -156,14 +156,36 @@ source revisions belong in release/rollback evidence, not this default Compose.
 The separate `.github/workflows/hub-control.yml` verifies the source, builds from
 that exact main commit, runs the isolated startup checks on the local candidate and
 again on the authenticated registry digest, checks the package is private, and
-publishes only immutable tags: `build-<sha>-<run>-<attempt>` and the write-once
-`sha-<commit>` (a run fails rather than move an existing sha tag). It never moves
-`latest` and uploads `hub-control-candidate-<commit>` evidence (90 days). PRs
-validate only and cannot publish. A plain restart does not pull an updated image.
+publishes immutable tags: `build-<sha>-<run>-<attempt>` and the write-once
+`sha-<commit>` (a run fails rather than move an existing sha tag). It uploads
+`hub-control-candidate-<commit>` evidence (90 days). PRs validate only and cannot
+publish. A plain restart does not pull an updated image.
 
-### Promoting a candidate to latest
+### latest on a verified main push
 
-`latest` moves only through `.github/workflows/hub-promote.yml`, run by hand from
+Like Project-Alpha, a push to `main` moves `latest` in the same run, after every
+check above has passed, to the exact digest it just built and tagged
+`sha-<commit>`. A manual dispatch of hub-control publishes the candidate only.
+The step is forward only: it reads the current `latest`, reads that image's
+`org.opencontainers.image.revision` label, and moves `latest` only when that
+commit is an ancestor of (or equal to) the new one (`git merge-base
+--is-ancestor`). A re-run of an older commit leaves `latest` alone. It stops,
+writing nothing, if `latest` is missing or unreadable or names a commit this
+repository does not know (use the manual promotion below in those cases).
+Immediately before the write it re-reads `latest`; if another writer changed it
+in the meantime, the run leaves it as that writer set it, with a warning, and the
+candidate stays promotable by hand. As with promotion, that re-read is not an
+atomic compare-and-swap. If the write or its read-back fails, the run fails and
+prints the rollback command; it does not restore `latest`. The run summary shows
+the commit, the digest and the previous `latest` (digest and commit), and a
+`hub-control-latest-<commit>-<run>-<attempt>` artifact records the result.
+
+### Promoting a candidate or rolling back by hand
+
+`.github/workflows/hub-promote.yml` is the manual path, for a rollback, for a
+candidate from a manual dispatch, or to set `latest` up for the first time. A
+rollback holds only until the next `main` push moves `latest` forward again;
+to keep it, revert the change on `main`. Run it by hand from
 `main` with the candidate's full commit SHA and digest (from its hub-control run
 summary), the approver's name and an approval reference (a Hub task or decision
 id), after the release approvals. Approver and reference are written into the
@@ -182,9 +204,10 @@ aborts, writing nothing, if it no longer equals the receipt's previous digest or
 cannot be read. That re-read is not an atomic compare-and-swap. If the write or the
 read-back fails, the run fails and prints the rollback command; it does **not**
 restore `latest`. It still uploads a `hub-promotion-result-<run>-<attempt>` record. Promotions are serialized
-(one concurrency group) and a test fails if any other workflow or script writes
-`latest` or a `sha-` tag, but this is not a registry-wide lock: package admins
-must not write `latest` during a release.
+(one concurrency group), main builds are serialized by theirs, and a test fails
+if anything other than the main-push step and this workflow writes `latest`, or
+anything but the main build writes a `sha-` tag. This is not a registry-wide
+lock: package admins must not write `latest` during a release.
 
 Rollback: promote an earlier candidate's commit and digest (the previous digest is in
 the last receipt). Evidence is kept up to 90 days; for older images pin the digest

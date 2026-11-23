@@ -34,7 +34,13 @@ if [[ "$1 $2 $3" == "buildx imagetools inspect" ]]; then
   f="$(key "$ref")"
   [[ -f "$f" ]] || { echo "${STUB_MISSING_MSG:-ERROR: $ref: not found}" >&2; exit 1; }
   if [[ "${5:-}" == "--raw" ]]; then echo "{\"manifest\": \"$(cat "$f")\"}"; else printf '"%s"\n' "$(cat "$f")"; fi
+  # Simulate another writer changing latest right after the first read.
+  if [[ "$ref" == *:latest && -f "$REG/latest-swap" ]]; then mv "$REG/latest-swap" "$f"; fi
   exit 0
+fi
+if [[ "$1" == pull ]]; then [[ -f "$REG/pull-fail" ]] && exit 1; exit 0; fi
+if [[ "$1" == inspect ]]; then
+  ref="${!#}"; cat "$REG/label-${ref#*@sha256:}" 2>/dev/null || echo '<no value>'; exit 0
 fi
 if [[ "$1 $2 $3" == "buildx imagetools create" ]]; then
   shift 3; [[ "$1" == "--prefer-index=false" ]] && shift
@@ -280,3 +286,127 @@ def test_both_recognised_absence_forms_initialize(registry):
     r = _promote(registry, STUB_MISSING_MSG=f'ERROR: {PACKAGE}:latest: MANIFEST_UNKNOWN: manifest unknown',
                  INITIALIZE_LATEST='true')
     assert r['move'].returncode == 0 and _read(registry, f'{PACKAGE}:latest') == NEW
+
+
+# Main-push `latest` step in hub-control.yml (Project-Alpha style, forward only).
+
+def _git(root, *args):
+    return subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', *args], cwd=root,
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+@pytest.fixture
+def history(registry):
+    """A tiny repository: base <- head on main, and side branching from base."""
+    _git(registry, 'init', '-q', '-b', 'main')
+    _git(registry, 'commit', '-q', '--allow-empty', '-m', 'base')
+    base = _git(registry, 'rev-parse', 'HEAD')
+    _git(registry, 'commit', '-q', '--allow-empty', '-m', 'head')
+    head = _git(registry, 'rev-parse', 'HEAD')
+    _git(registry, 'checkout', '-q', '-b', 'side', base)
+    _git(registry, 'commit', '-q', '--allow-empty', '-m', 'side')
+    side = _git(registry, 'rev-parse', 'HEAD')
+    _git(registry, 'checkout', '-q', 'main')
+    return registry, {'base': base, 'head': head, 'side': side}
+
+
+def _label(root, digest, commit):
+    (root / 'reg' / f'label-{digest.split(":", 1)[1]}').write_text(commit + '\n')
+
+
+def _main_latest(root, commit, digest=NEW, **extra):
+    step = _steps('hub-control.yml', 'publish')['Move latest forward to the tested digest']
+    return _run(root, step, {'GITHUB_SHA': commit, 'IMAGE_DIGEST': digest, 'LATEST_RETRY_DELAY_SECONDS': '0', **extra})
+
+
+def _latest_result(root):
+    path = root / 'hub-latest-result.json'
+    return path.read_text() if path.exists() else ''
+
+
+def test_main_push_moves_latest_forward_and_summarises(history):
+    root, c = history
+    _tag(root, f'{PACKAGE}:latest', OLD)
+    _label(root, OLD, c['base'])
+    r = _main_latest(root, c['head'])
+    assert r.returncode == 0, r.stderr
+    assert _read(root, f'{PACKAGE}:latest') == NEW
+    result = _latest_result(root)
+    assert '"status": "moved"' in result and f'"previousDigest": "{OLD}"' in result
+    assert f'"previousCommit": "{c["base"]}"' in result and f'"commit": "{c["head"]}"' in result
+    summary = (root / 'summary.md').read_text()
+    for text in [c['head'], NEW, OLD, c['base'], 'moved: latest now names this digest']:
+        assert text in summary
+
+
+@pytest.mark.parametrize('current,build', [('head', 'base'), ('side', 'head')])
+def test_main_push_never_moves_latest_to_a_non_descendant(history, current, build):
+    root, c = history
+    _tag(root, f'{PACKAGE}:latest', OLD)
+    _label(root, OLD, c[current])
+    r = _main_latest(root, c[build])
+    assert r.returncode == 0, r.stderr
+    assert _read(root, f'{PACKAGE}:latest') == OLD and not (root / 'reg' / 'written').exists()
+    assert '"status": "skipped-not-newer"' in _latest_result(root)
+
+
+def test_main_push_rerun_of_same_digest_is_a_no_op(history):
+    root, c = history
+    _tag(root, f'{PACKAGE}:latest', NEW)
+    r = _main_latest(root, c['head'])
+    assert r.returncode == 0 and not (root / 'reg' / 'written').exists()
+    assert '"status": "already-current"' in _latest_result(root)
+
+
+def test_main_push_aborts_when_latest_is_missing_or_unreadable(history):
+    root, c = history
+    r = _main_latest(root, c['head'], STUB_MISSING_MSG=MANIFEST_UNKNOWN)
+    assert r.returncode == 1 and _read(root, f'{PACKAGE}:latest') == 'absent'
+    assert '"status": "aborted-latest-unreadable"' in _latest_result(root)
+    _tag(root, f'{PACKAGE}:latest', OLD)
+    r = _main_latest(root, c['head'], STUB_LATEST_ERROR='ERROR: dial tcp: i/o timeout')
+    assert r.returncode == 1 and _read(root, f'{PACKAGE}:latest') == OLD
+    assert not (root / 'reg' / 'written').exists()
+
+
+@pytest.mark.parametrize('label', [None, 'f' * 40, 'not-a-commit'])
+def test_main_push_aborts_when_latest_commit_is_unknown(history, label):
+    root, c = history
+    _tag(root, f'{PACKAGE}:latest', OLD)
+    if label:
+        _label(root, OLD, label)
+    r = _main_latest(root, c['head'])
+    assert r.returncode == 1 and _read(root, f'{PACKAGE}:latest') == OLD
+    assert '"status": "aborted-previous-commit-unknown"' in _latest_result(root)
+
+
+def test_main_push_aborts_when_previous_image_cannot_be_pulled(history):
+    root, c = history
+    _tag(root, f'{PACKAGE}:latest', OLD)
+    _label(root, OLD, c['base'])
+    (root / 'reg' / 'pull-fail').touch()
+    r = _main_latest(root, c['head'])
+    assert r.returncode == 1 and _read(root, f'{PACKAGE}:latest') == OLD
+    assert '"status": "aborted-previous-commit-unknown"' in _latest_result(root)
+
+
+def test_main_push_leaves_latest_to_a_concurrent_writer(history):
+    root, c = history
+    _tag(root, f'{PACKAGE}:latest', OLD)
+    _label(root, OLD, c['base'])
+    (root / 'reg' / 'latest-swap').write_text(OTHER + '\n')
+    r = _main_latest(root, c['head'])
+    assert r.returncode == 0 and 'nothing was written' in r.stdout
+    assert _read(root, f'{PACKAGE}:latest') == OTHER and not (root / 'reg' / 'written').exists()
+    assert '"status": "skipped-latest-changed"' in _latest_result(root)
+
+
+def test_main_push_failed_read_back_is_reported_not_restored(history):
+    root, c = history
+    _tag(root, f'{PACKAGE}:latest', OLD)
+    _label(root, OLD, c['base'])
+    r = _main_latest(root, c['head'], STUB_VERIFY_FAIL=OTHER)
+    assert r.returncode == 1 and 'latest was NOT restored automatically.' in r.stdout
+    assert f'--tag {PACKAGE}:latest {PACKAGE}@{OLD}' in r.stdout
+    assert '"status": "verify-failed"' in _latest_result(root)
+    assert 'NOT restored automatically' in (root / 'summary.md').read_text()

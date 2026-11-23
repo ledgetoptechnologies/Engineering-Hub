@@ -174,13 +174,17 @@ def _publish_runs():
     return [step.get('run', '') for step in workflow('hub-control.yml')['jobs']['publish']['steps']]
 
 
-def test_main_build_publishes_only_immutable_tags_and_never_moves_latest():
+LATEST_STEP = 'Move latest forward to the tested digest'
+
+
+def test_main_build_publishes_immutable_tags_then_moves_latest_in_one_step():
     text = (ROOT / '.github/workflows/hub-control.yml').read_text()
-    assert ':latest' not in text and '--tag "$PACKAGE:latest"' not in text
+    assert text.count('--tag "$PACKAGE:latest"') == 1
     runs = _publish_runs()
     creates = [run for run in runs if 'imagetools create' in run]
-    assert len(creates) == 1
+    assert len(creates) == 2
     sha = creates[0]
+    assert ':latest' not in sha
     assert 'SHA_TAG="$PACKAGE:sha-$GITHUB_SHA"' in sha
     assert 'immutable sha tags are never moved"; exit 1' in sha
     assert 'docker buildx imagetools create --prefer-index=false --tag "$SHA_TAG" "$PACKAGE@$IMAGE_DIGEST"' in sha
@@ -192,9 +196,47 @@ def test_main_build_publishes_only_immutable_tags_and_never_moves_latest():
     tag = next(i for i, step in enumerate(steps) if 'imagetools create' in step.get('run', ''))
     evidence = next(i for i, step in enumerate(steps) if 'scripts/hub_candidate_evidence.py write' in step.get('run', ''))
     artifact = next(i for i, step in enumerate(steps) if step.get('with', {}).get('name') == 'hub-control-candidate-${{ github.sha }}')
-    assert upload < private < tag < evidence < artifact
+    latest = next(i for i, step in enumerate(steps) if step.get('name') == LATEST_STEP)
+    result = next(i for i, step in enumerate(steps) if step.get('name') == 'Upload the latest result')
+    # latest moves only after every smoke test, the private gate, the sha tag and the
+    # candidate evidence (so a candidate stays promotable by hand whatever happens next).
+    assert upload < private < tag < evidence < artifact < latest < result
     assert steps[artifact]['with']['if-no-files-found'] == 'error'
     assert 'hub-candidate.sha256' in steps[artifact]['with']['path']
+    assert steps[result]['if'] == "${{ always() && steps.latest.outcome != 'skipped' }}"
+    assert steps[result]['with']['path'] == 'hub-latest-result.json'
+
+
+def test_latest_moves_only_on_a_verified_main_push_and_forward_only():
+    config = workflow('hub-control.yml')
+    job = config['jobs']['publish']
+    assert job['needs'] == 'verify' and job['if'] == PUSH_OR_MANUAL_MAIN
+    # Full history for the ancestry check.
+    assert job['steps'][0]['with']['fetch-depth'] == '0'
+    step = next(step for step in job['steps'] if step.get('name') == LATEST_STEP)
+    # A manual dispatch publishes the candidate only; promotion stays manual for it.
+    assert step['if'] == "${{ github.event_name == 'push' }}" and step['id'] == 'latest'
+    assert 'env' not in step and '${{' not in step['run']
+    move = step['run']
+    assert move.startswith('set -euo pipefail')
+    read = move.index('if ! PREVIOUS_DIGEST="$(read_latest)"; then')
+    label = move.index('org.opencontainers.image.revision')
+    ancestry = move.index('git merge-base --is-ancestor "$PREVIOUS_COMMIT" "$GITHUB_SHA"')
+    not_newer = move.index('record skipped-not-newer')
+    reread = move.index('CURRENT="$(read_latest)"')
+    changed = move.index('record skipped-latest-changed')
+    write = move.index('imagetools create --prefer-index=false --tag "$PACKAGE:latest" "$PACKAGE@$IMAGE_DIGEST"')
+    verify = move.index('AFTER="$(read_latest)"')
+    assert read < label < ancestry < not_newer < reread < changed < write < verify
+    assert move.count('imagetools create') == 2  # the write and the printed rollback command
+    assert 'if [[ "$CURRENT" != "$PREVIOUS_DIGEST" ]]; then' in move
+    assert 'NOT an atomic compare-and-swap' in move
+    assert 'latest was NOT restored automatically.' in move
+    for field in ['previousDigest', 'previousCommit', 'newDigest', '"commit"', 'runId', 'latestAfter', 'recordedAt']:
+        assert field in move
+    # The step summary names the commit, the digest and the previous latest.
+    assert "printf -- '- Commit: `%s`\\n- Digest: `%s`\\n' \"$GITHUB_SHA\" \"$IMAGE_DIGEST\"" in move
+    assert "printf -- '- Previous latest: `%s` (commit `%s`)\\n' \"$PREVIOUS_DIGEST\" \"$PREVIOUS_COMMIT\"" in move
 
 
 PROMOTE_ORDER = [

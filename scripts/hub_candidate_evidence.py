@@ -1,9 +1,15 @@
 """Candidate evidence for the Hub control image.
 
 ``write`` runs at the end of a successful main publish job in hub-control.yml
-and records which commit, digest and run produced the tested candidate.
+and records which commit, digest and run produced the tested candidate. It is
+written before that run's own forward-only `latest` step, so it describes the
+candidate only; the `latest` outcome is a separate hub-latest-result.json.
 ``verify`` runs in hub-promote.yml before `latest` is moved and refuses any
 evidence that does not describe exactly the requested main candidate.
+
+Schema 1 (before main pushes moved `latest`) carried ``"latest": "unchanged"``.
+Schema 2 drops that field. Both verify, so older candidates stay promotable for
+a manual rollback.
 """
 from __future__ import annotations
 
@@ -53,7 +59,7 @@ def build_record(env: dict, directory: Path) -> dict:
             raise EvidenceError(f'missing smoke evidence {name}')
         json.loads(path.read_text(encoding='utf-8'))
     return {
-        'evidenceSchemaVersion': 1,
+        'evidenceSchemaVersion': 2,
         'repository': repository,
         'commit': commit,
         'package': PACKAGE,
@@ -67,7 +73,6 @@ def build_record(env: dict, directory: Path) -> dict:
             'workflowRef': _require(env, 'GITHUB_WORKFLOW_REF'),
         },
         'smokeEvidence': list(SMOKE_EVIDENCE),
-        'latest': 'unchanged',
     }
 
 
@@ -85,7 +90,8 @@ def verify_record(record: object, expected: dict, directory: Path | None = None)
         fail('run id must be numeric')
     if not isinstance(record, dict):
         fail('evidence must be a JSON object')
-    if record.get('evidenceSchemaVersion') != 1:
+    schema = record.get('evidenceSchemaVersion')
+    if schema not in (1, 2) or isinstance(schema, bool):
         fail('unsupported evidence schema')
     if record.get('repository') != repository:
         fail('evidence repository mismatch')
@@ -110,7 +116,9 @@ def verify_record(record: object, expected: dict, directory: Path | None = None)
         fail('candidate was not built by hub-control.yml on main')
     if record.get('smokeEvidence') != list(SMOKE_EVIDENCE):
         fail('smoke evidence list mismatch')
-    if record.get('latest') != 'unchanged':
+    if schema == 1 and record.get('latest') != 'unchanged':
+        fail('unexpected latest state')
+    if schema == 2 and 'latest' in record:
         fail('unexpected latest state')
     if directory is not None:
         for name in SMOKE_EVIDENCE:
