@@ -9,6 +9,7 @@ import argparse
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -28,14 +29,18 @@ def run(*argv, cwd):
 
 
 def changed_paths(repo, base, head):
-    """Unrelated histories have no merge base, so there is nothing to compare."""
+    """Missing history is unknown, not evidence of an empty diff."""
+    if not re.fullmatch(r'[0-9a-f]{40}', head):
+        return None
     try:
-        return frozenset(run('git', 'diff', '--name-only', f'origin/{base}...{head}', cwd=repo).split('\n')) - {''}
+        names = run('git', 'diff', '--name-only', '--no-renames', '-z',
+                    f'origin/{base}...{head}', '--', cwd=repo)
     except subprocess.CalledProcessError:
-        return frozenset()
+        return None
+    return frozenset(names.split('\0')) - {''}
 
 
-def read_refs(repo, base, namespace, strip, reviewing):
+def read_refs(repo, base, namespace, strip):
     fields = f'%(refname:lstrip={strip})%09%(objectname)%09%(committerdate:iso-strict)'
     rows = run('git', 'for-each-ref', namespace, f'--format={fields}', cwd=repo)
     merged = set(run('git', 'for-each-ref', namespace, f'--merged=origin/{base}',
@@ -45,25 +50,27 @@ def read_refs(repo, base, namespace, strip, reviewing):
     for row in rows.splitlines():
         name, head, committed = row.split('\t')
         if name not in {'HEAD', base}:
-            paths = changed_paths(repo, base, head) if name in reviewing else frozenset()
             landed = name in merged and head != base_head  # A brand-new branch has landed nothing.
-            branches[name] = Branch(name, head, datetime.fromisoformat(committed), landed, paths)
+            branches[name] = Branch(name, head, datetime.fromisoformat(committed), landed)
     return branches
 
 
-def read_branches(repo, base, prs):
+def read_branches(repo, base):
     """Local refs win: unpushed commits on a branch whose remote head merged have not landed."""
-    reviewing = {pr.branch for pr in prs if pr.state == 'OPEN'}
-    remote = read_refs(repo, base, 'refs/remotes/origin', 3, reviewing)
-    return list({**remote, **read_refs(repo, base, 'refs/heads', 2, reviewing)}.values())
+    remote = read_refs(repo, base, 'refs/remotes/origin', 3)
+    return list({**remote, **read_refs(repo, base, 'refs/heads', 2)}.values())
 
 
-def read_prs(repo):
+def read_prs(repo, base):
     rows = json.loads(run('gh', 'pr', 'list', '--state', 'all', '--limit', str(PR_LIMIT),
-                          '--json', 'number,headRefName,headRefOid,state', cwd=repo))
+                          '--json', 'number,headRefName,headRefOid,state,baseRefName', cwd=repo))
     if len(rows) >= PR_LIMIT:
         raise SystemExit('Pull request list hit its limit; findings would be incomplete')
-    return [PullRequest(row['number'], row['headRefName'], row['headRefOid'], row['state']) for row in rows]
+    return [PullRequest(row['number'], row['headRefName'], row['headRefOid'], row['state'],
+                        paths=changed_paths(repo, base, row['headRefOid'])
+                        if row['state'] == 'OPEN' and row['baseRefName'] == base else None,
+                        comparable=row['baseRefName'] == base)
+            for row in rows]
 
 
 def read_worktrees(repo):
@@ -85,8 +92,8 @@ def main(argv=None):
     if run('git', 'rev-parse', '--is-shallow-repository', cwd=args.repo).strip() == 'true':
         # Reachability and merge bases stop at the graft, so only PR-head matches are reliable.
         print('warning: shallow clone; merged and overlap findings may be incomplete', file=sys.stderr)
-    prs = read_prs(args.repo)
-    findings = sweep(now=datetime.now(timezone.utc), branches=read_branches(args.repo, args.base, prs),
+    prs = read_prs(args.repo, args.base)
+    findings = sweep(now=datetime.now(timezone.utc), branches=read_branches(args.repo, args.base),
                      prs=prs, worktrees=read_worktrees(args.repo), stale_days=args.stale_days)
     if args.json:
         print(json.dumps([asdict(item) for item in findings], indent=2))

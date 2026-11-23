@@ -13,7 +13,7 @@ STALE_DAYS = 7
 PROTECTED = frozenset({'main', 'master'})
 OWNER_PREFIXES = ('claude', 'codex', 'hermes')
 KINDS = ('merged_not_deleted', 'closed_pr_branch', 'no_pr_stale', 'worktree_merged',
-         'worktree_missing', 'overlap')
+         'worktree_missing', 'comparison_unavailable', 'overlap')
 
 
 @dataclass(frozen=True)
@@ -22,7 +22,6 @@ class Branch:
     head: str
     committed_at: datetime
     merged: bool = False  # Head is reachable from the default branch.
-    paths: frozenset[str] = frozenset()  # Changed since the merge base.
 
 
 @dataclass(frozen=True)
@@ -31,6 +30,8 @@ class PullRequest:
     branch: str
     head: str
     state: str  # OPEN, MERGED or CLOSED.
+    paths: frozenset[str] | None = None  # Exact PR head vs target base; None means unknown.
+    comparable: bool = True  # Only compare PRs targeting this sweep’s base.
 
 
 @dataclass(frozen=True)
@@ -66,12 +67,11 @@ def sweep(*, now, branches, prs, worktrees, stale_days=STALE_DAYS):
     landed = {branch.name for branch in live if _landed(branch, by_branch.get(branch.name, ()))}
     cutoff = now - timedelta(days=stale_days)
     findings = []
-    in_review = []
     for branch in live:
         mine = by_branch.get(branch.name, ())
         owner = owner_hint(branch.name)
         if any(pr.state == 'OPEN' for pr in mine):
-            in_review.append(branch)
+            continue  # A matching open PR prevents housekeeping suggestions.
         elif branch.name in landed:
             findings.append(Finding('merged_not_deleted', branch.name, owner,
                                     'Work is on the default branch; the branch can be cleaned up.'))
@@ -91,13 +91,22 @@ def sweep(*, now, branches, prs, worktrees, stale_days=STALE_DAYS):
         elif tree.branch in landed:
             findings.append(Finding('worktree_merged', tree.path, owner_hint(tree.branch),
                                     f'{tree.branch} has landed; check nothing is unsaved, then remove.'))
-    # Open PRs are what will actually meet at merge time, and only different
-    # owners can collide unknowingly; one owner already sees both branches.
-    for index, left in enumerate(in_review):
-        for right in in_review[index + 1:]:
-            shared = left.paths & right.paths
-            if shared and owner_hint(left.name) != owner_hint(right.name):
+    # Compare exact PRs, not local branch names or heads. Forks may reuse names.
+    in_review = []
+    for pr in sorted(prs, key=lambda pr: pr.number):
+        if pr.state != 'OPEN' or not pr.comparable:
+            continue
+        if pr.paths is None:
+            findings.append(Finding('comparison_unavailable', f'#{pr.number} {pr.branch}', None,
+                                    'Exact PR head or merge base is not available locally.'))
+        else:
+            in_review.append((pr, pr.paths))
+    for index, (left, left_paths) in enumerate(in_review):
+        for right, right_paths in in_review[index + 1:]:
+            shared = left_paths & right_paths
+            owner = owner_hint(left.branch)
+            if shared and (left.branch == right.branch or owner is None or owner != owner_hint(right.branch)):
                 sample = ', '.join(sorted(shared)[:3])
-                findings.append(Finding('overlap', f'{left.name} + {right.name}', None,
+                findings.append(Finding('overlap', f'#{left.number} {left.branch} + #{right.number} {right.branch}', None,
                                         f'{len(shared)} shared paths, including {sample}.'))
     return sorted(findings, key=lambda item: (KINDS.index(item.kind), item.subject))

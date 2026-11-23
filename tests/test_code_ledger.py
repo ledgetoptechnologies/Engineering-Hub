@@ -35,12 +35,13 @@ def test_commits_after_a_merged_pr_are_not_reported_as_landed():
 
 
 def test_open_pr_is_never_cleanup():
-    assert run([Branch('codex/x', 'a', OLD)], [PullRequest(1, 'codex/x', 'a', 'OPEN')]) == []
+    assert kinds(run([Branch('codex/x', 'a', OLD)],
+                     [PullRequest(1, 'codex/x', 'a', 'OPEN')])) == ['comparison_unavailable']
 
 
 def test_open_pr_wins_over_an_older_merged_pr():
     prs = [PullRequest(1, 'codex/x', 'a', 'MERGED'), PullRequest(2, 'codex/x', 'a', 'OPEN')]
-    assert run([Branch('codex/x', 'a', FRESH)], prs) == []
+    assert kinds(run([Branch('codex/x', 'a', FRESH)], prs)) == ['comparison_unavailable']
 
 
 def test_closed_unmerged_pr_branch():
@@ -70,32 +71,42 @@ def test_missing_worktree():
 
 
 def test_overlap_between_owners_only():
-    left = Branch('claude/a', 'a', FRESH, paths=frozenset({'x.py', 'y.py'}))
-    right = Branch('codex/b', 'b', FRESH, paths=frozenset({'y.py'}))
-    same = Branch('claude/c', 'c', FRESH, paths=frozenset({'x.py'}))
-    prs = [PullRequest(number, branch.name, branch.head, 'OPEN')
-           for number, branch in enumerate((left, right, same))]
-    found = run([left, right, same], prs)
-    assert [item.subject for item in found] == ['claude/a + codex/b']
+    prs = [PullRequest(0, 'claude/a', 'a', 'OPEN', frozenset({'x.py', 'y.py'})),
+           PullRequest(1, 'codex/b', 'b', 'OPEN', frozenset({'y.py'})),
+           PullRequest(2, 'claude/c', 'c', 'OPEN', frozenset({'x.py'}))]
+    found = run(prs=prs)
+    assert [item.subject for item in found] == ['#0 claude/a + #1 codex/b']
     assert 'y.py' in found[0].detail
 
 
 def test_landed_branches_do_not_cause_overlap():
-    left = Branch('claude/a', 'a', FRESH, merged=True, paths=frozenset({'x.py'}))
-    right = Branch('codex/b', 'b', FRESH, paths=frozenset({'x.py'}))
-    assert kinds(run([left, right], [PullRequest(1, 'codex/b', 'b', 'OPEN')])) == ['merged_not_deleted']
+    left = Branch('claude/a', 'a', FRESH, merged=True)
+    right = Branch('codex/b', 'b', FRESH)
+    assert kinds(run([left, right], [PullRequest(1, 'codex/b', 'b', 'OPEN', frozenset({'x.py'}))])) == ['merged_not_deleted']
 
 
-def test_branches_without_an_open_pr_do_not_cause_overlap():
-    left = Branch('claude/a', 'a', FRESH, paths=frozenset({'x.py'}))
-    right = Branch('codex/b', 'b', FRESH, paths=frozenset({'x.py'}))
-    assert run([left, right], [PullRequest(1, 'codex/b', 'b', 'OPEN')]) == []
+def test_stacked_prs_do_not_compare_against_a_different_target_base():
+    prs = [PullRequest(1, 'claude/a', 'a', 'OPEN', frozenset({'x.py'})),
+           PullRequest(2, 'codex/b', 'b', 'OPEN', comparable=False)]
+    assert run(prs=prs) == []
 
 
 def test_owner_is_only_a_prefix_hint():
     assert owner_hint('claude/x') == 'claude'
     assert owner_hint('feature/x') is None
     assert owner_hint('claude') is None
+
+
+def test_pr_heads_not_stale_or_unpushed_local_refs_drive_overlap():
+    branches = [Branch('claude/a', 'old', FRESH), Branch('codex/b', 'unpushed', FRESH)]
+    prs = [PullRequest(1, 'claude/a', 'head-a', 'OPEN', paths=frozenset({'shared.py'})),
+           PullRequest(2, 'codex/b', 'head-b', 'OPEN', paths=frozenset({'shared.py'})),
+           PullRequest(3, 'claude/a', 'fork-head', 'OPEN', paths=frozenset({'fork.py'})),
+           PullRequest(4, 'hermes/unknown', 'missing', 'OPEN')]
+    overlap = [item for item in run(branches, prs) if item.kind == 'overlap']
+    assert len(overlap) == 1 and '#1' in overlap[0].subject and '#2' in overlap[0].subject
+    assert 'shared.py' in overlap[0].detail
+    assert 'comparison_unavailable' in kinds(run(branches, prs))
 
 
 def test_findings_are_ordered_by_kind_then_subject():
