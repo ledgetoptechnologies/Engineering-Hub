@@ -18,6 +18,7 @@ from engineering_hub.cloudflare_access import CloudflareIdentity
 from engineering_hub.events import EventBroker
 from engineering_hub.registry_bridge import CanonicalRegistryBridge, HumanRegistryAccess
 from engineering_hub.registry_client import RegistryPointer, RegistrySnapshot
+from engineering_hub.repository import HubError
 from engineering_hub.sse_keepalive import with_keepalive
 
 
@@ -206,3 +207,14 @@ async def test_heartbeat_then_real_event_preserves_only_real_cursor(kind, setup_
     finally:
         await body.aclose()
     assert_unsubscribed(hub)
+
+
+@pytest.mark.parametrize("topic", ["Hermes:review", "eh.release-2", "Upper"])
+@pytest.mark.asyncio
+async def test_registry_events_route_refuses_topics_outside_registry_contract(topic, setup_hub):
+    # hub-ui topicEvents.ts opens only [a-z0-9][a-z0-9_-]{0,127}; keep the two sides in step.
+    hub = setup_hub("registry")
+    with pytest.raises(HubError) as raised:
+        await hub.endpoint(topic, hub.request, after=None, epoch=None)
+    assert raised.value.status == 422 and raised.value.code == "invalid_topic"
+    assert hub.readers == [] and not hub.registry.active
