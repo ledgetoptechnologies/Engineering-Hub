@@ -56,8 +56,9 @@ export function demoMachineMetrics(now = new Date()): MachineMetrics {
 }
 
 export function demoMachineHistory(hostKey: string, range: HistoryRange, now = Date.now()): MachineHistoryData {
-  const [seconds, step] = { "1h": [3600, 30], "6h": [21600, 180], "24h": [86400, 720], "7d": [604800, 3600] }[range];
-  const end = Math.floor(now / 1000 / step) * step, seed = hostKey.charCodeAt(5);
+  const [seconds, step] = { "1h": [3600, 30], "6h": [21600, 180], "24h": [86400, 720], "7d": [604800, 3600], "30d": [2592000, 21600] }[range];
+  const anchor = Math.min(step, 3600);
+  const end = Math.floor(now / 1000 / anchor) * anchor, seed = hostKey.charCodeAt(5);
   const wave = (base: number, swing: number, phase: number, top: number) => Array.from({ length: seconds / step + 1 }, (_, index): [number, number | null] => {
     const moment = end - seconds + index * step;
     if (index > seconds / step * 0.62 && index < seconds / step * 0.66) return [moment, null];

@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from engineering_hub.browser_pages import client_page_allowed, attach_browser_page_routes
 from engineering_hub.private_gateway import browser_route_allowed
 
-@pytest.mark.parametrize('path', ['/infrastructure/views/topology',
+@pytest.mark.parametrize('path', ['/infrastructure/views/topology', '/infrastructure/build-pc',
     '/infrastructure/machines/host:' + 'a' * 64, '/infrastructure/machines/target:' + '0' * 64])
 def test_infrastructure_drilldown_serves_only_authenticated_shell(tmp_path, path):
     (tmp_path / 'index.html').write_text('PACKAGED_INDEX', encoding='utf-8')
@@ -20,9 +20,10 @@ def test_infrastructure_drilldown_serves_only_authenticated_shell(tmp_path, path
     assert not browser_route_allowed('POST', path)
     assert not browser_route_allowed('GET', path + '/extra')
     with TestClient(app) as client:
-        assert client.get(path).status_code == 401
-        assert client.get(path, headers={'x-fixture-session': 'yes'}).text == 'PACKAGED_INDEX'
-        assert client.head(path, headers={'x-fixture-session': 'yes'}).status_code == 200
+        query = {'range': '30d'} if '/views/' not in path else {}
+        assert client.get(path, params=query).status_code == 401
+        assert client.get(path, params=query, headers={'x-fixture-session': 'yes'}).text == 'PACKAGED_INDEX'
+        assert client.head(path, params=query, headers={'x-fixture-session': 'yes'}).status_code == 200
 
 
 @pytest.mark.parametrize('path', ['/', '/inbox', '/work', '/planning', '/projects',

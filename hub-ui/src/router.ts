@@ -3,9 +3,12 @@
  * else #/ hashes. Editors can guard leaving, and a cancelled Back/Forward restores history.
  */
 import { useEffect, useState } from "react";
+import { HISTORY_RANGES, isHistoryHostKey, type HistoryRange } from "./infrastructureMetrics";
 
 export const PROJECT_TABS = ["overview", "work", "decisions", "notes", "plans", "labeling", "activity"] as const;
 export type ProjectTab = (typeof PROJECT_TABS)[number];
+export type MachineDetailRoute = ({ page: "device"; id: string; host?: string } | { page: "machine"; key: string })
+  & { range?: HistoryRange };
 
 export type Route =
   | { page: "home" }
@@ -24,8 +27,7 @@ export type Route =
   | { page: "staging-resources" }
   | { page: "infrastructure" }
   | { page: "topology" }
-  | { page: "device"; id: string }
-  | { page: "machine"; key: string }
+  | MachineDetailRoute
   // App shows an unavailable state until the orchestration backend exists.
   | { page: "orchestration" }
   | { page: "orchestration-request"; id: string };
@@ -33,7 +35,6 @@ export type Route =
 const projectId = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const setId = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const requestId = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
-const machineKey = /^(?:host|target):[a-f0-9]{64}$/;
 const reviewId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 // Section anchors from the single-page dashboard keep working as links.
 const legacy: Record<string, Route> = {
@@ -93,16 +94,22 @@ export function parseRoute(value: string): Route {
     case "orchestration":
       if (parts.length === 1) return { page: "orchestration" };
       return parts.length === 2 && requestId.test(parts[1]) ? { page: "orchestration-request", id: parts[1] } : { page: "orchestration" };
-    case "infrastructure":
+    case "infrastructure": {
+      const query = new URLSearchParams(raw.match(/^[^?#]*\?([^#]*)/)?.[1]);
+      const range = query.getAll("range").length === 1 ? HISTORY_RANGES.find(item => item === query.get("range")) : undefined;
+      const settings = range ? { range } : {};
       if (parts.length === 3 && parts[1] === "machines") {
         try {
           const key = decodeURIComponent(parts[2]);
-          return machineKey.test(key) ? { page: "machine", key } : { page: "infrastructure" };
+          return isHistoryHostKey(key) ? { page: "machine", key, ...settings } : { page: "infrastructure" };
         } catch { return { page: "infrastructure" }; }
       }
       if (parts.length === 1) return { page: "infrastructure" };
       if (parts.length === 3 && parts[1] === "views" && parts[2] === "topology") return { page: "topology" };
-      return parts.length === 2 && projectId.test(parts[1]) ? { page: "device", id: parts[1] } : { page: "infrastructure" };
+      if (parts.length !== 2 || !projectId.test(parts[1])) return { page: "infrastructure" };
+      const host = query.getAll("host").length === 1 ? query.get("host") : null;
+      return { page: "device", id: parts[1], ...(isHistoryHostKey(host) ? { host } : {}), ...settings };
+    }
     case "projects": {
       if (parts.length === 1 || !projectId.test(parts[1])) return { page: "projects" };
       if (parts.length === 2) return { page: "project", id: parts[1], tab: "overview" };
@@ -126,7 +133,7 @@ export function pathOf(route: Route): string {
     case "review": return `/projects/${route.project}/reviews/${route.id}`;
     case "device": return `/infrastructure/${route.id}`;
     case "topology": return "/infrastructure/views/topology";
-    case "machine": return machineKey.test(route.key) ? `/infrastructure/machines/${route.key}` : "/infrastructure";
+    case "machine": return isHistoryHostKey(route.key) ? `/infrastructure/machines/${route.key}` : "/infrastructure";
     case "orchestration-request": return `/orchestration/${route.id}`;
     case "agent-installations": return "/agents/installations";
     case "staging-queues": return "/staging/queues";
@@ -141,16 +148,34 @@ const listeners = new Set<() => void>();
 const notify = () => listeners.forEach((listener) => listener());
 
 export function href(route: Route): string {
-  return pathMode ? pathOf(route) + location.search : "#" + pathOf(route);
+  return pathMode ? routeUrl(route, location.search) : "#" + routeUrl(route);
 }
 
 /** In-app link for a literal path ("/inbox"), in whichever mode is active. The query (e.g. ?demo=1) is kept. */
 export function link(path: string): string {
-  return pathMode ? path + location.search : "#" + path;
+  return pathMode ? path + workspaceSearch(location.search) : "#" + path;
 }
 
-function routeAt(url: { pathname: string; hash: string }): Route {
-  return url.hash.length > 1 ? parseRoute(url.hash) : parseRoute(url.pathname);
+function workspaceSearch(search: string): string {
+  if (!search) return search;
+  const params = new URLSearchParams(search);
+  if (!params.has("range") && !params.has("host")) return search;
+  params.delete("range");
+  params.delete("host");
+  return params.size ? `?${params}` : "";
+}
+
+function routeUrl(route: Route, search = ""): string {
+  const base = workspaceSearch(search);
+  if (route.page !== "device" && route.page !== "machine") return pathOf(route) + base;
+  const query = new URLSearchParams(base);
+  if (route.range) query.set("range", route.range);
+  if (route.page === "device" && route.host) query.set("host", route.host);
+  return pathOf(route) + (query.size ? `?${query}` : "");
+}
+
+function routeAt(url: { pathname: string; search: string; hash: string }): Route {
+  return url.hash.length > 1 ? parseRoute(url.hash) : parseRoute(url.pathname + url.search);
 }
 const current = () => routeAt(location);
 const here = () => location.pathname + location.search + location.hash;
@@ -195,7 +220,7 @@ function enablePathMode() {
   // Move an old #/ address onto the real path without adding a history entry.
   if (location.hash.length > 1 && !restoring) {
     const value = accepted?.position ?? position() ?? freshPosition();
-    history.replaceState(stateAt(value), "", pathOf(parseRoute(location.hash)) + location.search);
+    history.replaceState(stateAt(value), "", routeUrl(parseRoute(location.hash), location.search));
     accepted = { url: here(), position: value };
   }
   notify();

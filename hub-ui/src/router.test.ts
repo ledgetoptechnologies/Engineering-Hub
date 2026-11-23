@@ -88,6 +88,16 @@ describe("section sub-page routes", () => {
     expect(parseRoute(path)).toEqual({ page: "machine", key });
     expect(parseRoute("/infrastructure/machines/not-a-host-key")).toEqual({ page: "infrastructure" });
   });
+  it("parses fixed ranges in path and hash links without treating opaque host choices as path identity", () => {
+    const key = `host:${"b".repeat(64)}`;
+    const machine = parseRoute(`/infrastructure/machines/${key}?range=30d&demo=1`);
+    expect(machine).toEqual({ page: "machine", key, range: "30d" });
+    expect(pathOf(machine)).toBe(`/infrastructure/machines/${key}`);
+    expect(parseRoute(`#/infrastructure/build-pc?range=7d&host=${encodeURIComponent(key)}`))
+      .toEqual({ page: "device", id: "build-pc", range: "7d", host: key });
+    expect(parseRoute("/infrastructure/build-pc?range=31d&host=invalid")).toEqual({ page: "device", id: "build-pc" });
+    expect(parseRoute("/infrastructure/build-pc?range=7d&range=30d")).toEqual({ page: "device", id: "build-pc" });
+  });
   // Every address that worked before the sidebar gained sub-pages still lands on the same place, or on the sub-page that now holds it.
   it.each([
     ["/agents", { page: "agents" }],

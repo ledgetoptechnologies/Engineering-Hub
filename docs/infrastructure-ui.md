@@ -84,13 +84,25 @@ punctuation normalization, and all other names follow alphabetically. **Customiz
 normalized display names in this browser, scoped to the live human actor; demo preferences are separate.
 It does not save host keys, change inventory associations, or affect another actor or demo.
 
-The overview reads current metrics only; it does not fetch history. When the device list was read,
-a matched card opens the inventory-device detail page and its current history charts. If Inventory
-read has not been established but metrics are permitted, matched and discovered-only cards instead
-open a direct detail route using the opaque metrics key; it shows only available readings and history
-without an Inventory read, device details or a new grant. A link whose target is no longer in the
-current response says its status is unknown. Existing metrics and history endpoints/data bindings are
-reused; no API or access grant is added.
+The overview reads current metrics only; it does not fetch history. The same machine workspace
+appears on registered-device and discovered-machine detail pages: the machine and time selectors
+sit above history charts, followed by current exporter readings and any authorized Inventory details.
+The machine selector uses the overview's browser-local order. The current snapshot stays in memory
+while switching within Infrastructure; history requests are limited to the selected detail and range.
+
+After a successful Inventory read, a matched card or picker choice opens the registered device.
+If multiple opaque groups match one device, `?host=` selects only a group actually bound to that
+device. Without an established Inventory read, a metrics-authorized visitor switches between opaque
+machine routes without reading Inventory. A missing target is unknown. Older mapped-only metrics
+still show current readings but their display keys do not support history. Neither route grants
+access; existing checks and maintenance controls keep their separate permissions.
+
+The default is **Last 24 hours**. The fixed options are 1 hour, 6 hours, 24 hours, 7 days and 30 days.
+`?range=7d` (or the equivalent hash query) restores the selection on reload and Back/Forward; the
+picker carries it to the next machine. Missing samples appear as gaps. The existing history endpoint
+now accepts `30d`: it samples every six hours (121 samples including both ends, ending at the most
+recent hour). CPU and network rates use the same one-hour window as the 7-day range; it is not a
+six-hour average. Available history depends on Prometheus retention and scrape coverage.
 
 ## Activation
 

@@ -446,7 +446,12 @@ async def test_cloudflare_inventory_owner_override_through_signed_gateways(tmp_p
             return json.dumps({'status': 'success', 'data': {'activeTargets': [{
                 'labels': {'job': 'node', 'instance': '192.0.2.1:9100', 'host': '192.0.2.1'},
                 'health': 'up', 'lastScrape': stamp, 'scrapeInterval': '1m'}]}}).encode()
-        query = parse_qs(urlsplit(path).query)['query'][0]
+        url = urlsplit(path)
+        params = parse_qs(url.query)
+        query = params['query'][0]
+        if url.path == '/api/v1/query_range':
+            series = [{'metric': {}, 'values': [[int(params['end'][0]), '0.25']]}] if 'node_cpu_seconds_total' in query else []
+            return json.dumps({'status': 'success', 'data': {'resultType': 'matrix', 'result': series}}).encode()
         kind, key = by_query[query]
         value = {'cpu': '0.25', 'mem_total': '1024', 'mem_available': '256', 'uptime': '42'}.get(key) if kind == 'node' else None
         series = [] if value is None else [{'metric': {'job': 'node', 'instance': '192.0.2.1:9100'},
@@ -495,6 +500,14 @@ async def test_cloudflare_inventory_owner_override_through_signed_gateways(tmp_p
             assert metrics.json()['devices'][0]['device_id'] == 'synthetic-pc'
             assert metrics.json()['devices'][0]['cpu_busy_ratio'] == 0.25
             assert len(calls) == 1 + len(by_query)
+            history_params = {'host': metrics.json()['devices'][0]['host_key'], 'range': '30d'}
+            history = await owner.get('/api/hub/v1/infrastructure/metrics/history', params=history_params)
+            assert history.status_code == 200, history.text
+            payload = history.json()
+            assert payload['source'] == {'status': 'ok'} and payload['range'] == '30d'
+            assert payload['step_seconds'] == 21600 and len(payload['series'][0]['points']) == 121
+            assert payload['series'][0]['points'][-1][1] == 0.25
+            after_history = len(calls)
 
             # A future project-only Access user and the prior agent-session
             # owner are authenticated humans, but neither is the Inventory owner.
@@ -508,7 +521,10 @@ async def test_cloudflare_inventory_owner_override_through_signed_gateways(tmp_p
                 assert projects.status_code == 200
                 assert other_overview.json()['capabilities']['infrastructure'] is False
                 assert other_metrics.status_code == 403
+                other_history = await client.get('/api/hub/v1/infrastructure/metrics/history', params=history_params)
+                assert other_history.status_code == 403
                 await client.aclose()
+            assert len(calls) == after_history
 
             # The override is browser-only: legacy family bearers and the old
             # session owner's explicitly classified installations retain their authority.

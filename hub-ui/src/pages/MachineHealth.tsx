@@ -10,12 +10,12 @@ import { HubApiError } from "../api";
 import type { Hub } from "../hub";
 import { demoMachineMetrics } from "../infrastructureDemo";
 import {
-  formatBytes, formatRate, formatUptime, groupMachines, percent, quickStats, readMetrics, type MachineGroup, type MachineMetrics, type MachineTarget,
+  HISTORY_RANGES, formatBytes, formatRate, formatUptime, groupMachines, isHistoryHostKey, percent, quickStats, readMetrics, type MachineGroup, type MachineMetrics, type MachineTarget,
 } from "../infrastructureMetrics";
-import { href } from "../router";
+import { href, navigate, type MachineDetailRoute } from "../router";
 import { Badge, PageHeader, PanelTitle } from "../ui";
 import { DEFAULT_MACHINE_ORDER, machineOrderStorageKey, normalizeMachineOrder, readMachineOrder, sortMachineGroups, writeMachineOrder, type MachineOrderScope } from "../machineOrder";
-import { MachineHistory } from "./MachineHistory";
+import { MachineHistory, RANGE_TEXT } from "./MachineHistory";
 
 type Load = { state: "loading" } | { state: "hidden" } | { state: "failed" } | { state: "unavailable" } | { state: "loaded"; value: MachineMetrics };
 
@@ -32,15 +32,6 @@ function omittedText(metrics: MachineMetrics): string | null {
   if (warnings.includes("invalid_target")) parts.push("Prometheus reported targets the Hub couldn't read; they're left out.");
   if (warnings.includes("series_truncated")) parts.push("Some machines reported more disks, GPUs or programs than are listed.");
   return parts.length ? parts.join(" ") : null;
-}
-function MachineHead({ group }: { group: MachineGroup }) {
-  return <div className="machine-card-head">
-    <strong>{group.title}</strong>
-    {group.labels.role && <span className="infra-chip">{group.labels.role}</span>}
-    {group.labels.env && <span className="infra-chip">{group.labels.env}</span>}
-    {group.unregistered && <Badge tone="neutral">Not in devices</Badge>}
-    {group.ambiguous && <Badge tone="amber">Matches more than one device</Badge>}
-  </div>;
 }
 const EXPORTER_TEXT = { node: "Linux", windows: "Windows", nvidia: "GPUs" } as const;
 
@@ -155,16 +146,20 @@ function CardStat({ label, value, ratio }: { label: string; value: string; ratio
   </div>;
 }
 
-function MachineCard({ group, inventoryReadAvailable }: { group: MachineGroup; inventoryReadAvailable: boolean }) {
+function machineRoute(group: MachineGroup, groups: MachineGroup[], inventoryReadAvailable: boolean): MachineDetailRoute {
+  if (!inventoryReadAvailable || !group.device_id) return { page: "machine", key: group.key };
+  // If two opaque hosts match one inventory record, keep the chosen host in the URL.
+  const shared = isHistoryHostKey(group.key) && groups.some(other => other.device_id === group.device_id && other.key !== group.key);
+  return { page: "device", id: group.device_id, ...(shared ? { host: group.key } : {}) };
+}
+
+function MachineCard({ group, destination }: { group: MachineGroup; destination: MachineDetailRoute }) {
   const stats = quickStats(group);
-  const destination = inventoryReadAvailable && group.device_id
-    ? href({ page: "device", id: group.device_id })
-    : href({ page: "machine", key: group.key });
   const exporters = [...new Set(group.targets.map(item => item.exporter ? EXPORTER_TEXT[item.exporter] : `Unknown · ${item.job}`))];
   const network = stats.down === null && stats.up === null ? "not reported"
     : `↓ ${formatRate(stats.down)} · ↑ ${formatRate(stats.up)}`;
   return <li className="machine-card">
-    <a className="machine-card-link" href={destination} aria-label={`View ${group.title} machine details`}>
+    <a className="machine-card-link" href={href(destination)} aria-label={`View ${group.title} machine details`}>
       <div className="machine-card-head">
         <strong className="machine-card-title">{group.title}</strong>
         <GroupStatus group={group} />
@@ -223,98 +218,149 @@ function MachineOrderControl({ order, scope, onSave }: { order: string[]; scope:
   </details>;
 }
 
-/** On a device page: the name Prometheus would need to report for this device to get stats. */
-export interface DeviceMatch { id: string; name: string | null }
+function orderScope(hub: Hub): MachineOrderScope {
+  return hub.demo ? { mode: "demo" } : { mode: "live", actor: hub.session?.actor ?? null };
+}
 
-export function MachineHealth({ hub, device, reading, inventoryReadAvailable = true }: {
-  hub: Hub; device?: DeviceMatch; reading: MachineReading; inventoryReadAvailable?: boolean;
+export function MachineHealth({ hub, reading, inventoryReadAvailable }: {
+  hub: Hub; reading: MachineReading; inventoryReadAvailable: boolean;
 }) {
-  const { load, now, refresh } = reading;
-  const deviceId = device?.id;
-  const orderScope: MachineOrderScope = hub.demo ? { mode: "demo" } : { mode: "live", actor: hub.session?.actor ?? null };
-  const scopeKey = machineOrderStorageKey(orderScope) ?? "live-anonymous";
-  const [savedOrder, setSavedOrder] = useState(() => ({ scopeKey, order: readMachineOrder(orderScope) }));
-  const order = savedOrder.scopeKey === scopeKey ? savedOrder.order : readMachineOrder(orderScope);
+  const { load, refresh } = reading;
+  const scope = orderScope(hub);
+  const scopeKey = machineOrderStorageKey(scope) ?? "live-anonymous";
+  const [savedOrder, setSavedOrder] = useState(() => ({ scopeKey, order: readMachineOrder(scope) }));
+  const order = savedOrder.scopeKey === scopeKey ? savedOrder.order : readMachineOrder(scope);
   if (load.state === "hidden") return null;
   const metrics = load.state === "loaded" ? load.value : null;
-  const targets = metrics ? metrics.targets.filter(item => deviceId !== undefined ? item.device_id === deviceId : true) : [];
-  if (metrics && device && targets.length === 0 && (metrics.source.status === "ok" || metrics.source.status === "partial")) {
-    return <section className="panel" aria-label="Machine health">
-      <PanelTitle title="Machine health"><button type="button" className="secondary" disabled={load.state === "loading"} onClick={refresh}>Refresh</button></PanelTitle>
-      <p className="infra-empty">{device.name
-        ? <>Prometheus isn't reporting a machine named <code>{device.name}</code>. If it uses a different name for this device, set it under Edit as the Prometheus host.</>
-        : <>No stats yet. Record a hostname, or the name Prometheus uses for this device, under Edit.</>}</p>
-    </section>;
-  }
-  const groups = groupMachines(targets);
-  const notice = metrics ? SOURCE_TEXT[metrics.source.status] : null;
-  const omitted = metrics && deviceId === undefined ? omittedText(metrics) : null;
-  const onOrder = (next: string[]) => setSavedOrder({ scopeKey, order: next });
+  const groups = groupMachines(metrics?.targets ?? []);
+  const notice = metrics && SOURCE_TEXT[metrics.source.status];
+  const omitted = metrics && omittedText(metrics);
   return <section className="panel" aria-label="Machine health">
-    <PanelTitle title="Machine health" count={metrics && deviceId === undefined ? groups.length : undefined}>
-      {deviceId === undefined && <MachineOrderControl key={scopeKey} order={order} scope={orderScope} onSave={onOrder} />}
+    <PanelTitle title="Machine health" count={metrics ? groups.length : undefined}>
       <button type="button" className="secondary" disabled={load.state === "loading"} onClick={refresh}>
         {load.state === "loading" ? "Reading…" : "Refresh"}</button>
     </PanelTitle>
-    {load.state === "loading" && !metrics && <p role="status">Reading machine health…</p>}
+    {load.state === "loading" && <p role="status">Reading machine health…</p>}
     {load.state === "failed" && <p className="notice error" role="alert">Machine health couldn't be read. Use Refresh to try again.</p>}
     {load.state === "unavailable" && <p className="notice" role="status">Machine stats aren't available on this Hub right now. Use Refresh to try again.</p>}
     {notice && <p className="notice" role="status">{notice}</p>}
     {omitted && <p className="notice" role="status">{omitted}</p>}
-    {metrics && deviceId === undefined && targets.length === 0 && metrics.source.status !== "not_configured" && metrics.source.status !== "unreachable" &&
-      <p className="infra-empty">Prometheus isn't scraping any machines yet.</p>}
-    {deviceId === undefined && groups.length > 0 && <ul className="machine-list">
-      {sortMachineGroups(groups, order).map(group => <MachineCard key={group.key} group={group} inventoryReadAvailable={inventoryReadAvailable} />)}
-    </ul>}
-    {deviceId !== undefined && groups.length > 0 && <ul className="machine-list">{groups.map(group => <li key={group.key} className="machine-card machine-card-detail">
-      <MachineHead group={group} />
+    {metrics && groups.length === 0 && !notice && <p className="infra-empty">Prometheus isn't scraping any machines yet.</p>}
+    {groups.length > 0 && <>
+      <MachineOrderControl key={scopeKey} order={order} scope={scope} onSave={next => setSavedOrder({ scopeKey, order: next })} />
+      <ul className="machine-list">
+        {sortMachineGroups(groups, order).map(group => <MachineCard key={group.key} group={group}
+          destination={machineRoute(group, groups, inventoryReadAvailable)} />)}
+      </ul>
+    </>}
+  </section>;
+}
+
+function CurrentReadings({ groups, now }: { groups: MachineGroup[]; now: Date }) {
+  return <section className="panel machine-current" aria-label="Current readings">
+    <PanelTitle title="Current readings" />
+    <p className="panel-description">Latest exporter readings, independent of the time range above.</p>
+    {groups.map(group => <div className="machine-reading-group" key={group.key}>
+      {groups.length > 1 && <h3>{group.title}</h3>}
+      <div className="machine-current-tags">
+        {group.labels.role && <span className="infra-chip">{group.labels.role}</span>}
+        {group.labels.env && <span className="infra-chip">{group.labels.env}</span>}
+        {group.unregistered && <Badge tone="neutral">Not in devices</Badge>}
+        {group.ambiguous && <Badge tone="amber">Matches more than one device</Badge>}
+      </div>
       {group.targets.map(item => <div key={`${item.job}\n${item.instance}`} className="machine-section">
         <div className="machine-section-head">
           <span>{item.exporter ? EXPORTER_TEXT[item.exporter] : item.job} <small><code>{item.instance}</code></small></span>
           {statusBadge(item, now)}
         </div>
-        {metrics?.source.status !== "unreachable" && <TargetBody item={item} />}
+        <TargetBody item={item} />
       </div>)}
-      <MachineHistory hub={hub} hostKey={group.key} />
-    </li>)}</ul>}
+    </div>)}
   </section>;
 }
 
-export function MachineDetailPage({ hub, actions, machineKey }: { hub: Hub; actions: ReactNode; machineKey: string }) {
-  const reading = useMachineMetrics(hub);
+function readingGroups(reading: MachineReading): MachineGroup[] {
   const { load } = reading;
-  const metrics = load.state === "loaded" ? load.value : null;
-  const group = metrics ? groupMachines(metrics.targets).find(item => item.key === machineKey) : undefined;
+  return load.state === "loaded" && load.value.source.status !== "unreachable" ? groupMachines(load.value.targets) : [];
+}
+
+export function MachineWorkspace({ hub, route, reading, inventoryReadAvailable, deviceName, groups = readingGroups(reading) }: {
+  hub: Hub; route: MachineDetailRoute; reading: MachineReading; inventoryReadAvailable: boolean;
+  deviceName?: string | null; groups?: MachineGroup[];
+}) {
+  const { load, refresh } = reading;
+  if (load.state === "hidden" && route.page === "device") return null;
+  const ordered = sortMachineGroups(groups, readMachineOrder(orderScope(hub)));
+  // Older metrics payloads have display-only group keys. Show their current readings
+  // by device, but never put a legacy label in a URL or send it to the history API.
+  const legacyDevices = new Set<string>();
+  const choices = ordered.filter(item => {
+    if (isHistoryHostKey(item.key)) return true;
+    if (!inventoryReadAvailable || !item.device_id || legacyDevices.has(item.device_id)) return false;
+    legacyDevices.add(item.device_id);
+    return true;
+  });
+  const group = route.page === "machine" ? groups.find(item => item.key === route.key)
+    : choices.find(item => item.device_id === route.id && (!route.host || item.key === route.host));
+  const canChart = group && isHistoryHostKey(group.key);
+  const currentGroups = !group ? [] : canChart ? [group] : ordered.filter(item => item.device_id === group.device_id);
+  const range = route.range ?? "24h";
+  const source = load.state === "loaded" ? SOURCE_TEXT[load.value.source.status] : null;
   return <>
-    <PageHeader eyebrow="INFRASTRUCTURE / MACHINE HEALTH" title={group?.title ?? "Machine health"}
-      subtitle={group ? "Current Prometheus readings and history. Missing values remain not reported." : undefined}>{actions}</PageHeader>
-    <p className="infra-back"><a href={href({ page: "infrastructure" })}>← Machine health</a></p>
-    {load.state === "loading" && <p role="status">Reading machine health…</p>}
-    {load.state === "hidden" && <p className="notice" role="status">Machine stats aren't available to you on this Hub.</p>}
-    {load.state === "failed" && <p className="notice error" role="alert">Machine health couldn't be read. Return to Machine health and try Refresh.</p>}
-    {load.state === "unavailable" && <p className="notice" role="status">Machine stats aren't available on this Hub right now.</p>}
-    {load.state === "loaded" && !group && <p className="notice" role="status">No current target matches this machine link. Its status is unknown.</p>}
-    {group && metrics && <div className="infra-detail">
-      <section className="panel" aria-label="Current readings">
-        <PanelTitle title="Current readings" />
-        <p className="panel-description">Values from the Hub's current Prometheus response. Missing fields are not reported, not zero.</p>
-        <div className="machine-current-tags">
-          {group.labels.role && <span className="infra-chip">{group.labels.role}</span>}
-          {group.labels.env && <span className="infra-chip">{group.labels.env}</span>}
-          {group.unregistered && <Badge tone="neutral">Not in devices</Badge>}
-          {group.ambiguous && <Badge tone="amber">Matches more than one device</Badge>}
+    <section className="panel machine-history-panel" aria-label="Machine history">
+      <div className="machine-workspace-head">
+        <div className="machine-history-title">
+          <h2>Machine history</h2>
+          {canChart && <span className="machine-history-source">{hub.demo ? "Demo data" : "Prometheus"} · Local time{range === "30d" ? " · 6h samples" : ""}</span>}
         </div>
-        {group.targets.map(item => <div key={`${item.job}\n${item.instance}`} className="machine-section">
-          <div className="machine-section-head">
-            <span>{item.exporter ? EXPORTER_TEXT[item.exporter] : item.job} <small><code>{item.instance}</code></small></span>
-            {statusBadge(item, reading.now)}
-          </div>
-          {metrics.source.status !== "unreachable" && <TargetBody item={item} />}
-        </div>)}
-      </section>
-      <section className="panel machine-history-panel" aria-label="Machine history">
-        <MachineHistory hub={hub} hostKey={group.key} />
-      </section>
-    </div>}
+        <div className="machine-toolbar">
+          <label className="machine-control machine-picker">Machine
+            <select value={group?.key ?? ""} disabled={!choices.length} onChange={event => {
+              const selected = choices.find(item => item.key === event.target.value);
+              if (selected) navigate({ ...machineRoute(selected, groups, inventoryReadAvailable), range: route.range });
+            }}>
+              {!group && <option disabled value="">{load.state === "loading" ? "Reading machines…" : "No matching machine"}</option>}
+              {choices.map(item => <option value={item.key} key={item.key}>{item.title}</option>)}
+            </select>
+          </label>
+          <label className="machine-control">Time range
+            <select value={range} disabled={!canChart && !choices.some(item => isHistoryHostKey(item.key))} onChange={event => {
+              const next = HISTORY_RANGES.find(item => item === event.target.value);
+              if (next) navigate({ ...route, range: next });
+            }}>
+              {HISTORY_RANGES.map(item => <option key={item} value={item}>{RANGE_TEXT[item]}</option>)}
+            </select>
+          </label>
+        </div>
+      </div>
+      {canChart ? <MachineHistory key={`${group.key}|${range}`} hub={hub} hostKey={group.key} range={range} /> : <div className="machine-history-empty">
+        {load.state === "loading" && <p role="status">Reading machine health…</p>}
+        {load.state === "hidden" && <p role="status">Machine stats aren't available to you on this Hub.</p>}
+        {load.state === "failed" && <p role="alert">Machine health couldn't be read.</p>}
+        {load.state === "unavailable" && <p role="status">Machine stats aren't available on this Hub right now.</p>}
+        {source && <p role="status">{source}</p>}
+        {group && <p role="status">History isn't available for this machine.</p>}
+        {!group && load.state === "loaded" && ["ok", "partial"].includes(load.value.source.status) && <p>{route.page === "machine" || route.host
+          ? "No current target matches this machine link. Its status is unknown."
+          : deviceName ? <>Prometheus isn't reporting a machine named <code>{deviceName}</code>.</>
+            : "No stats yet. A Prometheus host can be recorded in the device's declared details."}</p>}
+        {(load.state === "failed" || load.state === "unavailable") && <button type="button" className="secondary" onClick={refresh}>Try again</button>}
+      </div>}
+    </section>
+    {currentGroups.length > 0 && <CurrentReadings groups={currentGroups} now={reading.now} />}
+  </>;
+}
+
+export function MachineDetailPage({ hub, actions, route, reading, inventoryReadAvailable }: {
+  hub: Hub; actions: ReactNode; route: Extract<MachineDetailRoute, { page: "machine" }>; reading: MachineReading; inventoryReadAvailable: boolean;
+}) {
+  const groups = readingGroups(reading);
+  const group = groups.find(item => item.key === route.key);
+  return <>
+    <div className="machine-detail-heading"><PageHeader eyebrow="INFRASTRUCTURE / MACHINE HEALTH" title={group?.title ?? "Machine health"}>{actions}</PageHeader></div>
+    <p className="infra-back"><a href={href({ page: "infrastructure" })}>← Machine health</a></p>
+    <div className="infra-detail">
+      <MachineWorkspace hub={hub} route={route} reading={reading} groups={groups} inventoryReadAvailable={inventoryReadAvailable} />
+    </div>
   </>;
 }

@@ -4,6 +4,7 @@ import json
 from fastapi import Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .infrastructure_metric_history import HOST_KEY_PATTERN, RANGES
 from .infrastructure_service import InfrastructureService
 from .repository import HubError
 from .work_queue_api import _authorization
@@ -106,7 +107,15 @@ def attach_infrastructure_routes(app,service,actor,*,metrics=None,metrics_identi
             raise HubError('infrastructure_metrics_not_configured',404)
         return await metrics.read(identity)
 
-    @app.get('/api/hub/v1/infrastructure/metrics/history')
+    @app.get('/api/hub/v1/infrastructure/metrics/history', openapi_extra={
+        'parameters': [
+            {'name': 'host', 'in': 'query', 'required': True,
+             'schema': {'type': 'string', 'pattern': HOST_KEY_PATTERN}},
+            {'name': 'range', 'in': 'query', 'required': True,
+             'schema': {'type': 'string', 'enum': list(RANGES)},
+             'description': 'Fixed lookback. 30d returns up to 121 samples per series, spaced six hours apart.'},
+        ],
+    })
     async def machine_metric_history(request:Request):
         identity=metrics_identity(request) if metrics_identity is not None else authorized(request,'metrics_read')
         params=request.query_params

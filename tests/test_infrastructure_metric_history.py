@@ -37,13 +37,13 @@ def json_response(payload):
                           stream=httpx.ByteStream(json.dumps(payload).encode()))
 
 
-def reader(respond, *, origin=True, authorize=lambda actor: None):
+def reader(respond, *, origin=True, authorize=lambda actor: None, now=NOW):
     registry = InfrastructureRegistry(sqlite3.connect(':memory:', check_same_thread=False), capabilities={},
-                                      clock=lambda: NOW)
+                                       clock=lambda: now)
     return DiscoveryMetricsReader(InfrastructureService(registry),
                                   PrometheusOrigin('192.0.2.1', 9090) if origin else None,
                                   authorize=authorize, inventory=lambda actor: INVENTORY,
-                                  test_transport=httpx.MockTransport(respond), clock=lambda: NOW)
+                                  test_transport=httpx.MockTransport(respond), clock=lambda: now)
 
 
 def prometheus(values, calls=None):
@@ -109,10 +109,31 @@ async def test_unknown_machine_and_bad_input_are_refused_before_any_range_query(
     with pytest.raises(HubError) as missing:
         await source.history('internal', 'host:' + 'a' * 64, '1h')
     assert missing.value.status == 404 and not calls
-    for host, span in (('nas', '1h'), (key_for('nas'), '30d'), (key_for('nas') + '"} or up{', '1h')):
+    for host, span in (('nas', '1h'), (key_for('nas'), '31d'), (key_for('nas') + '"} or up{', '1h')):
         with pytest.raises(HubError) as bad:
             await source.history('internal', host, span)
         assert bad.value.code == 'invalid_infrastructure_filter'
+
+
+@pytest.mark.asyncio
+async def test_thirty_day_history_covers_full_window_without_increasing_sample_count():
+    calls = []
+
+    def values(query, params):
+        if 'node_cpu_seconds_total' not in query:
+            return []
+        return [{'metric': {}, 'values': [[int(params['start'][0]), '0.23'], [int(params['end'][0]), '0.42']]}]
+
+    now = NOW.replace(hour=15, minute=37)
+    result = await reader(prometheus(values, calls), now=now).history('internal', key_for('nas'), '30d')
+    assert result['range'] == '30d' and result['step_seconds'] == 21600
+    assert result['source'] == {'status': 'ok'}
+    points = result['series'][0]['points']
+    assert len(points) == 121 and points[-1][0] - points[0][0] == 30 * 86400
+    assert points[-1][0] == int(now.replace(minute=0).timestamp())
+    assert points[0][1] == 0.23 and points[-1][1] == 0.42 and points[1][1] is None
+    assert len(calls) == 5 and {call['step'][0] for call in calls} == {'21600'}
+    assert all('job="node",instance="nas:9100"' in call['query'][0] for call in calls)
 
 
 @pytest.mark.asyncio

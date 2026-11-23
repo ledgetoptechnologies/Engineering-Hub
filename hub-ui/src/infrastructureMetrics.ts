@@ -33,6 +33,7 @@ const MAX_TARGETS = 200, MAX_DISKS = 16, MAX_GPUS = 8, MAX_PROCESSES = 10;
 const LABELS = ["host", "role", "env"] as const;
 const slug = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const hostKey = /^(host|target):[a-f0-9]{64}$/;
+export const isHistoryHostKey = (value: unknown): value is string => typeof value === "string" && hostKey.test(value);
 
 function invalid(): never { throw new HubApiError(502, "invalid_infrastructure_metrics"); }
 function record(value: unknown, keys: readonly string[]): Record<string, unknown> {
@@ -96,7 +97,7 @@ function mappedTarget(value: unknown): MachineTarget {
 function discoveredTarget(value: unknown, network: boolean): MachineTarget {
   const row = record(value, ["host_key", "host_label", "association", "device_id", "probe_id", ...METRIC_KEYS,
     ...(network ? ["net_rx_bytes_per_second", "net_tx_bytes_per_second"] : [])]);
-  if (typeof row.host_key !== "string" || !hostKey.test(row.host_key)) return invalid();
+  if (!isHistoryHostKey(row.host_key)) return invalid();
   const association = oneOf(row.association, ASSOCIATIONS);
   // Only a unique inventory match names a device; unregistered and ambiguous targets never do.
   if (association === "matched" ? !isSlug(row.device_id) : row.device_id !== null) return invalid();
@@ -197,7 +198,7 @@ export async function readMetrics(signal: AbortSignal, fetchImpl: typeof fetch =
   return parseMetrics(body);
 }
 
-export const HISTORY_RANGES = ["1h", "6h", "24h", "7d"] as const;
+export const HISTORY_RANGES = ["1h", "6h", "24h", "7d", "30d"] as const;
 export type HistoryRange = typeof HISTORY_RANGES[number];
 export type HistoryPoint = [number, number | null];
 const HISTORY_KEYS = ["cpu", "memory", "disk", "network_rx", "network_tx"] as const;
@@ -215,9 +216,10 @@ function historySeries(value: unknown): HistorySeries {
   if (!points.length) return invalid();
   return { key: oneOf(row.key, HISTORY_KEYS), label: row.label === null ? null : plain(row.label, 128), unit, points };
 }
-export function parseHistory(value: unknown): MachineHistoryData {
+export function parseHistory(value: unknown, expected?: { hostKey: string; range: HistoryRange }): MachineHistoryData {
   const row = record(value, ["schema_version", "generated_at", "host_key", "range", "step_seconds", "source", "series"]);
-  if (row.schema_version !== 1) return invalid();
+  if (row.schema_version !== 1 || !isHistoryHostKey(row.host_key)) return invalid();
+  if (expected && (row.host_key !== expected.hostKey || row.range !== expected.range)) return invalid();
   return { range: oneOf(row.range, HISTORY_RANGES), source: oneOf(record(row.source, ["status"]).status, SOURCE_STATES),
     series: list(row.series, MAX_HISTORY_SERIES).map(historySeries) };
 }
@@ -241,7 +243,7 @@ export async function readHistory(hostKey: string, range: HistoryRange, signal: 
   if (!response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return invalid();
   let body: unknown;
   try { body = await response.json(); } catch { return invalid(); }
-  return parseHistory(body);
+  return parseHistory(body, { hostKey, range });
 }
 
 export interface MachineGroup {

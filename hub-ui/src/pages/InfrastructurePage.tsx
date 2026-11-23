@@ -13,9 +13,9 @@ import {
   actorLabel, ago, inNetwork, ipFamily, isHostname, isIpAddress, isNetwork, isSlug, maintenanceView, METRICS_HOST_PATTERN, needsAttention, observationView,
   TEXT_MAX, type Device, type DeviceDetail, type DeviceList, type Maintenance,
 } from "../infrastructureModel";
-import { href, navigate, registerRouteLeaveGuard } from "../router";
+import { href, navigate, registerRouteLeaveGuard, type MachineDetailRoute } from "../router";
 import { Badge, PageHeader, PanelTitle } from "../ui";
-import { MachineDetailPage, MachineHealth, useMachineMetrics } from "./MachineHealth";
+import { MachineDetailPage, MachineHealth, MachineWorkspace, useMachineMetrics, type MachineReading } from "./MachineHealth";
 
 type Load<T> = { state: "loading" } | { state: "loaded"; value: T } | { state: "failed"; message: string } | { state: "unavailable" };
 type Filter = "all" | "attention" | "maintenance";
@@ -58,9 +58,23 @@ function useRead<T>(hub: Hub, read: (signal: AbortSignal) => Promise<T>, deps: u
   return [load, () => setAttempt(value => value + 1)];
 }
 
-export function InfrastructurePage({ hub, actions, deviceId, machineKey }: { hub: Hub; actions: React.ReactNode; deviceId?: string; machineKey?: string }) {
-  if (machineKey) return <MachineDetailPage hub={hub} actions={actions} machineKey={machineKey} />;
-  return deviceId ? <DevicePage hub={hub} actions={actions} id={deviceId} /> : <DeviceListPage hub={hub} actions={actions} />;
+type InventoryAccess = (available: boolean) => void;
+export function InfrastructurePage({ hub, actions, route, inventoryReadAvailable, onInventoryAccess }: {
+  hub: Hub; actions: React.ReactNode; route: MachineDetailRoute | { page: "infrastructure" };
+  inventoryReadAvailable: boolean; onInventoryAccess: InventoryAccess;
+}) {
+  // One current snapshot serves the toolbar while switching views. Inventory editors
+  // still remount on device changes and history requests remain detail-only.
+  const reading = useMachineMetrics(hub);
+  if (route.page === "machine") return <MachineDetailPage hub={hub} actions={actions} route={route} reading={reading} inventoryReadAvailable={inventoryReadAvailable} />;
+  return route.page === "device" ? <DevicePage key={route.id} hub={hub} actions={actions} route={route} reading={reading} onInventoryAccess={onInventoryAccess} />
+    : <DeviceListPage hub={hub} actions={actions} reading={reading} onInventoryAccess={onInventoryAccess} />;
+}
+
+function useInventoryAccess(state: Load<unknown>["state"], onInventoryAccess: InventoryAccess) {
+  useEffect(() => {
+    if (state === "loaded" || state === "unavailable") onInventoryAccess(state === "loaded");
+  }, [state, onInventoryAccess]);
 }
 
 function Unavailable({ actions, children }: { actions: React.ReactNode; children?: React.ReactNode }) {
@@ -71,14 +85,16 @@ function Unavailable({ actions, children }: { actions: React.ReactNode; children
   </>;
 }
 
-function DeviceListPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
+function DeviceListPage({ hub, actions, reading, onInventoryAccess }: {
+  hub: Hub; actions: React.ReactNode; reading: MachineReading; onInventoryAccess: InventoryAccess;
+}) {
   const client = useClient(hub);
   const now = useNow();
-  const reading = useMachineMetrics(hub);
   const [retired, setRetired] = useState(false);
   const [filter, setFilter] = useState<Filter>("all");
   const [creating, setCreating] = useState(false);
   const [load, refresh] = useRead<DeviceList>(hub, signal => client.list(signal, retired), [client, retired, hub.data]);
+  useInventoryAccess(load.state, onInventoryAccess);
   // Machine health has its own admission: someone refused the device list may still read metrics, and it hides itself otherwise.
   if (load.state === "unavailable") return <Unavailable actions={actions}><MachineHealth hub={hub} reading={reading} inventoryReadAvailable={false} /></Unavailable>;
   const list = load.state === "loaded" ? load.value : null;
@@ -143,25 +159,29 @@ function DeviceRow({ device, now, self }: { device: Device; now: Date; self: str
   </li>;
 }
 
-function DevicePage({ hub, actions, id }: { hub: Hub; actions: React.ReactNode; id: string }) {
+function DevicePage({ hub, actions, route, reading, onInventoryAccess }: {
+  hub: Hub; actions: React.ReactNode; route: Extract<MachineDetailRoute, { page: "device" }>; reading: MachineReading; onInventoryAccess: InventoryAccess;
+}) {
+  const { id } = route;
   const client = useClient(hub);
   const now = useNow();
-  const reading = useMachineMetrics(hub);
   const self = hub.session?.actor ?? null;
   const [editing, setEditing] = useState(false);
   const [load, refresh] = useRead<DeviceDetail>(hub, signal => client.detail(id, signal), [client, id, hub.data]);
+  useInventoryAccess(load.state, onInventoryAccess);
   if (load.state === "unavailable") return <Unavailable actions={actions} />;
   const detail = load.state === "loaded" ? load.value : null;
   const device = detail?.device ?? null;
   const writable = hub.writable && !hub.stale && !hub.demo;
   const csrf = hub.session?.csrf_token ?? "";
   return <>
-    <PageHeader eyebrow="INFRASTRUCTURE" title={device?.name ?? "Device"}
-      subtitle={device ? device.role : undefined}>{actions}</PageHeader>
+    <div className="machine-detail-heading"><PageHeader eyebrow="INFRASTRUCTURE / REGISTERED DEVICE" title={device?.name ?? "Device"}
+      subtitle={device ? device.role : undefined}>{actions}</PageHeader></div>
     <p className="infra-back"><a href={href({ page: "infrastructure" })}>← All devices</a></p>
     {load.state === "loading" && !detail && <p role="status">Reading this device…</p>}
     {load.state === "failed" && <p className="notice error" role="alert">{load.message}</p>}
     {device && detail && <div className="infra-detail">
+      <MachineWorkspace hub={hub} route={route} reading={reading} inventoryReadAvailable deviceName={device.metrics_host ?? device.hostname} />
       <section className="panel" aria-label="Declared details">
         <PanelTitle title="Declared details">
           {detail.capabilities.device_write && writable && !editing && <button type="button" className="secondary" onClick={() => setEditing(true)}>Edit</button>}
@@ -189,7 +209,6 @@ function DevicePage({ hub, actions, id }: { hub: Hub; actions: React.ReactNode; 
             return <li key={item.probe_id}><div><strong>{view.label}</strong><small><code>{item.probe_id}</code></small></div>
               <Badge tone={view.tone}>{view.line}</Badge></li>; })}</ul>}
       </section>
-      <MachineHealth hub={hub} device={{ id: device.id, name: device.metrics_host ?? device.hostname }} reading={reading} />
       <MaintenanceSection client={client} csrf={csrf} detail={detail} now={now} self={self}
         canWrite={detail.capabilities.maintenance_write && writable && !device.retired} onChanged={refresh} />
     </div>}
