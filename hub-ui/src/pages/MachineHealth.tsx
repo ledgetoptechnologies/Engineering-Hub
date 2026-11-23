@@ -1,11 +1,11 @@
 /**
  * Machine health from the Hub's Prometheus: CPU, memory, disks, GPUs and the busiest processes for
- * every machine it scrapes, recorded as a device or not. Read on open, on Refresh, and once a minute
+ * every machine it scrapes, recorded as a device or not. Read on open, on Refresh, and every 30 seconds
  * while the page is showing. Hidden entirely when this person can't read metrics; says so when
  * Prometheus isn't set up.
  */
 import { useEffect, useState } from "react";
-import { useInfrastructureRefresh } from "../infrastructureRefresh";
+import { transientRefreshError, useInfrastructureRefresh } from "../infrastructureRefresh";
 import type { FormEvent, ReactNode } from "react";
 import { HubApiError } from "../api";
 import type { Hub } from "../hub";
@@ -18,7 +18,7 @@ import { Badge, PageHeader, PanelTitle } from "../ui";
 import { DEFAULT_MACHINE_ORDER, machineOrderStorageKey, normalizeMachineOrder, readMachineOrder, sortMachineGroups, writeMachineOrder, type MachineOrderScope } from "../machineOrder";
 import { MachineHistory, RANGE_TEXT } from "./MachineHistory";
 
-type Load = { state: "loading" } | { state: "hidden" } | { state: "failed" } | { state: "unavailable" } | { state: "loaded"; value: MachineMetrics };
+type Load = { state: "loading" } | { state: "hidden" } | { state: "failed" } | { state: "unavailable" } | { state: "loaded"; refreshFailed?: boolean; value: MachineMetrics };
 
 const SOURCE_TEXT = {
   ok: null,
@@ -107,11 +107,12 @@ export function useMachineMetrics(hub: Hub): MachineReading {
     readMetrics(controller.signal).then(value => {
       if (controller.signal.aborted) return;
       setNow(new Date());
-      setLoad(value === null ? { state: "hidden" } : value === "unavailable" ? { state: "unavailable" } : { state: "loaded", value });
+      setLoad(current => value === "unavailable" && current.state === "loaded" ? { ...current, refreshFailed: true } : value === null ? { state: "hidden" } : value === "unavailable" ? { state: "unavailable" } : { state: "loaded", value });
     }).catch(error => {
       if (controller.signal.aborted) return;
       if (error instanceof HubApiError && error.status === 401) { hub.clearPrivateWorkspace(); return; }
-      setLoad({ state: "failed" });
+      setLoad(current => current.state === "loaded" && transientRefreshError(error)
+        ? { ...current, refreshFailed: true } : { state: "failed" });
     });
     return () => controller.abort();
   }, [hub.demo, attempt]);
@@ -235,6 +236,7 @@ export function MachineHealth({ hub, reading, inventoryReadAvailable }: {
       <button type="button" className="secondary" disabled={load.state === "loading"} onClick={refresh}>
         {load.state === "loading" ? "Reading…" : "Refresh"}</button>
     </PanelTitle>
+    {load.state === "loaded" && load.refreshFailed && <p className="notice" role="status">Couldn't refresh machine health. Showing the last reading.</p>}
     {load.state === "loading" && <p role="status">Reading machine health…</p>}
     {load.state === "failed" && <p className="notice error" role="alert">Machine health couldn't be read. Use Refresh to try again.</p>}
     {load.state === "unavailable" && <p className="notice" role="status">Machine stats aren't available on this Hub right now. Use Refresh to try again.</p>}
@@ -328,6 +330,7 @@ export function MachineWorkspace({ hub, route, reading, inventoryReadAvailable, 
           </label>
         </div>
       </div>
+      {load.state === "loaded" && load.refreshFailed && <p className="notice" role="status">Couldn't refresh machine health. Showing the last reading.</p>}
       {canChart ? <MachineHistory key={`${group.key}|${range}`} hub={hub} hostKey={group.key} range={range} /> : <div className="machine-history-empty">
         {load.state === "loading" && <p role="status">Reading machine health…</p>}
         {load.state === "hidden" && <p role="status">Machine stats aren't available to you on this Hub.</p>}

@@ -152,6 +152,30 @@ test("a device page shows declared facts, checks and the journal as plain text",
   await expect(page.locator("img[src=x]")).toHaveCount(0);
 });
 
+test("a temporary detail outage preserves the maintenance draft and polling recovers", async ({ page }) => {
+  await page.clock.install();
+  const device = devices()[1];
+  const detail = { device, capabilities: { device_write: false, maintenance_write: true }, maintenance: { items: [], truncated: false } };
+  const state = await fixture(page, { detail: [{ status: 200, body: detail },
+    { status: 503, body: { detail: { code: "infrastructure_unavailable" } } },
+    { status: 200, body: { ...detail, device: { ...device, name: "Camera hub recovered" } } },
+    { status: 403, body: { detail: { code: "gateway_route_forbidden" } } }] });
+  await page.goto("/#/infrastructure/camera-hub");
+  const reason = page.getByRole("form", { name: "Record maintenance" }).getByLabel("Reason");
+  await reason.fill("Unsaved maintenance note");
+  await page.clock.runFor(30_000);
+  const notice = page.getByText("Couldn't refresh device details. Showing the last reading.");
+  await expect(notice).toBeVisible();
+  await expect(reason).toHaveValue("Unsaved maintenance note");
+  await page.clock.runFor(30_000);
+  await expect(page.getByRole("heading", { name: /Camera hub recovered/ })).toBeVisible();
+  await expect(notice).toHaveCount(0);
+  await expect(reason).toHaveValue("Unsaved maintenance note");
+  await page.clock.runFor(30_000);
+  await expect(reason).toHaveCount(0);
+  expect(state.details).toBe(4);
+});
+
 test("records maintenance with CSRF and keeps one request id across a retry", async ({ page }) => {
   const free = { ...devices()[1] };
   const state = await fixture(page, {
@@ -568,24 +592,34 @@ test("new Prometheus targets appear on the next refresh without reloading Infras
 
 test("visible registered device details, current readings and charts refresh every 30 seconds", async ({ page }) => {
   await page.clock.install();
-  const state = await fixture(page, { metrics: [{ status: 200, body: prioritizedMetrics() }] });
+  const metrics = { status: 200, body: prioritizedMetrics() };
+  const state = await fixture(page, { metrics: [metrics, { status: 503, body: {} }, metrics] });
   const historyReads: string[] = [];
   await page.route("**/api/hub/v1/infrastructure/metrics/history**", async route => {
     const { searchParams } = new URL(route.request().url());
     const host = searchParams.get("host"), range = searchParams.get("range");
     historyReads.push(`${host}|${range}`);
+    if (historyReads.length === 2) return route.fulfill({ status: 503, json: {} });
     await route.fulfill({ json: { schema_version: 1, generated_at: new Date().toISOString(), host_key: host, range,
       step_seconds: 3600, source: { status: "ok" }, series: [{ key: "cpu", label: null, unit: "ratio",
-        points: [[3600, 0.2], [7200, historyReads.length === 1 ? 0.6 : 0.8]] }] } });
+        points: historyReads.length === 1 ? [[3600, 0.2], [7200, 0.6]] : [[10800, 0.8]] }] } });
   });
   await page.goto("/infrastructure/build-pc?range=7d");
   const chart = page.getByRole("img", { name: /^CPU:/ });
   await expect(chart).toHaveAccessibleName(/60%/);
+  await chart.press("ArrowRight");
+  await expect(page.locator(".history-tip")).toBeVisible();
+  await page.clock.runFor(30_000);
+  await expect(page.getByText("Couldn't refresh machine health. Showing the last reading.")).toBeVisible();
+  await expect(page.getByText("Couldn't refresh history. Showing the last reading.")).toBeVisible();
+  await expect(chart).toHaveAccessibleName(/60%/);
   await page.clock.runFor(30_000);
   await expect(chart).toHaveAccessibleName(/80%/);
-  expect(state.details).toBe(2);
-  expect(state.metrics).toBe(2);
-  expect(historyReads).toEqual(Array(2).fill(`host:${"1".padStart(64, "0")}|7d`));
+  await expect(page.locator(".history-tip")).toHaveCount(0);
+  await expect(page.getByText(/Couldn't refresh/)).toHaveCount(0);
+  expect(state.details).toBe(3);
+  expect(state.metrics).toBe(3);
+  expect(historyReads).toEqual(Array(3).fill(`host:${"1".padStart(64, "0")}|7d`));
   await expect(page.getByRole("combobox", { name: "Time range" })).toHaveValue("7d");
 });
 

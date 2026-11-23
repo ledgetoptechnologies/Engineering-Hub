@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { HubApiError } from "../api";
-import { useInfrastructureRefresh } from "../infrastructureRefresh";
+import { inventoryUnavailable, transientRefreshError, useInfrastructureRefresh } from "../infrastructureRefresh";
 import type { Hub } from "../hub";
 import { httpInfrastructure, type InfrastructureClient } from "../infrastructureApi";
 import { demoInfrastructure } from "../infrastructureDemo";
@@ -10,7 +10,7 @@ import { href } from "../router";
 import { Badge, PageHeader, PanelTitle } from "../ui";
 import "./TopologyPage.css";
 
-type Load<T> = { state: "loading" } | { state: "loaded"; value: T } | { state: "failed"; message: string } | { state: "unavailable" };
+type Load<T> = { state: "loading" } | { state: "loaded"; refreshFailed?: boolean; value: T } | { state: "failed"; message: string } | { state: "unavailable" };
 const UNAVAILABLE = "Infrastructure isn't available to you on this Hub.";
 
 function useClient(hub: Hub): InfrastructureClient {
@@ -31,10 +31,11 @@ function useDeviceList(hub: Hub, client: InfrastructureClient): [Load<DeviceList
     }).catch(error => {
       if (controller.signal.aborted) return;
       if (error instanceof HubApiError && error.status === 401) { hub.clearPrivateWorkspace(); return; }
-      if (error instanceof HubApiError && [403, 404, 503].includes(error.status) && error.code !== "device_not_found") {
+      if (inventoryUnavailable(error)) {
         setLoad({ state: "unavailable" }); return;
       }
-      setLoad({ state: "failed", message: "The Hub's registered devices couldn't be read. Use Refresh to try again." });
+      setLoad(current => current.state === "loaded" && transientRefreshError(error)
+        ? { ...current, refreshFailed: true } : { state: "failed", message: "The Hub's registered devices couldn't be read. Use Refresh to try again." });
     });
     return () => controller.abort();
   }, [client, hub.clearPrivateWorkspace, hub.data, attempt]);
@@ -81,6 +82,7 @@ export function TopologyPage({ hub, actions }: { hub: Hub; actions: React.ReactN
           <span>Filter subnets and devices</span>
           <input type="search" aria-label="Filter topology" value={query} onChange={event => setQuery(event.target.value)} placeholder="Name, address, role, VLAN or CIDR" />
         </label>
+        {load.state === "loaded" && load.refreshFailed && <p className="notice" role="status">Couldn't refresh topology. Showing the last reading.</p>}
         {load.state === "loading" && !list && <p role="status">Reading registered devices…</p>}
         {load.state === "failed" && <p className="notice error" role="alert">{load.message}</p>}
         {list && list.items.length === 0 && <p className="infra-empty">No devices are recorded in Inventory yet.</p>}

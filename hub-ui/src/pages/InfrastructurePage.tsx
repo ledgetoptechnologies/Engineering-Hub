@@ -5,7 +5,7 @@
  * powers, restarts or changes a device.
  */
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { useInfrastructureRefresh } from "../infrastructureRefresh";
+import { inventoryUnavailable, transientRefreshError, useInfrastructureRefresh } from "../infrastructureRefresh";
 import { HubApiError } from "../api";
 import type { Hub } from "../hub";
 import { httpInfrastructure, writeFailureText, type DeviceDraft, type InfrastructureClient } from "../infrastructureApi";
@@ -18,7 +18,7 @@ import { href, navigate, registerRouteLeaveGuard, type MachineDetailRoute } from
 import { Badge, PageHeader, PanelTitle } from "../ui";
 import { MachineDetailPage, MachineHealth, MachineWorkspace, useMachineMetrics, type MachineReading } from "./MachineHealth";
 
-type Load<T> = { state: "loading" } | { state: "loaded"; value: T } | { state: "failed"; message: string } | { state: "unavailable" };
+type Load<T> = { state: "loading" } | { state: "loaded"; refreshFailed?: boolean; value: T } | { state: "failed"; message: string } | { state: "unavailable" };
 type Filter = "all" | "attention" | "maintenance";
 
 /** Ages badges and overdue notes by this browser's clock without reading anything. */
@@ -48,10 +48,11 @@ function useRead<T>(hub: Hub, read: (signal: AbortSignal) => Promise<T>, deps: u
     }).catch(error => {
       if (controller.signal.aborted) return;
       if (error instanceof HubApiError && error.status === 401) { hub.clearPrivateWorkspace(); return; }
-      if (error instanceof HubApiError && [403, 404, 503].includes(error.status) && error.code !== "device_not_found") {
+      if (inventoryUnavailable(error)) {
         setLoad({ state: "unavailable" }); return;
       }
-      setLoad({ state: "failed", message: error instanceof HubApiError && error.code === "device_not_found"
+      setLoad(current => current.state === "loaded" && transientRefreshError(error)
+        ? { ...current, refreshFailed: true } : { state: "failed", message: error instanceof HubApiError && error.code === "device_not_found"
         ? "This device isn't in the Hub's inventory." : "The Hub's infrastructure list couldn't be read. Use Refresh to try again." });
     });
     return () => controller.abort();
@@ -128,6 +129,7 @@ function DeviceListPage({ hub, actions, reading, onInventoryAccess }: {
       </div>
       {creating && canEdit && <DeviceEditor client={client} csrf={hub.session?.csrf_token ?? ""} device={null}
         onDone={saved => { setCreating(false); if (saved) { refresh(); navigate({ page: "device", id: saved.id }); } }} />}
+      {load.state === "loaded" && load.refreshFailed && <p className="notice" role="status">Couldn't refresh device list. Showing the last reading.</p>}
       {load.state === "loading" && !list && <p role="status">Reading the device list…</p>}
       {load.state === "failed" && <p className="notice error" role="alert">{load.message}</p>}
       {list && list.items.length === 0 && <p className="infra-empty">No devices are recorded yet.</p>}
@@ -179,6 +181,7 @@ function DevicePage({ hub, actions, route, reading, onInventoryAccess }: {
     <div className="machine-detail-heading"><PageHeader eyebrow="INFRASTRUCTURE / REGISTERED DEVICE" title={device?.name ?? "Device"}
       subtitle={device ? device.role : undefined}>{actions}</PageHeader></div>
     <p className="infra-back"><a href={href({ page: "infrastructure" })}>← All devices</a></p>
+    {load.state === "loaded" && load.refreshFailed && <p className="notice" role="status">Couldn't refresh device details. Showing the last reading.</p>}
     {load.state === "loading" && !detail && <p role="status">Reading this device…</p>}
     {load.state === "failed" && <p className="notice error" role="alert">{load.message}</p>}
     {device && detail && <div className="infra-detail">

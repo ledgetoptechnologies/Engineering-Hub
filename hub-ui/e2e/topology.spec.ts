@@ -25,7 +25,7 @@ const registered = () => ({ items: [
     observations: [], open_maintenance: null },
 ], capabilities: { device_write: false, maintenance_write: false } });
 
-async function fixture(page: import("@playwright/test").Page) {
+async function fixture(page: import("@playwright/test").Page, temporaryFailure = false) {
   const state = { listReads: 0, metricsReads: 0, writes: 0, requestedUrl: "" };
   await page.route("**/api/hub/v1/infrastructure/**", async route => {
     const request = route.request();
@@ -38,6 +38,7 @@ async function fixture(page: import("@playwright/test").Page) {
       state.listReads++;
       state.requestedUrl = url.pathname + url.search;
       if (request.method() !== "GET") state.writes++;
+      if (temporaryFailure && state.listReads === 2) return route.fulfill({ status: 503, json: {} });
       return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(registered()) });
     }
     state.writes++;
@@ -45,6 +46,22 @@ async function fixture(page: import("@playwright/test").Page) {
   });
   return state;
 }
+
+test("retains Topology through a temporary 503 and retries", async ({ page }) => {
+  await page.clock.install();
+  const state = await fixture(page, true);
+  await page.goto("/e2e/fixtures/topology.html");
+  const device = page.getByRole("link", { name: "Build PC" });
+  await expect(device).toBeVisible();
+  await page.clock.runFor(30_000);
+  const notice = page.getByText("Couldn't refresh topology. Showing the last reading.");
+  await expect(notice).toBeVisible();
+  await expect(device).toBeVisible();
+  await page.clock.runFor(30_000);
+  await expect(notice).toHaveCount(0);
+  await expect(device).toBeVisible();
+  expect(state).toMatchObject({ listReads: 3, metricsReads: 0, writes: 0 });
+});
 
 test("shows registered subnet groups, including devices without Prometheus, and links existing details", async ({ page }) => {
   const state = await fixture(page);
