@@ -78,3 +78,25 @@ test("filters subnet groups by declared device facts and stays usable on a phone
   await expect(page.getByRole("region", { name: "Unassigned devices" })).toContainText("Camera hub");
   expect(blocking(await audit(page, "page", 375))).toEqual([]);
 });
+
+test("refreshes visible topology at 30 seconds without polling hidden tabs or Prometheus", async ({ page }) => {
+  await page.addInitScript(() => {
+    let visible = true;
+    Object.defineProperty(document, "visibilityState", { get: () => visible ? "visible" : "hidden" });
+    document.addEventListener("test-visibility", event => { visible = (event as CustomEvent<boolean>).detail; });
+  });
+  await page.clock.install();
+  const state = await fixture(page);
+  await page.goto("/e2e/fixtures/topology.html");
+  const filter = page.getByRole("searchbox", { name: "Filter topology" });
+  await expect(page.getByRole("link", { name: "Build PC" })).toBeVisible();
+  await filter.fill("Build");
+  await page.evaluate(() => document.dispatchEvent(new CustomEvent("test-visibility", { detail: false })));
+  await page.clock.runFor(30_000);
+  expect(state.listReads).toBe(1);
+  await page.evaluate(() => document.dispatchEvent(new CustomEvent("test-visibility", { detail: true })));
+  await page.clock.runFor(30_000);
+  await expect.poll(() => state.listReads).toBe(2);
+  await expect(filter).toHaveValue("Build");
+  expect(state).toMatchObject({ metricsReads: 0, writes: 0 });
+});

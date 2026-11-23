@@ -76,7 +76,8 @@ test("appears in the menu only when the Hub grants infrastructure access", async
   await expect(devicesPanel(page)).toContainText("Build PC");
 });
 
-test("lists devices with each check and maintenance, worded honestly, and reads only when asked", async ({ page }) => {
+test("lists devices with each check and maintenance, and supports manual and 30-second refresh", async ({ page }) => {
+  await page.clock.install();
   const state = await fixture(page);
   await page.goto("/#/infrastructure");
   const row = devicesPanel(page).getByRole("listitem").filter({ hasText: "Build PC" });
@@ -86,10 +87,12 @@ test("lists devices with each check and maintenance, worded honestly, and reads 
   await expect(row).toContainText("Maintenance: Hermes: Planned shutdown to replace the disk. · overdue by 20 min");
   await expect(devicesPanel(page).getByRole("listitem").filter({ hasText: "Camera hub" })).toContainText("Unknown: no checks set up");
   await expect(devicesPanel(page)).not.toContainText(/\b(online|offline|powered|is up|is down)\b/i);
-  await page.waitForTimeout(500);
+  await page.clock.runFor(20_000);
   expect(state.lists).toBe(1);
   await devicesPanel(page).getByRole("button", { name: "Refresh" }).click();
   await expect.poll(() => state.lists).toBe(2);
+  await page.clock.runFor(10_000);
+  await expect.poll(() => state.lists).toBe(3);
   expect(blocking(await audit(page, "page", 1440))).toEqual([]);
 });
 
@@ -103,7 +106,8 @@ test("filters to devices needing attention or in maintenance", async ({ page }) 
   await expect(devicesPanel(page).getByRole("listitem")).toHaveText([/Build PC/]);
 });
 
-test("a check goes out of date by this browser's clock without reading again", async ({ page }) => {
+test("a check goes out of date by this browser's clock even while hidden and not polling", async ({ page }) => {
+  await page.addInitScript(() => Object.defineProperty(document, "visibilityState", { get: () => "hidden" }));
   const start = Date.now();
   await page.clock.install({ time: start });
   const state = await fixture(page, { list: [list(undefined, start)] });
@@ -506,6 +510,7 @@ test("a current failed scrape says so; an old one is only out of date", async ({
 });
 
 test("a device page says when Prometheus has no matching machine, and the editor sets the Prometheus host", async ({ page }) => {
+  await page.clock.install();
   const state = await fixture(page, { metrics: [metrics()], writes: [{ status: 200, body: devices()[0] }] });
   await page.goto("/#/infrastructure/build-pc");
   await expect(page.getByRole("region", { name: "Machine history" })).toContainText("Prometheus isn't reporting a machine named build.example.test");
@@ -516,6 +521,9 @@ test("a device page says when Prometheus has no matching machine, and the editor
   await expect(form.getByRole("alert")).toContainText("The Prometheus host can use letters");
   expect(state.writes).toHaveLength(0);
   await form.getByLabel(/Prometheus host/).fill("BUILD-PC");
+  await page.clock.runFor(30_000);
+  await expect(form.getByLabel(/Prometheus host/)).toHaveValue("BUILD-PC");
+  expect(state.details).toBe(1);
   await form.getByRole("button", { name: "Save changes" }).click();
   await expect.poll(() => state.writes.length).toBe(1);
   expect(state.writes[0].body).toMatchObject({ hostname: "build.example.test", metrics_host: "BUILD-PC" });
@@ -552,10 +560,33 @@ test("new Prometheus targets appear on the next refresh without reloading Infras
   const added = panel.getByRole("link", { name: /New monitoring host/ });
   await expect(added).toHaveCount(0);
   expect(state.metrics).toBe(1);
-  await page.clock.runFor(60_000);
+  await page.clock.runFor(30_000);
   await expect(added).toBeVisible();
   await expect(added).toHaveAttribute("href", /\/infrastructure\/machines\//);
   expect(state.metrics).toBe(2);
+});
+
+test("visible registered device details, current readings and charts refresh every 30 seconds", async ({ page }) => {
+  await page.clock.install();
+  const state = await fixture(page, { metrics: [{ status: 200, body: prioritizedMetrics() }] });
+  const historyReads: string[] = [];
+  await page.route("**/api/hub/v1/infrastructure/metrics/history**", async route => {
+    const { searchParams } = new URL(route.request().url());
+    const host = searchParams.get("host"), range = searchParams.get("range");
+    historyReads.push(`${host}|${range}`);
+    await route.fulfill({ json: { schema_version: 1, generated_at: new Date().toISOString(), host_key: host, range,
+      step_seconds: 3600, source: { status: "ok" }, series: [{ key: "cpu", label: null, unit: "ratio",
+        points: [[3600, 0.2], [7200, historyReads.length === 1 ? 0.6 : 0.8]] }] } });
+  });
+  await page.goto("/infrastructure/build-pc?range=7d");
+  const chart = page.getByRole("img", { name: /^CPU:/ });
+  await expect(chart).toHaveAccessibleName(/60%/);
+  await page.clock.runFor(30_000);
+  await expect(chart).toHaveAccessibleName(/80%/);
+  expect(state.details).toBe(2);
+  expect(state.metrics).toBe(2);
+  expect(historyReads).toEqual(Array(2).fill(`host:${"1".padStart(64, "0")}|7d`));
+  await expect(page.getByRole("combobox", { name: "Time range" })).toHaveValue("7d");
 });
 
 test("registered and discovered pages share graphs-first controls and keep the range through switching, reload and Back", async ({ page }) => {

@@ -4,6 +4,7 @@
  * A missing sample breaks the line, so a gap reads as a gap and never as zero.
  */
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
+import { useInfrastructureRefresh } from "../infrastructureRefresh";
 import { HubApiError } from "../api";
 import type { Hub } from "../hub";
 import { demoMachineHistory } from "../infrastructureDemo";
@@ -137,11 +138,11 @@ function bySeries(series: HistorySeries[], key: HistorySeries["key"]) { return s
 
 export function MachineHistory({ hub, hostKey, range }: { hub: Hub; hostKey: string; range: HistoryRange }) {
   const [load, setLoad] = useState<Load>({ state: "loading" });
-  const [attempt, setAttempt] = useState(0);
+  const [attempt, refresh] = useInfrastructureRefresh(!hub.demo && load.state !== "gone");
   useEffect(() => {
     if (hub.demo) { setLoad({ state: "loaded", value: demoMachineHistory(hostKey, range) }); return; }
     const controller = new AbortController();
-    setLoad({ state: "loading" });
+    setLoad(current => current.state === "loaded" ? current : { state: "loading" });
     readHistory(hostKey, range, controller.signal).then(value => {
       if (!controller.signal.aborted) setLoad(value === null ? { state: "gone" } : value === "unavailable" ? { state: "unavailable" } : { state: "loaded", value });
     }).catch(error => {
@@ -171,7 +172,7 @@ export function MachineHistory({ hub, hostKey, range }: { hub: Hub; hostKey: str
   return <div className="history">
     {message && <div className="history-message">
       <p role={load.state === "failed" ? "alert" : "status"}>{message}</p>
-      {retry && <button type="button" className="secondary" onClick={() => setAttempt(value => value + 1)}>Try again</button>}
+      {retry && <button type="button" className="secondary" onClick={refresh}>Try again</button>}
     </div>}
     {hasSamples && <div className="history-grid-layout">
       {charts.cpu.length > 0 && <Chart title="CPU" lines={charts.cpu} range={range} format={percent} ratio />}

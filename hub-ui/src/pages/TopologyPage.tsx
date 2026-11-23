@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { HubApiError } from "../api";
+import { useInfrastructureRefresh } from "../infrastructureRefresh";
 import type { Hub } from "../hub";
 import { httpInfrastructure, type InfrastructureClient } from "../infrastructureApi";
 import { demoInfrastructure } from "../infrastructureDemo";
@@ -18,7 +19,7 @@ function useClient(hub: Hub): InfrastructureClient {
 
 function useDeviceList(hub: Hub, client: InfrastructureClient): [Load<DeviceList>, () => void] {
   const [load, setLoad] = useState<Load<DeviceList>>({ state: "loading" });
-  const [attempt, setAttempt] = useState(0);
+  const [attempt, refresh] = useInfrastructureRefresh(!hub.demo && load.state !== "unavailable");
   const read = useRef(client.list);
   read.current = client.list;
   useEffect(() => {
@@ -37,7 +38,7 @@ function useDeviceList(hub: Hub, client: InfrastructureClient): [Load<DeviceList
     });
     return () => controller.abort();
   }, [client, hub.clearPrivateWorkspace, hub.data, attempt]);
-  return [load, () => setAttempt(value => value + 1)];
+  return [load, refresh];
 }
 
 function useNow(): Date {

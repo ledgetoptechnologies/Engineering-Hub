@@ -5,6 +5,7 @@
  * powers, restarts or changes a device.
  */
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useInfrastructureRefresh } from "../infrastructureRefresh";
 import { HubApiError } from "../api";
 import type { Hub } from "../hub";
 import { httpInfrastructure, writeFailureText, type DeviceDraft, type InfrastructureClient } from "../infrastructureApi";
@@ -35,9 +36,9 @@ const UNAVAILABLE = "Infrastructure isn't available to you on this Hub.";
 function useClient(hub: Hub): InfrastructureClient {
   return useMemo(() => hub.demo ? demoInfrastructure() : httpInfrastructure(), [hub.demo]);
 }
-function useRead<T>(hub: Hub, read: (signal: AbortSignal) => Promise<T>, deps: unknown[]): [Load<T>, () => void] {
+function useRead<T>(hub: Hub, read: (signal: AbortSignal) => Promise<T>, deps: unknown[], autoRefresh: boolean): [Load<T>, () => void] {
   const [load, setLoad] = useState<Load<T>>({ state: "loading" });
-  const [attempt, setAttempt] = useState(0);
+  const [attempt, refresh] = useInfrastructureRefresh(autoRefresh && !hub.demo && load.state !== "unavailable");
   const reader = useRef(read); reader.current = read;
   useEffect(() => {
     const controller = new AbortController();
@@ -55,7 +56,7 @@ function useRead<T>(hub: Hub, read: (signal: AbortSignal) => Promise<T>, deps: u
     });
     return () => controller.abort();
   }, [...deps, attempt]);
-  return [load, () => setAttempt(value => value + 1)];
+  return [load, refresh];
 }
 
 type InventoryAccess = (available: boolean) => void;
@@ -93,7 +94,7 @@ function DeviceListPage({ hub, actions, reading, onInventoryAccess }: {
   const [retired, setRetired] = useState(false);
   const [filter, setFilter] = useState<Filter>("all");
   const [creating, setCreating] = useState(false);
-  const [load, refresh] = useRead<DeviceList>(hub, signal => client.list(signal, retired), [client, retired, hub.data]);
+  const [load, refresh] = useRead<DeviceList>(hub, signal => client.list(signal, retired), [client, retired, hub.data], !creating);
   useInventoryAccess(load.state, onInventoryAccess);
   // Machine health has its own admission: someone refused the device list may still read metrics, and it hides itself otherwise.
   if (load.state === "unavailable") return <Unavailable actions={actions}><MachineHealth hub={hub} reading={reading} inventoryReadAvailable={false} /></Unavailable>;
@@ -167,7 +168,7 @@ function DevicePage({ hub, actions, route, reading, onInventoryAccess }: {
   const now = useNow();
   const self = hub.session?.actor ?? null;
   const [editing, setEditing] = useState(false);
-  const [load, refresh] = useRead<DeviceDetail>(hub, signal => client.detail(id, signal), [client, id, hub.data]);
+  const [load, refresh] = useRead<DeviceDetail>(hub, signal => client.detail(id, signal), [client, id, hub.data], !editing);
   useInventoryAccess(load.state, onInventoryAccess);
   if (load.state === "unavailable") return <Unavailable actions={actions} />;
   const detail = load.state === "loaded" ? load.value : null;
@@ -367,6 +368,7 @@ function DeviceEditor({ client, csrf, device, onDone }: { client: Infrastructure
   const initial: EditorDraft = { id: device?.id ?? "", name: device?.name ?? "", hostname: device?.hostname ?? "", metricsHost: device?.metrics_host ?? "",
     addresses: (device?.addresses ?? []).join("\n"), network: device?.network ?? "", vlan: device?.vlan?.toString() ?? "", role: device?.role ?? "" };
   const [draft, setDraft] = useState(initial);
+  const [expectedRevision] = useState(device?.revision ?? 0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [shown, setShown] = useState(false);
@@ -378,7 +380,7 @@ function DeviceEditor({ client, csrf, device, onDone }: { client: Infrastructure
     setShown(true);
     if (busy || problems.length) return;
     setBusy(true); setError("");
-    try { onDone(await client.saveDevice(toDraft(draft, retired), device?.revision ?? 0, csrf)); }
+    try { onDone(await client.saveDevice(toDraft(draft, retired), expectedRevision, csrf)); }
     catch (failure) { setError(writeFailureText(failure)); }
     finally { setBusy(false); }
   }

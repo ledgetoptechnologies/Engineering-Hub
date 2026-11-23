@@ -53,8 +53,7 @@ everything, so the page must not rely on "any signed-in person".
 
 ## What the page does
 
-- **Reading:** reads on open, on Refresh, and when the existing event feed refreshes the workspace.
-  It never polls.
+- **Reading:** reads on open, on Refresh, and when the existing event feed refreshes the workspace. While visible, live Infrastructure views also refresh their data every 30 seconds without reloading the page. Topology reads Inventory only, and charts refresh only on a machine detail view. Periodic Inventory reads pause while adding or editing a device.
 - **Ageing:** badges age every 15 seconds by the browser's clock.
   - A check past its `valid_until`, or marked `stale`, shows as "Out of date · last seen …".
   - A check that was never run shows "Unknown: no current check". Neither is worded as up or down.

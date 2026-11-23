@@ -5,6 +5,7 @@
  * Prometheus isn't set up.
  */
 import { useEffect, useState } from "react";
+import { useInfrastructureRefresh } from "../infrastructureRefresh";
 import type { FormEvent, ReactNode } from "react";
 import { HubApiError } from "../api";
 import type { Hub } from "../hub";
@@ -94,17 +95,11 @@ function TargetBody({ item }: { item: MachineTarget }) {
   </div>;
 }
 
-const POLL_MS = 60_000;
-
 export interface MachineReading { load: Load; now: Date; refresh: () => void }
 export function useMachineMetrics(hub: Hub): MachineReading {
   const [load, setLoad] = useState<Load>({ state: "loading" });
-  const [attempt, setAttempt] = useState(0);
+  const [attempt, refresh] = useInfrastructureRefresh(!hub.demo && load.state !== "hidden");
   const [now, setNow] = useState(() => new Date());
-  useEffect(() => {
-    const timer = window.setInterval(() => { if (document.visibilityState === "visible") setAttempt(value => value + 1); }, POLL_MS);
-    return () => window.clearInterval(timer);
-  }, []);
   useEffect(() => {
     if (hub.demo) { setNow(new Date()); setLoad({ state: "loaded", value: demoMachineMetrics() }); return; }
     const controller = new AbortController();
@@ -120,7 +115,7 @@ export function useMachineMetrics(hub: Hub): MachineReading {
     });
     return () => controller.abort();
   }, [hub.demo, attempt]);
-  return { load, now, refresh: () => setAttempt(value => value + 1) };
+  return { load, now, refresh };
 }
 
 function GroupStatus({ group }: { group: MachineGroup }) {
