@@ -233,6 +233,45 @@ test("the owner can add a device; the form catches mistakes before saving", asyn
       retired: false, expected_revision: 0 } });
 });
 
+test("Show retired cannot discard an open Add device draft", async ({ page }) => {
+  await fixture(page);
+  const active = list().body;
+  const retiredDevice = { ...active.items[1], id: "retired-fixture", name: "Retired fixture device", retired: true };
+  const queries: Array<string | null> = [];
+  await page.route(url => url.pathname === "/api/hub/v1/infrastructure/devices", route => {
+    const includeRetired = new URL(route.request().url()).searchParams.get("include_retired");
+    queries.push(includeRetired);
+    return route.fulfill({ json: includeRetired === "true" ? { ...active, items: [...active.items, retiredDevice] } : active });
+  });
+
+  await page.goto("/#/infrastructure");
+  const panel = devicesPanel(page);
+  const showRetired = panel.getByRole("checkbox", { name: "Show retired" });
+  const retiredRow = panel.getByRole("link", { name: /^Retired fixture device/ });
+  await panel.getByRole("button", { name: "Add device" }).click();
+  const form = page.getByRole("form", { name: "Add device" });
+  const name = form.getByLabel("Name", { exact: true });
+  await name.fill("Unsaved office printer");
+
+  // Attempt a real click without waiting for Playwright's enabled check.
+  await showRetired.scrollIntoViewIfNeeded();
+  const box = (await showRetired.boundingBox())!;
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await expect(name).toHaveValue("Unsaved office printer");
+  await expect(showRetired).toBeDisabled();
+  await expect(showRetired).not.toBeChecked();
+  await expect(retiredRow).toHaveCount(0);
+  expect(queries).toEqual([null]);
+
+  page.once("dialog", dialog => dialog.accept());
+  await form.getByRole("button", { name: "Cancel" }).click();
+  await expect(form).toHaveCount(0);
+  await expect(showRetired).toBeEnabled();
+  await showRetired.check();
+  await expect(retiredRow).toBeVisible();
+  expect(queries).toEqual([null, "true"]);
+});
+
 test("a single network can't hold both IP families; a dual-stack device leaves it empty", async ({ page }) => {
   const state = await fixture(page, { writes: [{ status: 200, body: devices()[0] }] });
   await page.goto("/#/infrastructure");

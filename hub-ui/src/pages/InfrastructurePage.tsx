@@ -106,6 +106,7 @@ function DeviceListPage({ hub, actions, reading, onInventoryAccess }: {
   const count = (kind: Filter) => (list?.items ?? []).filter(device =>
     kind === "maintenance" ? device.open_maintenance !== null : needsAttention(device, now)).length;
   const canEdit = Boolean(list?.capabilities.device_write) && hub.writable && !hub.stale && !hub.demo;
+  const showEditor = creating && canEdit;
   return <>
     <PageHeader eyebrow="INFRASTRUCTURE" title="Infrastructure"
       subtitle="The devices the Hub knows about, what its checks last saw, and any maintenance in progress. Nothing here powers or changes a device.">
@@ -126,9 +127,10 @@ function DeviceListPage({ hub, actions, reading, onInventoryAccess }: {
             {kind === "all" ? "All" : kind === "attention" ? "Needs attention" : "In maintenance"}
             {list && kind !== "all" && <span>{count(kind)}</span>}</button>)}
         </div>
-        <label className="infra-toggle"><input type="checkbox" checked={retired} onChange={event => setRetired(event.target.checked)} /> Show retired</label>
+        {/* Switching inventory queries unloads the list and would discard an open draft. */}
+        <label className="infra-toggle"><input type="checkbox" checked={retired} disabled={showEditor} onChange={event => setRetired(event.target.checked)} /> Show retired</label>
       </div>
-      {creating && canEdit && <DeviceEditor client={client} csrf={hub.session?.csrf_token ?? ""} device={null}
+      {showEditor && <DeviceEditor client={client} csrf={hub.session?.csrf_token ?? ""} device={null}
         onDone={saved => { setCreating(false); if (saved) { refresh(); navigate({ page: "device", id: saved.id }); } }} />}
       {load.state === "loaded" && load.refreshFailed && <p className="notice" role="status">Couldn't refresh device list. Showing the last reading.</p>}
       {load.state === "loading" && !list && <p role="status">Reading the device list…</p>}
