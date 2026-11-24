@@ -131,7 +131,7 @@ function DeviceListPage({ hub, actions, reading, onInventoryAccess }: {
         {/* Switching inventory queries unloads the list and would discard an open draft. */}
         <label className="infra-toggle"><input type="checkbox" checked={retired} disabled={creating} onChange={event => setRetired(event.target.checked)} /> Show retired</label>
       </div>
-      {creating && <DeviceEditor client={client} csrf={hub.session?.csrf_token ?? ""} device={null} writable={canEdit}
+      {creating && <DeviceEditor client={client} csrf={hub.session?.csrf_token ?? ""} device={null} writable={canEdit} onUnauthorized={hub.clearPrivateWorkspace}
         onDone={saved => { setCreating(false); if (saved) navigate({ page: "device", id: saved.id }); }} />}
       {load.state === "loaded" && load.refreshFailed && <p className="notice" role="status">Couldn't refresh device list. Showing the last reading.</p>}
       {load.state === "loading" && !list && <p role="status">Reading the device list…</p>}
@@ -198,7 +198,8 @@ function DevicePage({ hub, actions, route, reading, onInventoryAccess }: {
         </PanelTitle>
         <p className="panel-description">What's been recorded about this device. Recorded details aren't checked against the device itself.</p>
         {device.retired && <p className="notice" role="status">This device is retired. Its history is kept.</p>}
-        {editing ? <DeviceEditor client={client} csrf={csrf} device={device} writable={writable && detail.capabilities.device_write} onDone={() => setEditing(false)} />
+        {editing ? <DeviceEditor client={client} csrf={csrf} device={device} writable={writable && detail.capabilities.device_write}
+          onUnauthorized={hub.clearPrivateWorkspace} onDone={() => setEditing(false)} />
           : <dl className="infra-facts">
             <dt>Hostname</dt><dd>{device.hostname ?? "Not recorded"}</dd>
             {device.metrics_host && <><dt>Prometheus host</dt><dd><code>{device.metrics_host}</code></dd></>}
@@ -372,8 +373,9 @@ function toDraft(draft: EditorDraft, retired: boolean): DeviceDraft {
     network: draft.network.trim() || null, vlan: draft.vlan ? Number(draft.vlan) : null, role: draft.role.trim(), retired };
 }
 
-function DeviceEditor({ client, csrf, device, writable, onDone }: {
-  client: InfrastructureClient; csrf: string; device: Device | null; writable: boolean; onDone: (saved: Device | null) => void;
+function DeviceEditor({ client, csrf, device, writable, onUnauthorized, onDone }: {
+  client: InfrastructureClient; csrf: string; device: Device | null; writable: boolean;
+  onUnauthorized: () => void; onDone: (saved: Device | null) => void;
 }) {
   const creating = device === null;
   const initial: EditorDraft = { id: device?.id ?? "", name: device?.name ?? "", hostname: device?.hostname ?? "", metricsHost: device?.metrics_host ?? "",
@@ -385,26 +387,34 @@ function DeviceEditor({ client, csrf, device, writable, onDone }: {
   const [shown, setShown] = useState(false);
   const dirty = JSON.stringify(draft) !== JSON.stringify(initial);
   const clearLeaveGuard = useLeaveGuard(dirty, "Discard unsaved device changes?");
+  const form = useRef<HTMLFormElement>(null);
   const problems = editorProblems(draft, creating);
   const set = (key: keyof EditorDraft) => (event: { target: { value: string } }) => setDraft(current => ({ ...current, [key]: event.target.value }));
   async function save(retired: boolean) {
     setShown(true);
-    if (!writable || busy || problems.length) return;
+    // React detaches this ref on unmount, including when the workspace changes actor.
+    const activeForm = form.current;
+    if (!activeForm || !writable || busy || problems.length) return;
     setBusy(true); setError("");
     try {
       const saved = await client.saveDevice(toDraft(draft, retired), expectedRevision, csrf);
+      if (form.current !== activeForm) return;
       // Add navigates before React unmounts the editor and unregisters its guard.
       clearLeaveGuard();
       onDone(saved);
     }
-    catch (failure) { setError(writeFailureText(failure)); }
-    finally { setBusy(false); }
+    catch (failure) {
+      if (form.current !== activeForm) return;
+      if (failure instanceof HubApiError && failure.status === 401) onUnauthorized();
+      else setError(writeFailureText(failure));
+    }
+    finally { if (form.current === activeForm) setBusy(false); }
   }
   function retire() {
     if (device && window.confirm(device.retired ? `Bring ${device.name} back into service?` : `Retire ${device.name}? It's hidden from the list but its history is kept.`))
       void save(!device.retired);
   }
-  return <form className="infra-form" aria-label={creating ? "Add device" : "Edit device"} onSubmit={event => { event.preventDefault(); void save(device?.retired ?? false); }}>
+  return <form ref={form} className="infra-form" aria-label={creating ? "Add device" : "Edit device"} onSubmit={event => { event.preventDefault(); void save(device?.retired ?? false); }}>
     {creating && <label className="field compact"><span className="field-label">Device ID</span>
       <input required maxLength={64} value={draft.id} onChange={set("id")} placeholder="e.g. build-pc" />
       <small>Lowercase letters, numbers and dashes. It can't be changed later and doesn't depend on the address.</small></label>}

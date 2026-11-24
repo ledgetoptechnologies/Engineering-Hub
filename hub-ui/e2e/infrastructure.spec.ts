@@ -277,18 +277,24 @@ test("Show retired cannot discard an open Add device draft", async ({ page }) =>
   await form.getByRole("button", { name: "Cancel" }).click();
   await expect(form).toHaveCount(0);
   await expect(showRetired).toBeEnabled();
+  await expect.poll(() => queries).toEqual([null, null]);
   await showRetired.check();
   await expect(retiredRow).toBeVisible();
-  expect(queries).toEqual([null, "true"]);
+  expect(queries).toEqual([null, null, "true"]);
 });
 
-test("refreshing the workspace preserves an open Add device draft and pauses Inventory reads", async ({ page }) => {
+const editorCases = [
+  { title: "Add device", path: "/#/infrastructure", panelName: "Devices", open: "Add device", save: "Add device", count: "lists" },
+  { title: "Edit device", path: "/#/infrastructure/build-pc", panelName: "Declared details", open: "Edit", save: "Save changes", count: "details" },
+] as const;
+
+for (const editor of editorCases) test(`refreshing the workspace preserves an open ${editor.title} draft and pauses Inventory reads`, async ({ page }) => {
   await page.clock.install();
   const state = await fixture(page);
-  await page.goto("/#/infrastructure");
-  const panel = devicesPanel(page);
-  await panel.getByRole("button", { name: "Add device", exact: true }).click();
-  const form = panel.getByRole("form", { name: "Add device" });
+  await page.goto(editor.path);
+  const panel = page.getByRole("region", { name: editor.panelName });
+  await panel.getByRole("button", { name: editor.open, exact: true }).click();
+  const form = panel.getByRole("form", { name: editor.title });
   const name = form.getByRole("textbox", { name: "Name", exact: true });
   await name.fill("Unsaved workstation");
 
@@ -302,7 +308,7 @@ test("refreshing the workspace preserves an open Add device draft and pauses Inv
   });
   const refreshWorkspace = page.getByRole("button", { name: "Refresh workspace" });
   const refreshInventory = panel.getByRole("button", { name: "Refresh", exact: true });
-  const save = form.getByRole("button", { name: "Add device", exact: true });
+  const save = form.getByRole("button", { name: editor.save, exact: true });
   try {
     await refreshWorkspace.click();
     await expect(refreshWorkspace).toBeDisabled();
@@ -314,14 +320,45 @@ test("refreshing the workspace preserves an open Add device draft and pauses Inv
     await expect(save).toBeEnabled();
     await page.clock.runFor(30_000);
     await expect(name).toHaveValue("Unsaved workstation");
-    expect(state.lists).toBe(1);
+    expect(state[editor.count]).toBe(1);
 
     page.once("dialog", dialog => dialog.accept());
     await form.getByRole("button", { name: "Cancel" }).click();
     await expect(form).toHaveCount(0);
     await expect(refreshInventory).toBeEnabled();
-    await expect.poll(() => state.lists).toBe(2);
+    await expect.poll(() => state[editor.count]).toBe(2);
   } finally { release(); }
+});
+
+test("a device save 401 clears an open Inventory draft when metrics are forbidden", async ({ page }) => {
+  const state = await fixture(page, {
+    metrics: [{ status: 403, body: { detail: { code: "forbidden" } } }],
+    writes: [
+      { status: 403, body: { detail: { code: "infrastructure_forbidden" } } },
+      { status: 401, body: { detail: { code: "human_session_required" } } },
+    ],
+  });
+  await page.goto("/#/infrastructure");
+  const panel = devicesPanel(page);
+  await panel.getByRole("button", { name: "Add device" }).click();
+  const form = panel.getByRole("form", { name: "Add device" });
+  const name = form.getByLabel("Name", { exact: true });
+  const submit = form.getByRole("button", { name: "Add device", exact: true });
+  await form.getByLabel("Device ID").fill("office-printer");
+  await name.fill("Unsaved office printer");
+  await form.getByLabel("Role").fill("Printing");
+
+  await submit.click();
+  await expect(form.getByRole("alert")).toContainText("You aren't allowed to make this change.");
+  await expect(name).toHaveValue("Unsaved office printer");
+  await expect(submit).toBeEnabled();
+
+  await submit.click();
+  await expect(page.getByText("Sign in to Engineering Hub.")).toBeVisible();
+  await expect(form).toHaveCount(0);
+  await expect(panel).toHaveCount(0);
+  expect(state.writes).toHaveLength(2);
+  expect(state.metrics).toBe(1);
 });
 
 test("a single network can't hold both IP families; a dual-stack device leaves it empty", async ({ page }) => {
