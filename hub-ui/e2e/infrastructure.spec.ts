@@ -712,6 +712,59 @@ test("prioritizes compact machine cards and drills into device and discovered-ma
   expect(blocking(await audit(page, "page", 375))).toEqual([]);
 });
 
+test("machine cards keep Network labels and rates readable at dense widths", async ({ page }) => {
+  const rates = [
+    [999 * 1024 ** 2, 987 * 1024 ** 2, "↓ 999 MB/s · ↑ 987 MB/s"],
+    [38_093, 157 * 1024, "↓ 37.2 KB/s · ↑ 157 KB/s"],
+    [null, 10 * 1024, "↓ not reported · ↑ 10.0 KB/s"],
+    [null, null, "not reported"],
+    [830, 120, "↓ 830 B/s · ↑ 120 B/s"],
+  ] as const;
+  const body = { ...prioritizedMetrics(), schema_version: 3 };
+  body.devices = body.devices.slice(0, rates.length).map((device: object, index: number) => ({
+    ...device, net_rx_bytes_per_second: rates[index][0], net_tx_bytes_per_second: rates[index][1],
+    disks: [{ mount: "/", size_bytes: 1_000_000_000_000, free_bytes: 250_000_000_000 }],
+  }));
+  await fixture(page, { metrics: [{ status: 200, body }] });
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.setViewportSize({ width: 1840, height: 1100 });
+  await page.goto("/#/infrastructure");
+  const grid = healthPanel(page).locator(".machine-list");
+  const cards = grid.getByRole("listitem");
+  const network = cards.locator(".machine-card-stat").filter({ has: page.getByText("Network", { exact: true }) });
+  await expect(network.locator("strong")).toHaveText(rates.map(([, , text]) => text));
+  await page.evaluate(() => document.fonts.ready);
+
+  for (const width of [1840, 1543, 320]) {
+    await page.setViewportSize({ width, height: 1100 });
+    if (width === 1840) {
+      // The report shows five adjacent cards, not a full viewport. Match that density here.
+      const tops = await cards.evaluateAll(nodes => nodes.map(node => node.getBoundingClientRect().top));
+      expect(new Set(tops).size, "five cards in one dense row").toBe(1);
+      await grid.screenshot({ path: test.info().outputPath("machine-network-desktop.png") });
+    }
+    const issues = await network.evaluateAll(stats => stats.flatMap(stat => {
+      const textRects = (node: Element) => {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        return Array.from(range.getClientRects());
+      };
+      const label = textRects(stat.querySelector("span")!)[0];
+      const values = textRects(stat.querySelector("strong")!);
+      const cell = stat.getBoundingClientRect();
+      const card = stat.closest(".machine-card")!.getBoundingClientRect();
+      const fits = (rect: DOMRect) => rect.left >= Math.max(cell.left, card.left) - 1
+        && rect.right <= Math.min(cell.right, card.right) + 1
+        && rect.top >= cell.top - 1 && rect.bottom <= cell.bottom + 1;
+      const separated = values.every(rect => rect.left >= label.right + 3 || rect.top >= label.bottom);
+      if (values.length && separated && [label, ...values].every(fits)) return [];
+      return [{ text: stat.textContent, label: label.toJSON(), values: values.map(rect => rect.toJSON()), cell: cell.toJSON() }];
+    }));
+    expect.soft(issues, `Network labels and rates at ${width}px`).toEqual([]);
+    expect((await grid.boundingBox())!.width, `Machine Health grid width at ${width}px`).toBeLessThanOrEqual(width);
+  }
+});
+
 test("machine order preferences stay browser-local and reorder by exact normalized display alias", async ({ page }) => {
   await fixture(page, { metrics: [{ status: 200, body: prioritizedMetrics() }] });
   await page.goto("/#/infrastructure");
