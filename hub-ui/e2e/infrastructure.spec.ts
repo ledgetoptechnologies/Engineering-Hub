@@ -272,6 +272,48 @@ test("Show retired cannot discard an open Add device draft", async ({ page }) =>
   expect(queries).toEqual([null, "true"]);
 });
 
+test("refreshing the workspace preserves an open Add device draft and pauses Inventory reads", async ({ page }) => {
+  await page.clock.install();
+  const state = await fixture(page);
+  await page.goto("/#/infrastructure");
+  const panel = devicesPanel(page);
+  await panel.getByRole("button", { name: "Add device", exact: true }).click();
+  const form = panel.getByRole("form", { name: "Add device" });
+  const name = form.getByRole("textbox", { name: "Name", exact: true });
+  await name.fill("Unsaved workstation");
+
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  await page.route("**/api/hub/v1/overview", async route => {
+    await held;
+    const overview = createDemoOverview(new Date());
+    (overview.capabilities as Record<string, unknown>).infrastructure = true;
+    await route.fulfill({ json: overview });
+  });
+  const refreshWorkspace = page.getByRole("button", { name: "Refresh workspace" });
+  const refreshInventory = panel.getByRole("button", { name: "Refresh", exact: true });
+  const save = form.getByRole("button", { name: "Add device", exact: true });
+  try {
+    await refreshWorkspace.click();
+    await expect(refreshWorkspace).toBeDisabled();
+    await expect(name).toHaveValue("Unsaved workstation");
+    await expect(save).toBeDisabled();
+    await expect(refreshInventory).toBeDisabled();
+    release();
+    await expect(refreshWorkspace).toBeEnabled();
+    await expect(save).toBeEnabled();
+    await page.clock.runFor(30_000);
+    await expect(name).toHaveValue("Unsaved workstation");
+    expect(state.lists).toBe(1);
+
+    page.once("dialog", dialog => dialog.accept());
+    await form.getByRole("button", { name: "Cancel" }).click();
+    await expect(form).toHaveCount(0);
+    await expect(refreshInventory).toBeEnabled();
+    await expect.poll(() => state.lists).toBe(2);
+  } finally { release(); }
+});
+
 test("a single network can't hold both IP families; a dual-stack device leaves it empty", async ({ page }) => {
   const state = await fixture(page, { writes: [{ status: 200, body: devices()[0] }] });
   await page.goto("/#/infrastructure");

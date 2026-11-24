@@ -1,6 +1,6 @@
 /**
  * Infrastructure: what devices the Hub knows about, what its checks last saw, and why one is down.
- * Reads on open, on Refresh and when the Hub's event feed invalidates the workspace; never polls.
+ * Reads on open, on Refresh, on workspace invalidation, and every 30 seconds while visible.
  * Declared facts, probe observations and maintenance notes are shown separately, and nothing here
  * powers, restarts or changes a device.
  */
@@ -37,12 +37,14 @@ function useClient(hub: Hub): InfrastructureClient {
   return useMemo(() => hub.demo ? demoInfrastructure() : httpInfrastructure(), [hub.demo]);
 }
 type InventoryRead<T> = (signal: AbortSignal) => Promise<T>;
-function useRead<T>(hub: Hub, read: InventoryRead<T>, autoRefresh: boolean): [Load<T>, () => void] {
+function useRead<T>(hub: Hub, read: InventoryRead<T>, paused: boolean): [Load<T>, () => void] {
   // The memoized reader identifies the query; overview invalidations and refresh ticks don't change it.
   const [snapshot, setSnapshot] = useState<{ read: InventoryRead<T>; load: Load<T> }>();
   const load: Load<T> = snapshot?.read === read ? snapshot.load : { state: "loading" };
-  const [attempt, refresh, runRead] = useInfrastructureRefresh(autoRefresh && !hub.demo && load.state !== "unavailable");
+  const [attempt, refresh, runRead] = useInfrastructureRefresh(!paused && !hub.demo && load.state !== "unavailable");
   useEffect(() => {
+    // Entering the editor cancels an in-flight Inventory read. Closing it reads fresh data.
+    if (paused) return;
     setSnapshot(current => current?.read === read && current.load.state === "loaded" ? current : { read, load: { state: "loading" } });
     return runRead(read, value => {
       setSnapshot({ read, load: { state: "loaded", value } });
@@ -56,7 +58,7 @@ function useRead<T>(hub: Hub, read: InventoryRead<T>, autoRefresh: boolean): [Lo
       setSnapshot(current => current?.read === read && current.load.state === "loaded" && transientRefreshError(error)
         ? { read, load: { ...current.load, refreshFailed: true } } : { read, load: { state: "failed", message } });
     });
-  }, [read, hub.clearPrivateWorkspace, hub.data, attempt, runRead]);
+  }, [read, hub.clearPrivateWorkspace, hub.data, attempt, paused, runRead]);
   return [load, refresh];
 }
 
@@ -96,7 +98,7 @@ function DeviceListPage({ hub, actions, reading, onInventoryAccess }: {
   const [filter, setFilter] = useState<Filter>("all");
   const [creating, setCreating] = useState(false);
   const read = useCallback((signal: AbortSignal) => client.list(signal, retired), [client, retired]);
-  const [load, refresh] = useRead<DeviceList>(hub, read, !creating);
+  const [load, refresh] = useRead<DeviceList>(hub, read, creating);
   useInventoryAccess(load.state, onInventoryAccess);
   // Machine health has its own admission: someone refused the device list may still read metrics, and it hides itself otherwise.
   if (load.state === "unavailable") return <Unavailable actions={actions}><MachineHealth hub={hub} reading={reading} inventoryReadAvailable={false} /></Unavailable>;
@@ -106,7 +108,6 @@ function DeviceListPage({ hub, actions, reading, onInventoryAccess }: {
   const count = (kind: Filter) => (list?.items ?? []).filter(device =>
     kind === "maintenance" ? device.open_maintenance !== null : needsAttention(device, now)).length;
   const canEdit = Boolean(list?.capabilities.device_write) && hub.writable && !hub.stale && !hub.demo;
-  const showEditor = creating && canEdit;
   return <>
     <PageHeader eyebrow="INFRASTRUCTURE" title="Infrastructure"
       subtitle="The devices the Hub knows about, what its checks last saw, and any maintenance in progress. Nothing here powers or changes a device.">
@@ -115,8 +116,8 @@ function DeviceListPage({ hub, actions, reading, onInventoryAccess }: {
     <section className="panel infra" aria-label="Devices">
       <PanelTitle title="Devices" count={list ? shown.length : undefined}>
         {list && <a href={href({ page: "topology" })}>Topology</a>}
-        {canEdit && <button type="button" className="secondary" onClick={() => setCreating(true)}>Add device</button>}
-        <button type="button" className="secondary" disabled={load.state === "loading"} onClick={refresh}>
+        {canEdit && !creating && <button type="button" className="secondary" onClick={() => setCreating(true)}>Add device</button>}
+        <button type="button" className="secondary" disabled={creating || load.state === "loading"} onClick={refresh}>
           {load.state === "loading" ? "Reading…" : "Refresh"}</button>
       </PanelTitle>
       {hub.demo && <p role="status">Demo: illustrative devices with example addresses. Nothing is read from a real network.</p>}
@@ -128,10 +129,10 @@ function DeviceListPage({ hub, actions, reading, onInventoryAccess }: {
             {list && kind !== "all" && <span>{count(kind)}</span>}</button>)}
         </div>
         {/* Switching inventory queries unloads the list and would discard an open draft. */}
-        <label className="infra-toggle"><input type="checkbox" checked={retired} disabled={showEditor} onChange={event => setRetired(event.target.checked)} /> Show retired</label>
+        <label className="infra-toggle"><input type="checkbox" checked={retired} disabled={creating} onChange={event => setRetired(event.target.checked)} /> Show retired</label>
       </div>
-      {showEditor && <DeviceEditor client={client} csrf={hub.session?.csrf_token ?? ""} device={null}
-        onDone={saved => { setCreating(false); if (saved) { refresh(); navigate({ page: "device", id: saved.id }); } }} />}
+      {creating && <DeviceEditor client={client} csrf={hub.session?.csrf_token ?? ""} device={null} writable={canEdit}
+        onDone={saved => { setCreating(false); if (saved) navigate({ page: "device", id: saved.id }); }} />}
       {load.state === "loaded" && load.refreshFailed && <p className="notice" role="status">Couldn't refresh device list. Showing the last reading.</p>}
       {load.state === "loading" && !list && <p role="status">Reading the device list…</p>}
       {load.state === "failed" && <p className="notice error" role="alert">{load.message}</p>}
@@ -174,7 +175,7 @@ function DevicePage({ hub, actions, route, reading, onInventoryAccess }: {
   const self = hub.session?.actor ?? null;
   const [editing, setEditing] = useState(false);
   const read = useCallback((signal: AbortSignal) => client.detail(id, signal), [client, id]);
-  const [load, refresh] = useRead<DeviceDetail>(hub, read, !editing);
+  const [load, refresh] = useRead<DeviceDetail>(hub, read, editing);
   useInventoryAccess(load.state, onInventoryAccess);
   if (load.state === "unavailable") return <Unavailable actions={actions} />;
   const detail = load.state === "loaded" ? load.value : null;
@@ -193,11 +194,11 @@ function DevicePage({ hub, actions, route, reading, onInventoryAccess }: {
       <section className="panel" aria-label="Declared details">
         <PanelTitle title="Declared details">
           {detail.capabilities.device_write && writable && !editing && <button type="button" className="secondary" onClick={() => setEditing(true)}>Edit</button>}
-          <button type="button" className="secondary" disabled={load.state === "loading"} onClick={refresh}>Refresh</button>
+          <button type="button" className="secondary" disabled={editing || load.state === "loading"} onClick={refresh}>Refresh</button>
         </PanelTitle>
         <p className="panel-description">What's been recorded about this device. Recorded details aren't checked against the device itself.</p>
         {device.retired && <p className="notice" role="status">This device is retired. Its history is kept.</p>}
-        {editing ? <DeviceEditor client={client} csrf={csrf} device={device} onDone={saved => { setEditing(false); if (saved) refresh(); }} />
+        {editing ? <DeviceEditor client={client} csrf={csrf} device={device} writable={writable && detail.capabilities.device_write} onDone={() => setEditing(false)} />
           : <dl className="infra-facts">
             <dt>Hostname</dt><dd>{device.hostname ?? "Not recorded"}</dd>
             {device.metrics_host && <><dt>Prometheus host</dt><dd><code>{device.metrics_host}</code></dd></>}
@@ -370,7 +371,9 @@ function toDraft(draft: EditorDraft, retired: boolean): DeviceDraft {
     network: draft.network.trim() || null, vlan: draft.vlan ? Number(draft.vlan) : null, role: draft.role.trim(), retired };
 }
 
-function DeviceEditor({ client, csrf, device, onDone }: { client: InfrastructureClient; csrf: string; device: Device | null; onDone: (saved: Device | null) => void }) {
+function DeviceEditor({ client, csrf, device, writable, onDone }: {
+  client: InfrastructureClient; csrf: string; device: Device | null; writable: boolean; onDone: (saved: Device | null) => void;
+}) {
   const creating = device === null;
   const initial: EditorDraft = { id: device?.id ?? "", name: device?.name ?? "", hostname: device?.hostname ?? "", metricsHost: device?.metrics_host ?? "",
     addresses: (device?.addresses ?? []).join("\n"), network: device?.network ?? "", vlan: device?.vlan?.toString() ?? "", role: device?.role ?? "" };
@@ -385,7 +388,7 @@ function DeviceEditor({ client, csrf, device, onDone }: { client: Infrastructure
   const set = (key: keyof EditorDraft) => (event: { target: { value: string } }) => setDraft(current => ({ ...current, [key]: event.target.value }));
   async function save(retired: boolean) {
     setShown(true);
-    if (busy || problems.length) return;
+    if (!writable || busy || problems.length) return;
     setBusy(true); setError("");
     try { onDone(await client.saveDevice(toDraft(draft, retired), expectedRevision, csrf)); }
     catch (failure) { setError(writeFailureText(failure)); }
@@ -416,8 +419,8 @@ function DeviceEditor({ client, csrf, device, onDone }: { client: Infrastructure
     {error && <p className="notice error" role="alert">{error}</p>}
     <div className="button-row">
       <button type="button" className="secondary" disabled={busy} onClick={() => { if (!dirty || window.confirm("Discard unsaved device changes?")) onDone(null); }}>Cancel</button>
-      {!creating && <button type="button" className="secondary" disabled={busy} onClick={retire}>{device!.retired ? "Return to service" : "Retire device"}</button>}
-      <button type="submit" disabled={busy}>{busy ? "Saving…" : creating ? "Add device" : "Save changes"}</button>
+      {!creating && <button type="button" className="secondary" disabled={busy || !writable} onClick={retire}>{device!.retired ? "Return to service" : "Retire device"}</button>}
+      <button type="submit" disabled={busy || !writable}>{busy ? "Saving…" : creating ? "Add device" : "Save changes"}</button>
     </div>
   </form>;
 }
