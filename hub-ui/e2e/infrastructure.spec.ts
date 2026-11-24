@@ -622,6 +622,47 @@ test("a deferred manual read survives a poll tick, times out and recovers", asyn
   } finally { release(); }
 });
 
+test("Inventory discards the previous filter's reading when the new query fails", async ({ page }) => {
+  await fixture(page);
+  const queries: Array<string | null> = [];
+  const active = list().body;
+  const retiredDevice = { ...active.items[1], id: "retired-fixture", name: "Retired fixture device", retired: true };
+  await page.route("**/api/hub/v1/infrastructure/devices*", route => {
+    const includeRetired = new URL(route.request().url()).searchParams.get("include_retired");
+    queries.push(includeRetired);
+    if (queries.length === 3) return route.fulfill({ status: 503, json: { detail: { code: "infrastructure_unavailable" } } });
+    return route.fulfill({ json: includeRetired === "true" ? { ...active, items: [...active.items, retiredDevice] } : active });
+  });
+  await page.goto("/#/infrastructure");
+  const panel = devicesPanel(page);
+  const showRetired = panel.getByRole("checkbox", { name: "Show retired" });
+  const retired = panel.getByRole("link", { name: /^Retired fixture device/ });
+  const activeRow = panel.getByRole("link", { name: /^Build PC/ });
+  await expect(activeRow).toBeVisible();
+  await expect(retired).toHaveCount(0);
+  await showRetired.check();
+  await expect(retired).toBeVisible();
+
+  const failedRead = page.waitForResponse(response => {
+    const url = new URL(response.url());
+    return url.pathname === "/api/hub/v1/infrastructure/devices" && !url.searchParams.has("include_retired") && response.status() === 503;
+  });
+  await showRetired.uncheck();
+  await failedRead;
+  await expect(panel.getByText(/couldn't (refresh device list|be read)/i)).toBeVisible();
+  expect(queries).toEqual([null, "true", null]);
+  await expect(retired, "the active-only query must not show the retired row from the previous query").toHaveCount(0);
+  await expect(panel.getByRole("listitem")).toHaveCount(0);
+  await expect(panel.getByRole("alert")).toContainText("Use Refresh to try again");
+
+  await panel.getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect(activeRow).toBeVisible();
+  await expect(retired).toHaveCount(0);
+  await expect(showRetired).not.toBeChecked();
+  await expect(panel.getByRole("alert")).toHaveCount(0);
+  expect(queries).toEqual([null, "true", null, null]);
+});
+
 test("visible registered device details, current readings and charts refresh every 30 seconds", async ({ page }) => {
   await page.clock.install();
   const metrics = { status: 200, body: prioritizedMetrics() };

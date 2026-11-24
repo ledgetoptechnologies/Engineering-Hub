@@ -4,7 +4,7 @@
  * Declared facts, probe observations and maintenance notes are shown separately, and nothing here
  * powers, restarts or changes a device.
  */
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { inventoryUnavailable, transientRefreshError, useInfrastructureRefresh } from "../infrastructureRefresh";
 import { HubApiError } from "../api";
 import type { Hub } from "../hub";
@@ -36,24 +36,27 @@ const UNAVAILABLE = "Infrastructure isn't available to you on this Hub.";
 function useClient(hub: Hub): InfrastructureClient {
   return useMemo(() => hub.demo ? demoInfrastructure() : httpInfrastructure(), [hub.demo]);
 }
-function useRead<T>(hub: Hub, read: (signal: AbortSignal) => Promise<T>, deps: unknown[], autoRefresh: boolean): [Load<T>, () => void] {
-  const [load, setLoad] = useState<Load<T>>({ state: "loading" });
+type InventoryRead<T> = (signal: AbortSignal) => Promise<T>;
+function useRead<T>(hub: Hub, read: InventoryRead<T>, autoRefresh: boolean): [Load<T>, () => void] {
+  // The memoized reader identifies the query; overview invalidations and refresh ticks don't change it.
+  const [snapshot, setSnapshot] = useState<{ read: InventoryRead<T>; load: Load<T> }>();
+  const load: Load<T> = snapshot?.read === read ? snapshot.load : { state: "loading" };
   const [attempt, refresh, runRead] = useInfrastructureRefresh(autoRefresh && !hub.demo && load.state !== "unavailable");
-  const reader = useRef(read); reader.current = read;
   useEffect(() => {
-    setLoad(current => current.state === "loaded" ? current : { state: "loading" });
-    return runRead(signal => reader.current(signal), value => {
-      setLoad({ state: "loaded", value });
+    setSnapshot(current => current?.read === read && current.load.state === "loaded" ? current : { read, load: { state: "loading" } });
+    return runRead(read, value => {
+      setSnapshot({ read, load: { state: "loaded", value } });
     }, error => {
       if (error instanceof HubApiError && error.status === 401) { hub.clearPrivateWorkspace(); return; }
       if (inventoryUnavailable(error)) {
-        setLoad({ state: "unavailable" }); return;
+        setSnapshot({ read, load: { state: "unavailable" } }); return;
       }
-      setLoad(current => current.state === "loaded" && transientRefreshError(error)
-        ? { ...current, refreshFailed: true } : { state: "failed", message: error instanceof HubApiError && error.code === "device_not_found"
-        ? "This device isn't in the Hub's inventory." : "The Hub's infrastructure list couldn't be read. Use Refresh to try again." });
+      const message = error instanceof HubApiError && error.code === "device_not_found"
+        ? "This device isn't in the Hub's inventory." : "The Hub's infrastructure list couldn't be read. Use Refresh to try again.";
+      setSnapshot(current => current?.read === read && current.load.state === "loaded" && transientRefreshError(error)
+        ? { read, load: { ...current.load, refreshFailed: true } } : { read, load: { state: "failed", message } });
     });
-  }, [...deps, attempt, runRead]);
+  }, [read, hub.clearPrivateWorkspace, hub.data, attempt, runRead]);
   return [load, refresh];
 }
 
@@ -92,7 +95,8 @@ function DeviceListPage({ hub, actions, reading, onInventoryAccess }: {
   const [retired, setRetired] = useState(false);
   const [filter, setFilter] = useState<Filter>("all");
   const [creating, setCreating] = useState(false);
-  const [load, refresh] = useRead<DeviceList>(hub, signal => client.list(signal, retired), [client, retired, hub.data], !creating);
+  const read = useCallback((signal: AbortSignal) => client.list(signal, retired), [client, retired]);
+  const [load, refresh] = useRead<DeviceList>(hub, read, !creating);
   useInventoryAccess(load.state, onInventoryAccess);
   // Machine health has its own admission: someone refused the device list may still read metrics, and it hides itself otherwise.
   if (load.state === "unavailable") return <Unavailable actions={actions}><MachineHealth hub={hub} reading={reading} inventoryReadAvailable={false} /></Unavailable>;
@@ -167,7 +171,8 @@ function DevicePage({ hub, actions, route, reading, onInventoryAccess }: {
   const now = useNow();
   const self = hub.session?.actor ?? null;
   const [editing, setEditing] = useState(false);
-  const [load, refresh] = useRead<DeviceDetail>(hub, signal => client.detail(id, signal), [client, id, hub.data], !editing);
+  const read = useCallback((signal: AbortSignal) => client.detail(id, signal), [client, id]);
+  const [load, refresh] = useRead<DeviceDetail>(hub, read, !editing);
   useInventoryAccess(load.state, onInventoryAccess);
   if (load.state === "unavailable") return <Unavailable actions={actions} />;
   const detail = load.state === "loaded" ? load.value : null;
