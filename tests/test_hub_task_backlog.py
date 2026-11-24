@@ -72,6 +72,18 @@ def test_named_owner_claims_and_others_cannot(repo):
     assert repo.claim_task('claude', task['id'], 1)['status'] == 'claimed'
 
 
+def test_reprioritizing_a_verified_task_preserves_review_and_never_grants_admission(repo):
+    task = create(repo, owner='claude', reviewer='codex')
+    task = verified(repo, task)
+    updated = repo.update_task(BEAU, task['id'], task['revision'], priority='urgent')
+    assert {key: updated[key] for key in ('status', 'owner', 'candidate_commit', 'review')} == {
+        key: task[key] for key in ('status', 'owner', 'candidate_commit', 'review')}
+    assert updated['priority'] == 'urgent'
+    assert repo.task_allows_environment(task['id'], 'production') is False
+    assert repo.task_allows_environment(task['id'], 'staging') is False
+    assert repo.list_priority_task_views()[0]['id'] == task['id']
+
+
 def test_update_permissions_owner_reviewer_human_only(repo):
     task = create(repo, owner='claude', reviewer='codex')
     with pytest.raises(HubError, match='forbidden'):
@@ -235,6 +247,36 @@ def beau(client, app, settings):
     session = app.state.sessions.create_session(42)
     client.cookies.set(settings.auth_config.cookie_name, session['cookie_token'])
     return {'Origin': settings.auth_config.origin, 'X-Hub-CSRF': session['csrf_token']}
+
+
+def test_human_sets_task_priority_without_changing_state_or_legacy_contract(hub):
+    client, app, settings = hub
+    body = {'project': PROJECT, 'title': 'Ordinary work', 'client_request_id': 'legacy'}
+    old = client.post(BASE + '/tasks', headers=agent('claude'), json=body).json()
+    assert 'priority' not in old
+    update_url = f"{BASE}/tasks/{old['id']}/update"
+    update = {'expected_revision': old['revision'], 'client_request_id': 'priority-edit', 'priority': 'urgent'}
+    assert client.post(update_url, headers=agent('claude'), json=update).status_code == 403
+    assert client.post(BASE + '/tasks', headers=agent('claude'),
+                       json={**body, 'client_request_id': 'agent-new', 'priority': 'urgent'}).status_code == 403
+    before = client.get(BASE + '/tasks', headers=agent('claude')).json()['items'][0]
+    headers = beau(client, app, settings)
+    assert client.post(update_url, json=update).status_code == 403  # No CSRF.
+    response = client.post(update_url, headers=headers, json=update)
+    assert response.status_code == 200, response.text
+    changed = response.json()
+    assert changed['priority'] == 'urgent' and changed['status'] == old['status']
+    assert changed['revision'] == old['revision'] + 1
+    assert client.post(update_url, headers=headers, json=update).json() == changed
+    assert client.post(update_url, headers=headers, json={**update, 'priority': 'high'}).status_code == 409
+    assert client.post(update_url, headers=headers, json={**update, 'client_request_id': 'stale'}).status_code == 409
+    assert client.post(update_url, headers=headers, json={**update, 'priority': 'whatever'}).status_code == 422
+    after = client.get(BASE + '/tasks', headers=agent('claude')).json()['items'][0]
+    assert after['priority'] == 'urgent' and after['state_since'] == before['state_since']
+    assert client.post(BASE + '/tasks', headers=headers,
+                       json={**body, 'client_request_id': 'new', 'priority': 'high'}).json()['priority'] == 'high'
+    ranked = client.get(BASE + '/tasks?task_order=priority', headers=agent('claude')).json()['items']
+    assert [task['priority'] for task in ranked] == ['urgent', 'high']
 
 
 def test_rest_agent_create_update_and_beau_clears_action(hub):

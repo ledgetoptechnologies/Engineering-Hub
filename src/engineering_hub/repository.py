@@ -12,6 +12,7 @@ from agent_message_bus import session_hub_context as session_context
 from .pilot_ownership import PilotOwner
 from .image_state_boundary import ImageStateBoundaryError, require_image_state_mount
 from .entity_context import bounded_text, validated_context
+from .task_priority import PRIORITY_RANK
 
 
 PROJECTS = frozenset({'engineering-hub', '3d-viewer', 'project-alpha', 'ledge-top-ops', 'treedar'})
@@ -298,15 +299,25 @@ class HubRepository:
             fields['request_text'] = self._bounded(request_text, 2000)
         return fields
 
+    @classmethod
+    def _task_priority_fields(cls, actor, priority):
+        if priority is None:
+            return {}
+        cls._actor(actor, human=True)
+        if type(priority) is not str or priority not in PRIORITY_RANK:
+            raise HubError('invalid_priority')
+        return {'priority': priority}
+
     def create_task(self, actor, project, title, client_request_id, *, details=None, links=None,
-                    acceptance=None, owner=None, reviewer=None, request_text=None):
+                    acceptance=None, owner=None, reviewer=None, request_text=None, priority=None):
         """Humans and agents may add backlog tasks. Neither grants environment or production rights:
         an agent-created task records proposed_by without a scope, which task_allows_environment vetoes."""
         self._actor(actor)
         human = actor not in AGENTS and not session_context.actor_allowed(actor)
         title, key = self._text(title), self._text(client_request_id)
         context = self._context(details, links)
-        backlog =self._backlog_fields(acceptance, owner, reviewer, request_text)
+        backlog = self._backlog_fields(acceptance, owner, reviewer, request_text)
+        backlog.update(self._task_priority_fields(actor, priority))
         # Keep the legacy human fingerprint byte-for-byte when no backlog field is supplied.
         payload = ([] if human else ['agent_task']) + [project, title] + ([context] if context else []) + (
             [backlog] if backlog else [])
@@ -353,7 +364,7 @@ class HubRepository:
 
     def update_task(self, actor, identity, expected_revision, *, details=None, links=None, acceptance=None,
                     owner=None, reviewer=None, note=None, status=None, waiting=None, evidence=None,
-                    client_request_id=None):
+                    client_request_id=None, priority=None):
         """CAS edit by the owner, the named reviewer or a human. Omitted fields are unchanged.
 
         Status here covers only the backlog states: waiting_on_beau (with a decision/action item),
@@ -370,6 +381,7 @@ class HubRepository:
         key = None if client_request_id is None else self._text(client_request_id, 128)
         human = actor not in AGENTS and not session_context.actor_allowed(actor)
         backlog = self._backlog_fields(acceptance, owner, reviewer)
+        backlog.update(self._task_priority_fields(actor, priority))
         content = self._context(details, links)
         if 'acceptance' in backlog:
             content['acceptance'] = backlog.pop('acceptance')
@@ -450,6 +462,9 @@ class HubRepository:
                 action = 'task.reassigned'
             if 'reviewer' in backlog:
                 item['reviewer'] = backlog['reviewer']
+        if 'priority' in backlog:
+            # Metadata only: keep candidate, review, status and execution gates unchanged.
+            item['priority'] = backlog['priority']
         if note:
             item['notes'] = (item.get('notes') or [])[-(MAX_NOTES - 1):] + [dict(at=now, by=actor, text=note)]
         if status == 'waiting_on_beau':
@@ -626,6 +641,12 @@ class HubRepository:
 
     def list_tasks(self):
         return self._list('task')
+
+    def list_priority_task_views(self):
+        """Unfinished tasks ranked by urgency, oldest-created first on ties."""
+        tasks = (dict(task, priority=task.get('priority', 'normal')) for task in self.list_task_views()
+                 if task['status'] not in {'done', 'withdrawn'})
+        return sorted(tasks, key=lambda task: PRIORITY_RANK[task['priority']])
 
     def list_task_views(self):
         """Response copies of tasks plus the audited time each entered its current status.

@@ -1,4 +1,5 @@
 """Hub tools, standalone or explicitly registered on the unified bus server."""
+from typing import Literal
 from fastapi import HTTPException
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
@@ -148,10 +149,16 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
             raise ToolError('reachability_source_unavailable') from None
 
     @registration.tool()
-    async def hub_overview(ctx: Context) -> dict:
-        """Read shared tasks, decisions, runs and the emergency-pause state."""
+    async def hub_overview(ctx: Context, task_order: Literal['priority'] | None = None) -> dict:
+        """Read shared tasks, decisions, runs and the emergency-pause state.
+
+        Set task_order='priority' to list unfinished tasks by urgency: urgent,
+        high, normal, low. Older tasks without a priority count as normal.
+        Priority is advisory; it never authorizes or schedules execution.
+        """
         identity(ctx)
-        result = {"tasks": [HubRepository.overview_task(task) for task in invoke(repo.list_task_views)], "decisions": invoke(repo.list_decisions),
+        read_tasks = repo.list_priority_task_views if task_order == 'priority' else repo.list_task_views
+        result = {"tasks": [HubRepository.overview_task(task) for task in invoke(read_tasks)], "decisions": invoke(repo.list_decisions),
                   "runs": invoke(repo.list_runs), "paused": invoke(repo.get_paused)}
         if autonomy_status is not None:
             result['autonomy'] = invoke(autonomy_status)

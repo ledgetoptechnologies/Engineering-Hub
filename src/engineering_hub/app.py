@@ -43,6 +43,7 @@ from .dto import (
     HealthDTO, OverviewDTO, PauseDTO, ProjectListDTO, RunDTO, RunListDTO, RecoveryDTO,
     TaskDTO, TaskListDTO,
 )
+from .task_priority import TaskPriority
 
 @dataclass(frozen=True)
 class Settings:
@@ -170,6 +171,7 @@ class NewTask(Input):
     assignee: Literal["hermes", "codex", "claude"] | None = None
     assigned_reviewer: Literal["hermes", "codex", "claude"] | None = None
     request_text: str | None = Field(default=None, max_length=2000)
+    priority: TaskPriority | None = None
 
 
 class Revision(Input):
@@ -210,6 +212,7 @@ class WaitingItem(Input):
 
 class TaskUpdate(Revision):
     client_request_id: str = Field(min_length=1, max_length=128)
+    priority: TaskPriority | None = None
     details: str | None = Field(default=None, max_length=4096)
     links: list[dict[str, str]] | None = Field(default=None, max_length=8)
     acceptance: list[str] | None = Field(default=None, max_length=20)
@@ -1076,9 +1079,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         return {"items": await agents_for()}
 
     @app.get("/api/hub/v1/tasks", response_model=TaskListDTO, response_model_exclude_unset=True)
-    def list_tasks(request: Request):
+    def list_tasks(request: Request, task_order: Literal['priority'] | None = None):
         actor(request)
-        return {"items": repo.list_task_views()}
+        return {"items": repo.list_priority_task_views() if task_order else repo.list_task_views()}
 
     @app.post("/api/hub/v1/tasks", status_code=201, response_model=TaskDTO, response_model_exclude_unset=True)
     def create_task(payload: NewTask, request: Request):
@@ -1086,7 +1089,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         return repo.create_task(actor(request, mutation=True), payload.project,
                                 payload.title, payload.client_request_id,
                                 details=payload.details, links=payload.links, acceptance=payload.acceptance,
-                                owner=payload.assignee, reviewer=payload.assigned_reviewer, request_text=payload.request_text)
+                                owner=payload.assignee, reviewer=payload.assigned_reviewer, request_text=payload.request_text,
+                                priority=payload.priority)
 
     @app.post('/api/hub/v1/tasks/{task_id}/update', response_model=TaskDTO, response_model_exclude_unset=True)
     def update_task(task_id: str, payload: TaskUpdate, request: Request):
@@ -1095,7 +1099,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                                 owner=payload.assignee, reviewer=payload.assigned_reviewer, note=payload.note,
                                 status=payload.status, evidence=payload.evidence,
                                 waiting=payload.waiting.model_dump() if payload.waiting else None,
-                                client_request_id=payload.client_request_id)
+                                client_request_id=payload.client_request_id, priority=payload.priority)
 
     @app.post('/api/hub/v1/tasks/{task_id}/resolve-waiting', response_model=TaskDTO, response_model_exclude_unset=True)
     def resolve_waiting(task_id: str, payload: ResolveWaiting, request: Request):

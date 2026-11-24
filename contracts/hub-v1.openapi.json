@@ -2852,6 +2852,25 @@
       "get": {
         "summary": "List Tasks",
         "operationId": "list_tasks_api_hub_v1_tasks_get",
+        "parameters": [
+          {
+            "name": "task_order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "const": "priority",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Task Order"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -2862,6 +2881,16 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         }
       },
@@ -2869,14 +2898,14 @@
         "summary": "Create Task",
         "operationId": "create_task_api_hub_v1_tasks_post",
         "requestBody": {
+          "required": true,
           "content": {
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/NewTask"
               }
             }
-          },
-          "required": true
+          }
         },
         "responses": {
           "201": {
@@ -5746,6 +5775,23 @@
               }
             ],
             "title": "Request Text"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "urgent",
+                  "high",
+                  "normal",
+                  "low"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority"
           }
         },
         "additionalProperties": false,
@@ -7226,6 +7272,23 @@
             ],
             "title": "Status"
           },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "urgent",
+                  "high",
+                  "normal",
+                  "low"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority"
+          },
           "owner": {
             "anyOf": [
               {
@@ -7705,6 +7768,23 @@
             "maxLength": 128,
             "minLength": 1,
             "title": "Client Request Id"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "urgent",
+                  "high",
+                  "normal",
+                  "low"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority"
           },
           "details": {
             "anyOf": [

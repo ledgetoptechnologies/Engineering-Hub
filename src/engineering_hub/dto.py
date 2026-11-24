@@ -9,6 +9,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from .image_version_reports import ImageVersionsSummary
+from .task_priority import TaskPriority
 
 
 AgentId = Literal['hermes', 'codex', 'claude']
@@ -102,6 +103,7 @@ class TaskDTO(EntityDTO):
     project: ProjectId
     title: str
     status: TaskStatus
+    priority: TaskPriority | None = None
     owner: AgentActor | None
     candidate_commit: Commit | None
     review: ReviewDTO | None

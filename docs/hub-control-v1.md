@@ -103,6 +103,19 @@ agent and stays until Beau clears it. `hub_overview` omits long
 backlog text (acceptance, notes, request) and gives counts; `hub_task_get` returns
 the full record.
 
+Use **Work → Priority** to see unfinished tasks ranked Urgent, High, Normal,
+and Low. Done and withdrawn tasks stay out of this view; work waiting on Beau
+or passing review stays visible with its existing status. Within a level,
+older tasks come first. Existing tasks without a saved priority count as Normal.
+
+Agents can request `hub_overview(task_order="priority")`, or read
+`GET /api/hub/v1/tasks?task_order=priority`, for the same order and effective
+priority. Reads without the option retain their original ordering and scope.
+Only the authenticated human can explicitly set `priority` at creation or
+change it through the task update endpoint, using the current `expected_revision`
+and a `client_request_id` for edits. Changing urgency alone does not change task
+state, owner, candidate or review, or authorize, reorder, or dispatch a run.
+
 A distinct existing agent identity claims each task, records
 an exact 40-character commit and obtains a different agent's review of that exact
 commit. All changes use expected revisions. Replacing a candidate invalidates
