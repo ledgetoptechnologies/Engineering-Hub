@@ -75,7 +75,7 @@ test("priority mode ranks unfinished work without losing filters or creation-ord
   await expect(titles(page).filter({ hasText: "Completed urgent task" })).toHaveCount(1);
 });
 
-test("saving task priority uses a revision and CSRF, then reorders the persisted task", async ({ page }) => {
+test("saving task priority uses both revisions and CSRF without advancing the task revision", async ({ page }) => {
   const editable = task("08", "Editable legacy task");
   const high = task("01", "Existing high priority", { priority: "high" });
   const tasks = [editable, high];
@@ -86,8 +86,10 @@ test("saving task priority uses a revision and CSRF, then reorders the persisted
     const csrf = request.headers()["x-hub-csrf"];
     writes.push({ path, csrf, body });
     if (path !== `/api/hub/v1/tasks/${editable.id}/update` || csrf !== "fixture-csrf") return { json: {}, status: 403 };
-    if (body.expected_revision !== tasks[0].revision) return { json: { detail: { code: "revision_conflict" } }, status: 409 };
-    tasks[0] = { ...tasks[0], priority: body.priority, revision: tasks[0].revision + 1 };
+    const priorityRevision = tasks[0].priority_revision ?? 0;
+    if (body.expected_revision !== tasks[0].revision || body.expected_priority_revision !== priorityRevision)
+      return { json: { detail: { code: "revision_conflict" } }, status: 409 };
+    tasks[0] = { ...tasks[0], priority: body.priority, priority_revision: priorityRevision + 1 };
     return { json: tasks[0] };
   });
   await page.goto("/work");
@@ -101,7 +103,8 @@ test("saving task priority uses a revision and CSRF, then reorders the persisted
   await expect(save).toBeDisabled();
   await select.selectOption("urgent");
   expect(writes).toEqual([]);
-  await save.click();
+  const [request] = await Promise.all([page.waitForRequest((request) => request.method() === "POST" && request.url().endsWith("/update")), save.click()]);
+  expect(request.postDataJSON()).toMatchObject({ expected_revision: 3, expected_priority_revision: 0 });
   await expect(titles(page)).toHaveText([editable.title, high.title]);
   await expect(row.locator("summary")).toContainText("Urgent priority");
   await expect(page.getByText("Task priority updated.", { exact: true })).toBeVisible();
@@ -111,25 +114,80 @@ test("saving task priority uses a revision and CSRF, then reorders the persisted
   await select.selectOption("normal");
   await save.click();
   await expect(titles(page)).toHaveText([high.title, editable.title]);
-  expect(writes).toEqual([3, 4].map((revision, index) => ({ path: `/api/hub/v1/tasks/${editable.id}/update`,
-    csrf: "fixture-csrf", body: { expected_revision: revision, priority: index === 0 ? "urgent" : "normal",
+  expect(writes).toEqual([0, 1].map((priorityRevision) => ({ path: `/api/hub/v1/tasks/${editable.id}/update`,
+    csrf: "fixture-csrf", body: { expected_revision: 3, expected_priority_revision: priorityRevision, priority: priorityRevision === 0 ? "urgent" : "normal",
       client_request_id: expect.stringMatching(/^.{1,128}$/) } })));
   expect(writes[0].body.client_request_id).not.toBe(writes[1].body.client_request_id);
 });
 
-test("refreshing a changed revision clears an unsaved priority edit", async ({ page }) => {
-  const editable = task("08", "Task changed while editing");
-  const overview = await fixture(page, [editable]);
+for (const { changed, update, savedPriority } of [
+  { changed: "task revision", update: { revision: 4 }, savedPriority: "normal" },
+  { changed: "priority revision", update: { priority_revision: 1, priority: "high" }, savedPriority: "high" },
+  { changed: "priority revision with the same priority label", update: { priority_revision: 2, priority: "normal" }, savedPriority: "normal" },
+] as const) {
+  test(`refreshing a changed ${changed} clears an unsaved priority edit`, async ({ page }) => {
+    const editable = task("08", "Task changed while editing");
+    const overview = await fixture(page, [editable]);
+    await page.goto("/work");
+    const row = page.locator("#work .task-row").filter({ hasText: editable.title });
+    await row.locator("summary").click();
+    const select = row.getByRole("combobox", { name: "Priority" });
+    const save = row.getByRole("button", { name: "Save priority" });
+    await expect(select).toHaveValue("normal");
+    await select.selectOption("urgent");
+    await expect(save).toBeEnabled();
+    overview.tasks = [{ ...editable, ...update }];
+    await page.getByRole("button", { name: "Refresh workspace" }).click();
+    await expect(select).toHaveValue(savedPriority);
+    await expect(save).toBeDisabled();
+  });
+}
+
+test("priority retry keeps the original key and CAS pair until a newer priority revision is seen", async ({ page }) => {
+  const editable = task("08", "Retry a priority save");
+  const tasks = [editable];
+  const writes: Record<string, unknown>[] = [];
+  const receipts = new Map<string, { payload: string; result: Task }>();
+  await fixture(page, tasks, (request) => {
+    const body = request.postDataJSON();
+    writes.push(body);
+    const payload = JSON.stringify(body);
+    const prior = receipts.get(body.client_request_id);
+    if (prior) return prior.payload === payload ? { json: prior.result }
+      : { status: 409, json: { detail: { code: "idempotency_conflict" } } };
+    const current = tasks[0], priorityRevision = current.priority_revision ?? 0;
+    if (body.expected_revision !== current.revision || body.expected_priority_revision !== priorityRevision)
+      return { status: 409, json: { detail: { code: "revision_conflict" } } };
+    tasks[0] = { ...current, priority: body.priority, priority_revision: priorityRevision + 1 };
+    receipts.set(body.client_request_id, { payload, result: tasks[0] });
+    // The first write commits, but its success response does not reach the browser.
+    return receipts.size === 1 ? { status: 503, json: {} } : { json: tasks[0] };
+  });
   await page.goto("/work");
   const row = page.locator("#work .task-row").filter({ hasText: editable.title });
   await row.locator("summary").click();
   const select = row.getByRole("combobox", { name: "Priority" });
-  await expect(select).toHaveValue("normal");
+  const save = row.getByRole("button", { name: "Save priority" });
+
   await select.selectOption("urgent");
-  overview.tasks = [{ ...editable, revision: 4, priority: "high" }];
+  await save.click();
+  await expect(page.getByText("This service is not configured or available yet.")).toBeVisible();
+  await expect(select).toHaveValue("urgent");
+  await expect(row.locator("summary")).toContainText("Normal priority");
+  expect(writes).toEqual([{ expected_revision: 3, expected_priority_revision: 0, priority: "urgent", client_request_id: expect.any(String) }]);
+  await save.click();
+  await expect(row.locator("summary")).toContainText("Urgent priority");
+  expect(writes).toEqual([writes[0], writes[0]]);
+  expect(receipts.size).toBe(1);
+
+  tasks[0] = { ...tasks[0], priority: "high", priority_revision: 2 };
   await page.getByRole("button", { name: "Refresh workspace" }).click();
-  await expect(select).toHaveValue("high");
-  await expect(row.getByRole("button", { name: "Save priority" })).toBeDisabled();
+  await expect(row.locator("summary")).toContainText("High priority");
+  await select.selectOption("urgent");
+  const [request] = await Promise.all([page.waitForRequest((request) => request.method() === "POST" && request.url().endsWith("/update")), save.click()]);
+  expect(request.postDataJSON()).toMatchObject({ expected_revision: 3, expected_priority_revision: 2, priority: "urgent" });
+  expect(request.postDataJSON().client_request_id).not.toBe(writes[0].client_request_id);
+  await expect(row.locator("summary")).toContainText("Urgent priority");
 });
 
 test("New task sends selected priority but omits the default Normal", async ({ page }) => {

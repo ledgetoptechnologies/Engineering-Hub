@@ -104,6 +104,7 @@ class TaskDTO(EntityDTO):
     title: str
     status: TaskStatus
     priority: TaskPriority | None = None
+    priority_revision: int | None = Field(default=None, ge=0, description='Priority edit revision; absent means zero.')
     owner: AgentActor | None
     candidate_commit: Commit | None
     review: ReviewDTO | None

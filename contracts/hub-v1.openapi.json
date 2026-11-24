@@ -7289,6 +7289,19 @@
             ],
             "title": "Priority"
           },
+          "priority_revision": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority Revision",
+            "description": "Priority edit revision; absent means zero."
+          },
           "owner": {
             "anyOf": [
               {
@@ -7784,7 +7797,21 @@
                 "type": "null"
               }
             ],
-            "title": "Priority"
+            "title": "Priority",
+            "description": "Human-only; cannot be combined with other edits."
+          },
+          "expected_priority_revision": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Priority Revision",
+            "description": "Priority edits only; omitted or null means zero. Also send expected_revision."
           },
           "details": {
             "anyOf": [

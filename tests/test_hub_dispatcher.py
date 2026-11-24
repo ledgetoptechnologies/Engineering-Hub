@@ -256,6 +256,27 @@ async def test_known_target_contention_retries_after_terminal_release(setup, smo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('deferred', [False, True], ids=['pending-review', 'deferred-review'])
+async def test_priority_edit_preserves_exact_staging_approval(setup, deferred):
+    repo, target, client, workflow, dispatcher = setup
+    if deferred:
+        first = ready(repo, key='occupying-target')
+        held_run = workflow.create_run('codex', first['id'], first['revision'], DIGEST, target.target_id)
+    task = ready(repo, key='approved')
+    if deferred:
+        await dispatcher.drain_batch()
+        assert dispatcher.receipts()[0]['state'] == 'deferred' and not client.commands
+    repo.update_task('human:123', task['id'], task['revision'], priority='urgent')
+    if deferred:
+        await workflow.advance(held_run['id'])
+    await dispatcher.drain_batch()
+    receipts = [receipt for receipt in dispatcher.receipts() if receipt['entity_id'] == task['id']]
+    assert [receipt['state'] for receipt in receipts] == ['succeeded']
+    assert len(repo.list_runs()) == (2 if deferred else 1)
+    assert [command.action for command in client.commands] == ['deploy_fixture', 'smoke_fixture'] * (2 if deferred else 1)
+
+
+@pytest.mark.asyncio
 async def test_deferred_stale_review_does_not_launch(setup):
     repo, target, client, workflow, dispatcher = setup
     first = ready(repo, key='first')

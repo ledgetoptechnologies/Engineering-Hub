@@ -632,8 +632,9 @@ export function HubApp() {
     restoreWaiting: (task) => mutate(
       () => client.restoreWaiting(task.id, task.revision, session!.csrf_token!), "Question restored."),
     updateTaskPriority: (task, priority, key) => writable && data.tasks.some((item) =>
-      item.id === task.id && item.revision === task.revision)
-      ? mutate(() => client.updateTaskPriority(task.id, task.revision, priority, key, session!.csrf_token!), "Task priority updated.")
+      item.id === task.id && item.revision === task.revision && (item.priority_revision ?? 0) === (task.priority_revision ?? 0))
+      ? mutate(() => client.updateTaskPriority(task.id, task.revision, task.priority_revision ?? 0, priority, key, session!.csrf_token!),
+        "Task priority updated.")
       : Promise.resolve(false),
     withdraw: (kind, item, reason, supersededBy) => mutate(
       () => client.withdraw(kind, item.id, item.revision, reason, supersededBy, session!.csrf_token!),

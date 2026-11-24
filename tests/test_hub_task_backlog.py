@@ -266,10 +266,11 @@ def test_human_sets_task_priority_without_changing_state_or_legacy_contract(hub)
     assert response.status_code == 200, response.text
     changed = response.json()
     assert changed['priority'] == 'urgent' and changed['status'] == old['status']
-    assert changed['revision'] == old['revision'] + 1
+    assert changed['revision'] == old['revision'] and changed['priority_revision'] == 1
     assert client.post(update_url, headers=headers, json=update).json() == changed
     assert client.post(update_url, headers=headers, json={**update, 'priority': 'high'}).status_code == 409
-    assert client.post(update_url, headers=headers, json={**update, 'client_request_id': 'stale'}).status_code == 409
+    stale = client.post(update_url, headers=headers, json={**update, 'client_request_id': 'stale'})
+    assert stale.status_code == 409 and stale.json()['detail']['code'] == 'priority_revision_conflict'
     assert client.post(update_url, headers=headers, json={**update, 'priority': 'whatever'}).status_code == 422
     after = client.get(BASE + '/tasks', headers=agent('claude')).json()['items'][0]
     assert after['priority'] == 'urgent' and after['state_since'] == before['state_since']
@@ -277,6 +278,84 @@ def test_human_sets_task_priority_without_changing_state_or_legacy_contract(hub)
                        json={**body, 'client_request_id': 'new', 'priority': 'high'}).json()['priority'] == 'high'
     ranked = client.get(BASE + '/tasks?task_order=priority', headers=agent('claude')).json()['items']
     assert [task['priority'] for task in ranked] == ['urgent', 'high']
+
+
+def test_priority_edits_check_both_revisions_and_replay_after_reopen(hub):
+    client, app, settings = hub
+    headers = beau(client, app, settings)
+    create = client.post(BASE + '/tasks', headers=headers, json={
+        'project': PROJECT, 'title': 'Priority CAS', 'client_request_id': 'new', 'priority': 'high'})
+    assert create.status_code == 201, create.text
+    task = create.json()
+    update_url = f"{BASE}/tasks/{task['id']}/update"
+    first_body = {'expected_revision': task['revision'], 'expected_priority_revision': 0,
+                  'client_request_id': 'first', 'priority': 'urgent'}
+    first = client.post(update_url, headers=headers, json=first_body)
+    assert first.status_code == 200, first.text
+    assert first.json()['priority_revision'] == 1
+    note = client.post(update_url, headers=headers, json={
+        'expected_revision': task['revision'], 'client_request_id': 'note', 'note': 'Still relevant'})
+    assert note.status_code == 200, note.text
+    noted = note.json()
+    assert (noted['revision'], noted['priority_revision'], noted['priority']) == (task['revision'] + 1, 1, 'urgent')
+    next_body = {**first_body, 'expected_priority_revision': 1, 'client_request_id': 'next', 'priority': 'low'}
+    stale = client.post(update_url, headers=headers, json=next_body)
+    assert stale.status_code == 409 and stale.json()['detail']['code'] == 'revision_conflict'
+    next_body['expected_revision'] = noted['revision']
+    second = client.post(update_url, headers=headers, json=next_body)
+    assert second.status_code == 200, second.text
+    assert second.json() == {**noted, 'priority': 'low', 'priority_revision': 2,
+                             'updated_at': second.json()['updated_at']}
+    conflict = client.post(update_url, headers=headers, json={**next_body, 'expected_priority_revision': 2})
+    assert conflict.status_code == 409 and conflict.json()['detail']['code'] == 'idempotency_conflict'
+
+    reopened = HubRepository(app.state.repository.path)
+    assert reopened.get_task(task['id']) == second.json()
+    assert reopened.update_task(BEAU, task['id'], task['revision'], priority='urgent',
+                                client_request_id='first') == first.json()
+    with reopened._connection() as db:
+        for table in ('hub_audit', 'hub_outbox'):
+            rows = db.execute(f'SELECT action, revision FROM {table} WHERE entity_id=? ORDER BY sequence',
+                              (task['id'],)).fetchall()
+            assert list(map(tuple, rows)) == [
+                ('task.created', task['revision']), ('task.priority_updated', task['revision']),
+                ('task.updated', noted['revision']), ('task.priority_updated', noted['revision'])]
+    assert audit(reopened, task['id'])[-1] == (BEAU, 'task.priority_updated')
+
+
+@pytest.mark.parametrize('edit', [
+    {'details': 'Different instructions'}, {'links': []}, {'acceptance': []}, {'assignee': 'hermes'},
+    {'assigned_reviewer': 'codex'}, {'note': 'Progress'}, {'status': 'done'},
+    {'waiting': {'type': 'action', 'text': 'Approve build'}}, {'evidence': 'Completion evidence'},
+])
+def test_priority_rejects_mixed_update_without_effect(hub, edit):
+    client, app, settings = hub
+    headers = beau(client, app, settings)
+    task = app.state.repository.create_task(BEAU, PROJECT, 'Unchanged', 'new')
+    response = client.post(f"{BASE}/tasks/{task['id']}/update", headers=headers, json={
+        'expected_revision': task['revision'], 'client_request_id': 'mixed', 'priority': 'high', **edit})
+    assert response.status_code == 400 and response.json()['detail']['code'] == 'invalid_priority_update'
+    assert app.state.repository.get_task(task['id']) == task
+    assert audit(app.state.repository, task['id']) == [(BEAU, 'task.created')]
+
+
+@pytest.mark.parametrize('token', [False, -1, '0', 0.0])
+def test_priority_revision_is_a_nonnegative_strict_integer(hub, token):
+    client, app, settings = hub
+    headers = beau(client, app, settings)
+    task = app.state.repository.create_task(BEAU, PROJECT, 'Unchanged', 'new')
+    response = client.post(f"{BASE}/tasks/{task['id']}/update", headers=headers, json={
+        'expected_revision': task['revision'], 'client_request_id': 'invalid', 'priority': 'high',
+        'expected_priority_revision': token})
+    assert response.status_code == 422
+    assert app.state.repository.get_task(task['id']) == task
+
+
+def test_priority_revision_without_priority_does_not_apply_note(repo):
+    task = create(repo, owner='claude')
+    with pytest.raises(HubError, match='invalid_priority_update'):
+        repo.update_task(BEAU, task['id'], task['revision'], note='Mixed', expected_priority_revision=0)
+    assert repo.get_task(task['id']) == task
 
 
 def test_rest_agent_create_update_and_beau_clears_action(hub):

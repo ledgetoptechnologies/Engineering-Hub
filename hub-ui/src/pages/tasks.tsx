@@ -60,23 +60,20 @@ export function TaskPriorityField({ value, onChange, disabled }: {
 }
 
 function TaskPriorityEditor({ hub, task }: { hub: Hub; task: Task }) {
-  type Choice = { revision: number; priority: TaskPriority };
-  const [draft, setDraft] = useState<Choice | null>(null);
-  const request = useRef<(Choice & { key: string }) | null>(null);
+  const [draft, setDraft] = useState<TaskPriority | null>(null);
+  const request = useRef<{ priority: TaskPriority; key: string } | null>(null);
   const savedPriority = task.priority ?? "normal";
-  // An open editor must never apply an old selection to a newer task revision.
-  const choice = draft?.revision === task.revision ? draft.priority : savedPriority;
+  const choice = draft ?? savedPriority;
   const canSave = hub.writable && choice !== savedPriority;
   return <form className="task-priority-form" onSubmit={(event) => {
     event.preventDefault();
     if (!canSave) return;
-    if (request.current?.revision !== task.revision || request.current.priority !== choice)
-      request.current = { revision: task.revision, priority: choice, key: crypto.randomUUID() };
+    if (request.current?.priority !== choice)
+      request.current = { priority: choice, key: crypto.randomUUID() };
     // Retry the same intent under the same key if delivery could not be confirmed.
     void hub.updateTaskPriority(task, choice, request.current.key);
   }}>
-    <TaskPriorityField value={choice} onChange={(priority) => setDraft({ revision: task.revision, priority })}
-      disabled={!hub.writable} />
+    <TaskPriorityField value={choice} onChange={setDraft} disabled={!hub.writable} />
     <button type="submit" className="secondary" disabled={!canSave}>Save priority</button>
   </form>;
 }
@@ -118,7 +115,8 @@ export function TaskRow({ hub, task }: { hub: Hub; task: Task }) {
         </p>
         <p>Review is bound to the exact commit, not permission to deploy to production.</p>
         {task.status !== "done" && task.status !== "withdrawn" && !hub.data.projects.find((item) => item.id === task.project)?.archived && (
-          <TaskPriorityEditor hub={hub} task={task} />
+          // A changed CAS pair invalidates both the draft and any outstanding retry key.
+          <TaskPriorityEditor key={`${task.revision}:${task.priority_revision ?? 0}`} hub={hub} task={task} />
         )}
         {canWithdrawTask(task) && hub.writable && (
           <p><button type="button" className="link-button" onClick={() => setWithdrawing(true)}>

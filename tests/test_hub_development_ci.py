@@ -180,6 +180,28 @@ async def test_pause_after_accepted_phase_vetoes_future_effect_and_holds(rig):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('phase', ['invoke', 'verify'])
+async def test_priority_edit_preserves_in_flight_ci_attempt(rig, phase):
+    task, job = submit(rig)
+    release = asyncio.Event()
+    if phase == 'invoke':
+        rig.provider.release, entered = release, rig.provider.started
+    else:
+        rig.provider.inspect_release, entered = release, rig.provider.inspect_started
+    running = asyncio.create_task(rig.bridge.run_once())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert reservation(rig) == job['id']
+        rig.repo.update_task('human:123', task['id'], task['revision'], priority='urgent')
+    finally:
+        release.set()
+        result = await running
+    assert result['id'] == job['id'] and result['state'] == 'succeeded'
+    assert len(rig.provider.calls) == len(rig.provider.inspections) == 1
+    assert reservation(rig) is None
+
+
+@pytest.mark.asyncio
 async def test_review_drift_holds_and_never_inspects_as_completed(rig):
     task,job=submit(rig)
     def change():

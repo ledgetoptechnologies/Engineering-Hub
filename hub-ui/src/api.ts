@@ -286,11 +286,11 @@ export class HubClient {
     delete task.waiting_withdrawn;
     return structuredClone(task);
   }
-  async updateTaskPriority(id: string, revision: number, priority: TaskPriority, key: string, csrf: string): Promise<Task> {
-    const body = { expected_revision: revision, priority, client_request_id: key };
+  async updateTaskPriority(id: string, revision: number, priorityRevision: number, priority: TaskPriority, key: string, csrf: string): Promise<Task> {
+    const body = { expected_revision: revision, expected_priority_revision: priorityRevision, priority, client_request_id: key };
     if (this.mode === "live") return this.request(`/tasks/${encodeURIComponent(id)}/update`, body, csrf);
     this.demoHuman(csrf);
-    const payload = JSON.stringify([id, revision, priority]);
+    const payload = JSON.stringify([id, body]);
     const prior = this.demoPriorityRequests.get(key);
     if (prior) {
       if (prior.payload !== payload) throw new HubApiError(409, "idempotency_conflict");
@@ -298,9 +298,10 @@ export class HubClient {
     }
     const task = this.demo.tasks.find((item) => item.id === id);
     if (!task) throw new HubApiError(404, "not_found");
-    if (task.revision !== revision) throw new HubApiError(409, "revision_conflict");
+    if (task.revision !== revision || (task.priority_revision ?? 0) !== priorityRevision)
+      throw new HubApiError(409, "revision_conflict");
     if (task.status === "done" || task.status === "withdrawn") throw new HubApiError(409, "task_closed");
-    Object.assign(task, { priority, revision: task.revision + 1, updated_at: new Date().toISOString() });
+    Object.assign(task, { priority, priority_revision: priorityRevision + 1 });
     const result = structuredClone(task);
     this.demoPriorityRequests.set(key, { payload, result });
     return structuredClone(result);

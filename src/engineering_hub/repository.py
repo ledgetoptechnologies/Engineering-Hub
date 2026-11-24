@@ -246,6 +246,9 @@ class HubRepository:
 
     def _save(self, db, actor, action, kind, item, new=False):
         item['revision'] = 1 if new else item['revision'] + 1
+        return self._persist(db, actor, action, kind, item)
+
+    def _persist(self, db, actor, action, kind, item):
         item['updated_at'] = datetime.now(timezone.utc).isoformat()
         db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data',
                    (item['id'], kind, _json(item)))
@@ -364,7 +367,7 @@ class HubRepository:
 
     def update_task(self, actor, identity, expected_revision, *, details=None, links=None, acceptance=None,
                     owner=None, reviewer=None, note=None, status=None, waiting=None, evidence=None,
-                    client_request_id=None, priority=None):
+                    client_request_id=None, priority=None, expected_priority_revision=None):
         """CAS edit by the owner, the named reviewer or a human. Omitted fields are unchanged.
 
         Status here covers only the backlog states: waiting_on_beau (with a decision/action item),
@@ -376,12 +379,25 @@ class HubRepository:
         its own family created. Owner and reviewer are set by a human, or by the creating agent while
         the task is still assigned. With client_request_id, an identical retry returns the original
         result and a changed payload under the same id conflicts.
+
+        A priority edit is human-only and cannot be combined with other edits. It also checks the
+        priority revision (omitted is zero), then advances only that counter, not the task fence.
         """
         self._actor(actor)
         key = None if client_request_id is None else self._text(client_request_id, 128)
         human = actor not in AGENTS and not session_context.actor_allowed(actor)
+        priority_fields = self._task_priority_fields(actor, priority)
+        if priority_fields:
+            if any(value is not None for value in (details, links, acceptance, owner, reviewer, note, status,
+                                                   waiting, evidence)):
+                raise HubError('invalid_priority_update')
+            if expected_priority_revision is None:
+                expected_priority_revision = 0
+            if type(expected_priority_revision) is not int or expected_priority_revision < 0:
+                raise HubError('invalid_priority_update')
+        elif expected_priority_revision is not None:
+            raise HubError('invalid_priority_update')
         backlog = self._backlog_fields(acceptance, owner, reviewer)
-        backlog.update(self._task_priority_fields(actor, priority))
         content = self._context(details, links)
         if 'acceptance' in backlog:
             content['acceptance'] = backlog.pop('acceptance')
@@ -396,10 +412,12 @@ class HubRepository:
             waiting = dict(type=waiting['type'], text=self._bounded(waiting['text'], 300, 'invalid_waiting_item'))
         if evidence is not None:
             evidence = self._bounded(evidence, 2000, 'invalid_evidence')
-        if not (content or backlog or note or status):
+        if not (content or backlog or note or status or priority_fields):
             raise HubError('invalid_input')
-        fingerprint = hashlib.sha256(_json([identity, expected_revision, content, backlog, note, status,
-                                            waiting, evidence]).encode()).hexdigest()
+        payload = [identity, expected_revision, content, backlog, note, status, waiting, evidence]
+        if priority_fields:
+            payload.extend((priority_fields, expected_priority_revision))
+        fingerprint = hashlib.sha256(_json(payload).encode()).hexdigest()
         # Receipts reuse hub_requests (namespaced key) and an inert receipt row holding the original
         # result, so the ledger keeps its existing table set.
         receipt_key = None if key is None else 'task_update:' + key
@@ -411,7 +429,7 @@ class HubRepository:
                         raise HubError('idempotency_conflict', 409)
                     return self._get(db, prior['entity_id'], TASK_UPDATE_RECEIPT)['result']
             result = self._update_task(db, actor, human, identity, expected_revision, content, backlog, note,
-                                       status, waiting, evidence)
+                                       status, waiting, evidence, priority_fields, expected_priority_revision)
             if receipt_key is not None:
                 receipt = str(uuid.uuid4())
                 db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
@@ -420,7 +438,7 @@ class HubRepository:
             return result
 
     def _update_task(self, db, actor, human, identity, expected_revision, content, backlog, note, status,
-                     waiting, evidence):
+                     waiting, evidence, priority_fields, expected_priority_revision):
         item = self._get(db, identity, 'task')
         self._project(item['project'], db)
         self._cas(item, expected_revision)
@@ -430,6 +448,13 @@ class HubRepository:
         current = item['status']
         if current in {'withdrawn', 'done'}:
             raise HubError('task_closed', 409)
+        if priority_fields:
+            priority_revision = item.get('priority_revision', 0)
+            if priority_revision != expected_priority_revision:
+                raise HubError('priority_revision_conflict', 409)
+            item.update(priority_fields, priority_revision=priority_revision + 1)
+            # Keep approval, dispatch and CI fences bound to the original task revision.
+            return self._persist(db, actor, 'task.priority_updated', 'task', item)
         if current == 'waiting_on_beau' and status is not None and not human:
             raise HubError('waiting_on_beau', 409)
         action = 'task.updated'
@@ -462,9 +487,6 @@ class HubRepository:
                 action = 'task.reassigned'
             if 'reviewer' in backlog:
                 item['reviewer'] = backlog['reviewer']
-        if 'priority' in backlog:
-            # Metadata only: keep candidate, review, status and execution gates unchanged.
-            item['priority'] = backlog['priority']
         if note:
             item['notes'] = (item.get('notes') or [])[-(MAX_NOTES - 1):] + [dict(at=now, by=actor, text=note)]
         if status == 'waiting_on_beau':

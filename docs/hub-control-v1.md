@@ -112,9 +112,23 @@ Agents can request `hub_overview(task_order="priority")`, or read
 `GET /api/hub/v1/tasks?task_order=priority`, for the same order and effective
 priority. Reads without the option retain their original ordering and scope.
 Only the authenticated human can explicitly set `priority` at creation or
-change it through the task update endpoint, using the current `expected_revision`
-and a `client_request_id` for edits. Changing urgency alone does not change task
-state, owner, candidate or review, or authorize, reorder, or dispatch a run.
+edit it via `POST /tasks/{id}/update`. An edit sends `priority`, `client_request_id`,
+the current `expected_revision` and the current `expected_priority_revision`.
+An absent `priority_revision` on a task (including initially prioritized tasks)
+means zero; an omitted or null `expected_priority_revision` on a priority edit
+is equivalent to sending zero, not skipping the comparison. Non-null priority
+revisions are nonnegative integers. Non-null substantive edit fields cannot be
+sent with `priority`, and `expected_priority_revision` cannot be non-null without
+`priority` (`400 invalid_priority_update`).
+
+A new priority edit requires both revisions to match (`409 revision_conflict`
+or `409 priority_revision_conflict`). It increments `priority_revision` and
+records `task.priority_updated` in the audit and outbox without changing the
+task revision, state, owner, candidate, or review. Ordinary task edits retain
+their existing revision behavior and preserve both priority fields. A keyed
+retry returns the original response without advancing either revision; reusing
+the key with a different edit conflicts. Priority does not authorize, reorder,
+or dispatch a run, and does not invalidate existing approval or execution fences.
 
 A distinct existing agent identity claims each task, records
 an exact 40-character commit and obtains a different agent's review of that exact
