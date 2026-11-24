@@ -285,6 +285,10 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
         if event_source is not None:
             event_stats = event_source.stats
             push_health["cursor"] = event_stats["cursor"]
+            push_health["degraded"] = bool(event_stats.get("degraded", False))
+            push_health["busy_retry_count"] = event_stats.get("busy_retry_count", 0)
+            if event_stats.get("degraded") and push_health["state"] != "failed":
+                push_health["state"] = "degraded"
             # Safe fixed-stage and canonical SQLite diagnostics, never the
             # source's exception text (which can contain SQL or file paths).
             for key in ("failure_stage", "sqlite_errorcode", "sqlite_errorname"):
@@ -292,7 +296,7 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
                     push_health[key] = event_stats[key]
             if not event_source.healthy:
                 push_health["state"] = "failed"
-        return StarletteJSONResponse({"ok": db_status == "ok" and push_health["state"] != "failed",
+        return StarletteJSONResponse({"ok": db_status == "ok" and push_health["state"] not in {"failed", "degraded"},
                                       "database": db_status,
                                       "schema_version": 4,
                                       "version": version("agent-message-bus"),
