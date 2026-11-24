@@ -10,6 +10,7 @@ import type {
   ProjectId,
   Session,
   Task,
+  TaskPriority,
   TopicPreflight,
   TopicSnapshot,
 } from "./types";
@@ -91,8 +92,9 @@ export class HubClient {
   private demoCounter = 0;
   private demoRequests = new Map<
     string,
-    { project: ProjectId; title: string; task: Task }
+    { payload: string; task: Task }
   >();
+  private demoPriorityRequests = new Map<string, { payload: string; result: Task }>();
 
   constructor({
     mode,
@@ -284,6 +286,25 @@ export class HubClient {
     delete task.waiting_withdrawn;
     return structuredClone(task);
   }
+  async updateTaskPriority(id: string, revision: number, priority: TaskPriority, key: string, csrf: string): Promise<Task> {
+    const body = { expected_revision: revision, priority, client_request_id: key };
+    if (this.mode === "live") return this.request(`/tasks/${encodeURIComponent(id)}/update`, body, csrf);
+    this.demoHuman(csrf);
+    const payload = JSON.stringify([id, revision, priority]);
+    const prior = this.demoPriorityRequests.get(key);
+    if (prior) {
+      if (prior.payload !== payload) throw new HubApiError(409, "idempotency_conflict");
+      return structuredClone(prior.result);
+    }
+    const task = this.demo.tasks.find((item) => item.id === id);
+    if (!task) throw new HubApiError(404, "not_found");
+    if (task.revision !== revision) throw new HubApiError(409, "revision_conflict");
+    if (task.status === "done" || task.status === "withdrawn") throw new HubApiError(409, "task_closed");
+    Object.assign(task, { priority, revision: task.revision + 1, updated_at: new Date().toISOString() });
+    const result = structuredClone(task);
+    this.demoPriorityRequests.set(key, { payload, result });
+    return structuredClone(result);
+  }
   /** Retire a superseded task or question; the server keeps it, with the reason and replacement. */
   async withdraw(
     kind: "task" | "decision",
@@ -315,11 +336,12 @@ export class HubClient {
     title: string,
     key: string,
     csrf: string,
-    extra: { acceptance?: string[]; reviewer?: Agent | null } = {},
+    extra: { acceptance?: string[]; reviewer?: Agent | null; priority?: TaskPriority } = {},
   ): Promise<Task> {
     const backlog = {
       ...(extra.acceptance?.length ? { acceptance: extra.acceptance } : {}),
       ...(extra.reviewer ? { assigned_reviewer: extra.reviewer } : {}),
+      ...(extra.priority && extra.priority !== "normal" ? { priority: extra.priority } : {}),
     };
     if (this.mode === "live")
       return this.request(
@@ -328,9 +350,10 @@ export class HubClient {
         csrf,
       );
     this.demoHuman(csrf);
+    const payload = JSON.stringify([project, title, backlog]);
     const previous = this.demoRequests.get(key);
     if (previous) {
-      if (previous.project !== project || previous.title !== title)
+      if (previous.payload !== payload)
         throw new HubApiError(409, "idempotency_conflict");
       return structuredClone(previous.task);
     }
@@ -353,9 +376,10 @@ export class HubClient {
       repair_count: 0,
       ...(backlog.acceptance ? { acceptance: backlog.acceptance } : {}),
       ...(backlog.assigned_reviewer ? { reviewer: backlog.assigned_reviewer } : {}),
+      ...(backlog.priority ? { priority: backlog.priority } : {}),
     };
     this.demo.tasks.push(task);
-    this.demoRequests.set(key, { project, title, task });
+    this.demoRequests.set(key, { payload, task: structuredClone(task) });
     return structuredClone(task);
   }
   async setPause(

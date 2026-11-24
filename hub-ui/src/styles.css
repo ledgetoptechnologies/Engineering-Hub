@@ -716,6 +716,12 @@ h1 > span {
 .task-row .badge {
   justify-self: start;
 }
+.task-row .task-project-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
 .task-detail {
   background: #f1f3f7;
   padding: 12px;
@@ -727,6 +733,16 @@ h1 > span {
 }
 .task-detail p + p {
   margin-top: 7px;
+}
+.task-priority-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+  margin: 12px 0;
+}
+.task-priority-form .field {
+  margin: 0;
 }
 .task-detail strong {
   display: inline;

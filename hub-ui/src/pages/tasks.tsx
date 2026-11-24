@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { TASK_PRIORITIES } from "../backlog";
 import { link } from "../router";
 import { relativeAge, waitingOn } from "../dashboardText";
 import type { Hub } from "../hub";
-import type { Task } from "../types";
+import type { Task, TaskPriority } from "../types";
 import { actorAvatar, actorName } from "../actors";
 import { Badge, pretty } from "../ui";
 import { DetailsBlock } from "../DetailsBlock";
@@ -47,16 +48,53 @@ export function BacklogDetail({ hub, task }: { hub: Hub; task: Task }) {
   );
 }
 
+export function TaskPriorityField({ value, onChange, disabled }: {
+  value: TaskPriority; onChange: (value: TaskPriority) => void; disabled?: boolean;
+}) {
+  return <label className="field">
+    Priority
+    <select value={value} onChange={(event) => onChange(event.target.value as TaskPriority)} disabled={disabled}>
+      {TASK_PRIORITIES.map((priority) => <option key={priority} value={priority}>{pretty(priority)}</option>)}
+    </select>
+  </label>;
+}
+
+function TaskPriorityEditor({ hub, task }: { hub: Hub; task: Task }) {
+  type Choice = { revision: number; priority: TaskPriority };
+  const [draft, setDraft] = useState<Choice | null>(null);
+  const request = useRef<(Choice & { key: string }) | null>(null);
+  const savedPriority = task.priority ?? "normal";
+  // An open editor must never apply an old selection to a newer task revision.
+  const choice = draft?.revision === task.revision ? draft.priority : savedPriority;
+  const canSave = hub.writable && choice !== savedPriority;
+  return <form className="task-priority-form" onSubmit={(event) => {
+    event.preventDefault();
+    if (!canSave) return;
+    if (request.current?.revision !== task.revision || request.current.priority !== choice)
+      request.current = { revision: task.revision, priority: choice, key: crypto.randomUUID() };
+    // Retry the same intent under the same key if delivery could not be confirmed.
+    void hub.updateTaskPriority(task, choice, request.current.key);
+  }}>
+    <TaskPriorityField value={choice} onChange={(priority) => setDraft({ revision: task.revision, priority })}
+      disabled={!hub.writable} />
+    <button type="submit" className="secondary" disabled={!canSave}>Save priority</button>
+  </form>;
+}
+
 export function TaskRow({ hub, task }: { hub: Hub; task: Task }) {
   const [expanded, setExpanded] = useState(false);
   const [withdrawing, setWithdrawing] = useState(false);
+  const priority = task.priority ?? "normal";
   return (
     <>
     <details className="task-row" onToggle={(event) => setExpanded((event.currentTarget as HTMLDetailsElement).open)}>
       <summary>
         <span>
           <strong>{task.title}</strong>
-          <small><a className="project-chip" href={link(`/projects/${task.project}`)}>{hub.projectName(task.project)}</a></small>
+          <small className="task-project-meta">
+            <a className="project-chip" href={link(`/projects/${task.project}`)}>{hub.projectName(task.project)}</a>
+            <Badge tone={priority === "urgent" || priority === "high" ? "amber" : "neutral"}>{pretty(priority)} priority</Badge>
+          </small>
           {task.scope === "staging" && task.proposed_by && <small>Staging proposal · {actorName(task.proposed_by, { family: task.proposed_family, viewer: hub.session?.actor })}</small>}
           <small className="task-waiting">{waitingOn(task, (id, family) => actorName(id, { family, viewer: hub.session?.actor }))}</small>
           <small title={task.state_since ?? undefined}>{stateAge(task)}</small>
@@ -79,6 +117,9 @@ export function TaskRow({ hub, task }: { hub: Hub; task: Task }) {
           · Repairs used: {task.repair_count}/3
         </p>
         <p>Review is bound to the exact commit, not permission to deploy to production.</p>
+        {task.status !== "done" && task.status !== "withdrawn" && !hub.data.projects.find((item) => item.id === task.project)?.archived && (
+          <TaskPriorityEditor hub={hub} task={task} />
+        )}
         {canWithdrawTask(task) && hub.writable && (
           <p><button type="button" className="link-button" onClick={() => setWithdrawing(true)}>
             No longer needed? Withdraw this task</button></p>

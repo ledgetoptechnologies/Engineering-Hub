@@ -4,12 +4,11 @@ import type { Hub } from "../hub";
 import type { Task } from "../types";
 import { Badge, PageHeader, PanelTitle, pretty } from "../ui";
 import { answeredDecisions, DecisionList, openDecisions, RecentAnswers } from "./decisions";
-import { TaskTable } from "./tasks";
+import { statusLabel, TaskTable } from "./tasks";
 import { WithdrawnList } from "./Withdraw";
 import { ownershipRows, UNCLAIMED, WorkOwnership } from "./WorkOwnership";
-import { draftFor, type ItemDraft, WORK_FILTERS, waitingItemKey, waitingKind, waitingTasks, withdrawnWaitingTasks } from "../backlog";
+import { draftFor, type ItemDraft, TASK_PRIORITIES, WORK_FILTERS, waitingItemKey, waitingKind, waitingTasks, withdrawnWaitingTasks } from "../backlog";
 import { actorName, requesterLabel } from "../actors";
-import { statusLabel } from "./tasks";
 
 /** One task item Beau must clear: an action he marks Done, or a decision he answers in the note. */
 export function WaitingItemCard({ hub, task }: { hub: Hub; task: Task }) {
@@ -112,15 +111,20 @@ export function InboxPage({ hub, actions }: { hub: Hub; actions: React.ReactNode
   );
 }
 
-const statuses = WORK_FILTERS;
+const WORK_PRIORITY_KEY = "engineering-hub.work.priority";
+const priorityRank = (task: Task) => TASK_PRIORITIES.indexOf(task.priority ?? "normal");
 
 export function WorkPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const [project, setProject] = useState("all");
-  const [status, setStatus] = useState<(typeof statuses)[number]>("all");
+  const [status, setStatus] = useState<(typeof WORK_FILTERS)[number]>("all");
+  const [priorityMode, setPriorityMode] = useState(() => {
+    try { return localStorage.getItem(WORK_PRIORITY_KEY) === "true"; } catch { return false; }
+  });
   const [query, setQuery] = useState("");
   const [chosenOwner, setOwner] = useState("all");
   const needle = query.trim().toLowerCase();
-  const inProject = hub.data.tasks.filter((task) => project === "all" || task.project === project);
+  const inProject = hub.data.tasks.filter((task) => (project === "all" || task.project === project)
+    && (!priorityMode || (task.status !== "done" && task.status !== "withdrawn")));
   const owners = ownershipRows(inProject);
   // A refresh can remove the chosen owner's last summary card (withdrawn, or passed review over a week
   // ago); then the filter, and its "Show everyone" control, would be stranded. Fall back to everyone.
@@ -129,6 +133,14 @@ export function WorkPage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
   const byOwner = inProject.filter((task) => owner === "all" || (task.owner ?? UNCLAIMED) === owner);
   const tasks = byOwner.filter((task) => (status === "all" || task.status === status)
     && (!needle || task.title.toLowerCase().includes(needle)));
+  // Stable sort keeps the Hub's oldest-first creation order for equal priorities.
+  if (priorityMode) tasks.sort((a, b) => priorityRank(a) - priorityRank(b));
+  function togglePriority() {
+    const next = !priorityMode;
+    if (next && status === "done") setStatus("all");
+    setPriorityMode(next);
+    try { localStorage.setItem(WORK_PRIORITY_KEY, String(next)); } catch { /* use the in-memory selection */ }
+  }
   return (
     <>
       <PageHeader eyebrow="WORK" title="Work in motion"
@@ -145,9 +157,11 @@ export function WorkPage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
             {hub.data.projects.filter((item) => !item.archived).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
           </select>
         </label>
+        <button type="button" className={priorityMode ? "chip selected" : "chip"} aria-pressed={priorityMode}
+          onClick={togglePriority}>Priority</button>
         <div className="chip-row" role="group" aria-label="Filter by state">
-          {statuses.map((value) => (
-            <button key={value} className={status === value ? "chip selected" : "chip"} onClick={() => setStatus(value)}>
+          {WORK_FILTERS.filter((value) => !priorityMode || value !== "done").map((value) => (
+            <button key={value} className={status === value ? "chip selected" : "chip"} aria-pressed={status === value} onClick={() => setStatus(value)}>
               {value === "all" ? "All" : statusLabel({ status: value } as Task)}{" "}
               <span>{byOwner.filter((task) => value === "all" || task.status === value).length}</span>
             </button>
@@ -156,10 +170,12 @@ export function WorkPage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
       </div>
       <WorkOwnership hub={hub} rows={owners} selected={owner} onSelect={setOwner} />
       <section className="panel work" id="work">
-        <PanelTitle title="Work in motion" count={tasks.length} />
-        <p className="panel-description">An owner, an exact candidate, and a separate reviewer.</p>
-        <TaskTable hub={hub} tasks={tasks} empty={needle || status !== "all" || owner !== "all" ? "No tasks match these filters." : "No assigned work for this project."} />
-        <WithdrawnList hub={hub} kind="task" project={project === "all" ? undefined : project} />
+        <PanelTitle title={priorityMode ? "Work by priority" : "Work in motion"} count={tasks.length} />
+        <p className="panel-description">{priorityMode ? "Unfinished work, highest priority first. Tasks with the same priority are oldest first."
+          : "An owner, an exact candidate, and a separate reviewer."}</p>
+        <TaskTable hub={hub} tasks={tasks} empty={needle || status !== "all" || owner !== "all" ? "No tasks match these filters."
+          : priorityMode ? "No unfinished tasks for this project." : "No assigned work for this project."} />
+        {!priorityMode && <WithdrawnList hub={hub} kind="task" project={project === "all" ? undefined : project} />}
       </section>
     </>
   );
