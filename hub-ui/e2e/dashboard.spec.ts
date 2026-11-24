@@ -11,6 +11,7 @@ test.beforeEach(({}, testInfo) => {
   ORIGIN = new URL(baseURL).origin;
 });
 const CSRF = "fixture-human-only-csrf";
+const isOverview = (url: URL) => url.pathname === "/api/hub/v1/overview";
 /** Same-document page change (no reload), as when clicking the sidebar. */
 async function go(page: Page, route: string) {
   await page.evaluate((hash) => { location.hash = hash; }, route);
@@ -116,7 +117,7 @@ test("topic errors do not erase independent Hub connection snapshots", async ({ 
   await expect(page.getByText("Hub stream observed", { exact: true })).toBeVisible();
   await expect(page.getByText("Topic status unavailable.", { exact: false })).toBeVisible();
   await expect(page.getByText("Topic readiness: Not tracked yet", { exact: true })).toHaveCount(0);
-  await page.route("**/api/hub/v1/overview", (route) => route.fulfill({ status: 503, json: { detail: "unavailable" } }));
+  await page.route(isOverview, (route) => route.fulfill({ status: 503, json: { detail: "unavailable" } }));
   await page.getByRole("button", { name: "Refresh workspace", exact: true }).click();
   await expect(page.getByText("Hub stream observed", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Hub connection snapshot unverified", { exact: true })).toHaveCount(3);
@@ -417,7 +418,7 @@ test("topic ingress rejection remains panel-local but overview ingress rejection
   await go(page, "#/inbox");
   await expect(page.getByRole("heading", { name: "Needs Beau", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "New task", exact: true })).toBeEnabled();
-  await page.route("**/api/hub/v1/overview", (route) => route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ detail: { code: "ingress_forbidden" } }) }));
+  await page.route(isOverview, (route) => route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ detail: { code: "ingress_forbidden" } }) }));
   await page.getByRole("button", { name: "Refresh workspace", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Sign in to Engineering Hub." })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Needs Beau", exact: true })).toHaveCount(0);
@@ -679,10 +680,13 @@ test("live task creation uses browser session, same-origin request and CSRF with
     await expect
       .poll(() =>
         mock.requests.map(
-          (request) => `${request.method()} ${new URL(request.url()).pathname}`,
+          (request) => {
+            const url = new URL(request.url());
+            return `${request.method()} ${url.pathname}${url.search}`;
+          },
         ),
       )
-      .toContain("GET /api/hub/v1/overview");
+      .toContain("GET /api/hub/v1/overview?include_task_priorities=true");
     await page.getByRole("button", { name: "New task", exact: true }).click();
     await page
       .getByLabel("What needs to happen?")
@@ -948,7 +952,7 @@ for (const lost of ["error", "source_unavailable"] as const) {
     const pending = new Promise<void>((resolve) => {
       entered = resolve;
     });
-    await page.route("**/api/hub/v1/overview", async (route) => {
+    await page.route(isOverview, async (route) => {
       entered();
       await waiting;
       await route.fulfill({
@@ -1006,7 +1010,7 @@ test("a burst of invalidations coalesces to one in-flight refresh and one catchu
     entered = resolve;
   });
   let reads = 0;
-  await page.route("**/api/hub/v1/overview", async (route) => {
+  await page.route(isOverview, async (route) => {
     reads++;
     if (reads === 1) {
       entered();

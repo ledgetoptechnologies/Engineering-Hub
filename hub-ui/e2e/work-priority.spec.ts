@@ -7,13 +7,14 @@ const task = (id: string, title: string, fields: Partial<Task> = {}): Task => ({
   status: "claimed", revision: 3, updated_at: "2026-11-22T10:00:00Z", state_since: "2026-11-22T10:00:00Z",
   candidate_commit: null, review: null, repair_count: 0, ...fields,
 });
+const priorityPath = (id: string) => `/api/hub/v1/tasks/${id}/priority`;
 
 async function fixture(page: Page, tasks: Task[], write?: (request: Request) => { json: unknown; status?: number }) {
   const overview = createDemoOverview(new Date());
   overview.tasks = tasks;
   overview.withdrawn = { tasks: tasks.filter((item) => item.status === "withdrawn"), decisions: [] };
   await page.route("**/api/hub/v1/**", async (route) => {
-    const request = route.request(), path = new URL(request.url()).pathname;
+    const request = route.request(), url = new URL(request.url()), path = url.pathname;
     const respond = (json: unknown, status = 200) => route.fulfill({ status, json });
     if (request.method() === "POST" && write) {
       const { json, status } = write(request);
@@ -22,7 +23,13 @@ async function fixture(page: Page, tasks: Task[], write?: (request: Request) => 
     if (request.method() !== "GET") return respond({}, 405);
     if (path.endsWith("/auth/me")) return respond({ authenticated: true, actor: `human:cf:${"e".repeat(64)}`,
       github_id: null, auth_provider: "cloudflare_access", email: "operator@example.test", csrf_token: "fixture-csrf" });
-    if (path.endsWith("/overview")) return respond(overview);
+    if (path.endsWith("/overview")) {
+      if (url.searchParams.get("include_task_priorities") === "true") return respond(overview);
+      const withoutPriority = ({ priority, priority_revision, ...item }: Task) => item;
+      const withdrawn = overview.withdrawn;
+      return respond({ ...overview, tasks: overview.tasks.map(withoutPriority),
+        ...(withdrawn && { withdrawn: { ...withdrawn, tasks: withdrawn.tasks.map(withoutPriority) } }) });
+    }
     if (path.endsWith("/events/status")) return respond({ available: false, reason: "native_source_unsupported", observer_epoch: "f", cursor: 0 });
     if (path.endsWith("/peers")) return respond(createDemoTopic("auto-wake-v1-test"));
     if (path.endsWith("/work/status")) return respond({}, 423);
@@ -44,7 +51,9 @@ test("priority mode ranks unfinished work without losing filters or creation-ord
     task("05", "Newer urgent task", { priority: "urgent", updated_at: "2026-11-20T10:00:00Z", state_since: "2026-11-20T10:00:00Z", owner: null, status: "assigned" }),
     task("06", "Explicit normal task", { priority: "normal" }),
   ]);
+  const overviewRequest = page.waitForRequest((request) => new URL(request.url()).pathname === "/api/hub/v1/overview");
   await page.goto("/#/");
+  expect(new URL((await overviewRequest).url()).search).toBe("?include_task_priorities=true");
   await page.getByRole("link", { name: /^Work(?: \d+)?$/ }).click();
   await expect(titles(page).filter({ hasText: "Completed urgent task" })).toHaveCount(1);
   await expect(page.getByText("Withdrawn tasks (1)")).toBeVisible();
@@ -75,7 +84,7 @@ test("priority mode ranks unfinished work without losing filters or creation-ord
   await expect(titles(page).filter({ hasText: "Completed urgent task" })).toHaveCount(1);
 });
 
-test("saving task priority uses both revisions and CSRF without advancing the task revision", async ({ page }) => {
+test("saving task priority uses the dedicated route, both revisions and CSRF without advancing the task revision", async ({ page }) => {
   const editable = task("08", "Editable legacy task");
   const high = task("01", "Existing high priority", { priority: "high" });
   const tasks = [editable, high];
@@ -85,7 +94,7 @@ test("saving task priority uses both revisions and CSRF without advancing the ta
     const body = request.postDataJSON();
     const csrf = request.headers()["x-hub-csrf"];
     writes.push({ path, csrf, body });
-    if (path !== `/api/hub/v1/tasks/${editable.id}/update` || csrf !== "fixture-csrf") return { json: {}, status: 403 };
+    if (path !== priorityPath(editable.id) || csrf !== "fixture-csrf") return { json: {}, status: 403 };
     const priorityRevision = tasks[0].priority_revision ?? 0;
     if (body.expected_revision !== tasks[0].revision || body.expected_priority_revision !== priorityRevision)
       return { json: { detail: { code: "revision_conflict" } }, status: 409 };
@@ -103,8 +112,8 @@ test("saving task priority uses both revisions and CSRF without advancing the ta
   await expect(save).toBeDisabled();
   await select.selectOption("urgent");
   expect(writes).toEqual([]);
-  const [request] = await Promise.all([page.waitForRequest((request) => request.method() === "POST" && request.url().endsWith("/update")), save.click()]);
-  expect(request.postDataJSON()).toMatchObject({ expected_revision: 3, expected_priority_revision: 0 });
+  await save.click();
+  await expect.poll(() => writes[0]).toMatchObject({ path: priorityPath(editable.id), body: { expected_revision: 3, expected_priority_revision: 0 } });
   await expect(titles(page)).toHaveText([editable.title, high.title]);
   await expect(row.locator("summary")).toContainText("Urgent priority");
   await expect(page.getByText("Task priority updated.", { exact: true })).toBeVisible();
@@ -114,7 +123,7 @@ test("saving task priority uses both revisions and CSRF without advancing the ta
   await select.selectOption("normal");
   await save.click();
   await expect(titles(page)).toHaveText([high.title, editable.title]);
-  expect(writes).toEqual([0, 1].map((priorityRevision) => ({ path: `/api/hub/v1/tasks/${editable.id}/update`,
+  expect(writes).toEqual([0, 1].map((priorityRevision) => ({ path: priorityPath(editable.id),
     csrf: "fixture-csrf", body: { expected_revision: 3, expected_priority_revision: priorityRevision, priority: priorityRevision === 0 ? "urgent" : "normal",
       client_request_id: expect.stringMatching(/^.{1,128}$/) } })));
   expect(writes[0].body.client_request_id).not.toBe(writes[1].body.client_request_id);
@@ -149,6 +158,8 @@ test("priority retry keeps the original key and CAS pair until a newer priority 
   const writes: Record<string, unknown>[] = [];
   const receipts = new Map<string, { payload: string; result: Task }>();
   await fixture(page, tasks, (request) => {
+    if (new URL(request.url()).pathname !== priorityPath(editable.id) || request.headers()["x-hub-csrf"] !== "fixture-csrf")
+      return { json: {}, status: 403 };
     const body = request.postDataJSON();
     writes.push(body);
     const payload = JSON.stringify(body);
@@ -184,10 +195,10 @@ test("priority retry keeps the original key and CAS pair until a newer priority 
   await page.getByRole("button", { name: "Refresh workspace" }).click();
   await expect(row.locator("summary")).toContainText("High priority");
   await select.selectOption("urgent");
-  const [request] = await Promise.all([page.waitForRequest((request) => request.method() === "POST" && request.url().endsWith("/update")), save.click()]);
-  expect(request.postDataJSON()).toMatchObject({ expected_revision: 3, expected_priority_revision: 2, priority: "urgent" });
-  expect(request.postDataJSON().client_request_id).not.toBe(writes[0].client_request_id);
+  await save.click();
   await expect(row.locator("summary")).toContainText("Urgent priority");
+  expect(writes[2]).toMatchObject({ expected_revision: 3, expected_priority_revision: 2, priority: "urgent" });
+  expect(writes[2].client_request_id).not.toBe(writes[0].client_request_id);
 });
 
 test("New task sends selected priority but omits the default Normal", async ({ page }) => {

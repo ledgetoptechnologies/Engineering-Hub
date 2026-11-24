@@ -187,7 +187,7 @@ export class HubClient {
     return session;
   }
   async getOverview(): Promise<Overview> {
-    if (this.mode === "live") return splitWithdrawn(await this.request<Overview>("/overview"));
+    if (this.mode === "live") return splitWithdrawn(await this.request<Overview>("/overview?include_task_priorities=true"));
     this.demoHuman();
     return splitWithdrawn(structuredClone(this.demo));
   }
@@ -288,7 +288,7 @@ export class HubClient {
   }
   async updateTaskPriority(id: string, revision: number, priorityRevision: number, priority: TaskPriority, key: string, csrf: string): Promise<Task> {
     const body = { expected_revision: revision, expected_priority_revision: priorityRevision, priority, client_request_id: key };
-    if (this.mode === "live") return this.request(`/tasks/${encodeURIComponent(id)}/update`, body, csrf);
+    if (this.mode === "live") return this.request(`/tasks/${encodeURIComponent(id)}/priority`, body, csrf);
     this.demoHuman(csrf);
     const payload = JSON.stringify([id, body]);
     const prior = this.demoPriorityRequests.get(key);

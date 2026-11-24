@@ -163,8 +163,8 @@ test("without a preview address, opening a preview says so and shows no frame", 
   await expect(page.locator("iframe")).toHaveCount(0);
 });
 
-test("a preview URL on the dashboard's own origin is refused", async ({ page }) => {
-  await fixture(page, { previewUrl: "http://127.0.0.1:5174/preview/x/" });
+test("a preview URL on the dashboard's own origin is refused", async ({ page, baseURL }) => {
+  await fixture(page, { previewUrl: new URL("/preview/x/", baseURL).href });
   await page.goto("/#/staging/resources");
   await panel(page).getByRole("listitem").filter({ hasText: "Engineering Hub" }).getByRole("button", { name: "Open preview" }).first().click();
   await expect(panel(page).getByRole("alert")).toBeVisible();
