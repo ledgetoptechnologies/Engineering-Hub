@@ -8,6 +8,7 @@ describe("Infrastructure refresh error classification", () => {
     [503, "infrastructure_unavailable", false, true],
     [503, "service_unavailable", false, true],
     [502, "bad_gateway", false, true],
+    [429, "infrastructure_request_failed", false, true],
     [0, "network_unavailable", false, true],
     [403, "gateway_route_forbidden", true, false],
     [404, "device_not_found", false, false],

@@ -10,7 +10,7 @@ export function inventoryUnavailable(error: unknown): boolean {
 
 export function transientRefreshError(error: unknown): boolean {
   return error instanceof HubApiError && !inventoryUnavailable(error)
-    && (error.status === 0 || error.status >= 500);
+    && (error.status === 0 || error.status === 429 || error.status >= 500);
 }
 
 const REFRESH_MS = 30_000;

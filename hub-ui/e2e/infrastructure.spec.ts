@@ -754,6 +754,54 @@ test("Inventory discards the previous filter's reading when the new query fails"
   expect(queries).toEqual([null, "true", null, null]);
 });
 
+test("a same-query Inventory 429 keeps the last reading and the next poll recovers", async ({ page }) => {
+  const now = Date.now();
+  await page.clock.install({ time: now });
+  const initial = list(undefined, now);
+  const recovered = list(undefined, now + 60_000);
+  recovered.body.items[0].observations[0].state = "failed";
+  const state = await fixture(page, { list: [initial, initial, { status: 429, body: {} }, recovered] });
+  const query = "/api/hub/v1/infrastructure/devices?include_retired=true";
+  const read = () => page.waitForResponse(response => {
+    const url = new URL(response.url());
+    return response.request().method() === "GET" && url.pathname + url.search === query;
+  });
+  await page.goto("/#/infrastructure");
+  const panel = devicesPanel(page);
+  const reading = panel.getByRole("listitem").filter({ hasText: "Build PC" });
+  const showRetired = panel.getByRole("checkbox", { name: "Show retired" });
+  await expect(reading).toContainText("Exporter scrape: Check passed");
+  const firstRead = read();
+  await showRetired.check();
+  expect((await firstRead).status()).toBe(200);
+  await expect(reading).toContainText("Exporter scrape: Check passed");
+  expect(state.lists).toBe(2);
+
+  const rateLimited = read();
+  await page.clock.runFor(30_000);
+  const failed = await rateLimited;
+  expect(failed.status()).toBe(429);
+  expect(state.lists).toBe(3);
+  const notice = panel.getByRole("status").filter({ hasText: "Couldn't refresh device list. Showing the last reading." });
+  const alert = panel.getByRole("alert");
+  await expect(notice.or(alert)).toBeVisible();
+  // Soft checks still exercise the next poll if retention or its notice regresses.
+  expect.soft(await reading.allTextContents(), "retain the last successful reading").toEqual([expect.stringContaining("Exporter scrape: Check passed")]);
+  expect.soft(await notice.isVisible(), "show the refresh-failure notice").toBe(true);
+  await expect(showRetired).toBeChecked();
+
+  const nextPoll = read();
+  await page.clock.runFor(30_000);
+  const next = await nextPoll;
+  expect(next.status()).toBe(200);
+  expect(next.url()).toBe(failed.url());
+  expect(state.lists).toBe(4);
+  await expect(reading).toContainText("Exporter scrape: Last check failed");
+  await expect(notice).toHaveCount(0);
+  await expect(alert).toHaveCount(0);
+  await expect(showRetired).toBeChecked();
+});
+
 test("visible registered device details, current readings and charts refresh every 30 seconds", async ({ page }) => {
   await page.clock.install();
   const metrics = { status: 200, body: prioritizedMetrics() };
