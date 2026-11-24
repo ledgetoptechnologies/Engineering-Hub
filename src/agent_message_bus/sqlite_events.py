@@ -712,7 +712,11 @@ class SQLiteEventSource:
         self._dirty_since = None
         self._retry_at = None
         self._last_busy_error = None
-        self._set_stat("degraded", False)
+        # Waiters and health readers see a recovered cursor only after its
+        # invalidation was handed off and the native watch is armed again.
+        with self._condition:
+            self._stats.update(cursor=self._cursor, degraded=False)
+            self._condition.notify_all()
 
     def _reconcile(self, *, reason: str) -> None:
         assert self._barrier is not None and self._reader is not None
@@ -755,7 +759,6 @@ class SQLiteEventSource:
             self._dirty = False
             self._dirty_since = None
             self._cursor = next_cursor
-            self._set_stat("cursor", next_cursor)
             if selected:
                 self._stage = "publish_invalidation"
                 self.deliver(selected, next_cursor)

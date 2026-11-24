@@ -366,8 +366,14 @@ def _capture_start_result(source, results, errors):
 def test_busy_writer_retry_catches_committed_recipient_without_early_wake(tmp_path):
     repository = MessageRepository(tmp_path / 'messages.sqlite3')
     deliveries = []
-    source = SQLiteEventSource(repository.path, MessageCursorReader(),
-        lambda recipients, cursor: deliveries.append((tuple(recipients), cursor)),
+    publishing, release_publication = threading.Event(), threading.Event()
+
+    def deliver(recipients, cursor):
+        publishing.set()
+        assert release_publication.wait(3)
+        deliveries.append((tuple(recipients), cursor))
+
+    source = SQLiteEventSource(repository.path, MessageCursorReader(), deliver,
         busy_timeout_ms=10, busy_retry_interval_ms=20,
         busy_retry_deadline_ms=2_000)
     writer = sqlite3.connect(repository.path, isolation_level=None)
@@ -388,10 +394,14 @@ def test_busy_writer_retry_catches_committed_recipient_without_early_wake(tmp_pa
         assert source.stats['degraded'] is True
         assert deliveries == [], 'uncommitted rows must not publish an invalidation'
         writer.commit()
+        assert publishing.wait(3)
+        assert source.stats['cursor'] == 0 and source.stats['degraded'] is True
+        release_publication.set()
         assert source.wait_for_cursor(1, timeout=3), 'dirty cursor was not reconciled after lock release'
         assert deliveries == [(('codex',), 1)]
         assert source.healthy and source.stats['degraded'] is False
     finally:
+        release_publication.set()
         writer.rollback()
         writer.close()
         source.stop()
