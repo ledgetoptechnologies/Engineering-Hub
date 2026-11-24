@@ -290,6 +290,15 @@ async def test_existing_mcp_subscription_recovers_after_busy_writer(tmp_path, mo
                 assert health["ok"] is False
                 assert health["push"]["cursor"] == cursor
                 assert health["push"]["subscriptions_enabled"] is True
+                during_backoff = source.stats["inotify_batches"]
+                # Hold past the old 10-second fatal timeout and keep spilling WAL
+                # writes. While degraded the kernel queues hints without waking
+                # the thread continuously before the next SQLite attempt.
+                for _ in range(22):
+                    writer.executemany("INSERT INTO incident_fixture_padding VALUES (zeroblob(8192))",
+                                       [()] * 32)
+                    await asyncio.sleep(0.5)
+                assert source.stats["inotify_batches"] == during_backoff
                 assert await no_notification(events)
                 writer.commit()
             finally:

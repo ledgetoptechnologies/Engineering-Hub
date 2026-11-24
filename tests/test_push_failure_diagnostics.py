@@ -278,27 +278,81 @@ def test_retry_busy_timeout_never_exceeds_remaining_deadline(monkeypatch):
     assert 0 < configured[0] <= 25
 
 
-def test_first_barrier_acquired_after_deadline_is_rolled_back(monkeypatch):
+def test_successful_snapshot_can_finish_after_retry_deadline(monkeypatch):
     source = object.__new__(SQLiteEventSource)
     source._reader = object()
     source._dirty_since = 1.0
-    source._retry_at = None
-    source._last_busy_error = None
+    source._cursor = None
     source.busy_retry_deadline_ms = 100
     source.busy_timeout_ms = 10_000
     source.busy_retry_interval_ms = 250
     commands = []
+    ticks = iter((1.0, 1.101))
+    monkeypatch.setattr('agent_message_bus.sqlite_events.time.monotonic', lambda: next(ticks))
 
     class Barrier:
         def execute(self, statement):
             commands.append(statement)
+            if statement == 'BEGIN IMMEDIATE':
+                assert next(ticks) > 1.1  # Worker resumes after the cutoff.
 
     source._barrier = Barrier()
-    ticks = iter((1.0, 1.101))
-    monkeypatch.setattr('agent_message_bus.sqlite_events.time.monotonic', lambda: next(ticks))
-    with pytest.raises(WatcherFailed, match='busy retry deadline'):
-        source._reconcile(reason='startup')
+    source.read_after = lambda *_: ((), 9)
+    source._add_stat = lambda key, amount=1: None
+    source._set_stat = lambda key, value: None
+    source._verify_watched_paths = lambda: None
+    source._reconcile(reason='startup')
     assert commands == ['PRAGMA busy_timeout=100', 'BEGIN IMMEDIATE', 'ROLLBACK']
+    assert source._cursor == 9 and source._dirty_since is None
+
+
+@pytest.mark.parametrize('before_eventfd', [True, False])
+@pytest.mark.skipif(not sys_platform_linux(), reason='Actual Linux native-source lifecycle')
+def test_stop_during_startup_is_not_a_push_failure(tmp_path, before_eventfd):
+    repository = MessageRepository(tmp_path / 'messages.sqlite3')
+    entered, release = threading.Event(), threading.Event()
+    observed, results, errors = [], [], []
+
+    class StartGate(SQLiteEventSource):
+        def _setup(self):
+            if before_eventfd:
+                entered.set()
+                assert release.wait(3)
+            super()._setup()
+
+    source = StartGate(repository.path, MessageCursorReader(), lambda *_: None,
+                       busy_retry_interval_ms=30, on_error=observed.append)
+    writer = sqlite3.connect(repository.path, isolation_level=None)
+    starter = threading.Thread(target=_capture_start_result, args=(source, results, errors))
+    stopper = threading.Thread(target=source.stop)
+    try:
+        if not before_eventfd:
+            writer.execute('BEGIN IMMEDIATE')
+        starter.start()
+        if before_eventfd:
+            assert entered.wait(3) and source._event_fd is None
+        else:
+            with source._condition:
+                assert source._condition.wait_for(lambda: source.stats['degraded'], timeout=3)
+        stopper.start()
+        assert source._stop_requested.wait(3)
+        release.set()
+        stopper.join(3)
+        starter.join(3)
+        assert not starter.is_alive() and not stopper.is_alive()
+        assert not results and len(errors) == 1
+        assert isinstance(errors[0], WatcherFailed)
+        assert 'did not complete startup' in str(errors[0])
+        assert not observed and source.failure is None and not source.running
+        assert source.stats['watcher_stopped'] and not source.stats['degraded']
+    finally:
+        release.set()
+        writer.close()
+        if starter.ident is not None:
+            starter.join(3)
+        if stopper.ident is not None:
+            stopper.join(3)
+        source.stop()
 
 
 def _capture_start_result(source, results, errors):
