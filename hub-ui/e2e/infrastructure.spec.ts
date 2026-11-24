@@ -211,7 +211,12 @@ test("a resolve that loses a race says so and keeps the text", async ({ page }) 
 });
 
 test("the owner can add a device; the form catches mistakes before saving", async ({ page }) => {
-  const state = await fixture(page, { writes: [{ status: 200, body: devices()[1] }] });
+  const saved = { ...devices()[1], id: "office-printer", name: "Office printer", role: "Printing" };
+  const state = await fixture(page, {
+    writes: [{ status: 200, body: saved }],
+    detail: [{ status: 200, body: { device: saved, capabilities: { device_write: true, maintenance_write: true },
+      maintenance: { items: [], truncated: false } } }],
+  });
   await page.goto("/#/infrastructure");
   await devicesPanel(page).getByRole("button", { name: "Add device" }).click();
   const form = page.getByRole("form", { name: "Add device" });
@@ -226,11 +231,16 @@ test("the owner can add a device; the form catches mistakes before saving", asyn
   expect(state.writes).toHaveLength(0);
   await form.getByLabel("Device ID").fill("office-printer");
   await form.getByLabel(/IP addresses/).fill("192.0.2.40");
+  const dialogs: string[] = [];
+  page.on("dialog", async dialog => { dialogs.push(dialog.message()); await dialog.dismiss(); });
   await form.getByRole("button", { name: "Add device" }).click();
   await expect.poll(() => state.writes.length).toBe(1);
   expect(state.writes[0]).toMatchObject({ method: "PUT", path: "/api/hub/v1/infrastructure/devices/office-printer", csrf: "fixture-csrf",
     body: { name: "Office printer", hostname: null, addresses: ["192.0.2.40"], network: "192.0.2.0/24", vlan: null, role: "Printing",
       retired: false, expected_revision: 0 } });
+  await expect(page).toHaveURL(/\/infrastructure\/office-printer$/);
+  await expect(page.getByRole("heading", { name: "Office printer", exact: true })).toBeVisible();
+  expect(dialogs).toEqual([]);
 });
 
 test("Show retired cannot discard an open Add device draft", async ({ page }) => {

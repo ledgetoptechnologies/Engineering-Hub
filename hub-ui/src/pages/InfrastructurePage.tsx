@@ -227,6 +227,7 @@ function DevicePage({ hub, actions, route, reading, onInventoryAccess }: {
 function useLeaveGuard(dirty: boolean, message: string) {
   const ref = useRef(dirty); ref.current = dirty;
   useEffect(() => registerRouteLeaveGuard(() => !ref.current || window.confirm(message)), []);
+  return () => { ref.current = false; };
 }
 const when = (iso: string) => new Date(iso).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 const newRequestId = () => (globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`);
@@ -383,14 +384,19 @@ function DeviceEditor({ client, csrf, device, writable, onDone }: {
   const [error, setError] = useState("");
   const [shown, setShown] = useState(false);
   const dirty = JSON.stringify(draft) !== JSON.stringify(initial);
-  useLeaveGuard(dirty, "Discard unsaved device changes?");
+  const clearLeaveGuard = useLeaveGuard(dirty, "Discard unsaved device changes?");
   const problems = editorProblems(draft, creating);
   const set = (key: keyof EditorDraft) => (event: { target: { value: string } }) => setDraft(current => ({ ...current, [key]: event.target.value }));
   async function save(retired: boolean) {
     setShown(true);
     if (!writable || busy || problems.length) return;
     setBusy(true); setError("");
-    try { onDone(await client.saveDevice(toDraft(draft, retired), expectedRevision, csrf)); }
+    try {
+      const saved = await client.saveDevice(toDraft(draft, retired), expectedRevision, csrf);
+      // Add navigates before React unmounts the editor and unregisters its guard.
+      clearLeaveGuard();
+      onDone(saved);
+    }
     catch (failure) { setError(writeFailureText(failure)); }
     finally { setBusy(false); }
   }
