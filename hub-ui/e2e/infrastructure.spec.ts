@@ -239,7 +239,7 @@ test("the owner can add a device; the form catches mistakes before saving", asyn
     body: { name: "Office printer", hostname: null, addresses: ["192.0.2.40"], network: "192.0.2.0/24", vlan: null, role: "Printing",
       retired: false, expected_revision: 0 } });
   await expect(page).toHaveURL(/\/infrastructure\/office-printer$/);
-  await expect(page.getByRole("heading", { name: "Office printer", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: `${saved.name}.`, exact: true })).toBeVisible();
   expect(dialogs).toEqual([]);
 });
 
