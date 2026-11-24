@@ -50,6 +50,40 @@ describe("backend bridge wire fixture (agent-hub-bridge-wire-v1)", () => {
   });
 });
 
+describe("priority metadata on stored tasks in claim recovery responses", () => {
+  const item = wire.recoverable_claims.items[0];
+
+  it("lists an initially prioritized claim with no priority revision", () => {
+    const page = { ...wire.recoverable_claims, items: [{ ...item, task: { ...item.task, priority: "high" } }] };
+    expect(parseClaims(page, installation)).toEqual(parseClaims(wire.recoverable_claims, installation));
+  });
+
+  it("reads claim history after a priority edit", () => {
+    const history = { ...wire.recovery_history, task: { ...wire.recovery_history.task, priority: "urgent", priority_revision: 3 } };
+    expect(parseHistory(history, taskId)).toEqual(parseHistory(wire.recovery_history, taskId));
+  });
+
+  it.each([wire.recovery, wire.recovery_replay])("reads a prioritized recovery result (replayed=$replayed)", (result) => {
+    const response = { ...result, task: { ...result.task, priority: "low", priority_revision: 2 } };
+    expect(parseRecoveryResult(response, taskId)).toEqual(parseRecoveryResult(result, taskId));
+  });
+
+  it.each([{ priority: "normal", priority_revision: 0 }, { priority: null, priority_revision: null }])(
+    "accepts DTO-compatible optional metadata %j", (metadata) => {
+      expect(parseBridgeTask({ ...item.task, ...metadata })).toEqual(parseBridgeTask(item.task));
+    },
+  );
+
+  it.each([
+    { priority: "critical" }, { priority: "URGENT" }, { priority: 1 }, { priority: ["urgent"] },
+    { priority_revision: -1 }, { priority_revision: 1.5 }, { priority_revision: "1" }, { priority_revision: true },
+    { priority_revision: Number.MAX_SAFE_INTEGER + 1 },
+  ])("rejects malformed priority metadata %j", (metadata) => {
+    const task = { ...item.task, priority: "urgent", priority_revision: 1, ...metadata };
+    expect(() => parseBridgeTask(task)).toThrow(HubApiError);
+  });
+});
+
 describe("bridge client", () => {
   it("saves a grant with the grant revision, sorted choices and a bounded lifetime", async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(json(wire.active_grant));

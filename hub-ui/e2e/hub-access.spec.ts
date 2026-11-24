@@ -9,7 +9,9 @@ const OLD_SESSION = wire.recoverable_claims.items[0].claim_session_id;
 const NEW_SESSION = wire.recoverable_claims.items[0].recovery.target_session_ids[0];
 const TASK = wire.recovery.task.id;
 
-async function fixture(page: Page, options: { catalog?: boolean } = {}) {
+async function fixture(page: Page, options: { catalog?: boolean; prioritizedClaim?: boolean } = {}) {
+  const withPriority = <T extends object>(task: T) => options.prioritizedClaim
+    ? { ...task, priority: "urgent", priority_revision: 2 } : task;
   const state = {
     grant: structuredClone(wire.absent_grant) as Record<string, unknown>,
     claims: structuredClone(wire.recoverable_claims),
@@ -53,8 +55,12 @@ async function fixture(page: Page, options: { catalog?: boolean } = {}) {
         if (state.holdGrant) { state.holdGrant = false; await new Promise<void>(resolve => state.grantReleases.push(resolve)); }
         return respond(body);
       }
-      if (rest === `/installations/${INSTALL}/task-claims`) return respond(state.claims);
-      if (rest === `/tasks/${TASK}/claim-recoveries`) return respond(state.recovered ? wire.recovery_history : { task: wire.recoverable_claims.items[0].task, recoveries: [] });
+      if (rest === `/installations/${INSTALL}/task-claims`) return respond({ ...state.claims,
+        items: state.claims.items.map(item => ({ ...item, task: withPriority(item.task) })) });
+      if (rest === `/tasks/${TASK}/claim-recoveries`) {
+        const history = state.recovered ? wire.recovery_history : { task: wire.recoverable_claims.items[0].task, recoveries: [] };
+        return respond({ ...history, task: withPriority(history.task) });
+      }
       return respond({}, 404);
     }
     const body = request.postDataJSON() as Record<string, unknown>;
@@ -74,7 +80,8 @@ async function fixture(page: Page, options: { catalog?: boolean } = {}) {
     if (rest === `/installations/${INSTALL}/hub-grant/revoke`) { state.grant = structuredClone(wire.revoked_grant); return respond(state.grant); }
     if (rest === `/tasks/${TASK}/recover-claim`) {
       const replay = state.recovered; state.recovered = true;
-      return respond(replay ? wire.recovery_replay : wire.recovery);
+      const result = replay ? wire.recovery_replay : wire.recovery;
+      return respond({ ...result, task: withPriority(result.task) });
     }
     return respond({}, 404);
   });
@@ -148,8 +155,8 @@ test("an inactive-connection refusal is explained, not treated as a lost sign-in
   await expect(panel(page)).toBeVisible();
 });
 
-test("a stranded claim is handed over only after reason and confirmation, with one request id per intent", async ({ page }) => {
-  const state = await fixture(page);
+test("a prioritized stranded claim can be handed over and its history read", async ({ page }) => {
+  const state = await fixture(page, { prioritizedClaim: true });
   await openAccess(page);
   const claims = access(page).getByRole("region", { name: "Tasks claimed by Codex on the desk PC" });
   await expect(claims).toContainText("held by old chat");

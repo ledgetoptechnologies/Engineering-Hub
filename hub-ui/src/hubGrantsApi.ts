@@ -6,6 +6,7 @@
  */
 import { HubApiError } from "./api";
 import { at, ownerCall, read, write } from "./agentConnectionsApi";
+import { TASK_PRIORITIES } from "./backlog";
 import type { Agent } from "./types";
 
 export const GRANT_STATES = ["absent", "inactive", "revoked", "expired", "active"] as const;
@@ -135,7 +136,7 @@ const TASK_OPTIONAL = ["scope", "proposed_by", "proposed_family", "owner_session
   "details", "links", "withdrawn_reason", "superseded_by", "withdrawn_by", "withdrawn_at", "withdrawn_family", "withdrawn_session_id",
   // Backlog fields: accepted so newer records still parse; this page doesn't show them.
   "acceptance", "reviewer", "request_text", "notes", "waiting_on", "waiting_resolved", "waiting_withdrawn", "completion_evidence", "completed_by",
-  "completed_at"] as const;
+  "completed_at", "priority", "priority_revision"] as const;
 function parseLinks(value: unknown): { label: string; url: string }[] {
   return list(value, item => { const row = record(item, ["label", "url"]); return { label: context(100)(row.label), url: linkUrl(row.url) }; }, 8, false);
 }
@@ -145,6 +146,7 @@ export function parseBridgeTask(value: unknown): BridgeTask {
   optional(row, "details", context(4096)); optional(row, "links", parseLinks); optional(row, "state_since", time);
   optional(row, "withdrawn_reason", context(500)); optional(row, "superseded_by", str(uuid)); optional(row, "withdrawn_at", time);
   optional(row, "withdrawn_session_id", str(uuid));
+  optional(row, "priority", oneOf(TASK_PRIORITIES)); optional(row, "priority_revision", count(0));
   return { id: str(uuid)(row.id), project: str(projectId)(row.project), title: text(200)(row.title),
     status: oneOf(["assigned", "claimed", "in_review", "verified", "withdrawn", "waiting_on_beau", "done"] as const)(row.status),
     owner: nullable(row.owner, str(actorPattern)), owner_family: optional(row, "owner_family", family),
