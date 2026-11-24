@@ -110,15 +110,18 @@ def test_agent_can_read_open_tasks_in_priority_order(hub):
     repo.update_task(human, closed['id'], 1, status='done', evidence='Fixture completion')
     before = call(client, 'hub_overview', {'task_order': 'priority'})
     assert not before.get('isError'), before
+    default_before = call(client, 'hub_overview')['structuredContent']['tasks']
     for task, priority in [(urgent, 'urgent'), (low, 'low'), (urgent2, 'urgent'), (high, 'high')]:
         repo.update_task(human, task['id'], 1, priority=priority)
     ranked = call(client, 'hub_overview', {'task_order': 'priority'})['structuredContent']['tasks']
     assert [(task['id'], task['priority']) for task in ranked] == [
         (urgent['id'], 'urgent'), (urgent2['id'], 'urgent'), (high['id'], 'high'),
         (ordinary['id'], 'normal'), (low['id'], 'low')]
+    assert [task.get('priority_revision', 0) for task in ranked] == [1, 1, 1, 0, 1]
     ordinary_results = call(client, 'hub_overview')['structuredContent']['tasks']
     assert [x['id'] for x in ordinary_results] == [x['id'] for x in (ordinary, urgent, low, urgent2, high, closed)]
-    assert 'priority' not in ordinary_results[0]
+    assert ordinary_results == default_before
+    assert call(client, 'hub_task_get', {'task_id': urgent['id']})['structuredContent'] == urgent
     assert call(client, 'hub_overview', {'task_order': 'unrecognized'}).get('isError')
 
 

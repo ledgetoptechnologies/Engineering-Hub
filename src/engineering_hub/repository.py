@@ -26,6 +26,9 @@ TASK_STATUS_ACTIONS = ('task.created', 'task.proposed', 'task.claimed', 'task.cl
 UPDATE_STATUSES = frozenset({'waiting_on_beau', 'done', 'assigned', 'claimed', 'in_review', 'verified'})
 MAX_ACCEPTANCE, MAX_NOTES = 20, 50
 TASK_UPDATE_RECEIPT = 'task_update_receipt'
+# Prefixed IDs cannot collide with canonical UUID entities or the policy key.
+TASK_PRIORITY = 'task_priority'
+TASK_PRIORITY_PREFIX = TASK_PRIORITY + ':'
 # Long backlog text left out of hub_overview; hub_task_get returns the full record.
 OVERVIEW_OMITTED = frozenset({'acceptance', 'notes', 'request_text', 'completion_evidence', 'waiting_resolved'})
 # Audit actions that record who created a task or decision. Withdrawal by an agent
@@ -252,11 +255,14 @@ class HubRepository:
         item['updated_at'] = datetime.now(timezone.utc).isoformat()
         db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data',
                    (item['id'], kind, _json(item)))
+        self._record_change(db, actor, action, item)
+        return item
+
+    def _record_change(self, db, actor, action, item):
         db.execute('INSERT INTO hub_audit(actor,action,entity_id,revision,created_at) VALUES(?,?,?,?,?)',
                    (actor, action, item['id'], item['revision'], item['updated_at']))
         session_context.provenance(db, db.execute("SELECT last_insert_rowid()").fetchone()[0])
         self._emit(db, action, item)
-        return item
 
     def _emit(self, db, action, item):
         db.execute('INSERT INTO hub_outbox(action,entity_id,revision,created_at) VALUES(?,?,?,?)',
@@ -311,6 +317,20 @@ class HubRepository:
             raise HubError('invalid_priority')
         return {'priority': priority}
 
+    @staticmethod
+    def _read_task_priority(db, task_id):
+        row = db.execute('SELECT data FROM hub_entities WHERE id=? AND kind=?',
+                         (TASK_PRIORITY_PREFIX + task_id, TASK_PRIORITY)).fetchone()
+        return json.loads(row['data']) if row is not None else {}
+
+    @staticmethod
+    def _write_task_priority(db, task_id, fields):
+        result = db.execute('''INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)
+            ON CONFLICT(id) DO UPDATE SET data=excluded.data WHERE hub_entities.kind=excluded.kind''',
+            (TASK_PRIORITY_PREFIX + task_id, TASK_PRIORITY, _json(fields)))
+        if result.rowcount != 1:
+            raise HubError('task_priority_storage_conflict', 409)
+
     def create_task(self, actor, project, title, client_request_id, *, details=None, links=None,
                     acceptance=None, owner=None, reviewer=None, request_text=None, priority=None):
         """Humans and agents may add backlog tasks. Neither grants environment or production rights:
@@ -320,10 +340,10 @@ class HubRepository:
         title, key = self._text(title), self._text(client_request_id)
         context = self._context(details, links)
         backlog = self._backlog_fields(acceptance, owner, reviewer, request_text)
-        backlog.update(self._task_priority_fields(actor, priority))
+        priority_fields = self._task_priority_fields(actor, priority)
         # Keep the legacy human fingerprint byte-for-byte when no backlog field is supplied.
         payload = ([] if human else ['agent_task']) + [project, title] + ([context] if context else []) + (
-            [backlog] if backlog else [])
+            [backlog | priority_fields] if backlog or priority_fields else [])
         fingerprint = hashlib.sha256(_json(payload).encode()).hexdigest()
         with self._transaction() as db:
             self._project(project, db)
@@ -331,15 +351,18 @@ class HubRepository:
             if prior:
                 if prior['fingerprint'] != fingerprint:
                     raise HubError('idempotency_conflict', 409)
-                return self._get(db, prior['entity_id'], 'task')
+                item = self._get(db, prior['entity_id'], 'task')
+                return item | self._read_task_priority(db, item['id']) if priority_fields else item
             provenance = {} if human else dict(proposed_by=actor, **(
                 {'proposed_family': session_context.family(actor)} if session_context.actor_allowed(actor) else {}))
             item = dict(id=str(uuid.uuid4()), project=project, title=title, status='assigned', owner=None,
                         candidate_commit=None, review=None, repair_count=0, **provenance, **context)
             item.update(backlog)
             item = self._save(db, actor, 'task.created', 'task', item, new=True)
+            if priority_fields:
+                self._write_task_priority(db, item['id'], priority_fields)
             db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
-            return item
+            return item | priority_fields
 
     def _is_owner(self, item, actor):
         owner = item.get('owner')
@@ -449,12 +472,16 @@ class HubRepository:
         if current in {'withdrawn', 'done'}:
             raise HubError('task_closed', 409)
         if priority_fields:
-            priority_revision = item.get('priority_revision', 0)
+            priority_revision = self._read_task_priority(db, identity).get('priority_revision', 0)
             if priority_revision != expected_priority_revision:
                 raise HubError('priority_revision_conflict', 409)
-            item.update(priority_fields, priority_revision=priority_revision + 1)
-            # Keep approval, dispatch and CI fences bound to the original task revision.
-            return self._persist(db, actor, 'task.priority_updated', 'task', item)
+            fields = dict(priority_fields, priority_revision=priority_revision + 1)
+            self._write_task_priority(db, identity, fields)
+            # Report the actual event time against the task ID and execution fence,
+            # without writing the canonical task row or changing its timestamp.
+            self._record_change(db, actor, 'task.priority_updated',
+                                dict(item, updated_at=datetime.now(timezone.utc).isoformat()))
+            return item | fields
         if current == 'waiting_on_beau' and status is not None and not human:
             raise HubError('waiting_on_beau', 409)
         action = 'task.updated'
@@ -666,11 +693,12 @@ class HubRepository:
 
     def list_priority_task_views(self):
         """Unfinished tasks ranked by urgency, oldest-created first on ties."""
-        tasks = (dict(task, priority=task.get('priority', 'normal')) for task in self.list_task_views()
+        tasks = (dict(task, priority=task.get('priority', 'normal'))
+                 for task in self.list_task_views(include_task_priorities=True)
                  if task['status'] not in {'done', 'withdrawn'})
         return sorted(tasks, key=lambda task: PRIORITY_RANK[task['priority']])
 
-    def list_task_views(self):
+    def list_task_views(self, *, include_task_priorities=False):
         """Response copies of tasks plus the audited time each entered its current status.
 
         state_since is derived from the audit log, never stored on the task, and is
@@ -683,8 +711,16 @@ class HubRepository:
         with self._connection() as db:
             db.execute('BEGIN')
             try:
-                tasks = [json.loads(row['data']) for row in db.execute(
-                    "SELECT data FROM hub_entities WHERE kind='task' ORDER BY rowid")]
+                if include_task_priorities:
+                    rows = db.execute('''SELECT task.data, priority.data AS metadata
+                        FROM hub_entities task LEFT JOIN hub_entities priority
+                            ON priority.id = ? || task.id AND priority.kind = ?
+                        WHERE task.kind = 'task' ORDER BY task.rowid''', (TASK_PRIORITY_PREFIX, TASK_PRIORITY))
+                    tasks = [json.loads(row['data']) | (json.loads(row['metadata']) if row['metadata'] else {})
+                             for row in rows]
+                else:
+                    tasks = [json.loads(row['data']) for row in db.execute(
+                        "SELECT data FROM hub_entities WHERE kind='task' ORDER BY rowid")]
                 audit = db.execute(
                     f'SELECT entity_id, revision, created_at FROM hub_audit WHERE action IN ({marks})',
                     TASK_STATUS_ACTIONS).fetchall()
