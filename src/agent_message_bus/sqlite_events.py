@@ -201,11 +201,11 @@ _FIONREAD = getattr(termios, "FIONREAD", None) if termios is not None else None
 class SQLiteEventSource:
     """Persistent native eventsource for message delivery-sequence changes.
 
-Lifecycle methods are blocking and must be called via ``asyncio.to_thread``
-from an ASGI lifespan. Startup installs every watch before taking one
-barrier-protected head snapshot. Normal operation has no timer or SQLite
-query when idle; a bounded retry timer exists only while an invalidation is
-dirty and a verified SQLite BUSY prevents reconciliation.
+    Lifecycle methods are blocking and must be called via ``asyncio.to_thread``
+    from an ASGI lifespan. Startup installs every watch before taking one
+    barrier-protected head snapshot. Normal operation has no timer or SQLite
+    query when idle; a bounded retry timer exists only while an invalidation is
+    dirty and a verified SQLite BUSY prevents reconciliation.
     """
 
     def __init__(
@@ -580,7 +580,12 @@ dirty and a verified SQLite BUSY prevents reconciliation.
             if data:
                 self._process_data(data)
 
-    def _process_data(self, data: bytes, *, reconcile: bool = True) -> None:
+    def _process_data(self, data: bytes) -> None:
+        self._accumulate_native_events(data)
+        if self._dirty and self._retry_at is None:
+            self._attempt_reconcile(reason="inotify")
+
+    def _accumulate_native_events(self, data: bytes) -> None:
         self._stage = "process_native_events"
         dirty = False
         relevant = 0
@@ -641,8 +646,6 @@ dirty and a verified SQLite BUSY prevents reconciliation.
             self._dirty = True
             if self._dirty_since is None:
                 self._dirty_since = time.monotonic()
-            if reconcile and self._retry_at is None:
-                self._attempt_reconcile(reason="inotify")
 
     def _drain_pending_events_before_publish(self) -> None:
         """Drain a bounded native-event snapshot before releasing the barrier."""
@@ -667,7 +670,7 @@ dirty and a verified SQLite BUSY prevents reconciliation.
             if not chunk:
                 continue
             total += len(chunk)
-            self._process_data(chunk, reconcile=False)
+            self._accumulate_native_events(chunk)
             if time.monotonic() - started > 1.0:
                 raise WatcherFailed("pre-publish inotify validation exceeded its time bound")
 
@@ -742,7 +745,11 @@ dirty and a verified SQLite BUSY prevents reconciliation.
             elif selected and next_cursor <= self._cursor:
                 raise WatcherFailed("recipient rows did not advance the message cursor")
             self._add_stat("snapshot_reads")
-            self._drain_pending_events_before_publish()
+            # Startup only records the committed head; it delivers nothing. Leave
+            # newly queued WAL creation to the native loop so commits made before
+            # that inode watch is installed are reconciled after the startup head.
+            if self._cursor is not None:
+                self._drain_pending_events_before_publish()
             self._verify_watched_paths()
             self._assert_retry_deadline()
             self._stage = "release_write_barrier"

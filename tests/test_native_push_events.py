@@ -251,6 +251,63 @@ def _independent_writer(db_path: str, sender: str, recipient: str, message_id: s
         conn.close()
 
 
+@pytest.mark.asyncio
+async def test_existing_mcp_subscription_recovers_after_busy_writer(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_BUS_ALLOWED_HOSTS", "127.0.0.1:*")
+    db_path = tmp_path / "messages.sqlite3"
+    app = create_app(db_path=db_path, audit_path=tmp_path / "audit.jsonl", auth=TOKENS,
+                     file_root=tmp_path / "files")
+    recipient_uri = BASE_URI.format("codex")
+    marker, message_id = "fixture-private-retry-body", str(uuid.uuid4())
+    async with loopback(app) as base_url, httpx.AsyncClient(timeout=3) as client:
+        async with mcp_client(base_url, TOKENS.codex_token) as (receiver, events, session_id, _):
+            await receiver.subscribe_resource(AnyUrl(recipient_uri))
+            original_session = session_id()
+            health = (await client.get(f"{base_url}/health")).json()
+            assert health["ok"] is True
+            cursor = health["push"]["cursor"]
+            source = app.state.push_event_source
+            writer = sqlite3.connect(db_path, isolation_level=None)
+            try:
+                # Spill private pages into the WAL before commit, generating a
+                # real inotify invalidation while the write barrier is unavailable.
+                writer.execute("PRAGMA cache_size=5")
+                writer.execute("BEGIN IMMEDIATE")
+                writer.execute("""INSERT INTO messages
+                    (id,sender,recipient,message_type,body_json,created_at)
+                    VALUES (?, 'hermes', 'codex', 'task', ?, '2026-01-01T00:00:00Z')""",
+                               (message_id, json.dumps({"private": marker})))
+                writer.execute("INSERT INTO message_delivery_sequence (message_id) VALUES (?)", (message_id,))
+                writer.execute("CREATE TABLE incident_fixture_padding(value BLOB)")
+                writer.executemany("INSERT INTO incident_fixture_padding VALUES (zeroblob(8192))", [()] * 32)
+                async with asyncio.timeout(14):
+                    while True:
+                        health = (await client.get(f"{base_url}/health")).json()
+                        if health["push"]["state"] != "healthy":
+                            break
+                        await asyncio.sleep(0.05)
+                assert health["push"]["state"] == "degraded"
+                assert health["ok"] is False
+                assert health["push"]["cursor"] == cursor
+                assert health["push"]["subscriptions_enabled"] is True
+                assert await no_notification(events)
+                writer.commit()
+            finally:
+                writer.close()
+            notice = await asyncio.wait_for(events.get(), 3)
+            assert_recipient_only_notification(notice, "codex", secret=marker, message_id=message_id)
+            inbox = resource_json(await receiver.read_resource(AnyUrl(f"{recipient_uri}?after={cursor}&limit=100")))
+            assert [row["id"] for row in inbox["messages"]] == [message_id]
+            health = (await client.get(f"{base_url}/health")).json()
+            assert health["ok"] is True
+            assert health["push"]["state"] == "healthy"
+            assert health["push"]["cursor"] > cursor
+            assert health["push"]["busy_retry_count"] >= 1
+            assert session_id() == original_session
+            assert app.state.push_event_source is source
+            assert await no_notification(events)
+
+
 async def _cleanup_owned_writers(processes):
     """Bounded cleanup of this fixture's children, including on assertions.
 
