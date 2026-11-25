@@ -785,7 +785,8 @@ export function HubApp() {
             : infrastructureRoute ? `infrastructure-${session?.actor ?? ""}` : route.page}>
             {route.page === "home" && <HomePage hub={hub} actions={actions} />}
             {route.page === "inbox" && <InboxPage hub={hub} actions={<>{actions}
-              {!demo && session?.authenticated && session.actor?.startsWith("human:") && (events?.available || alertState === "on") && (
+              {!demo && session?.authenticated && session.actor?.startsWith("human:") &&
+                (alertState === "on" || (events?.available && connection !== "manual")) && (
                 <>
                   <button className="secondary" type="button" onClick={() => void toggleAlerts(
                     !stale && !loading && connection === "live" && events?.available === true && data !== null,

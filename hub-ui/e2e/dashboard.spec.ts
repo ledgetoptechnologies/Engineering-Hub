@@ -346,7 +346,7 @@ async function controllableEvents(page: Page) {
 
 async function emit(
   page: Page,
-  kind: "invalidate" | "source_unavailable" | "error" | "open",
+  kind: "invalidate" | "source_unavailable" | "error" | "open" | "malformed",
 ) {
   await page.evaluate((kind) => {
     const stream = (window as any).__hubStreams.at(-1);
@@ -354,6 +354,7 @@ async function emit(
       throw new Error("fixture event source unavailable");
     if (kind === "open") stream.onopen?.(new Event("open"));
     else if (kind === "error") stream.onerror?.(new Event("error"));
+    else if (kind === "malformed") stream.onmessage?.({ data: "{" });
     else
       stream.onmessage?.({
         data: JSON.stringify({
@@ -738,8 +739,8 @@ test("Needs Me browser alerts opt in and announce fresh background items once wi
   expect(await alerts()).toHaveLength(1);
 });
 
-for (const firstSeenInBackground of [true, false]) {
-  test(`Needs Me ${firstSeenInBackground ? "queues background" : "suppresses foreground"} items first seen on manual refresh`, async ({ page }) => {
+for (const scenario of ["queues background", "suppresses foreground", "clears queue on a focused manual refresh"]) {
+  test(`Needs Me ${scenario} for items first seen on manual refresh`, async ({ page }) => {
     await controllableEvents(page);
     await page.addInitScript((background) => {
       const fixture = { background, alerts: [] as unknown[] };
@@ -750,7 +751,7 @@ for (const firstSeenInBackground of [true, false]) {
         constructor(title: string, options: NotificationOptions) { fixture.alerts.push({ title, options }); }
         close() {}
       } });
-    }, firstSeenInBackground);
+    }, scenario !== "suppresses foreground");
     const mock = await mockLive(page, { events: true });
     await page.goto("/#/inbox");
     await expect(page.getByText("Snapshot unverified", { exact: true })).toBeVisible();
@@ -766,6 +767,13 @@ for (const firstSeenInBackground of [true, false]) {
     await refresh.click();
     await expect(page.getByRole("heading", { name: "Private manual item", exact: true })).toBeVisible();
     expect(await alerts()).toEqual([]);
+    if (scenario === "clears queue on a focused manual refresh") {
+      await page.evaluate(() => { (window as any).__alertFixture.background = false; });
+      mock.overview.decisions.push({ ...original, id: "focus-marker", title: "Focused refresh marker" });
+      await refresh.click();
+      await expect(page.getByRole("heading", { name: "Focused refresh marker", exact: true })).toBeVisible();
+      expect(await alerts()).toEqual([]);
+    }
     await page.evaluate(() => { (window as any).__alertFixture.background = true; });
 
     for (let i = 0; i < 2; i++) {
@@ -774,7 +782,7 @@ for (const firstSeenInBackground of [true, false]) {
       await expect.poll(mock.reads).toBeGreaterThan(reads);
       await expect(refresh).toBeEnabled();
       await expect(page.getByText("Event feed connected", { exact: true })).toBeVisible();
-      expect(await alerts()).toEqual(firstSeenInBackground ? [{
+      expect(await alerts()).toEqual(scenario === "queues background" ? [{
         title: "Engineering Hub needs your attention",
         options: { body: "Open Engineering Hub to view your inbox.", tag: "engineering-hub-needs-me" },
       }] : []);
@@ -782,33 +790,40 @@ for (const firstSeenInBackground of [true, false]) {
   });
 }
 
-test("Needs Me lets an enabled user disable browser alerts during an event feed outage", async ({ page }) => {
-  await controllableEvents(page);
-  await page.addInitScript(() => {
-    Object.assign(window, { Notification: class { static permission = "granted"; } });
-  });
-  await mockLive(page, { events: true });
-  await page.goto("/#/inbox");
-  await expect(page.getByText("Snapshot unverified", { exact: true })).toBeVisible();
-  await emit(page, "invalidate");
-  await expect(page.getByText("Event feed connected", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Enable browser alerts" }).click();
-  const disable = page.getByRole("button", { name: "Disable browser alerts" });
-  await expect(disable).toBeVisible();
+for (const outageKind of ["http", "source_unavailable", "malformed"] as const) {
+  test(`Needs Me lets an enabled user disable browser alerts during an event feed outage (${outageKind})`, async ({ page }) => {
+    await controllableEvents(page);
+    await page.addInitScript(() => {
+      Object.assign(window, { Notification: class { static permission = "granted"; } });
+    });
+    await mockLive(page, { events: true });
+    await page.goto("/#/inbox");
+    await expect(page.getByText("Snapshot unverified", { exact: true })).toBeVisible();
+    await emit(page, "invalidate");
+    await expect(page.getByText("Event feed connected", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Enable browser alerts" }).click();
+    const disable = page.getByRole("button", { name: "Disable browser alerts" });
+    await expect(disable).toBeVisible();
 
-  await page.route("**/api/hub/v1/events/status", (route) => route.fulfill({ json: {
-    available: false, reason: "native_source_unsupported", observer_epoch: "fixture-public-epoch", cursor: 0,
-  } }));
-  const refresh = page.getByRole("button", { name: "Refresh workspace" });
-  const outage = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/hub/v1/events/status");
-  await refresh.click();
-  expect((await (await outage).json()).available).toBe(false);
-  await expect(refresh).toBeEnabled();
-  await expect(disable).toBeVisible();
-  await disable.click();
-  await expect(disable).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Enable browser alerts" })).toHaveCount(0);
-});
+    if (outageKind === "http") {
+      await page.route("**/api/hub/v1/events/status", (route) => route.fulfill({ json: {
+        available: false, reason: "native_source_unsupported", observer_epoch: "fixture-public-epoch", cursor: 0,
+      } }));
+      const refresh = page.getByRole("button", { name: "Refresh workspace" });
+      const outage = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/hub/v1/events/status");
+      await refresh.click();
+      expect((await (await outage).json()).available).toBe(false);
+      await expect(refresh).toBeEnabled();
+    } else {
+      await emit(page, outageKind);
+      await expect(page.getByText("Snapshot unverified", { exact: true })).toBeVisible();
+    }
+    await expect(disable).toBeVisible();
+    await disable.click();
+    await expect(disable).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Enable browser alerts" })).toHaveCount(0);
+  });
+}
 
 for (const deferredPermission of [false, true] as const) {
   test(`stale opt-in baselines reconnect items (${deferredPermission ? "permission pending" : "permission granted"})`, async ({ page }: { page: Page }) => {

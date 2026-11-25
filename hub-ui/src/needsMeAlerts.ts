@@ -85,13 +85,16 @@ export function useNeedsMeAlerts() {
       pending.current.clear();
       return;
     }
-    const foreground = document.visibilityState === "visible" && document.hasFocus();
+    if (document.visibilityState === "visible" && document.hasFocus()) {
+      pending.current.clear();
+      return;
+    }
     for (const id of pending.current) if (!ids.has(id)) pending.current.delete(id);
     // Record background arrivals even when this refresh cannot send an alert.
-    if (!foreground) for (const id of ids) if (!before.has(id)) pending.current.add(id);
+    for (const id of ids) if (!before.has(id)) pending.current.add(id);
     if (!allowAlert || pending.current.size === 0) return;
     pending.current.clear();
-    if (foreground) return;
+
     try {
       close();
       const notification = new Notification("Engineering Hub needs your attention", {
