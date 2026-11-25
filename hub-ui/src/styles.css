@@ -4138,10 +4138,11 @@ dialog.modal-full .modal-head h2 { font-size: 19px; line-height: 1.3; }
 .machine-card-exporters { color: var(--muted); font-size: 12px; }
 .machine-card-warning { color: var(--ink-3); font-size: 12px; }
 .machine-card-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-.machine-card-stat { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 3px 8px; min-width: 0; padding-top: 7px; border-top: 1px solid var(--line); }
+/* Long values (such as Network rates) wrap below the label instead of crowding it. */
+.machine-card-stat { display: flex; flex-wrap: wrap; align-content: start; align-items: baseline; gap: 3px 8px; min-width: 0; padding-top: 7px; border-top: 1px solid var(--line); }
 .machine-card-stat > span:first-child { color: var(--muted); font-size: 12px; }
-.machine-card-stat strong { min-width: 0; color: var(--ink); font-size: 13px; font-variant-numeric: tabular-nums; text-align: right; overflow-wrap: anywhere; }
-.machine-card-meter { grid-column: 1 / -1; height: 4px; overflow: hidden; border-radius: 999px; background: var(--line); }
+.machine-card-stat strong { min-width: 0; margin-inline-start: auto; color: var(--ink); font-size: 13px; font-variant-numeric: tabular-nums; text-align: end; overflow-wrap: anywhere; }
+.machine-card-meter { flex: 0 0 100%; height: 4px; overflow: hidden; border-radius: 999px; background: var(--line); }
 .machine-card-meter i { display: block; height: 100%; background: var(--forest); }
 .machine-card-meter.warm i, .machine-card-meter.high i { background: var(--amber); }
 .machine-card-cta { justify-self: end; color: var(--forest); font-size: 12px; font-weight: 600; }
