@@ -12,6 +12,7 @@ from agent_message_bus import session_hub_context as session_context
 from .pilot_ownership import PilotOwner
 from .image_state_boundary import ImageStateBoundaryError, require_image_state_mount
 from .entity_context import bounded_text, validated_context
+from .task_priority import PRIORITY_RANK
 
 
 PROJECTS = frozenset({'engineering-hub', '3d-viewer', 'project-alpha', 'ledge-top-ops', 'treedar'})
@@ -25,6 +26,9 @@ TASK_STATUS_ACTIONS = ('task.created', 'task.proposed', 'task.claimed', 'task.cl
 UPDATE_STATUSES = frozenset({'waiting_on_beau', 'done', 'assigned', 'claimed', 'in_review', 'verified'})
 MAX_ACCEPTANCE, MAX_NOTES = 20, 50
 TASK_UPDATE_RECEIPT = 'task_update_receipt'
+# Prefixed IDs cannot collide with canonical UUID entities or the policy key.
+TASK_PRIORITY = 'task_priority'
+TASK_PRIORITY_PREFIX = TASK_PRIORITY + ':'
 # Long backlog text left out of hub_overview; hub_task_get returns the full record.
 OVERVIEW_OMITTED = frozenset({'acceptance', 'notes', 'request_text', 'completion_evidence', 'waiting_resolved'})
 # Audit actions that record who created a task or decision. Withdrawal by an agent
@@ -245,14 +249,20 @@ class HubRepository:
 
     def _save(self, db, actor, action, kind, item, new=False):
         item['revision'] = 1 if new else item['revision'] + 1
+        return self._persist(db, actor, action, kind, item)
+
+    def _persist(self, db, actor, action, kind, item):
         item['updated_at'] = datetime.now(timezone.utc).isoformat()
         db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data',
                    (item['id'], kind, _json(item)))
+        self._record_change(db, actor, action, item)
+        return item
+
+    def _record_change(self, db, actor, action, item):
         db.execute('INSERT INTO hub_audit(actor,action,entity_id,revision,created_at) VALUES(?,?,?,?,?)',
                    (actor, action, item['id'], item['revision'], item['updated_at']))
         session_context.provenance(db, db.execute("SELECT last_insert_rowid()").fetchone()[0])
         self._emit(db, action, item)
-        return item
 
     def _emit(self, db, action, item):
         db.execute('INSERT INTO hub_outbox(action,entity_id,revision,created_at) VALUES(?,?,?,?)',
@@ -298,18 +308,42 @@ class HubRepository:
             fields['request_text'] = self._bounded(request_text, 2000)
         return fields
 
+    @classmethod
+    def _task_priority_fields(cls, actor, priority):
+        if priority is None:
+            return {}
+        cls._actor(actor, human=True)
+        if type(priority) is not str or priority not in PRIORITY_RANK:
+            raise HubError('invalid_priority')
+        return {'priority': priority}
+
+    @staticmethod
+    def _read_task_priority(db, task_id):
+        row = db.execute('SELECT data FROM hub_entities WHERE id=? AND kind=?',
+                         (TASK_PRIORITY_PREFIX + task_id, TASK_PRIORITY)).fetchone()
+        return json.loads(row['data']) if row is not None else {}
+
+    @staticmethod
+    def _write_task_priority(db, task_id, fields):
+        result = db.execute('''INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)
+            ON CONFLICT(id) DO UPDATE SET data=excluded.data WHERE hub_entities.kind=excluded.kind''',
+            (TASK_PRIORITY_PREFIX + task_id, TASK_PRIORITY, _json(fields)))
+        if result.rowcount != 1:
+            raise HubError('task_priority_storage_conflict', 409)
+
     def create_task(self, actor, project, title, client_request_id, *, details=None, links=None,
-                    acceptance=None, owner=None, reviewer=None, request_text=None):
+                    acceptance=None, owner=None, reviewer=None, request_text=None, priority=None):
         """Humans and agents may add backlog tasks. Neither grants environment or production rights:
         an agent-created task records proposed_by without a scope, which task_allows_environment vetoes."""
         self._actor(actor)
         human = actor not in AGENTS and not session_context.actor_allowed(actor)
         title, key = self._text(title), self._text(client_request_id)
         context = self._context(details, links)
-        backlog =self._backlog_fields(acceptance, owner, reviewer, request_text)
+        backlog = self._backlog_fields(acceptance, owner, reviewer, request_text)
+        priority_fields = self._task_priority_fields(actor, priority)
         # Keep the legacy human fingerprint byte-for-byte when no backlog field is supplied.
         payload = ([] if human else ['agent_task']) + [project, title] + ([context] if context else []) + (
-            [backlog] if backlog else [])
+            [backlog | priority_fields] if backlog or priority_fields else [])
         fingerprint = hashlib.sha256(_json(payload).encode()).hexdigest()
         with self._transaction() as db:
             self._project(project, db)
@@ -317,15 +351,18 @@ class HubRepository:
             if prior:
                 if prior['fingerprint'] != fingerprint:
                     raise HubError('idempotency_conflict', 409)
-                return self._get(db, prior['entity_id'], 'task')
+                item = self._get(db, prior['entity_id'], 'task')
+                return item | self._read_task_priority(db, item['id']) if priority_fields else item
             provenance = {} if human else dict(proposed_by=actor, **(
                 {'proposed_family': session_context.family(actor)} if session_context.actor_allowed(actor) else {}))
             item = dict(id=str(uuid.uuid4()), project=project, title=title, status='assigned', owner=None,
                         candidate_commit=None, review=None, repair_count=0, **provenance, **context)
             item.update(backlog)
             item = self._save(db, actor, 'task.created', 'task', item, new=True)
+            if priority_fields:
+                self._write_task_priority(db, item['id'], priority_fields)
             db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
-            return item
+            return item | priority_fields
 
     def _is_owner(self, item, actor):
         owner = item.get('owner')
@@ -353,7 +390,7 @@ class HubRepository:
 
     def update_task(self, actor, identity, expected_revision, *, details=None, links=None, acceptance=None,
                     owner=None, reviewer=None, note=None, status=None, waiting=None, evidence=None,
-                    client_request_id=None):
+                    client_request_id=None, priority=None, expected_priority_revision=None):
         """CAS edit by the owner, the named reviewer or a human. Omitted fields are unchanged.
 
         Status here covers only the backlog states: waiting_on_beau (with a decision/action item),
@@ -365,10 +402,24 @@ class HubRepository:
         its own family created. Owner and reviewer are set by a human, or by the creating agent while
         the task is still assigned. With client_request_id, an identical retry returns the original
         result and a changed payload under the same id conflicts.
+
+        A priority edit is human-only and cannot be combined with other edits. It also checks the
+        priority revision (omitted is zero), then advances only that counter, not the task fence.
         """
         self._actor(actor)
         key = None if client_request_id is None else self._text(client_request_id, 128)
         human = actor not in AGENTS and not session_context.actor_allowed(actor)
+        priority_fields = self._task_priority_fields(actor, priority)
+        if priority_fields:
+            if any(value is not None for value in (details, links, acceptance, owner, reviewer, note, status,
+                                                   waiting, evidence)):
+                raise HubError('invalid_priority_update')
+            if expected_priority_revision is None:
+                expected_priority_revision = 0
+            if type(expected_priority_revision) is not int or expected_priority_revision < 0:
+                raise HubError('invalid_priority_update')
+        elif expected_priority_revision is not None:
+            raise HubError('invalid_priority_update')
         backlog = self._backlog_fields(acceptance, owner, reviewer)
         content = self._context(details, links)
         if 'acceptance' in backlog:
@@ -384,10 +435,12 @@ class HubRepository:
             waiting = dict(type=waiting['type'], text=self._bounded(waiting['text'], 300, 'invalid_waiting_item'))
         if evidence is not None:
             evidence = self._bounded(evidence, 2000, 'invalid_evidence')
-        if not (content or backlog or note or status):
+        if not (content or backlog or note or status or priority_fields):
             raise HubError('invalid_input')
-        fingerprint = hashlib.sha256(_json([identity, expected_revision, content, backlog, note, status,
-                                            waiting, evidence]).encode()).hexdigest()
+        payload = [identity, expected_revision, content, backlog, note, status, waiting, evidence]
+        if priority_fields:
+            payload.extend((priority_fields, expected_priority_revision))
+        fingerprint = hashlib.sha256(_json(payload).encode()).hexdigest()
         # Receipts reuse hub_requests (namespaced key) and an inert receipt row holding the original
         # result, so the ledger keeps its existing table set.
         receipt_key = None if key is None else 'task_update:' + key
@@ -399,7 +452,7 @@ class HubRepository:
                         raise HubError('idempotency_conflict', 409)
                     return self._get(db, prior['entity_id'], TASK_UPDATE_RECEIPT)['result']
             result = self._update_task(db, actor, human, identity, expected_revision, content, backlog, note,
-                                       status, waiting, evidence)
+                                       status, waiting, evidence, priority_fields, expected_priority_revision)
             if receipt_key is not None:
                 receipt = str(uuid.uuid4())
                 db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
@@ -408,7 +461,7 @@ class HubRepository:
             return result
 
     def _update_task(self, db, actor, human, identity, expected_revision, content, backlog, note, status,
-                     waiting, evidence):
+                     waiting, evidence, priority_fields, expected_priority_revision):
         item = self._get(db, identity, 'task')
         self._project(item['project'], db)
         self._cas(item, expected_revision)
@@ -418,6 +471,17 @@ class HubRepository:
         current = item['status']
         if current in {'withdrawn', 'done'}:
             raise HubError('task_closed', 409)
+        if priority_fields:
+            priority_revision = self._read_task_priority(db, identity).get('priority_revision', 0)
+            if priority_revision != expected_priority_revision:
+                raise HubError('priority_revision_conflict', 409)
+            fields = dict(priority_fields, priority_revision=priority_revision + 1)
+            self._write_task_priority(db, identity, fields)
+            # Report the actual event time against the task ID and execution fence,
+            # without writing the canonical task row or changing its timestamp.
+            self._record_change(db, actor, 'task.priority_updated',
+                                dict(item, updated_at=datetime.now(timezone.utc).isoformat()))
+            return item | fields
         if current == 'waiting_on_beau' and status is not None and not human:
             raise HubError('waiting_on_beau', 409)
         action = 'task.updated'
@@ -627,7 +691,14 @@ class HubRepository:
     def list_tasks(self):
         return self._list('task')
 
-    def list_task_views(self):
+    def list_priority_task_views(self):
+        """Unfinished tasks ranked by urgency, oldest-created first on ties."""
+        tasks = (dict(task, priority=task.get('priority', 'normal'))
+                 for task in self.list_task_views(include_task_priorities=True)
+                 if task['status'] not in {'done', 'withdrawn'})
+        return sorted(tasks, key=lambda task: PRIORITY_RANK[task['priority']])
+
+    def list_task_views(self, *, include_task_priorities=False):
         """Response copies of tasks plus the audited time each entered its current status.
 
         state_since is derived from the audit log, never stored on the task, and is
@@ -640,8 +711,16 @@ class HubRepository:
         with self._connection() as db:
             db.execute('BEGIN')
             try:
-                tasks = [json.loads(row['data']) for row in db.execute(
-                    "SELECT data FROM hub_entities WHERE kind='task' ORDER BY rowid")]
+                if include_task_priorities:
+                    rows = db.execute('''SELECT task.data, priority.data AS metadata
+                        FROM hub_entities task LEFT JOIN hub_entities priority
+                            ON priority.id = ? || task.id AND priority.kind = ?
+                        WHERE task.kind = 'task' ORDER BY task.rowid''', (TASK_PRIORITY_PREFIX, TASK_PRIORITY))
+                    tasks = [json.loads(row['data']) | (json.loads(row['metadata']) if row['metadata'] else {})
+                             for row in rows]
+                else:
+                    tasks = [json.loads(row['data']) for row in db.execute(
+                        "SELECT data FROM hub_entities WHERE kind='task' ORDER BY rowid")]
                 audit = db.execute(
                     f'SELECT entity_id, revision, created_at FROM hub_audit WHERE action IN ({marks})',
                     TASK_STATUS_ACTIONS).fetchall()

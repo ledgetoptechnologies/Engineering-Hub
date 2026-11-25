@@ -2798,6 +2798,20 @@
       "get": {
         "summary": "Overview",
         "operationId": "overview_api_hub_v1_overview_get",
+        "parameters": [
+          {
+            "name": "include_task_priorities",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Include saved task priorities for an authenticated human session.",
+              "default": false,
+              "title": "Include Task Priorities"
+            },
+            "description": "Include saved task priorities for an authenticated human session."
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -2805,6 +2819,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/OverviewDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
                 }
               }
             }
@@ -2852,6 +2876,25 @@
       "get": {
         "summary": "List Tasks",
         "operationId": "list_tasks_api_hub_v1_tasks_get",
+        "parameters": [
+          {
+            "name": "task_order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "const": "priority",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Task Order"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -2862,6 +2905,16 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         }
       },
@@ -2869,14 +2922,14 @@
         "summary": "Create Task",
         "operationId": "create_task_api_hub_v1_tasks_post",
         "requestBody": {
+          "required": true,
           "content": {
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/NewTask"
               }
             }
-          },
-          "required": true
+          }
         },
         "responses": {
           "201": {
@@ -2923,6 +2976,57 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/TaskUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/tasks/{task_id}/priority": {
+      "post": {
+        "summary": "Update Task Priority",
+        "description": "Edit advisory priority only; requires a human session, Origin and CSRF token.",
+        "operationId": "update_task_priority_api_hub_v1_tasks__task_id__priority_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskPriorityUpdate"
               }
             }
           }
@@ -5746,6 +5850,23 @@
               }
             ],
             "title": "Request Text"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "urgent",
+                  "high",
+                  "normal",
+                  "low"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority"
           }
         },
         "additionalProperties": false,
@@ -7226,6 +7347,36 @@
             ],
             "title": "Status"
           },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "urgent",
+                  "high",
+                  "normal",
+                  "low"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority"
+          },
+          "priority_revision": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority Revision",
+            "description": "Priority edit revision; absent means zero."
+          },
           "owner": {
             "anyOf": [
               {
@@ -7693,6 +7844,46 @@
         ],
         "title": "TaskNoteDTO"
       },
+      "TaskPriorityUpdate": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          },
+          "priority": {
+            "type": "string",
+            "enum": [
+              "urgent",
+              "high",
+              "normal",
+              "low"
+            ],
+            "title": "Priority"
+          },
+          "expected_priority_revision": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Expected Priority Revision",
+            "description": "Send zero if the task has no priority revision."
+          },
+          "client_request_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Client Request Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "priority",
+          "expected_priority_revision",
+          "client_request_id"
+        ],
+        "title": "TaskPriorityUpdate"
+      },
       "TaskUpdate": {
         "properties": {
           "expected_revision": {
@@ -7705,6 +7896,37 @@
             "maxLength": 128,
             "minLength": 1,
             "title": "Client Request Id"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "urgent",
+                  "high",
+                  "normal",
+                  "low"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority",
+            "description": "Human-only; cannot be combined with other edits."
+          },
+          "expected_priority_revision": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Priority Revision",
+            "description": "Priority edits only; omitted or null means zero. Also send expected_revision."
           },
           "details": {
             "anyOf": [

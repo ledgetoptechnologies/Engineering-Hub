@@ -1,6 +1,6 @@
 /** The view of Hub state that pages read. All mutation still goes through HubApp. */
 import type { FormEvent } from "react";
-import type { AgentSummary, Decision, Overview, PublicReachability, Session, Task, TopicSnapshot } from "./types";
+import type { AgentSummary, Decision, Overview, PublicReachability, Session, Task, TaskPriority, TopicSnapshot } from "./types";
 
 export interface DecisionChoice { revision: number; answer: string }
 
@@ -25,6 +25,7 @@ export interface Hub {
   resolveWaiting: (task: Task, note: string) => Promise<boolean>;
   /** Undo an agent's withdrawal of its waiting question (Beau only); it waits on Beau again. */
   restoreWaiting: (task: Task) => Promise<boolean>;
+  updateTaskPriority: (task: Task, priority: TaskPriority, key: string) => Promise<boolean>;
   clearPrivateWorkspace: () => void;
   /** Re-read the workspace snapshot (after a successful human change). */
   refresh: () => Promise<void>;

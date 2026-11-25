@@ -107,7 +107,7 @@ test("a conflict keeps the draft and never overwrites; archive asks first and hi
   await expect(form.getByLabel("Description")).toHaveValue("My unsaved description");
   await expect(form.getByRole("button", { name: "Save changes" })).toBeDisabled();
   // Simulate an overview refresh/event while an editor overlays the workspace.
-  const refreshed = page.waitForResponse((response) => response.url().endsWith("/overview"));
+  const refreshed = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/hub/v1/overview");
   await page.getByRole("button", { name: "Refresh workspace" }).evaluate((button: HTMLButtonElement) => button.click());
   await refreshed;
   await expect(form.getByLabel("Description")).toHaveValue("My unsaved description");
@@ -129,7 +129,7 @@ test("same-project refresh preserves an editable draft and project switching loa
   await page.getByRole("button", { name: "Edit project" }).click();
   const form = page.getByRole("form", { name: "Edit project" });
   await form.getByLabel("Description").fill("Keep this unsaved draft");
-  const refreshed = page.waitForResponse((response) => response.url().endsWith("/overview"));
+  const refreshed = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/hub/v1/overview");
   await page.getByRole("button", { name: "Refresh workspace" }).evaluate((button: HTMLButtonElement) => button.click());
   await refreshed;
   await expect(form.getByLabel("Description")).toHaveValue("Keep this unsaved draft");

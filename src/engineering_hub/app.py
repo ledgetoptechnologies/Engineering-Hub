@@ -7,10 +7,10 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Path as APIPath, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -43,6 +43,7 @@ from .dto import (
     HealthDTO, OverviewDTO, PauseDTO, ProjectListDTO, RunDTO, RunListDTO, RecoveryDTO,
     TaskDTO, TaskListDTO,
 )
+from .task_priority import TaskPriority
 
 @dataclass(frozen=True)
 class Settings:
@@ -170,6 +171,7 @@ class NewTask(Input):
     assignee: Literal["hermes", "codex", "claude"] | None = None
     assigned_reviewer: Literal["hermes", "codex", "claude"] | None = None
     request_text: str | None = Field(default=None, max_length=2000)
+    priority: TaskPriority | None = None
 
 
 class Revision(Input):
@@ -210,6 +212,9 @@ class WaitingItem(Input):
 
 class TaskUpdate(Revision):
     client_request_id: str = Field(min_length=1, max_length=128)
+    priority: TaskPriority | None = Field(default=None, description='Human-only; cannot be combined with other edits.')
+    expected_priority_revision: int | None = Field(
+        default=None, ge=0, description='Priority edits only; omitted or null means zero. Also send expected_revision.')
     details: str | None = Field(default=None, max_length=4096)
     links: list[dict[str, str]] | None = Field(default=None, max_length=8)
     acceptance: list[str] | None = Field(default=None, max_length=20)
@@ -220,6 +225,12 @@ class TaskUpdate(Revision):
     status: Literal["waiting_on_beau", "done", "assigned", "claimed", "in_review", "verified"] | None = None
     waiting: WaitingItem | None = None
     evidence: str | None = Field(default=None, max_length=2000)
+
+
+class TaskPriorityUpdate(Revision):
+    priority: TaskPriority
+    expected_priority_revision: int = Field(ge=0, description='Send zero if the task has no priority revision.')
+    client_request_id: str = Field(min_length=1, max_length=128)
 
 
 class ResolveWaiting(Revision):
@@ -1030,7 +1041,12 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         return result
 
     @app.get("/api/hub/v1/overview", response_model=OverviewDTO, response_model_exclude_unset=True)
-    async def overview(request: Request):
+    async def overview(
+        request: Request,
+        include_task_priorities: Annotated[
+            bool, Query(description='Include saved task priorities for an authenticated human session.')
+        ] = False,
+    ):
         principal = actor(request)
         # Keep the recovery page discoverable for the configured owner if inventory startup fails.
         # Device and metric routes still enforce their existing authorization and readiness.
@@ -1049,7 +1065,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 except (HubError, HTTPException):
                     pass
         return {"paused": repo.get_paused(), "projects": projects(),
-                "tasks": repo.list_task_views(),
+                "tasks": repo.list_task_views(
+                    include_task_priorities=include_task_priorities and principal.startswith("human:")),
                 "decisions": repo.list_decision_views() if principal.startswith("human:") else repo.list_decisions(),
                 "runs": repo.list_runs(), "agents": await agents_for(), "autonomy": autonomy_for(),
                 "image_versions": image_versions_for(notes_repository),
@@ -1076,9 +1093,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         return {"items": await agents_for()}
 
     @app.get("/api/hub/v1/tasks", response_model=TaskListDTO, response_model_exclude_unset=True)
-    def list_tasks(request: Request):
+    def list_tasks(request: Request, task_order: Literal['priority'] | None = None):
         actor(request)
-        return {"items": repo.list_task_views()}
+        return {"items": repo.list_priority_task_views() if task_order else repo.list_task_views()}
 
     @app.post("/api/hub/v1/tasks", status_code=201, response_model=TaskDTO, response_model_exclude_unset=True)
     def create_task(payload: NewTask, request: Request):
@@ -1086,7 +1103,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         return repo.create_task(actor(request, mutation=True), payload.project,
                                 payload.title, payload.client_request_id,
                                 details=payload.details, links=payload.links, acceptance=payload.acceptance,
-                                owner=payload.assignee, reviewer=payload.assigned_reviewer, request_text=payload.request_text)
+                                owner=payload.assignee, reviewer=payload.assigned_reviewer, request_text=payload.request_text,
+                                priority=payload.priority)
 
     @app.post('/api/hub/v1/tasks/{task_id}/update', response_model=TaskDTO, response_model_exclude_unset=True)
     def update_task(task_id: str, payload: TaskUpdate, request: Request):
@@ -1095,7 +1113,22 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                                 owner=payload.assignee, reviewer=payload.assigned_reviewer, note=payload.note,
                                 status=payload.status, evidence=payload.evidence,
                                 waiting=payload.waiting.model_dump() if payload.waiting else None,
-                                client_request_id=payload.client_request_id)
+                                client_request_id=payload.client_request_id, priority=payload.priority,
+                                expected_priority_revision=payload.expected_priority_revision)
+
+    @app.post('/api/hub/v1/tasks/{task_id}/priority', response_model=TaskDTO, response_model_exclude_unset=True)
+    def update_task_priority(
+        task_id: Annotated[str, APIPath(pattern=r'^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$')],
+        payload: TaskPriorityUpdate,
+        request: Request,
+    ):
+        """Edit advisory priority only; requires a human session, Origin and CSRF token."""
+        canonical = f'/api/hub/v1/tasks/{task_id}/priority'.encode('ascii')
+        if request.scope.get('raw_path', canonical) != canonical:
+            raise HTTPException(400, detail={'code': 'invalid_path'})
+        return repo.update_task(human(request, mutation=True), task_id, payload.expected_revision,
+                                client_request_id=payload.client_request_id, priority=payload.priority,
+                                expected_priority_revision=payload.expected_priority_revision)
 
     @app.post('/api/hub/v1/tasks/{task_id}/resolve-waiting', response_model=TaskDTO, response_model_exclude_unset=True)
     def resolve_waiting(task_id: str, payload: ResolveWaiting, request: Request):

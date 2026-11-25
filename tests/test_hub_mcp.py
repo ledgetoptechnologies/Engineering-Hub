@@ -98,6 +98,33 @@ def test_errors_do_not_reflect_peer_input(hub):
     assert "not_found" in str(response)
 
 
+def test_agent_can_read_open_tasks_in_priority_order(hub):
+    client, repo = hub
+    human = 'human:123'
+    ordinary = repo.create_task(human, 'engineering-hub', 'Legacy', 'priority-legacy')
+    urgent = repo.create_task(human, 'engineering-hub', 'Urgent first', 'priority-urgent')
+    low = repo.create_task(human, 'engineering-hub', 'Low', 'priority-low')
+    urgent2 = repo.create_task(human, 'engineering-hub', 'Urgent second', 'priority-urgent2')
+    high = repo.create_task(human, 'engineering-hub', 'High', 'priority-high')
+    closed = repo.create_task(human, 'engineering-hub', 'Closed', 'priority-done')
+    repo.update_task(human, closed['id'], 1, status='done', evidence='Fixture completion')
+    before = call(client, 'hub_overview', {'task_order': 'priority'})
+    assert not before.get('isError'), before
+    default_before = call(client, 'hub_overview')['structuredContent']['tasks']
+    for task, priority in [(urgent, 'urgent'), (low, 'low'), (urgent2, 'urgent'), (high, 'high')]:
+        repo.update_task(human, task['id'], 1, priority=priority)
+    ranked = call(client, 'hub_overview', {'task_order': 'priority'})['structuredContent']['tasks']
+    assert [(task['id'], task['priority']) for task in ranked] == [
+        (urgent['id'], 'urgent'), (urgent2['id'], 'urgent'), (high['id'], 'high'),
+        (ordinary['id'], 'normal'), (low['id'], 'low')]
+    assert [task.get('priority_revision', 0) for task in ranked] == [1, 1, 1, 0, 1]
+    ordinary_results = call(client, 'hub_overview')['structuredContent']['tasks']
+    assert [x['id'] for x in ordinary_results] == [x['id'] for x in (ordinary, urgent, low, urgent2, high, closed)]
+    assert ordinary_results == default_before
+    assert call(client, 'hub_task_get', {'task_id': urgent['id']})['structuredContent'] == urgent
+    assert call(client, 'hub_overview', {'task_order': 'unrecognized'}).get('isError')
+
+
 def test_backlog_task_create_update_and_compact_overview(hub):
     client, repo = hub
     created = call(client, "hub_task_create", {

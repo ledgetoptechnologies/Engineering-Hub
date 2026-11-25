@@ -1,5 +1,8 @@
 """Backlog tasks: agent creation, reviewer/acceptance, waiting-on-Beau and done. No executor."""
+from concurrent.futures import ThreadPoolExecutor
 import json
+import sqlite3
+from threading import Barrier
 
 import pytest
 from fastapi.testclient import TestClient
@@ -70,6 +73,18 @@ def test_named_owner_claims_and_others_cannot(repo):
     with pytest.raises(HubError, match='forbidden'):
         repo.claim_task('hermes', task['id'], 1)
     assert repo.claim_task('claude', task['id'], 1)['status'] == 'claimed'
+
+
+def test_reprioritizing_a_verified_task_preserves_review_and_never_grants_admission(repo):
+    task = create(repo, owner='claude', reviewer='codex')
+    task = verified(repo, task)
+    updated = repo.update_task(BEAU, task['id'], task['revision'], priority='urgent')
+    assert {key: updated[key] for key in ('status', 'owner', 'candidate_commit', 'review')} == {
+        key: task[key] for key in ('status', 'owner', 'candidate_commit', 'review')}
+    assert updated['priority'] == 'urgent'
+    assert repo.task_allows_environment(task['id'], 'production') is False
+    assert repo.task_allows_environment(task['id'], 'staging') is False
+    assert repo.list_priority_task_views()[0]['id'] == task['id']
 
 
 def test_update_permissions_owner_reviewer_human_only(repo):
@@ -235,6 +250,202 @@ def beau(client, app, settings):
     session = app.state.sessions.create_session(42)
     client.cookies.set(settings.auth_config.cookie_name, session['cookie_token'])
     return {'Origin': settings.auth_config.origin, 'X-Hub-CSRF': session['csrf_token']}
+
+
+def test_human_sets_task_priority_without_changing_state_or_legacy_contract(hub):
+    client, app, settings = hub
+    body = {'project': PROJECT, 'title': 'Ordinary work', 'client_request_id': 'legacy'}
+    old = client.post(BASE + '/tasks', headers=agent('claude'), json=body).json()
+    assert 'priority' not in old
+    update_url = f"{BASE}/tasks/{old['id']}/update"
+    update = {'expected_revision': old['revision'], 'client_request_id': 'priority-edit', 'priority': 'urgent'}
+    assert client.post(update_url, headers=agent('claude'), json=update).status_code == 403
+    assert client.post(BASE + '/tasks', headers=agent('claude'),
+                       json={**body, 'client_request_id': 'agent-new', 'priority': 'urgent'}).status_code == 403
+    before = client.get(BASE + '/tasks', headers=agent('claude')).json()['items'][0]
+    headers = beau(client, app, settings)
+    assert client.post(update_url, json=update).status_code == 403  # No CSRF.
+    response = client.post(update_url, headers=headers, json=update)
+    assert response.status_code == 200, response.text
+    changed = response.json()
+    assert changed['priority'] == 'urgent' and changed['status'] == old['status']
+    assert changed['revision'] == old['revision'] and changed['priority_revision'] == 1
+    assert client.post(update_url, headers=headers, json=update).json() == changed
+    assert client.post(update_url, headers=headers, json={**update, 'priority': 'high'}).status_code == 409
+    stale = client.post(update_url, headers=headers, json={**update, 'client_request_id': 'stale'})
+    assert stale.status_code == 409 and stale.json()['detail']['code'] == 'priority_revision_conflict'
+    assert client.post(update_url, headers=headers, json={**update, 'priority': 'whatever'}).status_code == 422
+    after = client.get(BASE + '/tasks', headers=agent('claude')).json()['items'][0]
+    assert after == before
+    assert changed['updated_at'] == old['updated_at']
+    assert client.post(BASE + '/tasks', headers=headers,
+                       json={**body, 'client_request_id': 'new', 'priority': 'high'}).json()['priority'] == 'high'
+    ranked = client.get(BASE + '/tasks?task_order=priority', headers=agent('claude')).json()['items']
+    assert [task['priority'] for task in ranked] == ['urgent', 'high']
+
+
+def test_priority_edits_check_both_revisions_and_replay_after_reopen(hub):
+    client, app, settings = hub
+    headers = beau(client, app, settings)
+    create = client.post(BASE + '/tasks', headers=headers, json={
+        'project': PROJECT, 'title': 'Priority CAS', 'client_request_id': 'new', 'priority': 'high'})
+    assert create.status_code == 201, create.text
+    task = create.json()
+    update_url = f"{BASE}/tasks/{task['id']}/update"
+    first_body = {'expected_revision': task['revision'], 'expected_priority_revision': 0,
+                  'client_request_id': 'first', 'priority': 'urgent'}
+    first = client.post(update_url, headers=headers, json=first_body)
+    assert first.status_code == 200, first.text
+    assert first.json()['priority_revision'] == 1
+    note = client.post(update_url, headers=headers, json={
+        'expected_revision': task['revision'], 'client_request_id': 'note', 'note': 'Still relevant'})
+    assert note.status_code == 200, note.text
+    noted = note.json()
+    assert noted['revision'] == task['revision'] + 1
+    assert not {'priority', 'priority_revision'} & noted.keys()
+    next_body = {**first_body, 'expected_priority_revision': 1, 'client_request_id': 'next', 'priority': 'low'}
+    stale = client.post(update_url, headers=headers, json=next_body)
+    assert stale.status_code == 409 and stale.json()['detail']['code'] == 'revision_conflict'
+    next_body['expected_revision'] = noted['revision']
+    second = client.post(update_url, headers=headers, json=next_body)
+    assert second.status_code == 200, second.text
+    assert second.json() == {**noted, 'priority': 'low', 'priority_revision': 2}
+    conflict = client.post(update_url, headers=headers, json={**next_body, 'expected_priority_revision': 2})
+    assert conflict.status_code == 409 and conflict.json()['detail']['code'] == 'idempotency_conflict'
+
+    reopened = HubRepository(app.state.repository.path)
+    assert reopened.get_task(task['id']) == noted
+    assert reopened.list_priority_task_views() == [{
+        **second.json(), 'state_since': app.state.repository.list_task_views()[0]['state_since']}]
+    assert reopened.update_task(BEAU, task['id'], task['revision'], priority='urgent',
+                                client_request_id='first') == first.json()
+    with reopened._connection() as db:
+        for table in ('hub_audit', 'hub_outbox'):
+            rows = db.execute(f'SELECT action, revision FROM {table} WHERE entity_id=? ORDER BY sequence',
+                              (task['id'],)).fetchall()
+            assert list(map(tuple, rows)) == [
+                ('task.created', task['revision']), ('task.priority_updated', task['revision']),
+                ('task.updated', noted['revision']), ('task.priority_updated', noted['revision'])]
+    assert audit(reopened, task['id'])[-1] == (BEAU, 'task.priority_updated')
+
+
+def test_priority_endpoint_is_strict_and_projects_only_on_opt_in(hub):
+    client, app, settings = hub
+    repo = app.state.repository
+    task = repo.create_task(BEAU, PROJECT, 'Before', 'task')
+    task_path = f"{BASE}/tasks/{task['id']}"
+    priority_path = task_path + '/priority'
+    body = dict(priority='high', expected_revision=task['revision'], expected_priority_revision=0,
+                client_request_id='priority-edit')
+    assert client.post(priority_path, headers=agent('claude'), json=body).status_code == 403
+    headers = beau(client, app, settings)
+    assert client.post(priority_path, json=body).status_code == 403
+    assert client.post(priority_path, headers={**headers, 'Origin': 'https://other.test'}, json=body).status_code == 403
+    for field in body:
+        assert client.post(priority_path, headers=headers,
+                           json={k: v for k, v in body.items() if k != field}).status_code == 422
+    for bad in ({'expected_revision': True}, {'expected_priority_revision': None},
+                {'expected_priority_revision': False}, {'expected_priority_revision': '0'},
+                {'expected_priority_revision': 0.0}, {'expected_priority_revision': -1},
+                {'priority': None}, {'note': None}, {'client_request_id': ''}):
+        assert client.post(priority_path, headers=headers, json=body | bad).status_code == 422
+    assert client.post(f"{BASE}/tasks/{task['id'].upper()}/priority", headers=headers, json=body).status_code == 422
+    assert client.post(task_path + '/%70riority', headers=headers, json=body).status_code == 400
+    assert audit(repo, task['id']) == [(BEAU, 'task.created')]
+    before = client.get(BASE + '/overview').json()['tasks']
+
+    response = client.post(priority_path, headers=headers, json=body)
+    assert response.status_code == 200, response.text
+    changed = response.json()
+    assert changed == {**task, 'priority': 'high', 'priority_revision': 1}
+    # Both write adapters use the same receipt, even across route changes.
+    assert client.post(task_path + '/update', headers=headers, json=body).json() == changed
+    assert client.post(priority_path, headers=headers, json=body | {'priority': 'urgent'}).status_code == 409
+    assert client.get(task_path).json() == task
+    assert client.get(BASE + '/overview').json()['tasks'] == before
+    assert client.get(BASE + '/overview?include_task_priorities=true').json()['tasks'] == [
+        {**before[0], 'priority': 'high', 'priority_revision': 1}]
+    assert client.get(BASE + '/overview?include_task_priorities=true', headers=agent('claude')).json()['tasks'] == before
+
+
+def test_priority_receipt_failure_rolls_back_sidecar_audit_and_outbox(repo):
+    task = repo.create_task(BEAU, PROJECT, 'Atomic edit', 'task', priority='normal')
+    identity = task['id']
+
+    def snapshot():
+        with repo._connection() as db:
+            return [db.execute(f'SELECT * FROM {table} ORDER BY rowid').fetchall()
+                    for table in ('hub_entities', 'hub_requests', 'hub_audit', 'hub_outbox')]
+
+    before = snapshot()
+    with repo._transaction() as db:
+        db.execute('''CREATE TRIGGER fail_priority_receipt BEFORE INSERT ON hub_requests
+            WHEN NEW.key = 'task_update:atomic' BEGIN SELECT RAISE(ABORT, 'fixture abort'); END''')
+    edit = dict(priority='high', client_request_id='atomic', expected_priority_revision=0)
+    with pytest.raises(sqlite3.IntegrityError, match='fixture abort'):
+        repo.update_task(BEAU, identity, task['revision'], **edit)
+    assert snapshot() == before
+    with repo._transaction() as db:
+        db.execute('DROP TRIGGER fail_priority_receipt')
+    assert repo.update_task(BEAU, identity, task['revision'], **edit) == {
+        **task, 'priority': 'high', 'priority_revision': 1}
+
+
+def test_competing_priority_edits_at_same_versions_only_commit_one(repo):
+    task = repo.create_task(BEAU, PROJECT, 'No execution drift', 'task', priority='normal')
+    # Separate repositories/connections compete for the same ledger. Saving the
+    # same label still advances CAS, so a stale draft cannot replace its result.
+    barrier = Barrier(2)
+
+    def edit(key):
+        current = HubRepository(repo.path)
+        barrier.wait(timeout=10)
+        try:
+            return current.update_task(BEAU, task['id'], task['revision'], priority='normal',
+                                       expected_priority_revision=0, client_request_id=key)
+        except HubError as error:
+            return error.code
+
+    with ThreadPoolExecutor(2) as threads:
+        results = list(threads.map(edit, ('a', 'b')))
+    assert results.count('priority_revision_conflict') == 1
+    assert {**task, 'priority_revision': 1} in results
+    assert audit(repo, task['id']) == [(BEAU, 'task.created'), (BEAU, 'task.priority_updated')]
+
+
+@pytest.mark.parametrize('edit', [
+    {'details': 'Different instructions'}, {'links': []}, {'acceptance': []}, {'assignee': 'hermes'},
+    {'assigned_reviewer': 'codex'}, {'note': 'Progress'}, {'status': 'done'},
+    {'waiting': {'type': 'action', 'text': 'Approve build'}}, {'evidence': 'Completion evidence'},
+])
+def test_priority_rejects_mixed_update_without_effect(hub, edit):
+    client, app, settings = hub
+    headers = beau(client, app, settings)
+    task = app.state.repository.create_task(BEAU, PROJECT, 'Unchanged', 'new')
+    response = client.post(f"{BASE}/tasks/{task['id']}/update", headers=headers, json={
+        'expected_revision': task['revision'], 'client_request_id': 'mixed', 'priority': 'high', **edit})
+    assert response.status_code == 400 and response.json()['detail']['code'] == 'invalid_priority_update'
+    assert app.state.repository.get_task(task['id']) == task
+    assert audit(app.state.repository, task['id']) == [(BEAU, 'task.created')]
+
+
+@pytest.mark.parametrize('token', [False, -1, '0', 0.0])
+def test_priority_revision_is_a_nonnegative_strict_integer(hub, token):
+    client, app, settings = hub
+    headers = beau(client, app, settings)
+    task = app.state.repository.create_task(BEAU, PROJECT, 'Unchanged', 'new')
+    response = client.post(f"{BASE}/tasks/{task['id']}/update", headers=headers, json={
+        'expected_revision': task['revision'], 'client_request_id': 'invalid', 'priority': 'high',
+        'expected_priority_revision': token})
+    assert response.status_code == 422
+    assert app.state.repository.get_task(task['id']) == task
+
+
+def test_priority_revision_without_priority_does_not_apply_note(repo):
+    task = create(repo, owner='claude')
+    with pytest.raises(HubError, match='invalid_priority_update'):
+        repo.update_task(BEAU, task['id'], task['revision'], note='Mixed', expected_priority_revision=0)
+    assert repo.get_task(task['id']) == task
 
 
 def test_rest_agent_create_update_and_beau_clears_action(hub):

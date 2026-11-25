@@ -23,10 +23,15 @@ export interface Review {
   commit: string;
   verdict: "approve" | "reject";
 }
+export type TaskPriority = "low" | "normal" | "high" | "urgent";
 export interface Task extends Versioned {
   project: ProjectId;
   title: string;
   status: "assigned" | "claimed" | "in_review" | "verified" | "withdrawn" | "waiting_on_beau" | "done";
+  /** Triage metadata only; older records without a priority are normal. */
+  priority?: TaskPriority | null;
+  /** Independent of the task's execution revision; absent on legacy records (effective 0). */
+  priority_revision?: number | null;
   /** A legacy family, or "installation:<uuid>"; the installation's family is in owner_family. */
   owner: string | null;
   owner_family?: Agent | null;

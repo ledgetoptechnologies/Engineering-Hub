@@ -151,6 +151,8 @@ def browser_route_allowed(method, path):
         or re.fullmatch(r'/api/hub/v1/(?:tasks|decisions)/' + _UUID + '/(?:context|withdraw)', path) is not None
         # Beau's Inbox Done and Undo; both handlers are human-session only.
         or re.fullmatch(r'/api/hub/v1/tasks/' + _UUID + '/(?:resolve-waiting|restore-waiting)', path) is not None
+        # Admit only the advisory writer, never the generic task /update.
+        or re.fullmatch(r'/api/hub/v1/tasks/' + _UUID + '/priority', path) is not None
         or path == '/api/hub/v1/projects'
         or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + '/components', path) is not None
         or re.fullmatch(r'/api/hub/v1/components/' + _UUID + '/retire', path) is not None

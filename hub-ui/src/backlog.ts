@@ -1,5 +1,5 @@
 /** Backlog views over tasks: what waits on Beau, what is still moving, and the Work page filters. */
-import type { Task } from "./types";
+import type { Task, TaskPriority } from "./types";
 
 /** Tasks parked on Beau with a decision or action item he must clear. */
 export const waitingTasks = (tasks: Task[], project?: string) =>
@@ -15,6 +15,8 @@ export const isActive = (task: Task) => !["verified", "done", "withdrawn"].inclu
 
 export const WORK_FILTERS: (Task["status"] | "all")[] =
   ["all", "assigned", "claimed", "in_review", "verified", "waiting_on_beau", "done"];
+
+export const TASK_PRIORITIES: readonly TaskPriority[] = ["urgent", "high", "normal", "low"];
 
 /** One acceptance criterion per non-blank line. */
 export const parseAcceptance = (text: string) => text.split("\n").map((line) => line.trim()).filter(Boolean);

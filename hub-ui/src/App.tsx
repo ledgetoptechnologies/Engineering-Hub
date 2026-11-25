@@ -20,6 +20,7 @@ import { InfrastructurePage } from "./pages/InfrastructurePage";
 import { TopologyPage } from "./pages/TopologyPage";
 import { OrchestrationPage } from "./pages/OrchestrationPage";
 import { acceptsAnswer, retainsAnswerDraft, openDecisions } from "./pages/decisions";
+import { TaskPriorityField } from "./pages/tasks";
 import { isActive, parseAcceptance, waitingTasks } from "./backlog";
 import { LabelSetPage } from "./pages/LabelSets";
 import { ReviewPage } from "./ReviewsPanel";
@@ -32,6 +33,7 @@ import type {
   ProjectId,
   PublicReachability,
   Session,
+  TaskPriority,
   TopicSnapshot,
 } from "./types";
 
@@ -93,6 +95,7 @@ export function HubApp() {
   const [taskProject, setTaskProject] = useState<ProjectId>("engineering-hub");
   const [taskAcceptance, setTaskAcceptance] = useState("");
   const [taskReviewer, setTaskReviewer] = useState<Agent | "">("");
+  const [taskPriority, setTaskPriority] = useState<TaskPriority>("normal");
   const [pauseChoice, setPauseChoice] = useState<boolean | null>(null);
   const [decisionChoices, setDecisionChoices] = useState<
     Record<string, { revision: number; answer: string }>
@@ -134,6 +137,7 @@ export function HubApp() {
     setNewTask(false);
     setTaskTitle("");
     setTaskProject("engineering-hub");
+    setTaskPriority("normal");
     taskRequest.current = null;
     setPauseChoice(null);
     setDecisionChoices({});
@@ -543,7 +547,7 @@ export function HubApp() {
     event.preventDefault();
     const acceptance = parseAcceptance(taskAcceptance);
     const reviewer = taskReviewer || null;
-    const payload = JSON.stringify([taskProject, taskTitle.trim(), acceptance, reviewer]);
+    const payload = JSON.stringify([taskProject, taskTitle.trim(), acceptance, reviewer, taskPriority]);
     if (!taskRequest.current || taskRequest.current.payload !== payload)
       taskRequest.current = { payload, key: crypto.randomUUID() };
     const ok = await mutate(
@@ -553,7 +557,7 @@ export function HubApp() {
           taskTitle.trim(),
           taskRequest.current!.key,
           session!.csrf_token!,
-          { acceptance, reviewer },
+          { acceptance, reviewer, priority: taskPriority },
         ),
       "Task assigned.",
     );
@@ -563,6 +567,7 @@ export function HubApp() {
       setTaskTitle("");
       setTaskAcceptance("");
       setTaskReviewer("");
+      setTaskPriority("normal");
     }
   }
   async function recordDecision(
@@ -626,6 +631,11 @@ export function HubApp() {
       task.waiting_on?.type === "decision" ? "Answer recorded." : "Marked done."),
     restoreWaiting: (task) => mutate(
       () => client.restoreWaiting(task.id, task.revision, session!.csrf_token!), "Question restored."),
+    updateTaskPriority: (task, priority, key) => writable && data.tasks.some((item) =>
+      item.id === task.id && item.revision === task.revision && (item.priority_revision ?? 0) === (task.priority_revision ?? 0))
+      ? mutate(() => client.updateTaskPriority(task.id, task.revision, task.priority_revision ?? 0, priority, key, session!.csrf_token!),
+        "Task priority updated.")
+      : Promise.resolve(false),
     withdraw: (kind, item, reason, supersededBy) => mutate(
       () => client.withdraw(kind, item.id, item.revision, reason, supersededBy, session!.csrf_token!),
       kind === "task" ? "Task withdrawn. It is kept under Withdrawn with its history." : "Question withdrawn. It is kept under Withdrawn with its history."),
@@ -871,6 +881,7 @@ export function HubApp() {
               <textarea autoFocus value={taskTitle} onChange={(event) => setTaskTitle(event.target.value)}
                 maxLength={200} required rows={3} placeholder="A concrete, testable outcome…" />
             </label>
+            <TaskPriorityField value={taskPriority} onChange={setTaskPriority} disabled={!writable} />
             <label className="field">
               Acceptance criteria
               <textarea value={taskAcceptance} onChange={(event) => setTaskAcceptance(event.target.value)}

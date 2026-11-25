@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { HubApiError, HubClient } from "./api";
+import { createDemoOverview } from "./mocks";
 
 const response = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -8,6 +9,37 @@ const response = (body: unknown, status = 200) =>
   });
 
 describe("live human API boundary", () => {
+  it("opts into priority metadata on the same-origin overview read", async () => {
+    const overview = createDemoOverview();
+    const prioritized = { ...overview.tasks[0], priority: "high" as const, priority_revision: 2 };
+    overview.tasks[0] = prioritized;
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response(overview));
+    const client = new HubClient({ mode: "live", fetchImpl });
+
+    expect((await client.getOverview()).tasks).toEqual([prioritized, overview.tasks[1]]);
+    expect(fetchImpl.mock.calls).toEqual([["/api/hub/v1/overview?include_task_priorities=true", {
+      method: "GET", credentials: "same-origin", redirect: "error", headers: { Accept: "application/json" },
+    }]]);
+  });
+
+  it("sends only the priority edit fields to the dedicated same-origin CSRF route", async () => {
+    const id = "00000000-0000-4000-8000-000000000008";
+    const updated = { ...createDemoOverview().tasks[0], id, revision: 7, priority: "urgent", priority_revision: 3 };
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response(updated));
+    const client = new HubClient({ mode: "live", fetchImpl });
+
+    await expect(client.updateTaskPriority(id, 7, 2, "urgent", "priority-key", "")).rejects.toMatchObject({ code: "csrf_required" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(await client.updateTaskPriority(id, 7, 2, "urgent", "priority-key", "fixture-csrf")).toEqual(updated);
+    expect(fetchImpl).toHaveBeenCalledExactlyOnceWith(`/api/hub/v1/tasks/${id}/priority`, expect.objectContaining({
+      method: "POST", credentials: "same-origin", redirect: "error",
+      headers: { Accept: "application/json", "Content-Type": "application/json", "X-Hub-CSRF": "fixture-csrf" },
+    }));
+    expect(JSON.parse(fetchImpl.mock.calls[0][1]?.body as string)).toEqual({
+      priority: "urgent", expected_revision: 7, expected_priority_revision: 2, client_request_id: "priority-key",
+    });
+  });
+
   it.each([
     [403, "gateway_route_forbidden"],
     [400, "gateway_invalid_path"],

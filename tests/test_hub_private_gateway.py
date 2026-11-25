@@ -561,6 +561,7 @@ async def test_real_owner_human_session_tasks_decisions_and_csrf(tmp_path, monke
 
 TASK_ID = '1111aaaa-2222-4333-8444-00000000000b'
 WAITING_ROUTES = ('resolve-waiting', 'restore-waiting')
+NARROW_TASK_ROUTES = (*WAITING_ROUTES, 'priority')
 
 
 def recording_receiver():
@@ -577,18 +578,20 @@ def recording_receiver():
 
 
 @pytest.mark.parametrize('method,path', [
-    *[(method, f'{BASE}/tasks/{TASK_ID}/{route}') for route in WAITING_ROUTES
+    *[(method, f'{BASE}/tasks/{TASK_ID}/{route}') for route in NARROW_TASK_ROUTES
       for method in ('GET', 'HEAD', 'PUT', 'PATCH', 'DELETE')],
-    *[('POST', f'{BASE}/tasks/{bad}/{route}') for route in WAITING_ROUTES for bad in (
+    *[('POST', f'{BASE}/tasks/{bad}/{route}') for route in NARROW_TASK_ROUTES for bad in (
         'x', TASK_ID.upper(), TASK_ID[:-1], TASK_ID + '0', TASK_ID.replace('-', ''))],
     ('POST', f'{BASE}/tasks/resolve-waiting'), ('POST', f'{BASE}/tasks/{TASK_ID}/resolve-waiting/x'),
     ('POST', f'{BASE}/decisions/{TASK_ID}/resolve-waiting'),
     ('POST', f'{BASE}/decisions/{TASK_ID}/restore-waiting'),
+    ('POST', f'{BASE}/tasks/{TASK_ID}/priority/x'), ('POST', f'{BASE}/tasks/{TASK_ID}/priority/'),
+    ('POST', f'{BASE}/decisions/{TASK_ID}/priority'), ('POST', f'{BASE}/tasks/priority'),
     # Unrelated task mutations stay closed to the browser.
     ('POST', f'{BASE}/tasks/{TASK_ID}/update'), ('POST', f'{BASE}/tasks/{TASK_ID}/claim'),
     ('POST', f'{BASE}/tasks/{TASK_ID}/waiting-level'),
 ])
-async def test_waiting_actions_are_post_with_a_task_uuid_only(method, path):
+async def test_narrow_task_actions_are_post_with_a_task_uuid_only(method, path):
     calls, receiver = recording_receiver()
     result = await exchange(receiver, path, method=method)
     assert status(result) == 403
@@ -596,8 +599,8 @@ async def test_waiting_actions_are_post_with_a_task_uuid_only(method, path):
     assert calls == []
 
 
-@pytest.mark.parametrize('route', WAITING_ROUTES)
-async def test_waiting_actions_pass_the_route_table_but_still_need_browser_credentials(route):
+@pytest.mark.parametrize('route', NARROW_TASK_ROUTES)
+async def test_narrow_task_actions_pass_the_route_table_but_still_need_browser_credentials(route):
     calls, receiver = recording_receiver()
     path = f'{BASE}/tasks/{TASK_ID}/{route}'
     # Signed out: the route is admitted, then Access refuses before core.
@@ -609,7 +612,7 @@ async def test_waiting_actions_pass_the_route_table_but_still_need_browser_crede
     assert calls == []
 
 
-async def test_real_owner_human_done_and_undo_on_waiting_tasks(tmp_path, monkeypatch):
+async def test_real_owner_human_done_undo_and_priority_on_waiting_tasks(tmp_path, monkeypatch):
     private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(private.public_key()))
     jwk.update(kid='fixture-key', alg='RS256', use='sig')
@@ -651,7 +654,10 @@ async def test_real_owner_human_done_and_undo_on_waiting_tasks(tmp_path, monkeyp
                                          base_url=config.origin, follow_redirects=False)
             async with browser() as outsider:
                 # Signed out, and agent bearer tokens with or without a browser Origin.
-                for path, body in ((done_path, done_body), (undo_path, undo_body)):
+                priority_path = f"{BASE}/tasks/{asked['id']}/priority"
+                priority_body = dict(priority='urgent', expected_revision=asked['revision'],
+                                     expected_priority_revision=0, client_request_id='urgency')
+                for path, body in ((done_path, done_body), (undo_path, undo_body), (priority_path, priority_body)):
                     assert (await outsider.post(path, json=body,
                         headers={'Origin': config.origin})).status_code == 401
                     for token in ('test-codex', 'test-claude', 'test-hermes'):
@@ -666,7 +672,7 @@ async def test_real_owner_human_done_and_undo_on_waiting_tasks(tmp_path, monkeyp
                 assert me['authenticated'] and me['actor'].startswith('human:cf:')
                 beau.headers['Origin'] = config.origin
                 # Signed in, but a missing or wrong CSRF token is refused by the owner.
-                for path, body in ((done_path, done_body), (undo_path, undo_body)):
+                for path, body in ((done_path, done_body), (undo_path, undo_body), (priority_path, priority_body)):
                     assert (await beau.post(path, json=body)).status_code == 403
                     assert (await beau.post(path, json=body,
                         headers={'X-Hub-CSRF': 'incorrect'})).status_code == 403
@@ -679,6 +685,15 @@ async def test_real_owner_human_done_and_undo_on_waiting_tasks(tmp_path, monkeyp
                 assert repo.get_task(withdrawn['id']) == withdrawn
 
                 beau.headers['X-Hub-CSRF'] = me['csrf_token']
+                mixed = await beau.post(priority_path, json=priority_body | {'note': 'must not be accepted'})
+                assert mixed.status_code == 422
+                priority = await beau.post(priority_path, json=priority_body)
+                assert priority.status_code == 200, priority.text
+                assert priority.json() == {**asked, 'priority': 'urgent', 'priority_revision': 1}
+                assert repo.get_task(asked['id']) == asked
+                overview = await beau.get(BASE + '/overview?include_task_priorities=true')
+                assert overview.status_code == 200, overview.text
+                assert next(t for t in overview.json()['tasks'] if t['id'] == asked['id'])['priority'] == 'urgent'
                 done = await beau.post(done_path, json=done_body)
                 assert done.status_code == 200, done.text
                 assert done.json()['status'] == 'claimed'

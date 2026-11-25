@@ -103,6 +103,48 @@ agent and stays until Beau clears it. `hub_overview` omits long
 backlog text (acceptance, notes, request) and gives counts; `hub_task_get` returns
 the full record.
 
+Use **Work → Priority** to see unfinished tasks ranked Urgent, High, Normal,
+and Low. Done and withdrawn tasks stay out of this view; work waiting on Beau
+or passing review stays visible with its existing status. Within a level,
+older tasks come first. Existing tasks without a saved priority count as Normal.
+
+Agents can request `hub_overview(task_order="priority")`, or read
+`GET /api/hub/v1/tasks?task_order=priority`, for the same order and effective
+priority. Browser clients request `GET /api/hub/v1/overview?include_task_priorities=true`
+to include saved priorities in the usual overview, without changing its order or
+filter. Default list, detail and overview responses retain their existing shapes.
+
+Only the authenticated human can set `priority` at creation or edit it via
+`POST /api/hub/v1/tasks/{task_id}/priority`. The endpoint accepts only a canonical
+lowercase task UUID and exactly four required JSON fields: `priority`,
+`client_request_id`, the current `expected_revision`, and the current
+`expected_priority_revision`. Priority is `urgent`, `high`, `normal` or `low`.
+Send integer `0` for an absent `priority_revision`, including on a newly
+prioritized task. A human session, matching Origin and CSRF token are required.
+The browser gateways allow this specific edit; the generic `/update` stays
+denied there. Outside those gateways, existing `/update` clients can still send
+a priority-only edit, for which omitted or null `expected_priority_revision`
+means zero. `/update` rejects non-null substantive fields mixed with `priority`,
+or a non-null `expected_priority_revision` without `priority` (`400 invalid_priority_update`).
+
+A new priority edit requires both revisions to match (`409 revision_conflict`
+or `409 priority_revision_conflict`). It increments `priority_revision` and
+records `task.priority_updated` in the audit and outbox against the task ID
+without changing the canonical task row, including its revision and timestamp.
+The priority, request receipt, audit and outbox are committed together. An
+identical keyed retry returns the original result without another effect, even
+if the task has since changed; reusing the key with a different edit conflicts.
+Priority does not authorize, reorder, or dispatch a run and does not invalidate
+existing approval or execution fences.
+
+Priority uses a distinct `task_priority` record in `hub_entities`, not inline
+fields on the task and not a schema migration. On rollback to `60263aa`, priority
+is not visible; the older build can read and update the same canonical task. The
+saved priority is visible again on re-upgrade. Rollback does not imply concurrent
+mixed-version writers are supported. An exact-source regression in
+`tests/test_hub_task_priority_rollback.py` exercises this cycle against a private
+ledger when the rollback commit is present in the local Git object store.
+
 A distinct existing agent identity claims each task, records
 an exact 40-character commit and obtains a different agent's review of that exact
 commit. All changes use expected revisions. Replacing a candidate invalidates
