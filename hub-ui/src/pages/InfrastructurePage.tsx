@@ -1,10 +1,11 @@
 /**
  * Infrastructure: what devices the Hub knows about, what its checks last saw, and why one is down.
- * Reads on open, on Refresh and when the Hub's event feed invalidates the workspace; never polls.
+ * Reads on open, on Refresh, on workspace invalidation, and every 30 seconds while visible.
  * Declared facts, probe observations and maintenance notes are shown separately, and nothing here
  * powers, restarts or changes a device.
  */
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { inventoryUnavailable, transientRefreshError, useInfrastructureRefresh } from "../infrastructureRefresh";
 import { HubApiError } from "../api";
 import type { Hub } from "../hub";
 import { httpInfrastructure, writeFailureText, type DeviceDraft, type InfrastructureClient } from "../infrastructureApi";
@@ -17,7 +18,7 @@ import { href, navigate, registerRouteLeaveGuard, type MachineDetailRoute } from
 import { Badge, PageHeader, PanelTitle } from "../ui";
 import { MachineDetailPage, MachineHealth, MachineWorkspace, useMachineMetrics, type MachineReading } from "./MachineHealth";
 
-type Load<T> = { state: "loading" } | { state: "loaded"; value: T } | { state: "failed"; message: string } | { state: "unavailable" };
+type Load<T> = { state: "loading" } | { state: "loaded"; refreshFailed?: boolean; value: T } | { state: "failed"; message: string } | { state: "unavailable" };
 type Filter = "all" | "attention" | "maintenance";
 
 /** Ages badges and overdue notes by this browser's clock without reading anything. */
@@ -35,27 +36,30 @@ const UNAVAILABLE = "Infrastructure isn't available to you on this Hub.";
 function useClient(hub: Hub): InfrastructureClient {
   return useMemo(() => hub.demo ? demoInfrastructure() : httpInfrastructure(), [hub.demo]);
 }
-function useRead<T>(hub: Hub, read: (signal: AbortSignal) => Promise<T>, deps: unknown[]): [Load<T>, () => void] {
-  const [load, setLoad] = useState<Load<T>>({ state: "loading" });
-  const [attempt, setAttempt] = useState(0);
-  const reader = useRef(read); reader.current = read;
+type InventoryRead<T> = (signal: AbortSignal) => Promise<T>;
+function useRead<T>(hub: Hub, read: InventoryRead<T>, paused: boolean): [Load<T>, () => void] {
+  // The memoized reader identifies the query; overview invalidations and refresh ticks don't change it.
+  const [snapshot, setSnapshot] = useState<{ read: InventoryRead<T>; load: Load<T> }>();
+  const load: Load<T> = snapshot?.read === read ? snapshot.load : { state: "loading" };
+  const [attempt, refresh, runRead] = useInfrastructureRefresh(!paused && !hub.demo && load.state !== "unavailable");
   useEffect(() => {
-    const controller = new AbortController();
-    setLoad(current => current.state === "loaded" ? current : { state: "loading" });
-    reader.current(controller.signal).then(value => {
-      if (!controller.signal.aborted) setLoad({ state: "loaded", value });
-    }).catch(error => {
-      if (controller.signal.aborted) return;
+    // Entering the editor cancels an in-flight Inventory read. Closing it reads fresh data.
+    if (paused) return;
+    setSnapshot(current => current?.read === read && current.load.state === "loaded" ? current : { read, load: { state: "loading" } });
+    return runRead(read, value => {
+      setSnapshot({ read, load: { state: "loaded", value } });
+    }, error => {
       if (error instanceof HubApiError && error.status === 401) { hub.clearPrivateWorkspace(); return; }
-      if (error instanceof HubApiError && [403, 404, 503].includes(error.status) && error.code !== "device_not_found") {
-        setLoad({ state: "unavailable" }); return;
+      if (inventoryUnavailable(error)) {
+        setSnapshot({ read, load: { state: "unavailable" } }); return;
       }
-      setLoad({ state: "failed", message: error instanceof HubApiError && error.code === "device_not_found"
-        ? "This device isn't in the Hub's inventory." : "The Hub's infrastructure list couldn't be read. Use Refresh to try again." });
+      const message = error instanceof HubApiError && error.code === "device_not_found"
+        ? "This device isn't in the Hub's inventory." : "The Hub's infrastructure list couldn't be read. Use Refresh to try again.";
+      setSnapshot(current => current?.read === read && current.load.state === "loaded" && transientRefreshError(error)
+        ? { read, load: { ...current.load, refreshFailed: true } } : { read, load: { state: "failed", message } });
     });
-    return () => controller.abort();
-  }, [...deps, attempt]);
-  return [load, () => setAttempt(value => value + 1)];
+  }, [read, hub.clearPrivateWorkspace, hub.data, attempt, paused, runRead]);
+  return [load, refresh];
 }
 
 type InventoryAccess = (available: boolean) => void;
@@ -93,7 +97,8 @@ function DeviceListPage({ hub, actions, reading, onInventoryAccess }: {
   const [retired, setRetired] = useState(false);
   const [filter, setFilter] = useState<Filter>("all");
   const [creating, setCreating] = useState(false);
-  const [load, refresh] = useRead<DeviceList>(hub, signal => client.list(signal, retired), [client, retired, hub.data]);
+  const read = useCallback((signal: AbortSignal) => client.list(signal, retired), [client, retired]);
+  const [load, refresh] = useRead<DeviceList>(hub, read, creating);
   useInventoryAccess(load.state, onInventoryAccess);
   // Machine health has its own admission: someone refused the device list may still read metrics, and it hides itself otherwise.
   if (load.state === "unavailable") return <Unavailable actions={actions}><MachineHealth hub={hub} reading={reading} inventoryReadAvailable={false} /></Unavailable>;
@@ -111,8 +116,8 @@ function DeviceListPage({ hub, actions, reading, onInventoryAccess }: {
     <section className="panel infra" aria-label="Devices">
       <PanelTitle title="Devices" count={list ? shown.length : undefined}>
         {list && <a href={href({ page: "topology" })}>Topology</a>}
-        {canEdit && <button type="button" className="secondary" onClick={() => setCreating(true)}>Add device</button>}
-        <button type="button" className="secondary" disabled={load.state === "loading"} onClick={refresh}>
+        {canEdit && !creating && <button type="button" className="secondary" onClick={() => setCreating(true)}>Add device</button>}
+        <button type="button" className="secondary" disabled={creating || load.state === "loading"} onClick={refresh}>
           {load.state === "loading" ? "Reading…" : "Refresh"}</button>
       </PanelTitle>
       {hub.demo && <p role="status">Demo: illustrative devices with example addresses. Nothing is read from a real network.</p>}
@@ -123,10 +128,12 @@ function DeviceListPage({ hub, actions, reading, onInventoryAccess }: {
             {kind === "all" ? "All" : kind === "attention" ? "Needs attention" : "In maintenance"}
             {list && kind !== "all" && <span>{count(kind)}</span>}</button>)}
         </div>
-        <label className="infra-toggle"><input type="checkbox" checked={retired} onChange={event => setRetired(event.target.checked)} /> Show retired</label>
+        {/* Switching inventory queries unloads the list and would discard an open draft. */}
+        <label className="infra-toggle"><input type="checkbox" checked={retired} disabled={creating} onChange={event => setRetired(event.target.checked)} /> Show retired</label>
       </div>
-      {creating && canEdit && <DeviceEditor client={client} csrf={hub.session?.csrf_token ?? ""} device={null}
-        onDone={saved => { setCreating(false); if (saved) { refresh(); navigate({ page: "device", id: saved.id }); } }} />}
+      {creating && <DeviceEditor client={client} csrf={hub.session?.csrf_token ?? ""} device={null} writable={canEdit} onUnauthorized={hub.clearPrivateWorkspace}
+        onDone={saved => { setCreating(false); if (saved) navigate({ page: "device", id: saved.id }); }} />}
+      {load.state === "loaded" && load.refreshFailed && <p className="notice" role="status">Couldn't refresh device list. Showing the last reading.</p>}
       {load.state === "loading" && !list && <p role="status">Reading the device list…</p>}
       {load.state === "failed" && <p className="notice error" role="alert">{load.message}</p>}
       {list && list.items.length === 0 && <p className="infra-empty">No devices are recorded yet.</p>}
@@ -167,7 +174,8 @@ function DevicePage({ hub, actions, route, reading, onInventoryAccess }: {
   const now = useNow();
   const self = hub.session?.actor ?? null;
   const [editing, setEditing] = useState(false);
-  const [load, refresh] = useRead<DeviceDetail>(hub, signal => client.detail(id, signal), [client, id, hub.data]);
+  const read = useCallback((signal: AbortSignal) => client.detail(id, signal), [client, id]);
+  const [load, refresh] = useRead<DeviceDetail>(hub, read, editing);
   useInventoryAccess(load.state, onInventoryAccess);
   if (load.state === "unavailable") return <Unavailable actions={actions} />;
   const detail = load.state === "loaded" ? load.value : null;
@@ -178,6 +186,7 @@ function DevicePage({ hub, actions, route, reading, onInventoryAccess }: {
     <div className="machine-detail-heading"><PageHeader eyebrow="INFRASTRUCTURE / REGISTERED DEVICE" title={device?.name ?? "Device"}
       subtitle={device ? device.role : undefined}>{actions}</PageHeader></div>
     <p className="infra-back"><a href={href({ page: "infrastructure" })}>← All devices</a></p>
+    {load.state === "loaded" && load.refreshFailed && <p className="notice" role="status">Couldn't refresh device details. Showing the last reading.</p>}
     {load.state === "loading" && !detail && <p role="status">Reading this device…</p>}
     {load.state === "failed" && <p className="notice error" role="alert">{load.message}</p>}
     {device && detail && <div className="infra-detail">
@@ -185,11 +194,12 @@ function DevicePage({ hub, actions, route, reading, onInventoryAccess }: {
       <section className="panel" aria-label="Declared details">
         <PanelTitle title="Declared details">
           {detail.capabilities.device_write && writable && !editing && <button type="button" className="secondary" onClick={() => setEditing(true)}>Edit</button>}
-          <button type="button" className="secondary" disabled={load.state === "loading"} onClick={refresh}>Refresh</button>
+          <button type="button" className="secondary" disabled={editing || load.state === "loading"} onClick={refresh}>Refresh</button>
         </PanelTitle>
         <p className="panel-description">What's been recorded about this device. Recorded details aren't checked against the device itself.</p>
         {device.retired && <p className="notice" role="status">This device is retired. Its history is kept.</p>}
-        {editing ? <DeviceEditor client={client} csrf={csrf} device={device} onDone={saved => { setEditing(false); if (saved) refresh(); }} />
+        {editing ? <DeviceEditor client={client} csrf={csrf} device={device} writable={writable && detail.capabilities.device_write}
+          onUnauthorized={hub.clearPrivateWorkspace} onDone={() => setEditing(false)} />
           : <dl className="infra-facts">
             <dt>Hostname</dt><dd>{device.hostname ?? "Not recorded"}</dd>
             {device.metrics_host && <><dt>Prometheus host</dt><dd><code>{device.metrics_host}</code></dd></>}
@@ -218,6 +228,7 @@ function DevicePage({ hub, actions, route, reading, onInventoryAccess }: {
 function useLeaveGuard(dirty: boolean, message: string) {
   const ref = useRef(dirty); ref.current = dirty;
   useEffect(() => registerRouteLeaveGuard(() => !ref.current || window.confirm(message)), []);
+  return () => { ref.current = false; };
 }
 const when = (iso: string) => new Date(iso).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 const newRequestId = () => (globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`);
@@ -362,31 +373,48 @@ function toDraft(draft: EditorDraft, retired: boolean): DeviceDraft {
     network: draft.network.trim() || null, vlan: draft.vlan ? Number(draft.vlan) : null, role: draft.role.trim(), retired };
 }
 
-function DeviceEditor({ client, csrf, device, onDone }: { client: InfrastructureClient; csrf: string; device: Device | null; onDone: (saved: Device | null) => void }) {
+function DeviceEditor({ client, csrf, device, writable, onUnauthorized, onDone }: {
+  client: InfrastructureClient; csrf: string; device: Device | null; writable: boolean;
+  onUnauthorized: () => void; onDone: (saved: Device | null) => void;
+}) {
   const creating = device === null;
   const initial: EditorDraft = { id: device?.id ?? "", name: device?.name ?? "", hostname: device?.hostname ?? "", metricsHost: device?.metrics_host ?? "",
     addresses: (device?.addresses ?? []).join("\n"), network: device?.network ?? "", vlan: device?.vlan?.toString() ?? "", role: device?.role ?? "" };
   const [draft, setDraft] = useState(initial);
+  const [expectedRevision] = useState(device?.revision ?? 0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [shown, setShown] = useState(false);
   const dirty = JSON.stringify(draft) !== JSON.stringify(initial);
-  useLeaveGuard(dirty, "Discard unsaved device changes?");
+  const clearLeaveGuard = useLeaveGuard(dirty, "Discard unsaved device changes?");
+  const form = useRef<HTMLFormElement>(null);
   const problems = editorProblems(draft, creating);
   const set = (key: keyof EditorDraft) => (event: { target: { value: string } }) => setDraft(current => ({ ...current, [key]: event.target.value }));
   async function save(retired: boolean) {
     setShown(true);
-    if (busy || problems.length) return;
+    // React detaches this ref on unmount, including when the workspace changes actor.
+    const activeForm = form.current;
+    if (!activeForm || !writable || busy || problems.length) return;
     setBusy(true); setError("");
-    try { onDone(await client.saveDevice(toDraft(draft, retired), device?.revision ?? 0, csrf)); }
-    catch (failure) { setError(writeFailureText(failure)); }
-    finally { setBusy(false); }
+    try {
+      const saved = await client.saveDevice(toDraft(draft, retired), expectedRevision, csrf);
+      if (form.current !== activeForm) return;
+      // Add navigates before React unmounts the editor and unregisters its guard.
+      clearLeaveGuard();
+      onDone(saved);
+    }
+    catch (failure) {
+      if (form.current !== activeForm) return;
+      if (failure instanceof HubApiError && failure.status === 401) onUnauthorized();
+      else setError(writeFailureText(failure));
+    }
+    finally { if (form.current === activeForm) setBusy(false); }
   }
   function retire() {
     if (device && window.confirm(device.retired ? `Bring ${device.name} back into service?` : `Retire ${device.name}? It's hidden from the list but its history is kept.`))
       void save(!device.retired);
   }
-  return <form className="infra-form" aria-label={creating ? "Add device" : "Edit device"} onSubmit={event => { event.preventDefault(); void save(device?.retired ?? false); }}>
+  return <form ref={form} className="infra-form" aria-label={creating ? "Add device" : "Edit device"} onSubmit={event => { event.preventDefault(); void save(device?.retired ?? false); }}>
     {creating && <label className="field compact"><span className="field-label">Device ID</span>
       <input required maxLength={64} value={draft.id} onChange={set("id")} placeholder="e.g. build-pc" />
       <small>Lowercase letters, numbers and dashes. It can't be changed later and doesn't depend on the address.</small></label>}
@@ -407,8 +435,8 @@ function DeviceEditor({ client, csrf, device, onDone }: { client: Infrastructure
     {error && <p className="notice error" role="alert">{error}</p>}
     <div className="button-row">
       <button type="button" className="secondary" disabled={busy} onClick={() => { if (!dirty || window.confirm("Discard unsaved device changes?")) onDone(null); }}>Cancel</button>
-      {!creating && <button type="button" className="secondary" disabled={busy} onClick={retire}>{device!.retired ? "Return to service" : "Retire device"}</button>}
-      <button type="submit" disabled={busy}>{busy ? "Saving…" : creating ? "Add device" : "Save changes"}</button>
+      {!creating && <button type="button" className="secondary" disabled={busy || !writable} onClick={retire}>{device!.retired ? "Return to service" : "Retire device"}</button>}
+      <button type="submit" disabled={busy || !writable}>{busy ? "Saving…" : creating ? "Add device" : "Save changes"}</button>
     </div>
   </form>;
 }

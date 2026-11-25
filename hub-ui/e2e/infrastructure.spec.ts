@@ -76,7 +76,8 @@ test("appears in the menu only when the Hub grants infrastructure access", async
   await expect(devicesPanel(page)).toContainText("Build PC");
 });
 
-test("lists devices with each check and maintenance, worded honestly, and reads only when asked", async ({ page }) => {
+test("lists devices with each check and maintenance, and supports manual and 30-second refresh", async ({ page }) => {
+  await page.clock.install();
   const state = await fixture(page);
   await page.goto("/#/infrastructure");
   const row = devicesPanel(page).getByRole("listitem").filter({ hasText: "Build PC" });
@@ -86,10 +87,12 @@ test("lists devices with each check and maintenance, worded honestly, and reads 
   await expect(row).toContainText("Maintenance: Hermes: Planned shutdown to replace the disk. · overdue by 20 min");
   await expect(devicesPanel(page).getByRole("listitem").filter({ hasText: "Camera hub" })).toContainText("Unknown: no checks set up");
   await expect(devicesPanel(page)).not.toContainText(/\b(online|offline|powered|is up|is down)\b/i);
-  await page.waitForTimeout(500);
+  await page.clock.runFor(20_000);
   expect(state.lists).toBe(1);
   await devicesPanel(page).getByRole("button", { name: "Refresh" }).click();
   await expect.poll(() => state.lists).toBe(2);
+  await page.clock.runFor(10_000);
+  await expect.poll(() => state.lists).toBe(3);
   expect(blocking(await audit(page, "page", 1440))).toEqual([]);
 });
 
@@ -103,7 +106,8 @@ test("filters to devices needing attention or in maintenance", async ({ page }) 
   await expect(devicesPanel(page).getByRole("listitem")).toHaveText([/Build PC/]);
 });
 
-test("a check goes out of date by this browser's clock without reading again", async ({ page }) => {
+test("a check goes out of date by this browser's clock even while hidden and not polling", async ({ page }) => {
+  await page.addInitScript(() => Object.defineProperty(document, "visibilityState", { get: () => "hidden" }));
   const start = Date.now();
   await page.clock.install({ time: start });
   const state = await fixture(page, { list: [list(undefined, start)] });
@@ -117,7 +121,7 @@ test("a check goes out of date by this browser's clock without reading again", a
 
 test("not allowed, not set up and an older Hub all show the same plain message", async ({ page }) => {
   for (const reply of [{ status: 403, body: { detail: { code: "infrastructure_forbidden" } } },
-    { status: 503, body: { detail: { code: "infrastructure_disabled" } } },
+    { status: 503, body: { detail: { code: "infrastructure_not_configured" } } },
     { status: 403, body: { detail: { code: "gateway_route_forbidden" } } }]) {
     await page.unrouteAll();
     await fixture(page, { list: [reply] });
@@ -146,6 +150,32 @@ test("a device page shows declared facts, checks and the journal as plain text",
   // Agent-written text is shown, never run or rendered as markup.
   await expect(maintenance).toContainText("<img src=x onerror=alert(1)>");
   await expect(page.locator("img[src=x]")).toHaveCount(0);
+});
+
+test("a temporary detail outage preserves the maintenance draft and polling recovers", async ({ page }) => {
+  await page.clock.install();
+  const device = devices()[1];
+  const detail = { device, capabilities: { device_write: false, maintenance_write: true }, maintenance: { items: [], truncated: false } };
+  const state = await fixture(page, { detail: [{ status: 200, body: detail },
+    { status: 503, body: { detail: { code: "infrastructure_unavailable" } } },
+    { status: 200, body: { ...detail, device: { ...device, name: "Camera hub recovered" } } },
+    { status: 503, body: { detail: { code: "infrastructure_not_configured" } } }] });
+  await page.goto("/#/infrastructure/camera-hub");
+  const reason = page.getByRole("form", { name: "Record maintenance" }).getByLabel("Reason");
+  await reason.fill("Unsaved maintenance note");
+  await page.clock.runFor(30_000);
+  const notice = page.getByText("Couldn't refresh device details. Showing the last reading.");
+  await expect(notice).toBeVisible();
+  await expect(reason).toHaveValue("Unsaved maintenance note");
+  await page.clock.runFor(30_000);
+  await expect(page.getByRole("heading", { name: /Camera hub recovered/ })).toBeVisible();
+  await expect(notice).toHaveCount(0);
+  await expect(reason).toHaveValue("Unsaved maintenance note");
+  await page.clock.runFor(30_000);
+  await expect(reason).toHaveCount(0);
+  await expect(page.getByText("Infrastructure isn't available to you on this Hub.")).toBeVisible();
+  await page.clock.runFor(30_000);
+  expect(state.details).toBe(4);
 });
 
 test("records maintenance with CSRF and keeps one request id across a retry", async ({ page }) => {
@@ -181,7 +211,12 @@ test("a resolve that loses a race says so and keeps the text", async ({ page }) 
 });
 
 test("the owner can add a device; the form catches mistakes before saving", async ({ page }) => {
-  const state = await fixture(page, { writes: [{ status: 200, body: devices()[1] }] });
+  const saved = { ...devices()[1], id: "office-printer", name: "Office printer", role: "Printing" };
+  const state = await fixture(page, {
+    writes: [{ status: 200, body: saved }],
+    detail: [{ status: 200, body: { device: saved, capabilities: { device_write: true, maintenance_write: true },
+      maintenance: { items: [], truncated: false } } }],
+  });
   await page.goto("/#/infrastructure");
   await devicesPanel(page).getByRole("button", { name: "Add device" }).click();
   const form = page.getByRole("form", { name: "Add device" });
@@ -196,11 +231,134 @@ test("the owner can add a device; the form catches mistakes before saving", asyn
   expect(state.writes).toHaveLength(0);
   await form.getByLabel("Device ID").fill("office-printer");
   await form.getByLabel(/IP addresses/).fill("192.0.2.40");
+  const dialogs: string[] = [];
+  page.on("dialog", async dialog => { dialogs.push(dialog.message()); await dialog.dismiss(); });
   await form.getByRole("button", { name: "Add device" }).click();
   await expect.poll(() => state.writes.length).toBe(1);
   expect(state.writes[0]).toMatchObject({ method: "PUT", path: "/api/hub/v1/infrastructure/devices/office-printer", csrf: "fixture-csrf",
     body: { name: "Office printer", hostname: null, addresses: ["192.0.2.40"], network: "192.0.2.0/24", vlan: null, role: "Printing",
       retired: false, expected_revision: 0 } });
+  await expect(page).toHaveURL(/\/infrastructure\/office-printer$/);
+  await expect(page.getByRole("heading", { level: 1, name: `${saved.name}.`, exact: true })).toBeVisible();
+  expect(dialogs).toEqual([]);
+});
+
+test("Show retired cannot discard an open Add device draft", async ({ page }) => {
+  await fixture(page);
+  const active = list().body;
+  const retiredDevice = { ...active.items[1], id: "retired-fixture", name: "Retired fixture device", retired: true };
+  const queries: Array<string | null> = [];
+  await page.route(url => url.pathname === "/api/hub/v1/infrastructure/devices", route => {
+    const includeRetired = new URL(route.request().url()).searchParams.get("include_retired");
+    queries.push(includeRetired);
+    return route.fulfill({ json: includeRetired === "true" ? { ...active, items: [...active.items, retiredDevice] } : active });
+  });
+
+  await page.goto("/#/infrastructure");
+  const panel = devicesPanel(page);
+  const showRetired = panel.getByRole("checkbox", { name: "Show retired" });
+  const retiredRow = panel.getByRole("link", { name: /^Retired fixture device/ });
+  await panel.getByRole("button", { name: "Add device" }).click();
+  const form = page.getByRole("form", { name: "Add device" });
+  const name = form.getByLabel("Name", { exact: true });
+  await name.fill("Unsaved office printer");
+
+  // Attempt a real click without waiting for Playwright's enabled check.
+  await showRetired.scrollIntoViewIfNeeded();
+  const box = (await showRetired.boundingBox())!;
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await expect(name).toHaveValue("Unsaved office printer");
+  await expect(showRetired).toBeDisabled();
+  await expect(showRetired).not.toBeChecked();
+  await expect(retiredRow).toHaveCount(0);
+  expect(queries).toEqual([null]);
+
+  page.once("dialog", dialog => dialog.accept());
+  await form.getByRole("button", { name: "Cancel" }).click();
+  await expect(form).toHaveCount(0);
+  await expect(showRetired).toBeEnabled();
+  await expect.poll(() => queries).toEqual([null, null]);
+  await showRetired.check();
+  await expect(retiredRow).toBeVisible();
+  expect(queries).toEqual([null, null, "true"]);
+});
+
+const editorCases = [
+  { title: "Add device", path: "/#/infrastructure", panelName: "Devices", open: "Add device", save: "Add device", count: "lists" },
+  { title: "Edit device", path: "/#/infrastructure/build-pc", panelName: "Declared details", open: "Edit", save: "Save changes", count: "details" },
+] as const;
+
+for (const editor of editorCases) test(`refreshing the workspace preserves an open ${editor.title} draft and pauses Inventory reads`, async ({ page }) => {
+  await page.clock.install();
+  const state = await fixture(page);
+  await page.goto(editor.path);
+  const panel = page.getByRole("region", { name: editor.panelName });
+  await panel.getByRole("button", { name: editor.open, exact: true }).click();
+  const form = panel.getByRole("form", { name: editor.title });
+  const name = form.getByRole("textbox", { name: "Name", exact: true });
+  await name.fill("Unsaved workstation");
+
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  await page.route("**/api/hub/v1/overview", async route => {
+    await held;
+    const overview = createDemoOverview(new Date());
+    (overview.capabilities as Record<string, unknown>).infrastructure = true;
+    await route.fulfill({ json: overview });
+  });
+  const refreshWorkspace = page.getByRole("button", { name: "Refresh workspace" });
+  const refreshInventory = panel.getByRole("button", { name: "Refresh", exact: true });
+  const save = form.getByRole("button", { name: editor.save, exact: true });
+  try {
+    await refreshWorkspace.click();
+    await expect(refreshWorkspace).toBeDisabled();
+    await expect(name).toHaveValue("Unsaved workstation");
+    await expect(save).toBeDisabled();
+    await expect(refreshInventory).toBeDisabled();
+    release();
+    await expect(refreshWorkspace).toBeEnabled();
+    await expect(save).toBeEnabled();
+    await page.clock.runFor(30_000);
+    await expect(name).toHaveValue("Unsaved workstation");
+    expect(state[editor.count]).toBe(1);
+
+    page.once("dialog", dialog => dialog.accept());
+    await form.getByRole("button", { name: "Cancel" }).click();
+    await expect(form).toHaveCount(0);
+    await expect(refreshInventory).toBeEnabled();
+    await expect.poll(() => state[editor.count]).toBe(2);
+  } finally { release(); }
+});
+
+test("a device save 401 clears an open Inventory draft when metrics are forbidden", async ({ page }) => {
+  const state = await fixture(page, {
+    metrics: [{ status: 403, body: { detail: { code: "forbidden" } } }],
+    writes: [
+      { status: 403, body: { detail: { code: "infrastructure_forbidden" } } },
+      { status: 401, body: { detail: { code: "human_session_required" } } },
+    ],
+  });
+  await page.goto("/#/infrastructure");
+  const panel = devicesPanel(page);
+  await panel.getByRole("button", { name: "Add device" }).click();
+  const form = panel.getByRole("form", { name: "Add device" });
+  const name = form.getByLabel("Name", { exact: true });
+  const submit = form.getByRole("button", { name: "Add device", exact: true });
+  await form.getByLabel("Device ID").fill("office-printer");
+  await name.fill("Unsaved office printer");
+  await form.getByLabel("Role").fill("Printing");
+
+  await submit.click();
+  await expect(form.getByRole("alert")).toContainText("You aren't allowed to make this change.");
+  await expect(name).toHaveValue("Unsaved office printer");
+  await expect(submit).toBeEnabled();
+
+  await submit.click();
+  await expect(page.getByText("Sign in to Engineering Hub.")).toBeVisible();
+  await expect(form).toHaveCount(0);
+  await expect(panel).toHaveCount(0);
+  expect(state.writes).toHaveLength(2);
+  expect(state.metrics).toBe(1);
 });
 
 test("a single network can't hold both IP families; a dual-stack device leaves it empty", async ({ page }) => {
@@ -506,6 +664,7 @@ test("a current failed scrape says so; an old one is only out of date", async ({
 });
 
 test("a device page says when Prometheus has no matching machine, and the editor sets the Prometheus host", async ({ page }) => {
+  await page.clock.install();
   const state = await fixture(page, { metrics: [metrics()], writes: [{ status: 200, body: devices()[0] }] });
   await page.goto("/#/infrastructure/build-pc");
   await expect(page.getByRole("region", { name: "Machine history" })).toContainText("Prometheus isn't reporting a machine named build.example.test");
@@ -516,6 +675,9 @@ test("a device page says when Prometheus has no matching machine, and the editor
   await expect(form.getByRole("alert")).toContainText("The Prometheus host can use letters");
   expect(state.writes).toHaveLength(0);
   await form.getByLabel(/Prometheus host/).fill("BUILD-PC");
+  await page.clock.runFor(30_000);
+  await expect(form.getByLabel(/Prometheus host/)).toHaveValue("BUILD-PC");
+  expect(state.details).toBe(1);
   await form.getByRole("button", { name: "Save changes" }).click();
   await expect.poll(() => state.writes.length).toBe(1);
   expect(state.writes[0].body).toMatchObject({ hostname: "build.example.test", metrics_host: "BUILD-PC" });
@@ -552,10 +714,172 @@ test("new Prometheus targets appear on the next refresh without reloading Infras
   const added = panel.getByRole("link", { name: /New monitoring host/ });
   await expect(added).toHaveCount(0);
   expect(state.metrics).toBe(1);
-  await page.clock.runFor(60_000);
+  await page.clock.runFor(30_000);
   await expect(added).toBeVisible();
   await expect(added).toHaveAttribute("href", /\/infrastructure\/machines\//);
   expect(state.metrics).toBe(2);
+});
+
+test("a deferred manual read survives a poll tick, times out and recovers", async ({ page }) => {
+  await page.clock.install();
+  await fixture(page);
+  let reads = 0;
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  await page.route("**/api/hub/v1/infrastructure/devices*", async route => {
+    if (++reads === 2) await held;
+    await route.fulfill({ json: list().body });
+  });
+  try {
+    await page.goto("/#/infrastructure");
+    const panel = devicesPanel(page);
+    await expect(panel.getByRole("link", { name: "Build PC" })).toBeVisible();
+    await page.clock.runFor(25_000);
+    await panel.getByRole("button", { name: "Refresh" }).click();
+    await expect.poll(() => reads).toBe(2);
+    await page.clock.runFor(6_000);
+    expect(reads).toBe(2);
+    const notice = panel.getByText("Couldn't refresh device list. Showing the last reading.");
+    await expect(notice).toHaveCount(0);
+    await page.clock.runFor(10_000);
+    await expect(notice).toBeVisible();
+    await expect(panel.getByRole("link", { name: "Build PC" })).toBeVisible();
+    await page.clock.runFor(20_000);
+    await expect(notice).toHaveCount(0);
+    expect(reads).toBe(3);
+  } finally { release(); }
+});
+
+test("Inventory discards the previous filter's reading when the new query fails", async ({ page }) => {
+  await fixture(page);
+  const queries: Array<string | null> = [];
+  const active = list().body;
+  const retiredDevice = { ...active.items[1], id: "retired-fixture", name: "Retired fixture device", retired: true };
+  await page.route("**/api/hub/v1/infrastructure/devices*", route => {
+    const includeRetired = new URL(route.request().url()).searchParams.get("include_retired");
+    queries.push(includeRetired);
+    if (queries.length === 3) return route.fulfill({ status: 503, json: { detail: { code: "infrastructure_unavailable" } } });
+    return route.fulfill({ json: includeRetired === "true" ? { ...active, items: [...active.items, retiredDevice] } : active });
+  });
+  await page.goto("/#/infrastructure");
+  const panel = devicesPanel(page);
+  const showRetired = panel.getByRole("checkbox", { name: "Show retired" });
+  const retired = panel.getByRole("link", { name: /^Retired fixture device/ });
+  const activeRow = panel.getByRole("link", { name: /^Build PC/ });
+  await expect(activeRow).toBeVisible();
+  await expect(retired).toHaveCount(0);
+  await showRetired.check();
+  await expect(retired).toBeVisible();
+
+  const failedRead = page.waitForResponse(response => {
+    const url = new URL(response.url());
+    return url.pathname === "/api/hub/v1/infrastructure/devices" && !url.searchParams.has("include_retired") && response.status() === 503;
+  });
+  await showRetired.uncheck();
+  await failedRead;
+  await expect(panel.getByText(/couldn't (refresh device list|be read)/i)).toBeVisible();
+  expect(queries).toEqual([null, "true", null]);
+  await expect(retired, "the active-only query must not show the retired row from the previous query").toHaveCount(0);
+  await expect(panel.getByRole("listitem")).toHaveCount(0);
+  await expect(panel.getByRole("alert")).toContainText("Use Refresh to try again");
+
+  await panel.getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect(activeRow).toBeVisible();
+  await expect(retired).toHaveCount(0);
+  await expect(showRetired).not.toBeChecked();
+  await expect(panel.getByRole("alert")).toHaveCount(0);
+  expect(queries).toEqual([null, "true", null, null]);
+});
+
+test("a same-query Inventory 429 keeps the last reading and the next poll recovers", async ({ page }) => {
+  const now = Date.now();
+  await page.clock.install({ time: now });
+  const initial = list(undefined, now);
+  const recovered = list(undefined, now + 60_000);
+  recovered.body.items[0].observations[0].state = "failed";
+  const state = await fixture(page, { list: [initial, initial, { status: 429, body: {} }, recovered] });
+  const query = "/api/hub/v1/infrastructure/devices?include_retired=true";
+  const read = () => page.waitForResponse(response => {
+    const url = new URL(response.url());
+    return response.request().method() === "GET" && url.pathname + url.search === query;
+  });
+  await page.goto("/#/infrastructure");
+  const panel = devicesPanel(page);
+  const reading = panel.getByRole("listitem").filter({ hasText: "Build PC" });
+  const showRetired = panel.getByRole("checkbox", { name: "Show retired" });
+  await expect(reading).toContainText("Exporter scrape: Check passed");
+  const firstRead = read();
+  await showRetired.check();
+  expect((await firstRead).status()).toBe(200);
+  await expect(reading).toContainText("Exporter scrape: Check passed");
+  expect(state.lists).toBe(2);
+
+  const rateLimited = read();
+  await page.clock.runFor(30_000);
+  const failed = await rateLimited;
+  expect(failed.status()).toBe(429);
+  expect(state.lists).toBe(3);
+  const notice = panel.getByRole("status").filter({ hasText: "Couldn't refresh device list. Showing the last reading." });
+  const alert = panel.getByRole("alert");
+  await expect(notice.or(alert)).toBeVisible();
+  // Soft checks still exercise the next poll if retention or its notice regresses.
+  expect.soft(await reading.allTextContents(), "retain the last successful reading").toEqual([expect.stringContaining("Exporter scrape: Check passed")]);
+  expect.soft(await notice.isVisible(), "show the refresh-failure notice").toBe(true);
+  await expect(showRetired).toBeChecked();
+
+  const nextPoll = read();
+  await page.clock.runFor(30_000);
+  const next = await nextPoll;
+  expect(next.status()).toBe(200);
+  expect(next.url()).toBe(failed.url());
+  expect(state.lists).toBe(4);
+  await expect(reading).toContainText("Exporter scrape: Last check failed");
+  await expect(notice).toHaveCount(0);
+  await expect(alert).toHaveCount(0);
+  await expect(showRetired).toBeChecked();
+});
+
+test("visible registered device details, current readings and charts refresh every 30 seconds", async ({ page }) => {
+  await page.clock.install();
+  const metrics = { status: 200, body: prioritizedMetrics() };
+  const disabled = { status: 503, body: { detail: { code: "infrastructure_not_configured" } } };
+  const state = await fixture(page, { metrics: [metrics, { status: 503, body: {} }, metrics, metrics, disabled] });
+  const historyReads: string[] = [];
+  await page.route("**/api/hub/v1/infrastructure/metrics/history**", async route => {
+    const { searchParams } = new URL(route.request().url());
+    const host = searchParams.get("host"), range = searchParams.get("range");
+    historyReads.push(`${host}|${range}`);
+    if (historyReads.length === 2) return route.fulfill({ status: 503, json: {} });
+    if (historyReads.length === 4) return route.fulfill({ status: disabled.status, json: disabled.body });
+    await route.fulfill({ json: { schema_version: 1, generated_at: new Date().toISOString(), host_key: host, range,
+      step_seconds: 3600, source: { status: "ok" }, series: [{ key: "cpu", label: null, unit: "ratio",
+        points: historyReads.length === 1 ? [[3600, 0.2], [7200, 0.6]] : [[10800, 0.8]] }] } });
+  });
+  await page.goto("/infrastructure/build-pc?range=7d");
+  const chart = page.getByRole("img", { name: /^CPU:/ });
+  await expect(chart).toHaveAccessibleName(/60%/);
+  await chart.press("ArrowRight");
+  await expect(page.locator(".history-tip")).toBeVisible();
+  await page.clock.runFor(30_000);
+  await expect(page.getByText("Couldn't refresh machine health. Showing the last reading.")).toBeVisible();
+  await expect(page.getByText("Couldn't refresh history. Showing the last reading.")).toBeVisible();
+  await expect(chart).toHaveAccessibleName(/60%/);
+  await page.clock.runFor(30_000);
+  await expect(chart).toHaveAccessibleName(/80%/);
+  await expect(page.locator(".history-tip")).toHaveCount(0);
+  await expect(page.getByText(/Couldn't refresh/)).toHaveCount(0);
+  expect(state.details).toBe(3);
+  expect(state.metrics).toBe(3);
+  expect(historyReads).toEqual(Array(3).fill(`host:${"1".padStart(64, "0")}|7d`));
+  await expect(page.getByRole("combobox", { name: "Time range" })).toHaveValue("7d");
+  await page.clock.runFor(30_000);
+  await expect(chart).toHaveCount(0);
+  await expect(page.getByText("History isn't available for this machine.")).toBeVisible();
+  await page.clock.runFor(30_000);
+  await expect(page.getByRole("region", { name: "Machine history" })).toHaveCount(0);
+  await page.clock.runFor(30_000);
+  expect(historyReads).toHaveLength(4);
+  expect(state.metrics).toBe(5);
 });
 
 test("registered and discovered pages share graphs-first controls and keep the range through switching, reload and Back", async ({ page }) => {

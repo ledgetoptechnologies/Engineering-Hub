@@ -159,14 +159,17 @@ export function parseMetrics(value: unknown): MachineMetrics {
  * Why the Hub answered without readings. "not_configured" is only said after the person was
  * admitted (the server checks access first), so it doesn't reveal anything to someone refused.
  */
-export type MetricsGap = "not_configured" | "unavailable";
+export type MetricsGap = "not_configured" | "disabled" | "unavailable";
 async function metricsGap(response: Response): Promise<MetricsGap | null> {
-  if (response.status === 503) return "unavailable";
-  if (response.status !== 404 || !response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return null;
+  const fallback = response.status === 503 ? "unavailable" : null;
+  if (![404, 503].includes(response.status) || !response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return fallback;
   try {
     const body: unknown = await response.clone().json();
-    return (body as { detail?: { code?: unknown } })?.detail?.code === "infrastructure_metrics_not_configured" ? "not_configured" : null;
-  } catch { return null; }
+    const code = (body as { detail?: { code?: unknown } })?.detail?.code;
+    if (response.status === 503 && code === "infrastructure_not_configured") return "disabled";
+    if (response.status === 404 && code === "infrastructure_metrics_not_configured") return "not_configured";
+    return fallback;
+  } catch { return fallback; }
 }
 /** An admitted "not set up" answer, shown the same way as a Prometheus source that isn't configured. */
 export function notConfiguredMetrics(now = new Date()): MachineMetrics {
@@ -189,6 +192,7 @@ export async function readMetrics(signal: AbortSignal, fetchImpl: typeof fetch =
   if (response.status === 401) throw new HubApiError(401, "human_session_required");
   const gap = await metricsGap(response);
   if (gap === "not_configured") return notConfiguredMetrics();
+  if (gap === "disabled") return null;
   if (gap === "unavailable") return "unavailable";
   if ([403, 404].includes(response.status) || await isMissingRoute(response)) return null;
   if (!response.ok) throw new HubApiError(response.status, "infrastructure_metrics_failed");
@@ -237,6 +241,7 @@ export async function readHistory(hostKey: string, range: HistoryRange, signal: 
   if (response.status === 401) throw new HubApiError(401, "human_session_required");
   const gap = await metricsGap(response);
   if (gap === "not_configured") return { range, source: "not_configured", series: [] };
+  if (gap === "disabled") return null;
   if (gap === "unavailable") return "unavailable";
   if ([403, 404].includes(response.status) || await isMissingRoute(response)) return null;
   if (!response.ok) throw new HubApiError(response.status, "infrastructure_history_failed");

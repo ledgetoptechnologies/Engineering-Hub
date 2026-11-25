@@ -48,6 +48,10 @@ describe("machine metrics", () => {
     expect(unset).toMatchObject({ source: { status: "not_configured" }, targets: [] });
     expect(await readMetrics(new AbortController().signal, vi.fn(async () => json({ detail: { code: "infrastructure_unavailable" } }, 503)))).toBe("unavailable");
     expect(await readMetrics(new AbortController().signal, vi.fn(async () => new Response("down", { status: 503 })))).toBe("unavailable");
+    const disabled = () => json({ detail: { code: "infrastructure_not_configured" } }, 503);
+    expect(await readMetrics(new AbortController().signal, vi.fn(async () => disabled()))).toBeNull();
+    expect(await readHistory("host:" + "a".repeat(64), "6h", new AbortController().signal,
+      vi.fn(async () => disabled()))).toBeNull();
     const history = await readHistory("host:" + "a".repeat(64), "6h", new AbortController().signal,
       vi.fn(async () => json({ detail: { code: "infrastructure_metrics_not_configured" } }, 404)) as unknown as typeof fetch);
     expect(history).toEqual({ range: "6h", source: "not_configured", series: [] });

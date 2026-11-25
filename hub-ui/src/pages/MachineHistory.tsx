@@ -4,12 +4,13 @@
  * A missing sample breaks the line, so a gap reads as a gap and never as zero.
  */
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
+import { transientRefreshError, useInfrastructureRefresh } from "../infrastructureRefresh";
 import { HubApiError } from "../api";
 import type { Hub } from "../hub";
 import { demoMachineHistory } from "../infrastructureDemo";
 import { formatRate, percent, readHistory, type HistoryPoint, type HistoryRange, type HistorySeries, type MachineHistoryData } from "../infrastructureMetrics";
 
-type Load = { state: "loading" } | { state: "failed" } | { state: "gone" } | { state: "unavailable" } | { state: "loaded"; value: MachineHistoryData };
+type Load = { state: "loading" } | { state: "failed" } | { state: "gone" } | { state: "unavailable" } | { state: "loaded"; refreshFailed?: boolean; value: MachineHistoryData };
 interface Line { name: string; slot: number; points: HistoryPoint[] }
 
 export const RANGE_TEXT: Record<HistoryRange, string> = {
@@ -70,8 +71,9 @@ function useWidth() {
 
 function Chart({ title, lines, range, format, ratio }: { title: string; lines: Line[]; range: HistoryRange; format: (value: number | null) => string; ratio: boolean }) {
   const [ref, width] = useWidth();
-  const [hover, setHover] = useState<number | null>(null);
+  const [selectedTime, setHover] = useState<number | null>(null);
   const times = [...new Set(lines.flatMap(line => line.points.map(point => point[0])))].sort((a, b) => a - b);
+  const hover = selectedTime !== null && times.includes(selectedTime) ? selectedTime : null;
   const count = times.length, span = times[count - 1] - times[0];
   const samples = lines.map(line => new Map(line.points));
   const top = ratio ? 1 : niceMax(Math.max(0, ...lines.map(line => peak(line.points) ?? 0)));
@@ -83,12 +85,13 @@ function Chart({ title, lines, range, format, ratio }: { title: string; lines: L
   const labels = !span ? [0.5] : plot < 330 ? [0, 0.5, 1] : [0, 0.25, 0.5, 0.75, 1];
   const pick = (event: PointerEvent<SVGSVGElement>) => {
     const at = event.clientX - event.currentTarget.getBoundingClientRect().left;
-    setHover(times.reduce((best, moment, index) => Math.abs(x(moment) - at) < Math.abs(x(times[best]) - at) ? index : best, 0));
+    setHover(times.reduce((best, moment) => Math.abs(x(moment) - at) < Math.abs(x(best) - at) ? moment : best));
   };
   const keys = (event: KeyboardEvent<SVGSVGElement>) => {
     if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
     event.preventDefault();
-    setHover(current => Math.min(count - 1, Math.max(0, (current ?? count - 1) + (event.key === "ArrowLeft" ? -1 : 1))));
+    const index = hover === null ? count - 1 : times.indexOf(hover);
+    setHover(times[Math.min(count - 1, Math.max(0, index + (event.key === "ArrowLeft" ? -1 : 1)))]);
   };
   const multiple = lines.length > 1 || title === "Storage used" || title === "Network";
   const summary = lines.map(line => `${multiple ? line.name + " " : ""}latest ${format(latest(line.points))}, peak ${format(peak(line.points))}`).join("; ");
@@ -116,14 +119,14 @@ function Chart({ title, lines, range, format, ratio }: { title: string; lines: L
           </g>;
         })}
         {hover !== null && <g>
-          <line className="history-cross" x1={x(times[hover])} x2={x(times[hover])} y1={TOP} y2={TOP + inner} />
-          {lines.map((line, slot) => { const value = samples[slot].get(times[hover]);
-            return value == null ? null : <circle key={line.name} className={`history-mark history-series-${line.slot}`} cx={x(times[hover])} cy={y(value)} r={4} />; })}
+          <line className="history-cross" x1={x(hover)} x2={x(hover)} y1={TOP} y2={TOP + inner} />
+          {lines.map((line, slot) => { const value = samples[slot].get(hover);
+            return value == null ? null : <circle key={line.name} className={`history-mark history-series-${line.slot}`} cx={x(hover)} cy={y(value)} r={4} />; })}
         </g>}
       </svg>
-      {hover !== null && <div className={x(times[hover]) > width / 2 ? "history-tip left" : "history-tip"} role="status">
-        <small>{fullTime(times[hover])}</small>
-        {lines.map((line, slot) => { const value = samples[slot].get(times[hover]);
+      {hover !== null && <div className={x(hover) > width / 2 ? "history-tip left" : "history-tip"} role="status">
+        <small>{fullTime(hover)}</small>
+        {lines.map((line, slot) => { const value = samples[slot].get(hover);
           return <span key={line.name}><strong>{value == null ? "No data" : format(value)}</strong>{multiple ? ` ${line.name}` : ""}</span>;
         })}
       </div>}
@@ -137,20 +140,18 @@ function bySeries(series: HistorySeries[], key: HistorySeries["key"]) { return s
 
 export function MachineHistory({ hub, hostKey, range }: { hub: Hub; hostKey: string; range: HistoryRange }) {
   const [load, setLoad] = useState<Load>({ state: "loading" });
-  const [attempt, setAttempt] = useState(0);
+  const [attempt, refresh, runRead] = useInfrastructureRefresh(!hub.demo && load.state !== "gone");
   useEffect(() => {
     if (hub.demo) { setLoad({ state: "loaded", value: demoMachineHistory(hostKey, range) }); return; }
-    const controller = new AbortController();
-    setLoad({ state: "loading" });
-    readHistory(hostKey, range, controller.signal).then(value => {
-      if (!controller.signal.aborted) setLoad(value === null ? { state: "gone" } : value === "unavailable" ? { state: "unavailable" } : { state: "loaded", value });
-    }).catch(error => {
-      if (controller.signal.aborted) return;
+    setLoad(current => current.state === "loaded" ? current : { state: "loading" });
+    return runRead(signal => readHistory(hostKey, range, signal), value => {
+      setLoad(current => value === "unavailable" && current.state === "loaded" ? { ...current, refreshFailed: true } : value === null ? { state: "gone" } : value === "unavailable" ? { state: "unavailable" } : { state: "loaded", value });
+    }, error => {
       if (error instanceof HubApiError && error.status === 401) { hub.clearPrivateWorkspace(); return; }
-      setLoad({ state: "failed" });
+      setLoad(current => current.state === "loaded" && transientRefreshError(error)
+        ? { ...current, refreshFailed: true } : { state: "failed" });
     });
-    return () => controller.abort();
-  }, [hub.demo, hostKey, range, attempt]);
+  }, [hub.demo, hostKey, range, attempt, runRead]);
   const data = load.state === "loaded" ? load.value : null;
   const { charts, hasSamples } = useMemo(() => {
     const series = data?.series.filter(item => item.points.some(([, value]) => value !== null)) ?? [];
@@ -169,9 +170,10 @@ export function MachineHistory({ hub, hostKey, range }: { hub: Hub; hostKey: str
     : SOURCE_TEXT[load.value.source] ?? (!hasSamples ? "No history for this range." : null);
   const retry = load.state === "failed" || load.state === "unavailable" || data?.source === "unreachable";
   return <div className="history">
+    {load.state === "loaded" && load.refreshFailed && <p className="notice" role="status">Couldn't refresh history. Showing the last reading.</p>}
     {message && <div className="history-message">
       <p role={load.state === "failed" ? "alert" : "status"}>{message}</p>
-      {retry && <button type="button" className="secondary" onClick={() => setAttempt(value => value + 1)}>Try again</button>}
+      {retry && <button type="button" className="secondary" onClick={refresh}>Try again</button>}
     </div>}
     {hasSamples && <div className="history-grid-layout">
       {charts.cpu.length > 0 && <Chart title="CPU" lines={charts.cpu} range={range} format={percent} ratio />}
