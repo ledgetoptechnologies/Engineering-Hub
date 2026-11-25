@@ -163,7 +163,7 @@ def test_observed_wheel_preserved_before_expected_verification(monkeypatch, tmp_
 
     def fake_run(*args, **kwargs):
         if 'download' in args:
-            (tmp_path / 'backend/setuptools-84.0.0-py3-none-any.whl').write_bytes(backend)
+            (tmp_path / 'backend/setuptools-84.1.0-py3-none-any.whl').write_bytes(backend)
         elif 'wheel' in args:
             (tmp_path / 'wheels').mkdir()
             (tmp_path / 'wheels/fixture.whl').write_bytes(wheel_bytes)

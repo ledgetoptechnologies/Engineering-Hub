@@ -10,7 +10,6 @@ on:
       source_commit:
         description: Reviewed executor source commit (must be on main)
         required: true
-        default: 40d3d2fa126b8c0fb78f6f48a47c25aae38d38bc
       core_digest:
         description: Immutable fixed Hub control package digest, without prefix
         required: true
@@ -26,7 +25,6 @@ on:
       wheel_sha256:
         description: Independently reviewed exact executor wheel SHA256
         required: true
-        default: e9db6a97b34e723acbf681308dfcc167dc37e2c798063799ab25d150f3940d29
       source_date_epoch:
         description: Reviewed fixed wheel reproducibility timestamp
         required: true

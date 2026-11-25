@@ -15,7 +15,8 @@ from verify_hub_executor_wheel import verify_wheel
 from hub_executor_image_smoke import smoke
 
 PACKAGE = 'ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:'
-BACKEND_SHA = '51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670'
+BACKEND_VERSION = '84.1.0'
+BACKEND_SHA = '5231689c6ac8156cd155cfb98c3fd6fb252c3e7e9bd3d78b64d3c55f132624c9'
 
 
 class CommandFailure(RuntimeError):
@@ -92,12 +93,12 @@ def wheel(values, directory, evidence=None):
     backend = directory / 'backend'
     backend.mkdir()
     requirement = directory / 'backend-requirements.txt'
-    requirement.write_text('setuptools==84.0.0 --hash=sha256:' + BACKEND_SHA + '\n')
+    requirement.write_text(f'setuptools=={BACKEND_VERSION} --hash=sha256:{BACKEND_SHA}\n')
     evidence['stage'] = 'backend_download'
     run(sys.executable, '-m', 'pip', '--isolated', '--disable-pip-version-check',
         'download', '--index-url', 'https://pypi.org/simple', '--require-hashes',
         '--only-binary=:all:', '--no-deps', '-r', str(requirement), '-d', str(backend))
-    artifact = backend / 'setuptools-84.0.0-py3-none-any.whl'
+    artifact = backend / f'setuptools-{BACKEND_VERSION}-py3-none-any.whl'
     evidence['stage'] = 'backend_verify'
     evidence['observed_backend_sha256'] = hashlib.sha256(artifact.read_bytes()).hexdigest()
     evidence['observed_backend_bytes'] = artifact.stat().st_size

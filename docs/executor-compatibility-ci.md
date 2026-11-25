@@ -6,14 +6,15 @@ wheel, core manifest/config and commit inputs must be explicit immutable values;
 source must be an ancestor of the checked-out main commit. The existing job
 `GITHUB_TOKEN` needs only `contents: read` and `packages: read`.
 
-The default tuple uses reviewed source `40d3d2f`, core manifest `d78d1576`, and
-config `c3ebafe5`. Source is read from Git archives/blobs (canonical LF), with
-setuptools 84.0.0 downloaded as a binary wheel using its reviewed SHA256 and
+Supply a reviewed source commit and its independently verified wheel SHA256
+for each dispatch. Source is read from Git archives/blobs (canonical LF), with
+setuptools 84.1.0 downloaded as a binary wheel using its reviewed SHA256 and
 `--require-hashes --no-deps`. The wheel build uses no index/dependency resolution
 and fixed `SOURCE_DATE_EPOCH=1792972800`. Python is pinned to 3.12.15. The prior
 local toolchain used pip 25.0.1; CI records its actual pip version. Any wheel
 byte difference fails the expected hash check; it does not silently accept or
-replace the reviewed hash. The default wheel is 126151 bytes, SHA256
+replace the reviewed hash. The historical wheel built with setuptools 84.0.0
+from source `40d3d2f` is 126151 bytes, SHA256
 `e9db6a97b34e723acbf681308dfcc167dc37e2c798063799ab25d150f3940d29`.
 Prepared source files, including generated provenance, have mode `0644`.
 Prepare and build inside Linux; copying a Windows-prepared tree into a Linux
@@ -54,6 +55,7 @@ Independent byte comparison reproduced that exact hash by changing only the
 ZIP mode of `_executor_source.json` from `0777` to `0644` in the original local
 wheel (`3a7a04ca...`). Every uncompressed member remained identical; one ZIP
 attribute byte changed. A fresh offline Linux rebuild with normalized source
-modes reproduced the CI hash. The corrected default pin names those reviewed
-bytes, rather than accepting arbitrary build output or bypassing verification.
+modes reproduced the CI hash. The historical pin identified those reviewed
+bytes. Supply a freshly verified wheel hash when the source or build toolchain
+changes.
 The original artifact and both failed CI receipts remain historical evidence.

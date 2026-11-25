@@ -31,7 +31,7 @@ Use a trusted, exclusively controlled output parent. The freshness checks and
 rename do not implement atomic no-replace publication against concurrent writers.
 
 In an independently approved local Linux build environment with uv 0.11.17 and
-setuptools 84.0.0 already cached, build using `uv build --offline --wheel
+setuptools 84.1.0 already cached, build using `uv build --offline --wheel
 <prepared-directory>`. Do not download build tools implicitly. Pin the resulting
 wheel SHA-256 and independently pin the core wheel and OCI image by digest.
 Embedded commit/archive hashes describe the input; they are not issuer evidence.
