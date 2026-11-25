@@ -8,6 +8,7 @@ const supported = () => window.isSecureContext && typeof window.Notification ===
 /** Track only identities, not question text. Permission and opt-in are separate. */
 export function useNeedsMeAlerts() {
   const previous = useRef<Set<string> | null>(null);
+  const pending = useRef(new Set<string>());
   const active = useRef<Notification | null>(null);
   const enabled = useRef(false);
   const generation = useRef(0);
@@ -28,6 +29,7 @@ export function useNeedsMeAlerts() {
     needsBaseline.current = false;
     enabled.current = false;
     previous.current = null;
+    pending.current.clear();
     close();
     setState("off");
   }, [close]);
@@ -45,6 +47,7 @@ export function useNeedsMeAlerts() {
       revisionValue.current++;
       needsBaseline.current = false;
       enabled.current = false;
+      pending.current.clear();
       close();
       setState("off");
       return;
@@ -78,10 +81,17 @@ export function useNeedsMeAlerts() {
       return;
     }
     previous.current = ids;
-    if (!allowAlert || !before || !enabled.current || !supported()
-        || Notification.permission !== "granted"
-        || (document.visibilityState === "visible" && document.hasFocus())
-        || !Array.from(ids).some(id => !before.has(id))) return;
+    if (!before || !enabled.current || !supported() || Notification.permission !== "granted") {
+      pending.current.clear();
+      return;
+    }
+    const foreground = document.visibilityState === "visible" && document.hasFocus();
+    for (const id of pending.current) if (!ids.has(id)) pending.current.delete(id);
+    // Record background arrivals even when this refresh cannot send an alert.
+    if (!foreground) for (const id of ids) if (!before.has(id)) pending.current.add(id);
+    if (!allowAlert || pending.current.size === 0) return;
+    pending.current.clear();
+    if (foreground) return;
     try {
       close();
       const notification = new Notification("Engineering Hub needs your attention", {
