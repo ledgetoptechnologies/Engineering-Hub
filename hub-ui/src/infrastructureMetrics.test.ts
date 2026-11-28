@@ -176,7 +176,10 @@ describe("network rates and history", () => {
     const stats = quickStats(groupMachines(parseMetrics(metrics([row()])).targets)[0]);
     expect(diskAlert(stats)).toBe("Disk 90% full on /data");
     expect(diskAlert({ ...stats, diskRatio: 0.8 })).toBe("Disk 80% full on /data");
+    expect(diskAlert({ ...stats, diskRatio: 0.796 })).toBe("Disk 80% full on /data");
     expect(diskAlert({ ...stats, diskRatio: 0.79 })).toBeNull();
+    const stale = quickStats(groupMachines(parseMetrics(metrics([row({ state: "stale" })])).targets)[0]);
+    expect(diskAlert(stale)).toBe("Disk 90% full on /data (last reading)");
     expect(diskAlert({ ...stats, disk: null, diskRatio: null })).toBeNull();
   });
   it("keeps gaps in history and rejects anything outside the contract", () => {

@@ -283,7 +283,7 @@ export function MachineHealth({ hub, reading, inventoryReadAvailable }: {
   const custom = order.join("\n") !== DEFAULT_MACHINE_ORDER.join("\n");
   const notice = metrics && SOURCE_TEXT[metrics.source.status];
   const omitted = metrics && omittedText(metrics);
-  const full = groups.filter(group => diskAlert(quickStats(group)));
+  const full = shown.filter(group => diskAlert(quickStats(group)));
   return <section className="panel" aria-label="Machine health">
     <PanelTitle title="Machine health" count={metrics ? groups.length : undefined}>
       {custom && groups.length > 1 && <button type="button" className="secondary" onClick={() => { save([...DEFAULT_MACHINE_ORDER]); setMoved("Order reset."); }}>Reset order</button>}
@@ -296,7 +296,7 @@ export function MachineHealth({ hub, reading, inventoryReadAvailable }: {
     {notice && <p className="notice" role="status">{notice}</p>}
     {omitted && <p className="notice" role="status">{omitted}</p>}
     {metrics && groups.length === 0 && !notice && <p className="infra-empty">Prometheus isn't scraping any machines yet.</p>}
-    {full.length > 0 && <p className="notice error" role="alert">
+    {full.length > 0 && <p className="notice amber" role="status">
       {full.map(group => `${group.title}: ${diskAlert(quickStats(group))}`).join(" · ")}</p>}
     {groups.length > 0 && <>
       <ul className={dragging ? "machine-list reordering" : "machine-list"} ref={list}>
