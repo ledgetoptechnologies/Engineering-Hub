@@ -315,6 +315,9 @@ export function niceTop(value: number, base: 1000 | 1024): number {
   return [1, 2, 2.5, 5, 10].map(step => step * scale).find(step => step >= value * (1 - 1e-9)) ?? value;
 }
 export const percent = (ratio: number | null) => ratio === null ? "not reported" : `${Math.round(ratio * 100)}%`;
+/** Warning text when the fullest disk shows 80% or more used, else null. Compares the shown, rounded percent. */
+export const diskAlert = (stats: QuickStats) => stats.disk && stats.diskRatio !== null && Math.round(stats.diskRatio * 100) >= 80
+  ? `Disk ${percent(stats.diskRatio)} full on ${stats.disk.mount}${stats.reporting ? "" : " (last reading)"}` : null;
 export function formatUptime(seconds: number | null): string {
   if (seconds === null) return "not reported";
   const days = Math.floor(seconds / 86400), hours = Math.floor(seconds % 86400 / 3600), minutes = Math.floor(seconds % 3600 / 60);

@@ -1,4 +1,4 @@
-import { HISTORY_RANGES, formatHertz, formatRate, niceTop, parseHistory, quickStats, readHistory } from "./infrastructureMetrics";
+import { HISTORY_RANGES, diskAlert, formatHertz, formatRate, niceTop, parseHistory, quickStats, readHistory } from "./infrastructureMetrics";
 import { describe, expect, it, vi } from "vitest";
 import fixture from "./fixtures/infrastructure-metrics-v1.json";
 import discovered from "./fixtures/infrastructure-metrics-v2.json";
@@ -171,6 +171,16 @@ describe("network rates and history", () => {
     expect(stats.disk?.mount).toBe("/data");
     const stale = quickStats(groupMachines(parseMetrics(metrics([row({ state: "stale" })])).targets)[0]);
     expect(stale.reporting).toBe(false);
+  });
+  it("alerts when the fullest disk is at or over 80%, not below", () => {
+    const stats = quickStats(groupMachines(parseMetrics(metrics([row()])).targets)[0]);
+    expect(diskAlert(stats)).toBe("Disk 90% full on /data");
+    expect(diskAlert({ ...stats, diskRatio: 0.8 })).toBe("Disk 80% full on /data");
+    expect(diskAlert({ ...stats, diskRatio: 0.796 })).toBe("Disk 80% full on /data");
+    expect(diskAlert({ ...stats, diskRatio: 0.79 })).toBeNull();
+    const stale = quickStats(groupMachines(parseMetrics(metrics([row({ state: "stale" })])).targets)[0]);
+    expect(diskAlert(stale)).toBe("Disk 90% full on /data (last reading)");
+    expect(diskAlert({ ...stats, disk: null, diskRatio: null })).toBeNull();
   });
   it("keeps gaps in history and rejects anything outside the contract", () => {
     expect(parseHistory(history()).series[0].points[1]).toEqual([130, null]);
