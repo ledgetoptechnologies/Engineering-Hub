@@ -232,11 +232,11 @@ export function MachineHealth({ hub, reading, inventoryReadAvailable }: {
   const shown = sortMachineGroups(groups, order);
   useCardSlide(list, shown.map(group => group.key).join("\n"));
   // The dragged card's node moves while dragging, so follow the pointer on the window, not the handle.
-  const dragMove = useRef<(event: globalThis.PointerEvent) => void>(() => {});
+  const dragMove = useRef<(event: globalThis.PointerEvent, drop?: boolean) => void>(() => {});
   useEffect(() => {
     if (!dragging) return;
     const follow = (event: globalThis.PointerEvent) => dragMove.current(event);
-    const end = () => setDragging(null);
+    const end = (event: Event) => { if (event.type === "pointerup") dragMove.current(event as globalThis.PointerEvent, true); setDragging(null); };
     const events = [["pointermove", follow], ["pointerup", end], ["pointercancel", end], ["blur", end]] as const;
     for (const [name, handler] of events) window.addEventListener(name, handler as EventListener);
     return () => { for (const [name, handler] of events) window.removeEventListener(name, handler as EventListener); };
@@ -251,10 +251,13 @@ export function MachineHealth({ hub, reading, inventoryReadAvailable }: {
     setMoved(`${shown[from].title} moved to position ${to + 1} of ${shown.length}.`);
     return true;
   };
-  dragMove.current = event => {
-    if (!dragging || !event.buttons) { setDragging(null); return; }
-    // While cards slide, they are drawn away from their slots; hit-testing then would swap them straight back.
-    if (list.current?.getAnimations?.({ subtree: true }).length) return;
+  dragMove.current = (event, drop = false) => {
+    if (!dragging || (!drop && !event.buttons)) { setDragging(null); return; }
+    // While cards slide (element.animate, not CSS hover fades) they are drawn away from their slots, and
+    // hit-testing would swap them straight back: wait while dragging, and on release land them first.
+    const slides = list.current?.getAnimations?.({ subtree: true }).filter(item => !("transitionProperty" in item) && !("animationName" in item)) ?? [];
+    if (slides.length && !drop) return;
+    for (const slide of slides) slide.finish();
     const over = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-machine-key]")?.dataset.machineKey;
     if (over && over !== dragging) move(dragging, shown.findIndex(item => item.key === over));
   };
