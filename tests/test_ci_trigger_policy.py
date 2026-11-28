@@ -205,10 +205,12 @@ PROMOTE_ORDER = [
     'Upload the rollback receipt', 'Move latest to the tested digest', 'Upload the promotion result']
 
 
-def test_only_the_manual_main_promotion_moves_latest():
+def test_only_the_main_promotion_moves_latest():
     config = workflow('hub-promote.yml')
     text = (ROOT / '.github/workflows/hub-promote.yml').read_text()
-    assert set(config['on']) == {'workflow_dispatch'}
+    assert set(config['on']) == {'workflow_dispatch', 'workflow_run'}
+    # Automatic promotion follows only a successful main push build of hub-control.yml.
+    assert config['on']['workflow_run'] == {'workflows': [workflow('hub-control.yml')['name']], 'types': ['completed'], 'branches': ['main']}
     inputs = config['on']['workflow_dispatch']['inputs']
     assert set(inputs) == {'commit', 'digest', 'initialize_latest', 'approved_by', 'approval_reference'}
     assert inputs['approved_by']['required'] == 'true' and inputs['approval_reference']['required'] == 'true'
@@ -216,7 +218,19 @@ def test_only_the_manual_main_promotion_moves_latest():
     assert config['permissions'] == {'contents': 'read'}
     assert config['concurrency'] == {'group': 'hub-promote-latest', 'cancel-in-progress': 'false'}
     job = config['jobs']['promote']
-    assert job['if'] == "${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}"
+    condition = ' '.join(job['if'].split())
+    assert condition.startswith("${{ github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || (")
+    for guard in ["github.event.workflow_run.conclusion == 'success'", "github.event.workflow_run.event == 'push'",
+                  "github.event.workflow_run.head_branch == 'main'", "github.event.workflow_run.path == '.github/workflows/hub-control.yml'",
+                  'github.event.workflow_run.head_repository.full_name == github.repository']:
+        assert guard in condition
+    # Automatic runs: the build's commit, its evidence digest, a recorded auto approval, and never an older commit.
+    assert job['env']['PROMOTE_COMMIT'] == "${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.commit }}"
+    assert 'PROMOTE_DIGEST' not in job['env'] and job['env']['REQUESTED_DIGEST'] == '${{ inputs.digest }}'
+    assert job['env']['APPROVAL_REFERENCE'] == "${{ github.event_name == 'workflow_run' && github.event.workflow_run.html_url || inputs.approval_reference }}"
+    assert 'repos/$GITHUB_REPOSITORY/commits/main' in [s for s in job['steps'] if s.get('name') == 'Require the commit to be on main'][0]['run']
+    evidence_step = [s for s in job['steps'] if s.get('name') == "Verify the candidate's evidence"][0]['run']
+    assert evidence_step.index('["digest"]') < evidence_step.index('hub_candidate_evidence.py verify')
     assert job['permissions'] == {'contents': 'read', 'actions': 'read', 'packages': 'write'}
     assert [step.get('name') for step in job['steps']] == PROMOTE_ORDER
     steps = {step.get('name'): step for step in job['steps']}
@@ -269,7 +283,7 @@ def test_only_the_manual_main_promotion_moves_latest():
     assert 'It was NOT restored automatically' in move
     validate = steps['Validate requested candidate']['run']
     assert '$APPROVED_BY' in validate and '$APPROVAL_REFERENCE' in validate
-    assert job['env']['APPROVED_BY'] == '${{ inputs.approved_by }}'
+    assert job['env']['APPROVED_BY'] == "${{ github.event_name == 'workflow_run' && 'auto-main' || inputs.approved_by }}"
     assert 'GitHub Environment with required' in text and 'reviewers' in text
 
 

@@ -280,3 +280,20 @@ def test_both_recognised_absence_forms_initialize(registry):
     r = _promote(registry, STUB_MISSING_MSG=f'ERROR: {PACKAGE}:latest: MANIFEST_UNKNOWN: manifest unknown',
                  INITIALIZE_LATEST='true')
     assert r['move'].returncode == 0 and _read(registry, f'{PACKAGE}:latest') == NEW
+
+
+def test_dispatch_and_automatic_runs_resolve_the_digest_differently(registry):
+    steps = _steps('hub-promote.yml', 'promote')
+    github_env = registry / 'github_env'
+    github_env.touch()
+    base = {'GITHUB_ENV': str(github_env), 'APPROVED_BY': 'auto-main',
+            'APPROVAL_REFERENCE': 'https://github.com/o/r/actions/runs/11'}
+    # A manual dispatch passes its digest on; an automatic run must not bring one.
+    manual = _run(registry, steps['Validate requested candidate'], {**base, 'GITHUB_EVENT_NAME': 'workflow_dispatch', 'REQUESTED_DIGEST': NEW})
+    assert manual.returncode == 0, manual.stderr
+    assert github_env.read_text() == f'PROMOTE_DIGEST={NEW}\n'
+    github_env.write_text('')
+    auto = _run(registry, steps['Validate requested candidate'], {**base, 'GITHUB_EVENT_NAME': 'workflow_run', 'REQUESTED_DIGEST': ''})
+    assert auto.returncode == 0, auto.stderr and github_env.read_text() == ''
+    smuggled = _run(registry, steps['Validate requested candidate'], {**base, 'GITHUB_EVENT_NAME': 'workflow_run', 'REQUESTED_DIGEST': NEW})
+    assert smuggled.returncode != 0

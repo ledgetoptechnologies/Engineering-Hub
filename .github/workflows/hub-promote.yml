@@ -1,14 +1,18 @@
 name: Promote Engineering Hub control candidate to latest
-# Manual, main-only promotion. hub-control.yml builds, smoke-tests and publishes
-# every main candidate as an immutable digest with a write-once `sha-<commit>`
-# tag. This workflow moves `latest` to one of those tested digests and nothing
-# else moves it. It does not rebuild or deploy. Rollback is a promotion of an
-# older candidate.
+# Main-only promotion. hub-control.yml builds, smoke-tests and publishes every
+# main candidate as an immutable digest with a write-once `sha-<commit>` tag.
+# This workflow moves `latest` to one of those tested digests and nothing else
+# moves it. It does not rebuild or deploy.
 #
-# Approval: the approved_by and approval_reference inputs are written into the
-# rollback receipt as a RECORD of who authorized the promotion. They do not
-# enforce anything. The enforcing mechanism is a GitHub Environment with required
-# reviewers, which is an owner repository setting and is not created here.
+# Automatic: when hub-control.yml succeeds for a push to main, its candidate is
+# promoted with approved_by=auto-main and the build run URL as the reference,
+# provided that commit is still the head of main (an older build never replaces
+# a newer one). Manual dispatch stays for rollbacks: promote an older candidate.
+#
+# Approval: approved_by and approval_reference are written into the rollback
+# receipt as a RECORD of who authorized the promotion. They do not enforce
+# anything. A GitHub Environment with required reviewers would be the enforcing
+# mechanism; it is an owner repository setting and is not created here.
 #
 # Exclusion: this is the only workflow that writes `latest` (a test fails if
 # another writer appears). The `hub-promote-latest` concurrency group stops two
@@ -17,6 +21,10 @@ name: Promote Engineering Hub control candidate to latest
 # immediately before writing and aborts if it changed. That re-read narrows the
 # window but is NOT an atomic compare-and-swap.
 on:
+  workflow_run:
+    workflows: [Engineering Hub control image]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       commit:
@@ -47,7 +55,11 @@ concurrency:
   cancel-in-progress: false
 jobs:
   promote:
-    if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
+    if: >-
+      ${{ github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run'
+      && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.path == '.github/workflows/hub-control.yml'
+      && github.event.workflow_run.head_repository.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -56,17 +68,23 @@ jobs:
       packages: write
     env:
       PACKAGE: ghcr.io/ledgetoptechnologies/engineering-hub-control
-      PROMOTE_COMMIT: ${{ inputs.commit }}
-      PROMOTE_DIGEST: ${{ inputs.digest }}
-      APPROVED_BY: ${{ inputs.approved_by }}
-      APPROVAL_REFERENCE: ${{ inputs.approval_reference }}
+      # Automatic runs name the build's commit; their digest is read from its verified evidence.
+      PROMOTE_COMMIT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.commit }}
+      REQUESTED_DIGEST: ${{ inputs.digest }}
+      APPROVED_BY: ${{ github.event_name == 'workflow_run' && 'auto-main' || inputs.approved_by }}
+      APPROVAL_REFERENCE: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.html_url || inputs.approval_reference }}
     steps:
       - name: Validate requested candidate
         shell: bash
         run: |
           set -euo pipefail
           [[ "$PROMOTE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::commit must be a full lowercase 40-character SHA'; exit 1; }
-          [[ "$PROMOTE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo '::error::digest must be sha256:<64 hex>'; exit 1; }
+          if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
+            [[ -z "$REQUESTED_DIGEST" ]] || { echo '::error::automatic promotion takes its digest from the candidate evidence'; exit 1; }
+          else
+            [[ "$REQUESTED_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo '::error::digest must be sha256:<64 hex>'; exit 1; }
+            echo "PROMOTE_DIGEST=$REQUESTED_DIGEST" >> "$GITHUB_ENV"
+          fi
           [[ "$APPROVED_BY" =~ ^[A-Za-z0-9][A-Za-z0-9._@\ -]{0,63}$ ]] || { echo '::error::approved_by is required (letters, digits, space, . _ @ -; max 64)'; exit 1; }
           [[ "$APPROVAL_REFERENCE" =~ ^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,127}$ ]] || { echo '::error::approval_reference is required (e.g. a Hub task or decision id)'; exit 1; }
       - name: Check out promotion verifier
@@ -85,6 +103,10 @@ jobs:
           set -euo pipefail
           STATUS="$(gh api "repos/$GITHUB_REPOSITORY/compare/$PROMOTE_COMMIT...$GITHUB_SHA" --jq .status)"
           [[ "$STATUS" == ahead || "$STATUS" == identical ]] || { echo "::error::$PROMOTE_COMMIT is not part of main ($STATUS)"; exit 1; }
+          if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
+            HEAD="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)"
+            [[ "$HEAD" == "$PROMOTE_COMMIT" ]] || { echo "::error::main has moved on to $HEAD; its own build promotes it, so $PROMOTE_COMMIT is not promoted"; exit 1; }
+          fi
       - name: Find the successful main build run for the commit
         id: run
         shell: bash
@@ -107,7 +129,12 @@ jobs:
           DIR="$RUNNER_TEMP/candidate-evidence"
           gh run download "$CANDIDATE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "hub-control-candidate-$PROMOTE_COMMIT" --dir "$DIR"
           (cd "$DIR" && sha256sum --check --strict hub-candidate.sha256)
-          python3 scripts/hub_candidate_evidence.py verify "$DIR/hub-candidate.json"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
+            PROMOTE_DIGEST="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["digest"])' "$DIR/hub-candidate.json")"
+            [[ "$PROMOTE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo '::error::candidate evidence has no valid digest'; exit 1; }
+            echo "PROMOTE_DIGEST=$PROMOTE_DIGEST" >> "$GITHUB_ENV"
+          fi
+          PROMOTE_DIGEST="$PROMOTE_DIGEST" python3 scripts/hub_candidate_evidence.py verify "$DIR/hub-candidate.json"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
