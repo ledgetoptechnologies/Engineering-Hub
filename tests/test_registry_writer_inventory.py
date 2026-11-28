@@ -1,8 +1,12 @@
 """Inventory of every place in the repository that can write a registry tag.
 
-`latest` of engineering-hub-control may be written only by hub-promote.yml's
-`promote` job, and the immutable `sha-<commit>` tag only by hub-control.yml's
-`publish` job. Every other registry writer must write a different tag. A new writer anywhere in workflows or scripts fails this test until it is
+`latest` of engineering-hub-control is written only by hub-latest-writer.yml's
+`write` job, which is serialized in one concurrency group and has exactly two
+write steps: the forward-only move for a verified main push (called from
+hub-control.yml) and the manual promotion or rollback (called from
+hub-promote.yml). The immutable `sha-<commit>` tag is written only by
+hub-control.yml's `publish` job. Every other registry writer must write a
+different tag. A new writer anywhere in workflows or scripts fails this test until it is
 reviewed and added here.
 """
 import re
@@ -21,10 +25,16 @@ WRITE = re.compile(
 # (workflow, job) -> what that job is allowed to write.
 ALLOWED_JOBS = {
     ('hub-control.yml', 'publish'): 'build-<sha>-<run>-<attempt> and write-once sha-<commit>',
-    ('hub-promote.yml', 'promote'): 'latest',
+    ('hub-latest-writer.yml', 'write'): 'latest (forward move or manual promotion), serialized',
     ('hub-executor-publication.yml', 'publication'): 'staging-executor-* via scripts/publish_hub_executor.py',
 }
 ALLOWED_SCRIPTS = {'scripts/publish_hub_executor.py'}
+LATEST_WRITE = 'imagetools create --prefer-index=false --tag "$PACKAGE:latest"'
+# (workflow, job, step name, step condition) of the only two `latest` write steps.
+LATEST_WRITERS = {
+    ('hub-latest-writer.yml', 'write', 'Move latest forward to the tested digest', "${{ inputs.mode == 'forward' }}"),
+    ('hub-latest-writer.yml', 'write', 'Move latest to the tested digest', "${{ inputs.mode == 'promote' }}"),
+}
 
 
 def _workflows():
@@ -55,31 +65,46 @@ def test_every_workflow_registry_writer_is_known():
     assert set(ALLOWED_JOBS) <= found, 'inventory lists a writer that no longer exists; update it'
 
 
-def test_only_promote_writes_latest_and_only_publish_writes_sha_tags():
+def _writes_latest(run):
+    return bool(re.search(r'--tag\s+"?\$PACKAGE:latest|engineering-hub-control:latest', run)) or (
+        'imagetools create' in run and ':latest' in run.split('imagetools create', 1)[1].split('\n', 1)[0])
+
+
+def test_exactly_two_latest_writers_and_only_publish_writes_sha_tags():
+    found = set()
     for name, config in _workflows():
-        text = (WORKFLOWS / name).read_text()
         for job_id, job in config.get('jobs', {}).items():
-            for run in _job_writes(job):
-                writes_latest = bool(re.search(r'--tag\s+"?\$PACKAGE:latest|engineering-hub-control:latest', run)) or (
-                    'imagetools create' in run and ':latest' in run.split('imagetools create', 1)[1].split('\n', 1)[0])
-                writes_sha = '$SHA_TAG' in run or re.search(r':sha-', run.split('imagetools create', 1)[-1]) is not None
-                if writes_latest:
-                    assert (name, job_id) == ('hub-promote.yml', 'promote'), (name, job_id)
+            for step in job.get('steps', []):
+                run = step.get('run', '')
+                if not _job_writes({'steps': [step]}):
+                    continue
+                if _writes_latest(run):
+                    found.add((name, job_id, step.get('name'), step.get('if', '')))
+                    assert run.count(LATEST_WRITE) == 1, (name, job_id)
+                # A sha write is an `imagetools create` command (continuation lines joined)
+                # that names a sha tag; reading a sha tag elsewhere in the step is not one.
+                commands = [line for line in run.replace('\\\n', ' ').splitlines() if 'imagetools create' in line]
+                writes_sha = any('$SHA_TAG' in line or ':sha-' in line for line in commands)
                 if writes_sha and 'imagetools create' in run:
                     assert (name, job_id) == ('hub-control.yml', 'publish'), (name, job_id)
-        if name not in ('hub-promote.yml',):
+                    assert not _writes_latest(run), 'the sha tag and latest are written by separate steps'
+    assert found == LATEST_WRITERS, f'latest writers changed: {sorted(found)}'
+    for name, _config in _workflows():
+        text = (WORKFLOWS / name).read_text()
+        expected = 2 if name == 'hub-latest-writer.yml' else 0
+        assert text.count(LATEST_WRITE) == expected, name
+        if not expected:
             assert not re.search(r'--tag\s+"?\$PACKAGE:latest', text), name
-    promote = (WORKFLOWS / 'hub-promote.yml').read_text()
-    assert promote.count('imagetools create --prefer-index=false --tag "$PACKAGE:latest"') == 1
-    publish = (WORKFLOWS / 'hub-control.yml').read_text()
-    assert ':latest' not in publish
 
 
 def test_latest_writer_and_sha_writer_are_serialized():
     promote = yaml.load((WORKFLOWS / 'hub-promote.yml').read_text(), Loader=yaml.BaseLoader)
-    assert promote['concurrency'] == {'group': 'hub-promote-latest', 'cancel-in-progress': 'false'}
+    assert promote['concurrency'] == {'group': 'hub-promote-latest', 'queue': 'max'}
     control = yaml.load((WORKFLOWS / 'hub-control.yml').read_text(), Loader=yaml.BaseLoader)
     assert control['concurrency']['cancel-in-progress'] == 'false'
+    assert control['concurrency']['group'] == 'hub-control-${{ github.ref }}'
+    writer = yaml.load((WORKFLOWS / 'hub-latest-writer.yml').read_text(), Loader=yaml.BaseLoader)
+    assert writer['jobs']['write']['concurrency'] == {'group': 'hub-latest-writer', 'queue': 'max'}
     executor = yaml.load((WORKFLOWS / 'hub-executor-publication.yml').read_text(), Loader=yaml.BaseLoader)
     assert executor['concurrency']['group'] == 'hub-executor-publication'
 

@@ -174,10 +174,15 @@ def _publish_runs():
     return [step.get('run', '') for step in workflow('hub-control.yml')['jobs']['publish']['steps']]
 
 
-def test_main_build_publishes_only_immutable_tags_and_never_moves_latest():
-    text = (ROOT / '.github/workflows/hub-control.yml').read_text()
-    assert ':latest' not in text and '--tag "$PACKAGE:latest"' not in text
+LATEST_STEP = 'Move latest forward to the tested digest'
+PROMOTE_MOVE = 'Move latest to the tested digest'
+WRITER = './.github/workflows/hub-latest-writer.yml'
+
+
+def test_main_build_publishes_only_immutable_tags_in_the_publish_job():
+    publish = workflow('hub-control.yml')['jobs']['publish']
     runs = _publish_runs()
+    assert not any(':latest' in run for run in runs)
     creates = [run for run in runs if 'imagetools create' in run]
     assert len(creates) == 1
     sha = creates[0]
@@ -186,7 +191,7 @@ def test_main_build_publishes_only_immutable_tags_and_never_moves_latest():
     assert 'docker buildx imagetools create --prefer-index=false --tag "$SHA_TAG" "$PACKAGE@$IMAGE_DIGEST"' in sha
     assert 'cmp hub-registry-manifest.json hub-sha-manifest.json' in sha
     assert "denied|unauthori[sz]ed|forbidden" in sha and '{ cat sha-inspect-error.txt >&2; exit 1; }' in sha
-    steps = workflow('hub-control.yml')['jobs']['publish']['steps']
+    steps = publish['steps']
     upload = next(i for i, step in enumerate(steps) if 'docker push "$BUILD_IMAGE"' in step.get('run', ''))
     private = next(i for i, step in enumerate(steps) if 'Anonymous pull token unexpectedly available' in step.get('run', ''))
     tag = next(i for i, step in enumerate(steps) if 'imagetools create' in step.get('run', ''))
@@ -195,6 +200,92 @@ def test_main_build_publishes_only_immutable_tags_and_never_moves_latest():
     assert upload < private < tag < evidence < artifact
     assert steps[artifact]['with']['if-no-files-found'] == 'error'
     assert 'hub-candidate.sha256' in steps[artifact]['with']['path']
+    # The digest handed to the latest job is the one the registry step verified.
+    assert publish['outputs'] == {'digest': '${{ steps.registry.outputs.digest }}'}
+    registry = next(step for step in steps if step.get('id') == 'registry')
+    assert 'echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"' in registry['run']
+
+
+def test_latest_is_a_separate_job_so_the_candidate_stays_promotable():
+    jobs = workflow('hub-control.yml')['jobs']
+    latest = jobs['latest']
+    # Only after publish succeeded, only on a main push (a manual dispatch publishes only).
+    assert latest['needs'] == 'publish'
+    assert latest['if'] == "${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}"
+    assert latest['uses'] == WRITER
+    assert latest['with'] == {'mode': 'forward', 'commit': '${{ github.sha }}',
+                              'digest': '${{ needs.publish.outputs.digest }}'}
+    assert latest['permissions'] == {'contents': 'read', 'packages': 'write'}
+    assert set(jobs) == {'verify', 'publish', 'latest', 'latest-confirm'}
+    confirm = jobs['latest-confirm']
+    assert confirm['needs'] == ['publish', 'latest']
+    assert confirm['if'] == ("${{ always() && needs.publish.result == 'success' && github.ref == 'refs/heads/main' "
+                             "&& github.event_name == 'push' }}")
+    assert confirm['steps'][0]['env'] == {'LATEST_RESULT': '${{ needs.latest.result }}'}
+    # hub-promote accepts a run whose publish job succeeded, whatever happened to `latest`.
+    find = {s.get('name'): s for s in workflow('hub-promote.yml')['jobs']['promote']['steps']}[
+        'Find the successful main build run for the commit']['run']
+    assert '-f status=completed' in find and '-f status=success' not in find
+    assert 'select(.name == "publish" and .conclusion == "success")' in find
+    assert '.conclusion == \\"success\\"' not in find
+
+
+def test_one_serialized_writer_for_forward_moves_and_manual_promotion():
+    writer = workflow('hub-latest-writer.yml')
+    assert set(writer['on']) == {'workflow_call'}
+    assert set(writer['on']['workflow_call']['inputs']) == {'mode', 'commit', 'digest', 'expected_previous'}
+    assert writer['permissions'] == {'contents': 'read'}
+    assert set(writer['jobs']) == {'write'}
+    job = writer['jobs']['write']
+    # One repository-wide group; a running write is never cancelled.
+    # A bounded, non-replacing queue (GitHub: up to 100 pending, FIFO; cannot be
+    # combined with cancel-in-progress, whose default false is what this needs).
+    assert job['concurrency'] == {'group': 'hub-latest-writer', 'queue': 'max'}
+    assert job['if'] == ("${{ github.ref == 'refs/heads/main' && ((inputs.mode == 'forward' && github.event_name == 'push') "
+                         "|| (inputs.mode == 'promote' && github.event_name == 'workflow_dispatch')) }}")
+    assert job['permissions'] == {'contents': 'read', 'packages': 'write'}
+    # Both callers use it, and nothing else does.
+    callers = {(name, job_id) for name in ('hub-control.yml', 'hub-promote.yml', 'hub-latest-writer.yml',
+                                           'hub-executor-publication.yml', 'hub-executor-compatibility.yml',
+                                           'hub-rollback-verification.yml', 'verify-published.yml', 'container.yml')
+               for job_id, body in workflow(name)['jobs'].items() if body.get('uses') == WRITER}
+    assert callers == {('hub-control.yml', 'latest'), ('hub-promote.yml', 'write')}
+    steps = {step.get('name'): step for step in job['steps']}
+    assert steps[LATEST_STEP]['if'] == "${{ inputs.mode == 'forward' }}"
+    assert steps[PROMOTE_MOVE]['if'] == "${{ inputs.mode == 'promote' }}"
+    assert steps[PROMOTE_MOVE]['env'] == {'PROMOTE_COMMIT': '${{ inputs.commit }}', 'PROMOTE_DIGEST': '${{ inputs.digest }}',
+                                          'PREVIOUS_DIGEST': '${{ inputs.expected_previous }}'}
+    assert steps['Check out history for the forward-only check']['with']['fetch-depth'] == '0'
+    assert all('${{' not in step.get('run', '') for step in job['steps'])
+    text = (ROOT / '.github/workflows/hub-latest-writer.yml').read_text()
+    for documented in ['queue: max', 'up to 100 jobs wait', 'queue is full', 'latest-confirm', 'NOT an atomic compare-and-swap']:
+        assert documented in text
+
+
+def test_forward_move_is_forward_only_and_summarised():
+    steps = {s.get('name'): s for s in workflow('hub-latest-writer.yml')['jobs']['write']['steps']}
+    move = steps[LATEST_STEP]['run']
+    assert move.startswith('set -euo pipefail')
+    candidate = move.index('read_digest "$PACKAGE:sha-$TARGET_COMMIT"')
+    read = move.index('if ! PREVIOUS_DIGEST="$(read_digest "$PACKAGE:latest")"; then')
+    label = move.index('org.opencontainers.image.revision')
+    ancestry = move.index('git merge-base --is-ancestor "$PREVIOUS_COMMIT" "$TARGET_COMMIT"')
+    behind = move.index('git merge-base --is-ancestor "$TARGET_COMMIT" "$PREVIOUS_COMMIT"')
+    reread = move.index('CURRENT="$(read_digest "$PACKAGE:latest")"')
+    write = move.index('imagetools create --prefer-index=false --tag "$PACKAGE:latest" "$PACKAGE@$TARGET_DIGEST"')
+    verify = move.index('AFTER="$(read_digest "$PACKAGE:latest")"')
+    assert candidate < read < label < ancestry < behind < reread < write < verify
+    assert move.count('imagetools create') == 2  # the write and the printed rollback command
+    for status in ['skipped-older-build', 'aborted-diverged', 'aborted-latest-changed', 'aborted-not-candidate',
+                   'already-current', 'write-failed', 'verify-failed', 'record moved']:
+        assert status in move
+    assert 'latest was NOT restored automatically.' in move
+    for field in ['previousDigest', 'previousCommit', 'newDigest', '"commit"', 'runId', 'latestAfter', 'recordedAt']:
+        assert field in move
+    assert "printf -- '- Commit: `%s`\\n- Digest: `%s`\\n' \"$TARGET_COMMIT\" \"$TARGET_DIGEST\"" in move
+    assert "printf -- '- Previous latest: `%s` (commit `%s`)\\n' \"$PREVIOUS_DIGEST\" \"$PREVIOUS_COMMIT\"" in move
+    upload = steps['Upload the forward result']
+    assert upload['if'] == "${{ always() && steps.forward.outcome != 'skipped' }}"
 
 
 PROMOTE_ORDER = [
@@ -202,7 +293,7 @@ PROMOTE_ORDER = [
     'Find the successful main build run for the commit', "Verify the candidate's evidence", None, None,
     'Require the private package', 'Verify the registry still holds the exact candidate',
     'Read current latest and resolve the rollback target', 'Persist the rollback receipt before moving latest',
-    'Upload the rollback receipt', 'Move latest to the tested digest', 'Upload the promotion result']
+    'Upload the rollback receipt']
 
 
 def test_only_the_manual_main_promotion_moves_latest():
@@ -214,17 +305,30 @@ def test_only_the_manual_main_promotion_moves_latest():
     assert inputs['approved_by']['required'] == 'true' and inputs['approval_reference']['required'] == 'true'
     assert inputs['initialize_latest']['default'] == 'false' and inputs['initialize_latest']['type'] == 'boolean'
     assert config['permissions'] == {'contents': 'read'}
-    assert config['concurrency'] == {'group': 'hub-promote-latest', 'cancel-in-progress': 'false'}
+    # Manual admission queues instead of replacing a pending promotion.
+    assert config['concurrency'] == {'group': 'hub-promote-latest', 'queue': 'max'}
+    assert set(config['jobs']) == {'promote', 'write', 'confirm'}
     job = config['jobs']['promote']
     assert job['if'] == "${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}"
-    assert job['permissions'] == {'contents': 'read', 'actions': 'read', 'packages': 'write'}
+    # The promote job only checks and records; the write is the shared writer's.
+    assert job['permissions'] == {'contents': 'read', 'actions': 'read', 'packages': 'read'}
+    assert job['outputs'] == {'previous': '${{ steps.previous.outputs.digest }}'}
     assert [step.get('name') for step in job['steps']] == PROMOTE_ORDER
+    write = config['jobs']['write']
+    assert write['needs'] == 'promote' and write['uses'] == WRITER
+    assert write['with'] == {'mode': 'promote', 'commit': '${{ inputs.commit }}', 'digest': '${{ inputs.digest }}',
+                             'expected_previous': '${{ needs.promote.outputs.previous }}'}
+    assert write['permissions'] == {'contents': 'read', 'packages': 'write'}
+    confirm = config['jobs']['confirm']
+    assert confirm['needs'] == ['promote', 'write']
+    assert confirm['if'] == "${{ always() && needs.promote.result == 'success' }}"
     steps = {step.get('name'): step for step in job['steps']}
     # Inputs reach shell only through env; no build, no other secrets.
     assert all('${{ inputs.' not in step.get('run', '') for step in job['steps'])
     assert 'build-push-action' not in text and 'secrets.' not in text.replace('secrets.GITHUB_TOKEN', '')
+    assert 'imagetools create' not in text
     run = steps['Find the successful main build run for the commit']['run']
-    for guard in ['-f branch=main', '-f status=success', '.head_branch == \\"main\\"', '.conclusion == \\"success\\"',
+    for guard in ['-f branch=main', '-f status=completed', '.head_branch == \\"main\\"', '.status == \\"completed\\"',
                   '.path == \\".github/workflows/hub-control.yml\\"', '.head_repository.full_name == \\"$GITHUB_REPOSITORY\\"']:
         assert guard in run
     evidence = steps["Verify the candidate's evidence"]['run']
@@ -251,16 +355,19 @@ def test_only_the_manual_main_promotion_moves_latest():
                   'dispatchedBy', 'approvedBy', 'approvalReference', '"approvalEnforced": false']:
         assert field in receipt
     assert steps['Upload the rollback receipt']['with']['if-no-files-found'] == 'error'
-    assert steps['Upload the promotion result']['if'] == "${{ always() && steps.receipt.outcome == 'success' }}"
     assert text.count('always()') == 1
-    assert text.count('imagetools create --prefer-index=false --tag "$PACKAGE:latest"') == 1
-    move = steps['Move latest to the tested digest']['run']
+    # The guarded move itself, moved verbatim into the shared writer.
+    writer_text = (ROOT / '.github/workflows/hub-latest-writer.yml').read_text()
+    writer_steps = {s.get('name'): s for s in workflow('hub-latest-writer.yml')['jobs']['write']['steps']}
+    assert writer_steps['Upload the promotion result']['if'] == "${{ always() && steps.move.outcome != 'skipped' }}"
+    assert writer_text.count('imagetools create --prefer-index=false --tag "$PACKAGE:latest" "$PACKAGE@$PROMOTE_DIGEST"') == 1
+    move = writer_steps[PROMOTE_MOVE]['run']
     assert re.search(r'record verify-failed[\s\S]*?rollback_help[\s\S]*?exit 1', move)
     # Fail-closed re-read of latest immediately before the single write; documented as not a CAS.
     reread = move.index('CURRENT="$(docker buildx imagetools inspect "$PACKAGE:latest"')
     abort = move.index('record aborted-latest-changed')
-    write = move.index('imagetools create --prefer-index=false --tag "$PACKAGE:latest"')
-    assert reread < abort < write
+    write_at = move.index('imagetools create --prefer-index=false --tag "$PACKAGE:latest"')
+    assert reread < abort < write_at
     assert 'if [[ "$CURRENT" != "$PREVIOUS_DIGEST" ]]; then' in move
     assert 'if [[ "$PREVIOUS_DIGEST" == absent ]] && manifest_unknown_only "$RUNNER_TEMP/reread-error.txt" "$PACKAGE:latest"; then' in move
     assert 'NOT an atomic compare-and-swap' in move
@@ -271,6 +378,52 @@ def test_only_the_manual_main_promotion_moves_latest():
     assert '$APPROVED_BY' in validate and '$APPROVAL_REFERENCE' in validate
     assert job['env']['APPROVED_BY'] == '${{ inputs.approved_by }}'
     assert 'GitHub Environment with required' in text and 'reviewers' in text
+
+
+@pytest.mark.parametrize('result,code', [('success', 0), ('cancelled', 1), ('failure', 1), ('skipped', 1)])
+def test_a_cancelled_or_failed_manual_write_fails_the_promotion_loudly(tmp_path, result, code):
+    bash = shutil.which('bash')
+    if os.name == 'nt' or not bash:
+        pytest.skip('requires POSIX Bash')
+    step = workflow('hub-promote.yml')['jobs']['confirm']['steps'][0]
+    assert step['env'] == {'WRITE_RESULT': '${{ needs.write.result }}'}
+    summary = tmp_path / 'summary.md'
+    run = subprocess.run([bash, '-c', step['run']], capture_output=True, text=True, timeout=5,
+                         env={**os.environ, 'WRITE_RESULT': result, 'GITHUB_STEP_SUMMARY': str(summary)})
+    assert run.returncode == code
+    if code:
+        assert '::error::' in run.stdout and 'run this promotion again' in run.stdout
+        assert f'This promotion did NOT complete: the write job was {result}.' in summary.read_text()
+    if result == 'cancelled':
+        assert 'queue was full (100 pending) or someone cancelled the run' in run.stdout
+
+
+@pytest.mark.parametrize('result,code', [('success', 0), ('cancelled', 1), ('failure', 1), ('skipped', 1)])
+def test_an_incomplete_forward_move_fails_the_main_run_loudly(tmp_path, result, code):
+    bash = shutil.which('bash')
+    if os.name == 'nt' or not bash:
+        pytest.skip('requires POSIX Bash')
+    step = workflow('hub-control.yml')['jobs']['latest-confirm']['steps'][0]
+    summary = tmp_path / 'summary.md'
+    run = subprocess.run([bash, '-c', step['run']], capture_output=True, text=True, timeout=5,
+                         env={**os.environ, 'LATEST_RESULT': result, 'GITHUB_STEP_SUMMARY': str(summary)})
+    assert run.returncode == code
+    if code:
+        assert '::error::' in run.stdout and 'promote this candidate by hand' in run.stdout
+        assert f'the latest job was {result}. The candidate stays promotable' in summary.read_text()
+    if result == 'cancelled':
+        assert 'queue was full (100 pending) or someone cancelled the run' in run.stdout
+
+
+def test_no_queue_is_combined_with_cancel_in_progress():
+    # GitHub rejects `queue: max` together with cancel-in-progress.
+    for path in sorted((ROOT / '.github/workflows').glob('*.yml')):
+        config = workflow(path.name)
+        groups = [config.get('concurrency')] + [job.get('concurrency') for job in config.get('jobs', {}).values()]
+        for group in groups:
+            if isinstance(group, dict) and group.get('queue') == 'max':
+                assert 'cancel-in-progress' not in group, path.name
+                assert set(group) == {'group', 'queue'}, path.name
 
 
 def test_verify_runs_backend_e2e_and_pidfd_gates_once():

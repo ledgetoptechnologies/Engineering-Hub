@@ -36,5 +36,6 @@ the timeout and Ctrl+C paths with stand-in steps (about a minute). Logs stay und
 `~/.eh-premerge/<commit>-<id>/`; `--help` lists the options.
 
 Not covered locally: GHCR push, the registry-digest re-test and the write-once
-`sha-<commit>` tag, which only the main `publish` job performs. `latest` moves
-only through the hand-run `hub-promote.yml` (see docs/hub-control-deployment.md).
+`sha-<commit>` tag, which only the main `publish` job performs, and moves of
+`latest`, which only `hub-latest-writer.yml` performs: forward after a `main`
+push, or by hand through `hub-promote.yml` (see docs/hub-control-deployment.md).

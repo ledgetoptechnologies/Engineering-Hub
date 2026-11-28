@@ -1,6 +1,11 @@
 name: Engineering Hub control image
 # Main builds publish an immutable, smoke-tested candidate (build-<sha>-<run>-<attempt>
-# and write-once sha-<commit>). They never move `latest`; that is hub-promote.yml.
+# and write-once sha-<commit>). On a main push the separate `latest` job then moves
+# `latest` to that exact digest in the same run (Project-Alpha style), forward
+# only, through hub-latest-writer.yml: the single, serialized writer that
+# hub-promote.yml (manual promotion and rollback) also uses. The `latest` job is
+# separate so its failure or cancellation never changes the `publish` job's
+# success, which is what makes a candidate promotable by hand.
 on:
   push:
     branches: [main]
@@ -88,6 +93,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.registry.outputs.digest }}
     env:
       PACKAGE: ghcr.io/ledgetoptechnologies/engineering-hub-control
       BUILD_IMAGE: ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -142,6 +149,7 @@ jobs:
           wait_smokes "$first" "$second"
           python scripts/hub_settings_container_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-settings-startup.json
       - name: Publish unique build tag and verify authenticated registry read
+        id: registry
         run: |
           set -eu
           docker push "$BUILD_IMAGE"
@@ -149,6 +157,7 @@ jobs:
           docker buildx imagetools inspect "$BUILD_IMAGE" --format '{{json .Manifest}}' > hub-registry-descriptor.json
           DIGEST="$(python -c 'import json,re; d=json.load(open("hub-registry-descriptor.json"))["digest"]; assert re.fullmatch("sha256:[a-f0-9]{64}",d); print(d)')"
           echo "IMAGE_DIGEST=$DIGEST" >> "$GITHUB_ENV"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           docker pull "$PACKAGE@$DIGEST"
           wait_smokes() {
             local status=0 pid
@@ -180,11 +189,10 @@ jobs:
           print('Private registry gate passed')
           PY
       - name: Publish the write-once sha tag for the tested digest
-        # A main build never moves `latest`. Promotion is the separate, hand-run
-        # hub-promote.yml workflow. `sha-<commit>` is created once and never moved by
-        # this workflow (a test inventories every writer). The registry has no
-        # write-once lock, so this check-then-create is not atomic against a package
-        # admin writing the same tag concurrently.
+        # `sha-<commit>` is created once and never moved by this workflow (a test
+        # inventories every writer). The registry has no write-once lock, so this
+        # check-then-create is not atomic against a package admin writing the same
+        # tag concurrently. `latest` is handled by a later, separate step.
         run: |
           set -eu
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
@@ -206,10 +214,10 @@ jobs:
       - name: Write candidate evidence for promotion
         run: |
           set -eu
-          printf 'source=%s\nimage=%s:sha-%s\ndigest=%s\nlatest=unchanged\n' "$GITHUB_SHA" "$PACKAGE" "$GITHUB_SHA" "$IMAGE_DIGEST" > hub-release.txt
+          printf 'source=%s\nimage=%s:sha-%s\ndigest=%s\n' "$GITHUB_SHA" "$PACKAGE" "$GITHUB_SHA" "$IMAGE_DIGEST" > hub-release.txt
           python scripts/hub_candidate_evidence.py write hub-candidate.json
           sha256sum hub-candidate.json hub-*-startup.json hub-registry-manifest.json > hub-candidate.sha256
-          printf 'Candidate for promotion: commit `%s`, digest `%s`. `latest` was not changed.\n' "$GITHUB_SHA" "$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Tested candidate: commit `%s`, digest `%s`.\n\n' "$GITHUB_SHA" "$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
       - name: Upload candidate evidence
         uses: actions/upload-artifact@v4
         with:
@@ -230,3 +238,47 @@ jobs:
             hub-*-startup.json
             hub-*-manifest.json
             hub-release.txt
+  latest:
+    # Project-Alpha style: a verified main push moves `latest` to the exact digest
+    # `publish` just built, smoke-tested and tagged sha-<commit>, in this same run.
+    # A manual dispatch publishes the candidate only; promote it with hub-promote.yml.
+    # A separate job, so a failed or cancelled tag move leaves `publish` (and so the
+    # candidate's promotability) successful. The write itself happens only in
+    # hub-latest-writer.yml, serialized with hub-promote.yml in one concurrency group.
+    needs: publish
+    if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/hub-latest-writer.yml
+    with:
+      mode: forward
+      commit: ${{ github.sha }}
+      digest: ${{ needs.publish.outputs.digest }}
+  latest-confirm:
+    # Reports a forward move that did not complete: the hub-latest-writer queue was
+    # full (100 pending), someone cancelled it, or it failed. The candidate stays
+    # promotable by hand (hub-promote.yml accepts the successful `publish` job), and
+    # the next main push moves `latest` forward.
+    needs: [publish, latest]
+    if: ${{ always() && needs.publish.result == 'success' && github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the forward move to have run
+        shell: bash
+        env:
+          LATEST_RESULT: ${{ needs.latest.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$LATEST_RESULT" == success ]]; then
+            echo 'forward move completed; see the latest job summary'
+            exit 0
+          fi
+          printf 'latest was not moved to this candidate: the latest job was %s. The candidate stays promotable with hub-promote.yml.\n' "$LATEST_RESULT" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$LATEST_RESULT" == cancelled ]]; then
+            echo '::error::the forward move was cancelled: the hub-latest-writer queue was full (100 pending) or someone cancelled the run. If it was cancelled while writing, latest may have changed. Check latest; promote this candidate by hand or let the next main push move it.'
+          else
+            echo "::error::the forward move did not succeed ($LATEST_RESULT); see the latest job log. Check latest; promote this candidate by hand if needed."
+          fi
+          exit 1

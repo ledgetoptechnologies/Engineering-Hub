@@ -683,7 +683,7 @@ def main():
             lines.append(f'- {count} x {reason}')
     not_run = [s.label for s in run.steps.values() if s.result == NOT_RUN]
     lines += ['', f"Not run: {', '.join(not_run) if not_run else 'none'}",
-              'Not covered locally: GHCR push, registry-digest re-test and the sha tag (publish job only); `latest` moves only via hub-promote.yml.']
+              'Not covered locally: GHCR push, registry-digest re-test, the sha tag (main publish job only) and `latest` moves (hub-latest-writer.yml, from a main push or hub-promote.yml).']
     if run.leftovers:
         lines += ['', '**Left behind (cleanup not proven; remove by hand):**']
         lines += [f'- {item}' for item in run.leftovers]

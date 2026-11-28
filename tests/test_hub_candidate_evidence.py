@@ -29,8 +29,18 @@ def smoke_dir(tmp_path):
 
 def test_written_evidence_verifies_for_the_exact_candidate(tmp_path):
     record = build_record(ENV, smoke_dir(tmp_path))
-    assert record['latest'] == 'unchanged' and record['shaTag'] == f'{PACKAGE}:sha-{COMMIT}'
+    # Schema 2: written before the run's own latest step, so it makes no latest claim.
+    assert record['evidenceSchemaVersion'] == 2 and 'latest' not in record
+    assert record['shaTag'] == f'{PACKAGE}:sha-{COMMIT}'
     assert verify_record(record, EXPECTED, tmp_path) == {'commit': COMMIT, 'digest': DIGEST}
+
+
+def test_schema_1_candidates_stay_promotable_for_rollback(tmp_path):
+    record = {**build_record(ENV, smoke_dir(tmp_path)), 'evidenceSchemaVersion': 1, 'latest': 'unchanged'}
+    assert verify_record(record, EXPECTED, tmp_path) == {'commit': COMMIT, 'digest': DIGEST}
+    for bad in ({'latest': 'moved'}, {'evidenceSchemaVersion': 1, 'latest': None}):
+        with pytest.raises(EvidenceError, match='promotion refused'):
+            verify_record({**record, **bad}, EXPECTED, tmp_path)
 
 
 @pytest.mark.parametrize('override', [{'GITHUB_REF': 'refs/heads/feature'}, {'IMAGE_DIGEST': 'latest'},
@@ -62,7 +72,8 @@ def _mutate(path, value):
     (_mutate(['run', 'ref'], 'refs/heads/feature'), {}), (_mutate(['run', 'event'], 'pull_request'), {}),
     (_mutate(['run', 'workflowRef'], f'{REPO}/.github/workflows/other.yml@refs/heads/main'), {}),
     (_mutate(['package'], 'ghcr.io/example/other'), {}), (_mutate(['shaTag'], f'{PACKAGE}:latest'), {}),
-    (_mutate(['evidenceSchemaVersion'], 2), {}), (_mutate(['latest'], 'moved'), {}),
+    (_mutate(['evidenceSchemaVersion'], 3), {}), (_mutate(['evidenceSchemaVersion'], True), {}),
+    (_mutate(['latest'], 'unchanged'), {}), (_mutate(['latest'], 'moved'), {}),
     (_mutate(['smokeEvidence'], []), {}),
 ])
 def test_verify_refuses_anything_but_the_exact_main_candidate(tmp_path, change, overrides):
