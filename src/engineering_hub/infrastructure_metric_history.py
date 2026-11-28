@@ -49,6 +49,15 @@ def _label(value):
 def _series_queries(exporter, job, instance, window):
     """(key, unit, label name, PromQL) for one target; values come from Prometheus's target list."""
     target = f'job="{_label(job)}",instance="{_label(instance)}"'
+    if exporter == 'nvidia':
+        # DCGM reports percent, MiB and MHz; convert to the units the browser charts.
+        return (
+            ('gpu_util', 'ratio', 'gpu', f'max by (gpu) (DCGM_FI_DEV_GPU_UTIL{{{target}}}) / 100'),
+            ('gpu_memory', 'bytes', 'gpu', f'max by (gpu) (DCGM_FI_DEV_FB_USED{{{target}}}) * 1048576'),
+            ('gpu_temperature', 'celsius', 'gpu', f'max by (gpu) (DCGM_FI_DEV_GPU_TEMP{{{target}}})'),
+            ('gpu_power', 'watts', 'gpu', f'max by (gpu) (DCGM_FI_DEV_POWER_USAGE{{{target}}})'),
+            ('gpu_clock', 'hertz', 'gpu', f'max by (gpu) (DCGM_FI_DEV_SM_CLOCK{{{target}}}) * 1000000'),
+        )
     if exporter == 'node':
         return (
             ('cpu', 'ratio', None, f'1 - avg(rate(node_cpu_seconds_total{{{target},mode="idle"}}[{window}]))'),
@@ -153,7 +162,7 @@ async def read_history(reader, actor, host_key, span, targets_parser):
                     truncated = len(rows) > MAX_TARGETS_PER_HOST
                     plan = [(index, kind, query)
                             for index, row in enumerate(rows[:MAX_TARGETS_PER_HOST])
-                            for kind in ((row['exporter'],) if row['exporter'] in ('node', 'windows')
+                            for kind in ((row['exporter'],) if row['exporter'] in ('node', 'windows', 'nvidia')
                                          else ('node', 'windows') if row['exporter'] is None else ())
                             for query in _series_queries(kind, row['job'], row['instance'], window)]
                     planned = len(plan)

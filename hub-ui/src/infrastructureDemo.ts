@@ -49,6 +49,10 @@ export function demoMachineMetrics(now = new Date()): MachineMetrics {
     machine({ host_key: demoKey("b"), host_label: "build", device_id: "build-pc", instance: "198.51.100.20:9182", job: "windows", exporter: "windows",
       cpu_busy_ratio: 0.92, mem_total_bytes: 128 * GB, mem_available_bytes: 30 * GB, net_rx_bytes_per_second: 1_200_000, net_tx_bytes_per_second: 310_000,
       disks: [{ mount: "C:", size_bytes: 2_000 * GB, free_bytes: 900 * GB }] }),
+    machine({ host_key: demoKey("b"), host_label: "build", device_id: "build-pc", instance: "198.51.100.20:9400", job: "nvidia-gpu", exporter: "nvidia",
+      uptime_seconds: null, gpus: [
+        { index: 0, model: "Demo GPU 16 GB", util_ratio: 0.64, mem_used_bytes: 9 * GB, mem_total_bytes: 16 * GB, temperature_c: 66 },
+        { index: 1, model: "Demo GPU 12 GB", util_ratio: 0.08, mem_used_bytes: 1 * GB, mem_total_bytes: 12 * GB, temperature_c: 48 }] }),
     machine({ host_key: demoKey("c"), host_label: "lab-node", association: "unregistered", instance: "192.0.2.77:9100", cpu_busy_ratio: 0.04,
       mem_total_bytes: 16 * GB, mem_available_bytes: 12 * GB, net_rx_bytes_per_second: 9_000, net_tx_bytes_per_second: 4_000,
       disks: [{ mount: "/", size_bytes: 500 * GB, free_bytes: 410 * GB }] }),
@@ -71,6 +75,13 @@ export function demoMachineHistory(hostKey: string, range: HistoryRange, now = D
     line("disk", "/", "ratio", wave(0.25, 0.005, 2, 1)), line("disk", "/mnt/data", "ratio", wave(0.85, 0.01, 3, 1)),
     line("network_rx", null, "bytes_per_second", wave(30_000_000, 22_000_000, 4, 1e12)),
     line("network_tx", null, "bytes_per_second", wave(8_000_000, 6_000_000, 5, 1e12)),
+    ...(hostKey !== demoKey("b") ? [] : ["0", "1"].flatMap((gpu, index) => [
+      line("gpu_util", gpu, "ratio", wave(0.5 - index * 0.4, 0.3, 6 + index, 1)),
+      line("gpu_memory", gpu, "bytes", wave((9 - index * 8) * GB, GB, 7 + index, 16 * GB)),
+      line("gpu_temperature", gpu, "celsius", wave(62 - index * 14, 6, 8 + index, 95)),
+      line("gpu_power", gpu, "watts", wave(110 - index * 80, 30, 9 + index, 180)),
+      line("gpu_clock", gpu, "hertz", wave(1.8e9 - index * 1.2e9, 4e8, 10 + index, 3e9)),
+    ])),
   ] };
 }
 

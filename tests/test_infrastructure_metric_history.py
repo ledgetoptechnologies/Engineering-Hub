@@ -211,3 +211,37 @@ async def test_more_targets_than_charted_for_one_host_is_partial_and_stays_bound
         return json_response({'status': 'success', 'data': {'resultType': 'matrix', 'result': []}})
 
     assert (await reader(respond_exact).history('internal', key, '1h'))['source']['status'] == 'ok'
+
+
+@pytest.mark.asyncio
+async def test_dcgm_exporter_history_is_split_per_gpu_with_units():
+    gpu_targets = TARGETS + [{'labels': {'job': 'nvidia-gpu', 'instance': 'nas:9400', 'host': 'nas'}, 'health': 'up',
+                              'lastScrape': '2026-11-06T11:59:50Z', 'scrapeInterval': '15s'}]
+    calls = []
+
+    def respond(request):
+        if request.url.raw_path.decode() == TARGET_PATH:
+            return json_response({'status': 'success', 'data': {'activeTargets': gpu_targets}})
+        params = parse_qs(request.url.query.decode())
+        query, start = params['query'][0], int(params['start'][0])
+        calls.append(query)
+        values = {'GPU_UTIL': ('0.5', '0.25'), 'FB_USED': ('1024', '2048'), 'GPU_TEMP': ('45', '54'),
+                  'POWER_USAGE': ('20.5', '31'), 'SM_CLOCK': ('1500000000', '210000000')}
+        found = next((pair for name, pair in values.items() if name in query), None)
+        result = [] if found is None else [{'metric': {'gpu': gpu}, 'values': [[start, value]]}
+                                           for gpu, value in zip(('0', '1'), found)]
+        return json_response({'status': 'success', 'data': {'resultType': 'matrix', 'result': result}})
+
+    key = next(row['host_key'] for row in normalize_targets(gpu_targets, INVENTORY)['rows'] if row['host_label'] == 'nas')
+    result = await reader(respond).history('internal', key, '1h')
+    assert result['source']['status'] == 'ok'
+    gpu = {(item['key'], item['label']): (item['unit'], item['points'][0][1]) for item in result['series'] if item['key'].startswith('gpu_')}
+    assert gpu == {
+        ('gpu_util', '0'): ('ratio', 0.5), ('gpu_util', '1'): ('ratio', 0.25),
+        ('gpu_memory', '0'): ('bytes', 1024), ('gpu_memory', '1'): ('bytes', 2048),
+        ('gpu_temperature', '0'): ('celsius', 45), ('gpu_temperature', '1'): ('celsius', 54),
+        ('gpu_power', '0'): ('watts', 20.5), ('gpu_power', '1'): ('watts', 31),
+        ('gpu_clock', '0'): ('hertz', 1500000000), ('gpu_clock', '1'): ('hertz', 210000000),
+    }
+    dcgm = [query for query in calls if 'DCGM_' in query]
+    assert len(dcgm) == 5 and all('job="nvidia-gpu",instance="nas:9400"' in query for query in dcgm)

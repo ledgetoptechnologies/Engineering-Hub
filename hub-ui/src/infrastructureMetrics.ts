@@ -201,17 +201,19 @@ export async function readMetrics(signal: AbortSignal, fetchImpl: typeof fetch =
 export const HISTORY_RANGES = ["1h", "6h", "24h", "7d", "30d"] as const;
 export type HistoryRange = typeof HISTORY_RANGES[number];
 export type HistoryPoint = [number, number | null];
-const HISTORY_KEYS = ["cpu", "memory", "disk", "network_rx", "network_tx"] as const;
-export interface HistorySeries { key: typeof HISTORY_KEYS[number]; label: string | null; unit: "ratio" | "bytes_per_second"; points: HistoryPoint[] }
+const HISTORY_KEYS = ["cpu", "memory", "disk", "network_rx", "network_tx", "gpu_util", "gpu_memory", "gpu_temperature", "gpu_power", "gpu_clock"] as const;
+const HISTORY_UNITS = ["ratio", "bytes_per_second", "bytes", "celsius", "watts", "hertz"] as const;
+export interface HistorySeries { key: typeof HISTORY_KEYS[number]; label: string | null; unit: typeof HISTORY_UNITS[number]; points: HistoryPoint[] }
 export interface MachineHistoryData { range: HistoryRange; source: typeof SOURCE_STATES[number]; series: HistorySeries[] }
 const MAX_HISTORY_SERIES = 80, MAX_HISTORY_POINTS = 250;
 
 function historySeries(value: unknown): HistorySeries {
   const row = record(value, ["key", "label", "unit", "points"]);
-  const unit = oneOf(row.unit, ["ratio", "bytes_per_second"] as const);
+  const unit = oneOf(row.unit, HISTORY_UNITS);
+  const bound = unit === "ratio" ? { max: 1 } : unit === "celsius" ? { max: 150 } : {};
   const points = list(row.points, MAX_HISTORY_POINTS).map((item): HistoryPoint => {
     if (!Array.isArray(item) || item.length !== 2) return invalid();
-    return [number(item[0], { integer: true, nullable: false })!, number(item[1], unit === "ratio" ? { max: 1 } : {})];
+    return [number(item[0], { integer: true, nullable: false })!, number(item[1], bound)];
   });
   if (!points.length) return invalid();
   return { key: oneOf(row.key, HISTORY_KEYS), label: row.label === null ? null : plain(row.label, 128), unit, points };
@@ -296,6 +298,22 @@ export function formatBytes(value: number | null): string {
   return `${amount >= 100 || unit === 0 ? Math.round(amount) : amount.toFixed(1)} ${units[unit]}`;
 }
 export const formatRate = (value: number | null) => value === null ? "not reported" : `${formatBytes(Math.round(value))}/s`;
+export const formatCelsius = (value: number | null) => value === null ? "not reported" : `${Math.round(value)} °C`;
+export const formatWatts = (value: number | null) => value === null ? "not reported" : `${value >= 100 ? Math.round(value) : value.toFixed(1)} W`;
+export function formatHertz(value: number | null): string {
+  if (value === null) return "not reported";
+  return value >= 1e9 ? `${(value / 1e9).toFixed(2)} GHz` : `${Math.round(value / 1e6)} MHz`;
+}
+/** A round axis top at or above value: powers of 1024 for bytes, 1-2-2.5-5 steps otherwise. */
+export function niceTop(value: number, base: 1000 | 1024): number {
+  if (!(value > 0)) return 1;
+  if (base === 1024) {
+    const scale = 1024 ** Math.floor(Math.log(value) / Math.log(1024));
+    return [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024].map(step => step * scale).find(step => step >= value) ?? value;
+  }
+  const scale = 10 ** Math.floor(Math.log10(value));
+  return [1, 2, 2.5, 5, 10].map(step => step * scale).find(step => step >= value * (1 - 1e-9)) ?? value;
+}
 export const percent = (ratio: number | null) => ratio === null ? "not reported" : `${Math.round(ratio * 100)}%`;
 export function formatUptime(seconds: number | null): string {
   if (seconds === null) return "not reported";

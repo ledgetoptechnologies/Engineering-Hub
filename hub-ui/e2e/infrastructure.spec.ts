@@ -410,7 +410,7 @@ test("metrics-only matched and orphaned groups keep opaque details and history w
   await expect(page.getByRole("region", { name: "Current readings" })).toContainText("Not a recognized exporter");
   await expect(page.getByRole("link", { name: /Machine health/ })).toBeVisible();
   await expect.poll(() => historyReads.length).toBe(2);
-  await page.getByRole("combobox", { name: "Time range" }).selectOption("7d");
+  await page.getByRole("group", { name: "Time range" }).getByRole("button", { name: "Last 7 days" }).click();
   await page.getByRole("combobox", { name: "Machine" }).selectOption({ label: "demo-workstation" });
   await expect(page).toHaveURL(/\/infrastructure\/machines\/host:[a-f0-9]{64}\?range=7d$/);
   await expect(page.getByRole("heading", { name: "demo-workstation" })).toBeVisible();
@@ -456,7 +456,7 @@ test("a device page charts history, keeps gaps, and changes range on request", a
   await page.keyboard.press("ArrowLeft");
   await page.keyboard.press("ArrowLeft");
   await expect(page.locator(".history-tip")).toContainText("No data");
-  await page.getByRole("combobox", { name: "Time range" }).selectOption("7d");
+  await page.getByRole("group", { name: "Time range" }).getByRole("button", { name: "Last 7 days" }).click();
   await expect.poll(() => ranges.at(-1)).toBe("7d");
   expect(ranges[0]).toBe("24h");
   await page.setViewportSize({ width: 375, height: 812 });
@@ -571,35 +571,36 @@ test("registered and discovered pages share graphs-first controls and keep the r
   await page.goto("/infrastructure/build-pc?range=7d");
   const history = page.getByRole("region", { name: "Machine history" });
   const current = page.getByRole("region", { name: "Current readings" });
-  const time = page.getByRole("combobox", { name: "Time range" });
+  const time = page.getByRole("group", { name: "Time range" });
+  const pressed = time.locator('[aria-pressed="true"]');
   const machine = page.getByRole("combobox", { name: "Machine" });
-  await expect(time).toHaveValue("7d");
+  await expect(pressed).toHaveText("7d");
   await expect(history.getByRole("img", { name: /^CPU:/ })).toBeVisible();
   expect((await history.boundingBox())!.y).toBeLessThan((await current.boundingBox())!.y);
   expect((await history.boundingBox())!.y).toBeLessThan((await page.getByRole("region", { name: "Declared details" }).boundingBox())!.y);
   const mainKey = `host:${"1".padStart(64, "0")}`, clusterKey = `host:${"2".padStart(64, "0")}`;
   expect(historyReads).toEqual([`${mainKey}|7d`]);
-  await time.selectOption("6h");
+  await time.getByRole("button", { name: "Last 6 hours" }).click();
   await expect(page).toHaveURL(/\/infrastructure\/build-pc\?range=6h$/);
   await machine.selectOption({ label: "Cluster PC" });
   await expect(page).toHaveURL(/\/infrastructure\/machines\/host:[a-f0-9]{64}\?range=6h$/);
   await expect(page.getByRole("heading", { name: "Cluster PC" })).toBeVisible();
-  await expect(time).toHaveValue("6h");
+  await expect(pressed).toHaveText("6h");
   await expect.poll(() => historyReads.at(-1)).toBe(`${clusterKey}|6h`);
   expect(state.details).toBe(1);
   expect(state.metrics).toBe(1);
   await machine.selectOption({ label: "Main PC" });
   await expect(page).toHaveURL(/\/infrastructure\/build-pc\?range=6h$/);
-  await expect(time).toHaveValue("6h");
+  await expect(pressed).toHaveText("6h");
   await page.goBack();
   await expect(page.getByRole("heading", { name: "Cluster PC" })).toBeVisible();
-  await expect(time).toHaveValue("6h");
+  await expect(pressed).toHaveText("6h");
   await page.goBack();
-  await expect(time).toHaveValue("6h");
+  await expect(pressed).toHaveText("6h");
   await page.reload();
-  await expect(time).toHaveValue("6h");
+  await expect(pressed).toHaveText("6h");
   await page.goBack();
-  await expect(time).toHaveValue("7d");
+  await expect(pressed).toHaveText("7d");
 });
 
 test("a shared inventory record keeps the selected opaque machine without accepting an unrelated host", async ({ page }) => {
@@ -633,7 +634,15 @@ test("populated charts keep readable, non-overlapping axes and controls at deskt
   await page.goto("/?demo=1#/infrastructure/build-pc?range=30d");
   const history = page.getByRole("region", { name: "Machine history" });
   const charts = history.getByRole("img");
-  await expect(charts).toHaveCount(4);
+  // CPU, memory, storage and network, then five charts for each of the demo machine's two GPUs.
+  await expect(charts).toHaveCount(14);
+  for (const gpu of ["GPU 0", "GPU 1"]) {
+    const section = history.getByRole("region", { name: gpu });
+    await expect(section.getByRole("heading")).toContainText(gpu === "GPU 0" ? "Demo GPU 16 GB" : "Demo GPU 12 GB");
+    for (const title of ["Utilization", "Memory used", "Temperature", "Power", "SM clock"])
+      await expect(section.getByRole("img", { name: new RegExp(`^${title}:`) })).toBeVisible();
+  }
+  await expect(history.getByRole("img", { name: /^Temperature:/ }).first()).toHaveAttribute("aria-label", /°C/);
   await expect(page).toHaveURL(/\?demo=1&range=30d$/);
   for (const [width, height, name] of [[1440, 1100, "desktop"], [834, 1112, "tablet"], [375, 900, "mobile"], [320, 780, "small-phone"]] as const) {
     await page.setViewportSize({ width, height });
@@ -646,7 +655,7 @@ test("populated charts keep readable, non-overlapping axes and controls at deskt
         return Number.parseFloat(getComputedStyle(text).fontSize) >= 12 && rect.left >= box.left && rect.right <= box.right + 1;
       }) && time.every((text, i) => i === 0 || text.getBoundingClientRect().left >= time[i - 1].getBoundingClientRect().right + 4);
     }))).toBe(true);
-    for (const control of await history.getByRole("combobox").all()) {
+    for (const control of [...await history.getByRole("combobox").all(), ...await history.getByRole("group", { name: "Time range" }).getByRole("button").all()]) {
       const box = (await control.boundingBox())!;
       expect(box.height).toBeGreaterThanOrEqual(44);
       expect(box.x + box.width).toBeLessThanOrEqual(width);
@@ -712,54 +721,77 @@ test("prioritizes compact machine cards and drills into device and discovered-ma
   expect(blocking(await audit(page, "page", 375))).toEqual([]);
 });
 
-test("machine order preferences stay browser-local and reorder by exact normalized display alias", async ({ page }) => {
+test("machine cards reorder by keyboard and stay browser-local per actor across reloads", async ({ page }) => {
   await fixture(page, { metrics: [{ status: 200, body: prioritizedMetrics() }] });
   await page.goto("/#/infrastructure");
-  const panel = healthPanel(page);
-  await panel.getByText("Customize order", { exact: true }).click();
-  const order = panel.getByLabel("Priority machine names");
-  await order.fill("DNS\nmain-pc");
-  await panel.getByRole("button", { name: "Save order" }).click();
+  let panel = healthPanel(page);
+  await expect(panel.getByRole("button", { name: "Reset order" })).toHaveCount(0);
+  const dns = panel.getByRole("button", { name: "Reorder DNS" });
+  await dns.focus();
+  await page.keyboard.press("Home");
   await expect(panel.locator(".machine-card-title").evaluateAll(nodes => nodes.map(node => node.textContent?.trim()))).resolves.toEqual([
     "DNS", "Main PC", "Cluster PC", "Hermes", "Staging", "Sync Pi", "Zeta",
   ]);
-  const stored = await page.evaluate(actor => localStorage.getItem(`engineering-hub.machine-order.v1.live.${encodeURIComponent(actor)}`), human);
-  expect(stored).toBe('["dns","main pc"]');
+  await expect(dns).toBeFocused();
+  await expect(panel.getByRole("status").filter({ hasText: "DNS moved to position 1 of 7." })).toBeAttached();
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("ArrowUp");
+  await expect(panel.locator(".machine-card-title").first()).toHaveText("DNS");
+  const key = `engineering-hub.machine-order.v1.live.${encodeURIComponent(human)}`;
+  const stored = await page.evaluate(name => localStorage.getItem(name), key);
+  expect(stored).toBe('["dns","main pc","cluster pc","hermes","staging","sync pi","zeta"]');
   expect(stored).not.toContain("host:");
   expect(await page.evaluate(() => localStorage.getItem("engineering-hub.machine-order.v1"))).toBeNull();
   await page.reload();
-  await expect(healthPanel(page).locator(".machine-card-title").first()).toHaveText("DNS");
-});
-
-test("machine-order preferences persist separately for each live actor", async ({ page }) => {
-  const actorA = human;
-  const actorB = `human:cf:${"f".repeat(64)}`;
-  await fixture(page, { actor: actorA, metrics: [{ status: 200, body: prioritizedMetrics() }] });
-  await page.goto("/#/infrastructure");
-  let panel = healthPanel(page);
-  await panel.getByText("Customize order", { exact: true }).click();
-  let order = panel.getByLabel("Priority machine names");
-  await order.fill("DNS\nmain-pc");
-  await panel.getByRole("button", { name: "Save order" }).click();
+  panel = healthPanel(page);
   await expect(panel.locator(".machine-card-title").first()).toHaveText("DNS");
 
+  const actorB = `human:cf:${"f".repeat(64)}`;
   await page.unrouteAll();
   await fixture(page, { actor: actorB, metrics: [{ status: 200, body: prioritizedMetrics() }] });
   await page.reload();
   panel = healthPanel(page);
-  await panel.getByText("Customize order", { exact: true }).click();
-  order = panel.getByLabel("Priority machine names");
-  await expect(order).toHaveValue("main pc\ncluster pc\nhermes\nstaging\nsync pi\ndns");
-  await order.fill("Zeta\nCluster PC");
-  await panel.getByRole("button", { name: "Save order" }).click();
+  await expect(panel.locator(".machine-card-title").first()).toHaveText("Main PC");
+  await panel.getByRole("button", { name: "Reorder Zeta" }).focus();
+  await page.keyboard.press("Home");
   await expect(panel.locator(".machine-card-title").first()).toHaveText("Zeta");
+  await panel.getByRole("button", { name: "Reset order" }).click();
+  await expect(panel.locator(".machine-card-title").first()).toHaveText("Main PC");
 
   await page.unrouteAll();
-  await fixture(page, { actor: actorA, metrics: [{ status: 200, body: prioritizedMetrics() }] });
+  await fixture(page, { metrics: [{ status: 200, body: prioritizedMetrics() }] });
   await page.reload();
-  panel = healthPanel(page);
-  await panel.getByText("Customize order", { exact: true }).click();
-  order = panel.getByLabel("Priority machine names");
-  await expect(order).toHaveValue("dns\nmain pc");
-  await expect(panel.locator(".machine-card-title").first()).toHaveText("DNS");
+  await expect(healthPanel(page).locator(".machine-card-title").first()).toHaveText("DNS");
+});
+
+test("card stats keep their labels clear of their values at desktop and phone widths", async ({ page }) => {
+  await fixture(page, { metrics: [{ status: 200, body: prioritizedMetrics() }] });
+  await page.goto("/#/infrastructure");
+  const stats = healthPanel(page).locator(".machine-card-stat");
+  await expect(stats.first()).toBeVisible();
+  for (const width of [1280, 375, 320]) {
+    await page.setViewportSize({ width, height: 900 });
+    await expect.poll(() => stats.evaluateAll(nodes => nodes.every(node => {
+      const label = node.querySelector(":scope > span")!.getBoundingClientRect();
+      const value = node.querySelector(":scope > strong")!.getBoundingClientRect();
+      const apart = label.right <= value.left || label.bottom <= value.top;
+      return apart && label.width >= (node.querySelector(":scope > span") as HTMLElement).scrollWidth - 1;
+    }))).toBe(true);
+  }
+});
+
+test("dragging a card's handle onto another card moves it there", async ({ page }) => {
+  await fixture(page, { metrics: [{ status: 200, body: prioritizedMetrics() }] });
+  await page.goto("/#/infrastructure");
+  const panel = healthPanel(page);
+  const handle = panel.getByRole("button", { name: "Reorder Zeta" });
+  const target = panel.getByRole("listitem").filter({ hasText: "Main PC" });
+  await handle.hover();
+  await page.mouse.down();
+  const box = (await target.boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 8 });
+  await page.mouse.up();
+  await expect(panel.locator(".machine-card-title").first()).toHaveText("Zeta");
+  await page.reload();
+  await expect(healthPanel(page).locator(".machine-card-title").first()).toHaveText("Zeta");
 });
