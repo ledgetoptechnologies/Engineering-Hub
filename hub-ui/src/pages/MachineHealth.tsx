@@ -4,8 +4,8 @@
  * while the page is showing. Hidden entirely when this person can't read metrics; says so when
  * Prometheus isn't set up.
  */
-import { useEffect, useState } from "react";
-import type { FormEvent, ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import type { KeyboardEvent, PointerEvent, ReactNode, RefObject } from "react";
 import { HubApiError } from "../api";
 import type { Hub } from "../hub";
 import { demoMachineMetrics } from "../infrastructureDemo";
@@ -14,7 +14,7 @@ import {
 } from "../infrastructureMetrics";
 import { href, navigate, type MachineDetailRoute } from "../router";
 import { Badge, PageHeader, PanelTitle } from "../ui";
-import { DEFAULT_MACHINE_ORDER, machineOrderStorageKey, normalizeMachineOrder, readMachineOrder, sortMachineGroups, writeMachineOrder, type MachineOrderScope } from "../machineOrder";
+import { DEFAULT_MACHINE_ORDER, machineOrderStorageKey, moveMachine, readMachineOrder, sortMachineGroups, writeMachineOrder, type MachineOrderScope } from "../machineOrder";
 import { MachineHistory, RANGE_TEXT } from "./MachineHistory";
 
 type Load = { state: "loading" } | { state: "hidden" } | { state: "failed" } | { state: "unavailable" } | { state: "loaded"; value: MachineMetrics };
@@ -136,9 +136,9 @@ function GroupStatus({ group }: { group: MachineGroup }) {
   return <Badge tone="neutral">Unknown</Badge>;
 }
 
-function CardStat({ label, value, ratio }: { label: string; value: string; ratio?: number | null }) {
+function CardStat({ label, value, ratio, wide = false }: { label: string; value: string; ratio?: number | null; wide?: boolean }) {
   const tone = ratio === null || ratio === undefined ? "" : ratio >= 0.9 ? " high" : ratio >= 0.75 ? " warm" : "";
-  return <div className="machine-card-stat">
+  return <div className={wide ? "machine-card-stat wide" : "machine-card-stat"}>
     <span>{label}</span><strong>{value}</strong>
     {ratio !== undefined && <span className={`machine-card-meter${tone}`} aria-hidden="true">
       {ratio !== null && <i style={{ width: `${Math.round(ratio * 100)}%` }} />}
@@ -153,13 +153,21 @@ function machineRoute(group: MachineGroup, groups: MachineGroup[], inventoryRead
   return { page: "device", id: group.device_id, ...(shared ? { host: group.key } : {}) };
 }
 
-function MachineCard({ group, destination }: { group: MachineGroup; destination: MachineDetailRoute }) {
+interface Reorder {
+  dragging: boolean; onPointerDown: (event: PointerEvent<HTMLButtonElement>) => void;
+  onKeyDown: (event: KeyboardEvent<HTMLButtonElement>) => void;
+}
+function MachineCard({ group, destination, reorder }: { group: MachineGroup; destination: MachineDetailRoute; reorder: Reorder }) {
   const stats = quickStats(group);
   const exporters = [...new Set(group.targets.map(item => item.exporter ? EXPORTER_TEXT[item.exporter] : `Unknown · ${item.job}`))];
   const network = stats.down === null && stats.up === null ? "not reported"
     : `↓ ${formatRate(stats.down)} · ↑ ${formatRate(stats.up)}`;
-  return <li className="machine-card">
-    <a className="machine-card-link" href={href(destination)} aria-label={`View ${group.title} machine details`}>
+  return <li className={reorder.dragging ? "machine-card dragging" : "machine-card"} data-machine-key={group.key}>
+    <button type="button" className="machine-card-handle" data-handle={group.key} aria-label={`Reorder ${group.title}`}
+      title="Drag, or use the arrow keys, to reorder" onPointerDown={reorder.onPointerDown} onKeyDown={reorder.onKeyDown}>
+      <svg viewBox="0 0 12 18" width="12" height="18" aria-hidden="true">{[3, 9].flatMap(cx => [3, 9, 15].map(cy => <circle key={`${cx}${cy}`} cx={cx} cy={cy} r={1.6} />))}</svg>
+    </button>
+    <a className="machine-card-link" draggable={false} href={href(destination)} aria-label={`View ${group.title} machine details`}>
       <div className="machine-card-head">
         <strong className="machine-card-title">{group.title}</strong>
         <GroupStatus group={group} />
@@ -176,46 +184,32 @@ function MachineCard({ group, destination }: { group: MachineGroup; destination:
         <CardStat label="CPU" value={percent(stats.cpu)} ratio={stats.cpu} />
         <CardStat label="Memory" value={stats.memory === null ? "not reported" : percent(stats.memory)} ratio={stats.memory} />
         <CardStat label="Storage" value={stats.diskRatio === null ? "not reported" : percent(stats.diskRatio)} ratio={stats.diskRatio} />
-        <CardStat label="Network" value={network} />
+        <CardStat label="Network" value={network} wide />
       </div>
       <span className="machine-card-cta">View details <span aria-hidden="true">→</span></span>
     </a>
   </li>;
 }
 
-function MachineOrderControl({ order, scope, onSave }: { order: string[]; scope: MachineOrderScope; onSave: (value: string[]) => void }) {
-  const [draft, setDraft] = useState(order.join("\n"));
-  const [saved, setSaved] = useState(false);
-  useEffect(() => setDraft(order.join("\n")), [order]);
-  const save = (event: FormEvent) => {
-    event.preventDefault();
-    const next = normalizeMachineOrder(draft.split(/\r?\n/));
-    writeMachineOrder(next, scope);
-    onSave(next);
-    setDraft(next.join("\n"));
-    setSaved(true);
-  };
-  const reset = () => {
-    const next = [...DEFAULT_MACHINE_ORDER];
-    writeMachineOrder(next, scope);
-    onSave(next);
-    setDraft(next.join("\n"));
-    setSaved(false);
-  };
-  return <details className="machine-order-control">
-    <summary>Customize order</summary>
-    <form onSubmit={save}>
-      <label className="field"><span className="field-label">Priority machine names</span>
-        <textarea rows={4} value={draft} onChange={event => { setDraft(event.target.value); setSaved(false); }} />
-      </label>
-      <small>One exact display name per line. Matching ignores case and common punctuation; other machines follow alphabetically. Stored in this browser only.</small>
-      <div className="button-row">
-        <button type="submit" className="secondary">Save order</button>
-        <button type="button" className="secondary" onClick={reset}>Reset</button>
-        {saved && <span role="status">Order saved in this browser.</span>}
-      </div>
-    </form>
-  </details>;
+const MOVE_KEYS: Record<string, (index: number, last: number) => number> = {
+  ArrowUp: index => index - 1, ArrowLeft: index => index - 1, ArrowDown: index => index + 1, ArrowRight: index => index + 1,
+  Home: () => 0, End: (_, last) => last,
+};
+
+/** Slides cards from where they were to where they are after a reorder (FLIP), unless motion is reduced. */
+function useCardSlide(list: RefObject<HTMLUListElement | null>, order: string) {
+  const previous = useRef(new Map<string, DOMRect>());
+  useLayoutEffect(() => {
+    const cards = [...list.current?.querySelectorAll<HTMLElement>("[data-machine-key]") ?? []];
+    const still = typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    for (const card of cards) {
+      const before = previous.current.get(card.dataset.machineKey!), after = card.getBoundingClientRect();
+      if (!before || still || typeof card.animate !== "function" || (before.left === after.left && before.top === after.top)) continue;
+      card.animate([{ transform: `translate(${before.left - after.left}px, ${before.top - after.top}px)` }, { transform: "none" }],
+        { duration: 180, easing: "cubic-bezier(0.2, 0, 0, 1)" });
+    }
+    previous.current = new Map(cards.map(card => [card.dataset.machineKey!, card.getBoundingClientRect()]));
+  }, [order]);
 }
 
 function orderScope(hub: Hub): MachineOrderScope {
@@ -230,13 +224,67 @@ export function MachineHealth({ hub, reading, inventoryReadAvailable }: {
   const scopeKey = machineOrderStorageKey(scope) ?? "live-anonymous";
   const [savedOrder, setSavedOrder] = useState(() => ({ scopeKey, order: readMachineOrder(scope) }));
   const order = savedOrder.scopeKey === scopeKey ? savedOrder.order : readMachineOrder(scope);
-  if (load.state === "hidden") return null;
+  const [dragging, setDragging] = useState<string | null>(null);
+  const [moved, setMoved] = useState("");
+  const list = useRef<HTMLUListElement>(null);
   const metrics = load.state === "loaded" ? load.value : null;
   const groups = groupMachines(metrics?.targets ?? []);
+  const shown = sortMachineGroups(groups, order);
+  useCardSlide(list, shown.map(group => group.key).join("\n"));
+  // The dragged card's node moves while dragging, so follow the pointer on the window, not the handle.
+  const dragMove = useRef<(event: globalThis.PointerEvent, drop?: boolean) => void>(() => {});
+  useEffect(() => {
+    if (!dragging) return;
+    const follow = (event: globalThis.PointerEvent) => dragMove.current(event);
+    const end = (event: Event) => { if (event.type === "pointerup") dragMove.current(event as globalThis.PointerEvent, true); setDragging(null); };
+    const events = [["pointermove", follow], ["pointerup", end], ["pointercancel", end], ["blur", end]] as const;
+    for (const [name, handler] of events) window.addEventListener(name, handler as EventListener);
+    return () => { for (const [name, handler] of events) window.removeEventListener(name, handler as EventListener); };
+  }, [dragging]);
+  if (load.state === "hidden") return null;
+  const save = (next: string[]) => { writeMachineOrder(next, scope); setSavedOrder({ scopeKey, order: next }); };
+  const move = (key: string, index: number) => {
+    const from = shown.findIndex(group => group.key === key);
+    const to = Math.max(0, Math.min(index, shown.length - 1));
+    if (from < 0 || from === to) return false;
+    save(moveMachine(shown, key, to));
+    setMoved(`${shown[from].title} moved to position ${to + 1} of ${shown.length}.`);
+    return true;
+  };
+  dragMove.current = (event, drop = false) => {
+    if (!dragging || (!drop && !event.buttons)) { setDragging(null); return; }
+    // While cards slide (element.animate, not CSS hover fades) they are drawn away from their slots, and
+    // hit-testing would swap them straight back: wait while dragging, and on release land them first.
+    const slides = list.current?.getAnimations?.({ subtree: true }).filter(item => !("transitionProperty" in item) && !("animationName" in item)) ?? [];
+    if (slides.length && !drop) return;
+    for (const slide of slides) slide.finish();
+    const over = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-machine-key]")?.dataset.machineKey;
+    if (over && over !== dragging) move(dragging, shown.findIndex(item => item.key === over));
+  };
+  const reorder = (group: MachineGroup): Reorder => ({
+    dragging: dragging === group.key,
+    onPointerDown: event => {
+      if (event.button) return;
+      event.preventDefault();
+      event.currentTarget.releasePointerCapture?.(event.pointerId);
+      setDragging(group.key);
+    },
+    onKeyDown: event => {
+      const step = MOVE_KEYS[event.key];
+      if (!step) return;
+      event.preventDefault();
+      const index = shown.findIndex(item => item.key === group.key);
+      // Reordering moves the focused button's card; keep focus on it.
+      if (move(group.key, step(index, shown.length - 1)))
+        requestAnimationFrame(() => list.current?.querySelector<HTMLElement>(`[data-handle="${CSS.escape(group.key)}"]`)?.focus());
+    },
+  });
+  const custom = order.join("\n") !== DEFAULT_MACHINE_ORDER.join("\n");
   const notice = metrics && SOURCE_TEXT[metrics.source.status];
   const omitted = metrics && omittedText(metrics);
   return <section className="panel" aria-label="Machine health">
     <PanelTitle title="Machine health" count={metrics ? groups.length : undefined}>
+      {custom && groups.length > 1 && <button type="button" className="secondary" onClick={() => { save([...DEFAULT_MACHINE_ORDER]); setMoved("Order reset."); }}>Reset order</button>}
       <button type="button" className="secondary" disabled={load.state === "loading"} onClick={refresh}>
         {load.state === "loading" ? "Reading…" : "Refresh"}</button>
     </PanelTitle>
@@ -247,11 +295,11 @@ export function MachineHealth({ hub, reading, inventoryReadAvailable }: {
     {omitted && <p className="notice" role="status">{omitted}</p>}
     {metrics && groups.length === 0 && !notice && <p className="infra-empty">Prometheus isn't scraping any machines yet.</p>}
     {groups.length > 0 && <>
-      <MachineOrderControl key={scopeKey} order={order} scope={scope} onSave={next => setSavedOrder({ scopeKey, order: next })} />
-      <ul className="machine-list">
-        {sortMachineGroups(groups, order).map(group => <MachineCard key={group.key} group={group}
+      <ul className={dragging ? "machine-list reordering" : "machine-list"} ref={list}>
+        {shown.map(group => <MachineCard key={group.key} group={group} reorder={reorder(group)}
           destination={machineRoute(group, groups, inventoryReadAvailable)} />)}
       </ul>
+      <p className="sr-only" role="status">{moved}</p>
     </>}
   </section>;
 }
@@ -259,7 +307,6 @@ export function MachineHealth({ hub, reading, inventoryReadAvailable }: {
 function CurrentReadings({ groups, now }: { groups: MachineGroup[]; now: Date }) {
   return <section className="panel machine-current" aria-label="Current readings">
     <PanelTitle title="Current readings" />
-    <p className="panel-description">Latest exporter readings, independent of the time range above.</p>
     {groups.map(group => <div className="machine-reading-group" key={group.key}>
       {groups.length > 1 && <h3>{group.title}</h3>}
       <div className="machine-current-tags">
@@ -323,17 +370,16 @@ export function MachineWorkspace({ hub, route, reading, inventoryReadAvailable, 
               {choices.map(item => <option value={item.key} key={item.key}>{item.title}</option>)}
             </select>
           </label>
-          <label className="machine-control">Time range
-            <select value={range} disabled={!canChart && !choices.some(item => isHistoryHostKey(item.key))} onChange={event => {
-              const next = HISTORY_RANGES.find(item => item === event.target.value);
-              if (next) navigate({ ...route, range: next });
-            }}>
-              {HISTORY_RANGES.map(item => <option key={item} value={item}>{RANGE_TEXT[item]}</option>)}
-            </select>
-          </label>
+          <div className="machine-control machine-range-control">
+            <span id="machine-range-label">Time range</span>
+            <div className="machine-range" role="group" aria-labelledby="machine-range-label">
+              {HISTORY_RANGES.map(item => <button key={item} type="button" aria-pressed={item === range} title={RANGE_TEXT[item]}
+                disabled={!canChart} onClick={() => navigate({ ...route, range: item })}>{item}</button>)}
+            </div>
+          </div>
         </div>
       </div>
-      {canChart ? <MachineHistory key={`${group.key}|${range}`} hub={hub} hostKey={group.key} range={range} /> : <div className="machine-history-empty">
+      {canChart ? <MachineHistory key={`${group.key}|${range}`} hub={hub} hostKey={group.key} range={range} gpus={group.targets.flatMap(item => item.gpus)} /> : <div className="machine-history-empty">
         {load.state === "loading" && <p role="status">Reading machine health…</p>}
         {load.state === "hidden" && <p role="status">Machine stats aren't available to you on this Hub.</p>}
         {load.state === "failed" && <p role="alert">Machine health couldn't be read.</p>}

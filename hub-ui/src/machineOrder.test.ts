@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { MachineGroup } from "./infrastructureMetrics";
-import { DEFAULT_MACHINE_ORDER, MACHINE_ORDER_STORAGE_KEY, machineOrderStorageKey, normalizeMachineName, readMachineOrder, sortMachineGroups, writeMachineOrder } from "./machineOrder";
+import { DEFAULT_MACHINE_ORDER, MACHINE_ORDER_STORAGE_KEY, machineOrderStorageKey, moveMachine, normalizeMachineName, readMachineOrder, sortMachineGroups, writeMachineOrder } from "./machineOrder";
 
 const group = (title: string, key = title): MachineGroup => ({
   key, title, labels: {}, targets: [], device_id: null, unregistered: true, ambiguous: false,
@@ -61,5 +61,15 @@ describe("browser-local machine order", () => {
     const priorLength = local.length;
     writeMachineOrder(["private machine"], { mode: "live", actor: null }, local);
     expect(local.length).toBe(priorLength);
+  });
+
+  it("moving a card saves every shown machine in the new order, and sorting follows it", () => {
+    const shown = sortMachineGroups([group("staging"), group("beast"), group("processing"), group("dns")]);
+    expect(shown.map(item => item.title)).toEqual(["staging", "dns", "beast", "processing"]);
+    const next = moveMachine(shown, "processing", 0);
+    expect(next).toEqual(["processing", "staging", "dns", "beast"]);
+    expect(sortMachineGroups(shown, next).map(item => item.title)).toEqual(["processing", "staging", "dns", "beast"]);
+    expect(moveMachine(shown, "staging", 99)).toEqual(["dns", "beast", "processing", "staging"]);
+    expect(moveMachine(shown, "missing", 0)).toEqual(["staging", "dns", "beast", "processing"]);
   });
 });

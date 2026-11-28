@@ -1,4 +1,4 @@
-import { HISTORY_RANGES, formatRate, parseHistory, quickStats, readHistory } from "./infrastructureMetrics";
+import { HISTORY_RANGES, formatHertz, formatRate, niceTop, parseHistory, quickStats, readHistory } from "./infrastructureMetrics";
 import { describe, expect, it, vi } from "vitest";
 import fixture from "./fixtures/infrastructure-metrics-v1.json";
 import discovered from "./fixtures/infrastructure-metrics-v2.json";
@@ -179,6 +179,24 @@ describe("network rates and history", () => {
     expect(() => parseHistory(history({ extra: 1 }))).toThrow();
     expect(() => parseHistory(history({ series: [{ key: "cpu", label: null, unit: "ratio", points: [[100, 1.5]] }] }))).toThrow();
     expect(() => parseHistory(history({ series: [{ key: "gpu", label: null, unit: "ratio", points: [[100, 0.5]] }] }))).toThrow();
+  });
+  it("reads per-GPU DCGM history with its own units and checks each unit's bounds", () => {
+    const gpu = (key: string, unit: string, value: number) => ({ key, label: "1", unit, points: [[100, value]] });
+    const parsed = parseHistory(history({ series: [gpu("gpu_util", "ratio", 0.4), gpu("gpu_memory", "bytes", 1048576),
+      gpu("gpu_temperature", "celsius", 54), gpu("gpu_power", "watts", 31.5), gpu("gpu_clock", "hertz", 1.5e9)] }));
+    expect(parsed.series.map(item => [item.key, item.unit, item.label])).toEqual([["gpu_util", "ratio", "1"], ["gpu_memory", "bytes", "1"],
+      ["gpu_temperature", "celsius", "1"], ["gpu_power", "watts", "1"], ["gpu_clock", "hertz", "1"]]);
+    expect(() => parseHistory(history({ series: [gpu("gpu_util", "ratio", 40)] }))).toThrow();
+    expect(() => parseHistory(history({ series: [gpu("gpu_temperature", "celsius", -1)] }))).toThrow();
+  });
+  it("picks round axis tops in the unit's own base", () => {
+    expect(niceTop(0, 1000)).toBe(1);
+    expect(niceTop(73, 1000)).toBe(100);
+    expect(niceTop(231, 1000)).toBe(250);
+    expect(niceTop(1.6e9, 1000)).toBe(2e9);
+    expect(niceTop(3000, 1024)).toBe(4096);
+    expect(formatHertz(1.5e9)).toBe("1.50 GHz");
+    expect(formatHertz(210e6)).toBe("210 MHz");
   });
   it("asks for one fixed route and hides on refusal", async () => {
     const fetchImpl = vi.fn(async () => json(history()));

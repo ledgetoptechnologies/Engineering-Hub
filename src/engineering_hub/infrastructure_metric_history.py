@@ -14,7 +14,7 @@ from urllib.parse import urlencode
 import httpx
 
 from .infrastructure_discovery import normalize_targets
-from .infrastructure_metrics import (DEADLINE_SECONDS, MAX_DISKS, _NODE_FS, _Budget, _Exhausted,
+from .infrastructure_metrics import (DEADLINE_SECONDS, MAX_DISKS, MAX_GPUS, _NODE_FS, _Budget, _Exhausted,
                                      _iso, _number, _plain)
 from .infrastructure_prometheus import TARGET_PATH, _need
 from .repository import HubError
@@ -49,6 +49,15 @@ def _label(value):
 def _series_queries(exporter, job, instance, window):
     """(key, unit, label name, PromQL) for one target; values come from Prometheus's target list."""
     target = f'job="{_label(job)}",instance="{_label(instance)}"'
+    if exporter == 'nvidia':
+        # DCGM reports percent, MiB and MHz; convert to the units the browser charts.
+        return (
+            ('gpu_util', 'ratio', 'gpu', f'max by (gpu) (DCGM_FI_DEV_GPU_UTIL{{{target}}}) / 100'),
+            ('gpu_memory', 'bytes', 'gpu', f'max by (gpu) (DCGM_FI_DEV_FB_USED{{{target}}}) * 1048576'),
+            ('gpu_temperature', 'celsius', 'gpu', f'max by (gpu) (DCGM_FI_DEV_GPU_TEMP{{{target}}})'),
+            ('gpu_power', 'watts', 'gpu', f'max by (gpu) (DCGM_FI_DEV_POWER_USAGE{{{target}}})'),
+            ('gpu_clock', 'hertz', 'gpu', f'max by (gpu) (DCGM_FI_DEV_SM_CLOCK{{{target}}}) * 1000000'),
+        )
     if exporter == 'node':
         return (
             ('cpu', 'ratio', None, f'1 - avg(rate(node_cpu_seconds_total{{{target},mode="idle"}}[{window}]))'),
@@ -102,6 +111,8 @@ def _clean(value, unit):
         return None
     if unit == 'ratio':
         return min(max(value, 0.0), 1.0) if -0.05 <= value <= 1.05 else None
+    if unit == 'celsius' and value > 150:
+        return None
     return value if 0 <= value < 2 ** 53 else None
 
 
@@ -153,7 +164,7 @@ async def read_history(reader, actor, host_key, span, targets_parser):
                     truncated = len(rows) > MAX_TARGETS_PER_HOST
                     plan = [(index, kind, query)
                             for index, row in enumerate(rows[:MAX_TARGETS_PER_HOST])
-                            for kind in ((row['exporter'],) if row['exporter'] in ('node', 'windows')
+                            for kind in ((row['exporter'],) if row['exporter'] in ('node', 'windows', 'nvidia')
                                          else ('node', 'windows') if row['exporter'] is None else ())
                             for query in _series_queries(kind, row['job'], row['instance'], window)]
                     planned = len(plan)
@@ -190,7 +201,8 @@ async def read_history(reader, actor, host_key, span, targets_parser):
             if (key, label) not in seen and any(value is not None for value in samples.values()):
                 rows.append((label, samples))
         # More disks than the cap: keep the fullest by latest reading, then list them by name.
-        kept = sorted(rows, key=lambda row: (-_latest(row[1]), row[0] or ''))[:MAX_DISKS]
+        cap = MAX_GPUS if key.startswith('gpu_') else MAX_DISKS
+        kept = sorted(rows, key=lambda row: (-_latest(row[1]), row[0] or ''))[:cap]
         for label, samples in sorted(kept, key=lambda row: row[0] or ''):
             seen.add((key, label))
             series.append({'key': key, 'label': label, 'unit': unit, 'points': _points(samples, unit, start, end, step)})

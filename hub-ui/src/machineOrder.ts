@@ -61,3 +61,11 @@ export function writeMachineOrder(order: string[], scope: MachineOrderScope, sto
     local?.setItem(key, JSON.stringify(normalizedNames(order)));
   } catch { /* Browser storage can be disabled; ordering still works for this page session. */ }
 }
+
+/** Every shown machine's name, in order, after moving one card to a new position. */
+export function moveMachine(shown: MachineGroup[], key: string, index: number): string[] {
+  const names = shown.map(group => group.title);
+  const from = shown.findIndex(group => group.key === key);
+  if (from >= 0) names.splice(Math.max(0, Math.min(index, names.length - 1)), 0, ...names.splice(from, 1));
+  return normalizedNames(names);
+}
