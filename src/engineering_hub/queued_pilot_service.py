@@ -69,7 +69,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
     try:
         if (type(settings) is not Settings or settings.ingress_mode != 'combined'
                 or type(settings.auth_config) is not AuthConfig
-                or settings.auth_config.human_auth_mode != 'cloudflare_access'
+                or settings.auth_config.human_auth_mode not in {'cloudflare_access', 'github_cloudflare'}
                 or settings.auth_config.cloudflare_config is None
                 or type(machine_id) is not str or machine_id != settings.staging_machine_id
                 or not _synchronous(client_factory) or not _synchronous(target_verifier)

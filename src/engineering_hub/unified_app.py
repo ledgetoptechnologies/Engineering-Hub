@@ -34,7 +34,7 @@ def _create_unified_bus(settings, *, bus_paths=None):
     if cleanup_flag not in {'0', '1'}:
         raise ValueError('HUB_BUS_STARTUP_CLEANUP must be 0 or 1')
     if (settings.ingress_mode != 'combined'
-            or settings.auth_config.human_auth_mode != 'cloudflare_access'
+            or settings.auth_config.human_auth_mode not in {'cloudflare_access', 'github_cloudflare'}
             or settings.auth_config.cloudflare_config is None):
         raise ValueError('Unified Hub requires one shared split-frontends core')
     paths = {}

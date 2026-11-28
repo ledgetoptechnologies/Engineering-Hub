@@ -166,3 +166,29 @@ def test_preview_option_is_explicit_and_delegated_without_environment(monkeypatc
                         SimpleNamespace(serve_public_browser=serve))
     asyncio.run(module.run('/socket/browser.sock', preview_origin='https://preview.example'))
     assert calls == [(8771, 'https://preview.example')]
+
+
+def test_explicit_bound_callback_flag_reaches_runner(monkeypatch):
+    seen=[]
+    async def serve(factory, *, browser_port, allow_bound_oauth_callback):
+        seen.append((browser_port,allow_bound_oauth_callback))
+    monkeypatch.setitem(sys.modules,'engineering_hub.private_browser_socket',SimpleNamespace(create_private_browser_client=lambda _:None))
+    monkeypatch.setitem(sys.modules,'engineering_hub.split_server',SimpleNamespace(serve_public_browser=serve))
+    asyncio.run(module.run('/socket/browser.sock', allow_bound_oauth_callback=True))
+    assert seen == [(8771,True)]
+
+
+def test_bound_callback_cli_propagates_explicit_optin(monkeypatch):
+    seen=[]
+    async def run(path, port, *, allow_bound_oauth_callback):
+        seen.append((path,port,allow_bound_oauth_callback))
+    monkeypatch.setattr(module,'run',run)
+    assert module.main(['--socket','/socket/browser.sock','--bound-github-callback']) == 0
+    assert seen == [('/socket/browser.sock',8771,True)]
+
+
+@pytest.mark.parametrize('value', [None,1,'true'])
+def test_bound_callback_flag_requires_exact_boolean(monkeypatch,value):
+    monkeypatch.setitem(sys.modules,'engineering_hub.split_server',SimpleNamespace())
+    with pytest.raises(ValueError,match='boolean'):
+        asyncio.run(module.run('/socket/browser.sock',allow_bound_oauth_callback=value))
