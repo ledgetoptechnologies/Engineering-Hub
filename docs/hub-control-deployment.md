@@ -170,7 +170,10 @@ build's commit, takes the digest from the build's verified evidence, records
 commit that is no longer the head of `main`, so an older build never replaces a
 newer one. For a rollback, run it by hand from `main` with the earlier candidate's
 full commit SHA and digest (from its hub-control run summary), the approver's name
-and an approval reference (a Hub task or decision id). Approver and reference are written into the
+and an approval reference (a Hub task or decision id). A rollback holds only until
+the next main build promotes again, and since a newer promotion replaces a pending
+one in the shared concurrency group, dispatch it when no promotion is queued.
+Approver and reference are written into the
 receipt as a record; the workflow does not enforce them. Enforcement would be a
 GitHub Environment with required reviewers, an owner repository setting this
 change does not create. It does not rebuild. It requires the commit

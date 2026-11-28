@@ -8,6 +8,9 @@ name: Promote Engineering Hub control candidate to latest
 # promoted with approved_by=auto-main and the build run URL as the reference,
 # provided that commit is still the head of main (an older build never replaces
 # a newer one). Manual dispatch stays for rollbacks: promote an older candidate.
+# A rollback holds only until the next main build promotes again. Promotions share
+# one concurrency group, which keeps one run pending: a newer run replaces a pending
+# one, so dispatch a rollback when no other promotion is queued.
 #
 # Approval: approved_by and approval_reference are written into the rollback
 # receipt as a RECORD of who authorized the promotion. They do not enforce
@@ -112,11 +115,18 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          TRIGGER_RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           set -euo pipefail
+          # An automatic run promotes exactly the build that triggered it.
+          ONLY_RUN=""
+          if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
+            [[ "$TRIGGER_RUN_ID" =~ ^[0-9]+$ ]] || { echo '::error::triggering run id is missing'; exit 1; }
+            ONLY_RUN=" and .id == $TRIGGER_RUN_ID"
+          fi
           RUN_ID="$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/hub-control.yml/runs" \
             -f head_sha="$PROMOTE_COMMIT" -f branch=main -f status=success -f per_page=20 \
-            --jq "[.workflow_runs[] | select(.head_sha == \"$PROMOTE_COMMIT\" and .head_branch == \"main\" and (.event == \"push\" or .event == \"workflow_dispatch\") and .conclusion == \"success\" and .path == \".github/workflows/hub-control.yml\" and .head_repository.full_name == \"$GITHUB_REPOSITORY\")] | first | .id // empty")"
+            --jq "[.workflow_runs[] | select(.head_sha == \"$PROMOTE_COMMIT\" and .head_branch == \"main\" and (.event == \"push\" or .event == \"workflow_dispatch\") and .conclusion == \"success\" and .path == \".github/workflows/hub-control.yml\" and .head_repository.full_name == \"$GITHUB_REPOSITORY\"$ONLY_RUN)] | first | .id // empty")"
           [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::no successful main build run for $PROMOTE_COMMIT; it is not a tested candidate"; exit 1; }
           echo "id=$RUN_ID" >> "$GITHUB_OUTPUT"
       - name: Verify the candidate's evidence
@@ -167,7 +177,7 @@ jobs:
         id: previous
         shell: bash
         env:
-          INITIALIZE_LATEST: ${{ inputs.initialize_latest }}
+          INITIALIZE_LATEST: ${{ github.event_name == 'workflow_dispatch' && inputs.initialize_latest || false }}
         run: |
           set -euo pipefail
           # Production latest already exists, so anything other than a valid,

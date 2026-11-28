@@ -238,6 +238,8 @@ def test_only_the_main_promotion_moves_latest():
     assert all('${{ inputs.' not in step.get('run', '') for step in job['steps'])
     assert 'build-push-action' not in text and 'secrets.' not in text.replace('secrets.GITHUB_TOKEN', '')
     run = steps['Find the successful main build run for the commit']['run']
+    assert steps['Find the successful main build run for the commit']['env']['TRIGGER_RUN_ID'] == '${{ github.event.workflow_run.id }}'
+    assert 'ONLY_RUN=" and .id == $TRIGGER_RUN_ID"' in run and '$ONLY_RUN)] | first' in run
     for guard in ['-f branch=main', '-f status=success', '.head_branch == \\"main\\"', '.conclusion == \\"success\\"',
                   '.path == \\".github/workflows/hub-control.yml\\"', '.head_repository.full_name == \\"$GITHUB_REPOSITORY\\"']:
         assert guard in run
@@ -249,7 +251,8 @@ def test_only_the_main_promotion_moves_latest():
     registry = steps['Verify the registry still holds the exact candidate']['run']
     assert 'imagetools inspect "$PACKAGE:sha-$PROMOTE_COMMIT"' in registry and 'test "$SHA_DIGEST" = "$PROMOTE_DIGEST"' in registry
     previous = steps['Read current latest and resolve the rollback target']
-    assert previous['env'] == {'INITIALIZE_LATEST': '${{ inputs.initialize_latest }}'}
+    # inputs.* are empty on workflow_run, so automatic runs must render an explicit false.
+    assert previous['env'] == {'INITIALIZE_LATEST': "${{ github.event_name == 'workflow_dispatch' && inputs.initialize_latest || false }}"}
     body = previous['run']
     assert 'imagetools create' not in body and '2>/dev/null' not in body
     classifier = body.split('manifest_unknown_only() {')[1].split('\n}')[0]
