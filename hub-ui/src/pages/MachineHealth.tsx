@@ -10,7 +10,7 @@ import { HubApiError } from "../api";
 import type { Hub } from "../hub";
 import { demoMachineMetrics } from "../infrastructureDemo";
 import {
-  HISTORY_RANGES, formatBytes, formatRate, formatUptime, groupMachines, isHistoryHostKey, percent, quickStats, readMetrics, type MachineGroup, type MachineMetrics, type MachineTarget,
+  HISTORY_RANGES, diskAlert, formatBytes, formatRate, formatUptime, groupMachines, isHistoryHostKey, percent, quickStats, readMetrics, type MachineGroup, type MachineMetrics, type MachineTarget,
 } from "../infrastructureMetrics";
 import { href, navigate, type MachineDetailRoute } from "../router";
 import { Badge, PageHeader, PanelTitle } from "../ui";
@@ -178,6 +178,7 @@ function MachineCard({ group, destination, reorder }: { group: MachineGroup; des
         {group.unregistered && <Badge tone="neutral">Not in devices</Badge>}
         {group.ambiguous && <Badge tone="amber">Matches more than one device</Badge>}
         {group.targets.some(item => item.exporter === null) && <span className="machine-card-warning">Not a recognized exporter</span>}
+        {diskAlert(stats) && <Badge tone="amber">{diskAlert(stats)}</Badge>}
       </div>
       <div className="machine-card-exporters">{exporters.join(" · ")}</div>
       <div className="machine-card-stats">
@@ -282,6 +283,7 @@ export function MachineHealth({ hub, reading, inventoryReadAvailable }: {
   const custom = order.join("\n") !== DEFAULT_MACHINE_ORDER.join("\n");
   const notice = metrics && SOURCE_TEXT[metrics.source.status];
   const omitted = metrics && omittedText(metrics);
+  const full = groups.filter(group => diskAlert(quickStats(group)));
   return <section className="panel" aria-label="Machine health">
     <PanelTitle title="Machine health" count={metrics ? groups.length : undefined}>
       {custom && groups.length > 1 && <button type="button" className="secondary" onClick={() => { save([...DEFAULT_MACHINE_ORDER]); setMoved("Order reset."); }}>Reset order</button>}
@@ -294,6 +296,8 @@ export function MachineHealth({ hub, reading, inventoryReadAvailable }: {
     {notice && <p className="notice" role="status">{notice}</p>}
     {omitted && <p className="notice" role="status">{omitted}</p>}
     {metrics && groups.length === 0 && !notice && <p className="infra-empty">Prometheus isn't scraping any machines yet.</p>}
+    {full.length > 0 && <p className="notice error" role="alert">
+      {full.map(group => `${group.title}: ${diskAlert(quickStats(group))}`).join(" · ")}</p>}
     {groups.length > 0 && <>
       <ul className={dragging ? "machine-list reordering" : "machine-list"} ref={list}>
         {shown.map(group => <MachineCard key={group.key} group={group} reorder={reorder(group)}
