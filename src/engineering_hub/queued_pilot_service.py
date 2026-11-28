@@ -46,13 +46,30 @@ def _synchronous(value):
             and not inspect.isasyncgenfunction(getattr(value, '__call__', None)))
 
 
-async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
+
+
+async def serve_owned_queued_pilot(*args, _drain_handoff=None, **kwargs):
+    from engineering_hub.unproved_drain import acquire_reservation, validate_reservation, release_reservation
+    owned = _drain_handoff is None
+    try:
+        handoff = acquire_reservation() if owned else _drain_handoff
+        if not owned:
+            validate_reservation(handoff)
+    except Exception:
+        raise QueuedPilotServiceError() from None
+    try:
+        return await _reserved_serve_owned_queued_pilot(*args, _drain_handoff=handoff, **kwargs)
+    finally:
+        if owned:
+            release_reservation(handoff)
+
+async def _reserved_serve_owned_queued_pilot(settings, manifest, client_factory, *,
                                  action_key, machine_id, target_verifier, reconciliation_factory, socket_path,
                                  supervisor_stop_grace_seconds,
                                  agent_host='0.0.0.0', agent_port=8770,
                                  stop_event=None, on_ready=None,
                                  install_signals=True, recover_socket=False,
-                                 session_acceptance_factory=None, access_verifier=None):
+                                 session_acceptance_factory=None, access_verifier=None, _drain_handoff=None):
     """Bind first, then own exactly one persistent private queue composition.
 
     ``client_factory`` must synchronously return a new, dedicated, exact
@@ -66,6 +83,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
     installed timeout. Shutdown uses the existing listener/core drain before
     closing the accepted client and finally its newly constructed PilotOwner.
     """
+    drain_handoff = _drain_handoff
     try:
         if (type(settings) is not Settings or settings.ingress_mode != 'combined'
                 or type(settings.auth_config) is not AuthConfig
@@ -95,7 +113,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
             raise ValueError('explicit_access_verifier_binding_required')
 
     owner = client = reconciliation = acceptance_broker = None
-    shared = staging_draft = None
+    shared = staging_draft = retained_pair = None
     lifecycle_task = asyncio.current_task()
     rejected_reconciliation_tasks = []
     constructed = False
@@ -113,7 +131,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         return result is True
 
     def pair_factory():
-        nonlocal owner, client, reconciliation, acceptance_broker, constructed, shared, staging_draft
+        nonlocal owner, client, reconciliation, acceptance_broker, constructed, shared, staging_draft, retained_pair
         if constructed:
             raise QueuedPilotServiceError()
         constructed = True
@@ -150,11 +168,12 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         if staging_draft is not None:
             shared = SharedStagingLifecycle(owner, repo, queue, staging_draft.policies, runtime, staging_draft.module)
         core = create_app(settings, repository=repo, event_feed=feed,
-                          work_queue=queue, queued_pilot_runtime=runtime, shared_staging=shared, access_verifier=access_verifier)
+                          work_queue=queue, queued_pilot_runtime=runtime, shared_staging=shared, access_verifier=access_verifier, drain_handoff=drain_handoff)
         if session_acceptance_factory is not None:
             acceptance_broker = _session_acceptance(session_acceptance_factory, core,
                 owner, repo, target, reconciliation, rejected_reconciliation_tasks, lifecycle_task)
-        return HubFrontends(core, access_verifier=access_verifier)
+        retained_pair = HubFrontends(core, access_verifier=access_verifier)
+        return retained_pair
 
     async def cleanup():
         failed = False
@@ -165,10 +184,16 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                     await finish_owned(asyncio.gather(*rejected_reconciliation_tasks, return_exceptions=True))
                 except BaseException:
                     failed = True
-            release_owner, shared_failed = await _cleanup_shared_staging(shared, staging_draft)
+            try:
+                release_owner, shared_failed = await _cleanup_shared_staging(shared, staging_draft)
+            except BaseException:
+                if shared is not None or staging_draft is not None:
+                    release_owner = False
+                    await drain_handoff.retain_unproved(owner, shared, staging_draft, client, reconciliation, acceptance_broker, retained_pair)
+                raise
             failed = shared_failed or failed
             if not release_owner:
-                raise QueuedPilotServiceError()
+                await drain_handoff.retain_unproved(owner, shared, staging_draft, client, reconciliation, acceptance_broker, retained_pair)
             if acceptance_broker is not None:
                 try:
                     acceptance_broker.close()
@@ -229,7 +254,7 @@ async def _cleanup_shared_staging(shared, draft):
                 await draft.module.client.aclose()
         except BaseException:
             failed = True
-    return True, failed
+    return not failed, failed
 
 
 def _reconciliation(factory, owner, target, rejected_local_tasks, lifecycle_task):

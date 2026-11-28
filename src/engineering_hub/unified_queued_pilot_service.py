@@ -60,14 +60,31 @@ async def _reject_async_generation_result(result):
     raise QueuedPilotServiceError()
 
 
-async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *,
+
+
+async def serve_owned_unified_queued_pilot(*args, _drain_handoff=None, **kwargs):
+    from engineering_hub.unproved_drain import acquire_reservation, validate_reservation, release_reservation
+    owned = _drain_handoff is None
+    try:
+        handoff = acquire_reservation() if owned else _drain_handoff
+        if not owned:
+            validate_reservation(handoff)
+    except Exception:
+        raise QueuedPilotServiceError() from None
+    try:
+        return await _reserved_serve_owned_unified_queued_pilot(*args, _drain_handoff=handoff, **kwargs)
+    finally:
+        if owned:
+            release_reservation(handoff)
+
+async def _reserved_serve_owned_unified_queued_pilot(settings, manifest, client_factory, *,
                                          owner, bus_paths, action_key, machine_id,
                                          target_verifier, reconciliation_factory, supervisor_stop_grace_seconds,
                                          agent_host='0.0.0.0', agent_port=8770,
                                          browser_host='0.0.0.0', browser_port=8771,
                                          stop_event=None, on_ready=None,
                                          install_signals=True, generation_id=None,
-                                         on_generation_ready=None, session_acceptance_factory=None):
+                                         on_generation_ready=None, session_acceptance_factory=None, _drain_handoff=None):
     """Bind first, then transfer one pre-enrolled owner and dedicated client.
 
     Failed listener binding leaves the caller's owner untouched. Once the pair
@@ -79,6 +96,7 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
     The external supervisor grace is asserted, not configured or verified here.
     Default unified startup never selects this source-only composition.
     """
+    drain_handoff = _drain_handoff
     try:
         if type(settings) is Settings and settings.require_owned_ledger:
             from .protected_layout import validate_existing_boundary
@@ -112,7 +130,7 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
         raise ValueError('Explicit pre-enrolled unified queued pilot configuration required') from None
 
     client = reconciliation = acceptance_broker = None
-    shared = staging_draft = None
+    shared = staging_draft = retained_pair = None
     lifecycle_task = asyncio.current_task()
     rejected_reconciliation_tasks = []
     generation_drain = None
@@ -129,7 +147,7 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
         return result is True
 
     def pair_factory():
-        nonlocal client, reconciliation, transferred, constructed, generation_drain, acceptance_broker, shared, staging_draft
+        nonlocal client, reconciliation, transferred, constructed, generation_drain, acceptance_broker, shared, staging_draft, retained_pair
         if constructed:
             raise QueuedPilotServiceError()
         constructed = True
@@ -173,11 +191,12 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
             generation_drain = runtime.bind_generation_drain(owner, generation_id)
         bus = _create_unified_bus(settings, bus_paths=bus_paths)
         core = create_app(settings, repository=repo, event_feed=feed,
-                          work_queue=queue, queued_pilot_runtime=runtime, bus_app=bus, shared_staging=shared)
+                          work_queue=queue, queued_pilot_runtime=runtime, bus_app=bus, shared_staging=shared, drain_handoff=drain_handoff)
         if session_acceptance_factory is not None:
             acceptance_broker = _session_acceptance(session_acceptance_factory, core,
                 owner, repo, target, reconciliation, rejected_reconciliation_tasks, lifecycle_task)
-        return HubFrontends(core)
+        retained_pair = HubFrontends(core)
+        return retained_pair
 
     async def cleanup():
         failed = False
@@ -188,10 +207,16 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
                     await finish_owned(asyncio.gather(*rejected_reconciliation_tasks, return_exceptions=True))
                 except BaseException:
                     failed = True
-            release_owner, shared_failed = await _cleanup_shared_staging(shared, staging_draft)
+            try:
+                release_owner, shared_failed = await _cleanup_shared_staging(shared, staging_draft)
+            except BaseException:
+                if shared is not None or staging_draft is not None:
+                    release_owner = False
+                    await drain_handoff.retain_unproved(owner, shared, staging_draft, client, reconciliation, acceptance_broker, retained_pair)
+                raise
             failed = shared_failed or failed
             if not release_owner:
-                raise QueuedPilotServiceError()
+                await drain_handoff.retain_unproved(owner, shared, staging_draft, client, reconciliation, acceptance_broker, retained_pair)
             if acceptance_broker is not None:
                 try:
                     acceptance_broker.close()

@@ -222,8 +222,22 @@ def validate_configuration(config_path, profile_path):
         raise UnifiedPilotStartupError() from None
 
 
-async def serve_configuration(config_path, profile_path, *, reconciliation_factory=None,
-                              session_acceptance_factory=None, session_enrollment_path=None):
+
+
+async def serve_configuration(*args, _drain_handoff=None, **kwargs):
+    from engineering_hub.unproved_drain import acquire_reservation, validate_reservation, release_reservation
+    owned = _drain_handoff is None
+    handoff = acquire_reservation() if owned else _drain_handoff
+    if not owned:
+        validate_reservation(handoff)
+    try:
+        return await _reserved_serve_configuration(*args, _drain_handoff=handoff, **kwargs)
+    finally:
+        if owned:
+            release_reservation(handoff)
+
+async def _reserved_serve_configuration(config_path, profile_path, *, reconciliation_factory=None,
+                              session_acceptance_factory=None, session_enrollment_path=None, _drain_handoff=None):
     """The only activation operation; no new state, credential or policy setup."""
     owner = composition = None
     try:
@@ -275,7 +289,8 @@ async def serve_configuration(config_path, profile_path, *, reconciliation_facto
             reconciliation_factory=reconciliation_factory,
             session_acceptance_factory=session_acceptance_factory,
             supervisor_stop_grace_seconds=profile.grace_seconds,
-            agent_host='0.0.0.0', agent_port=8770, browser_host='0.0.0.0', browser_port=8771)
+            agent_host='0.0.0.0', agent_port=8770, browser_host='0.0.0.0', browser_port=8771,
+            _drain_handoff=_drain_handoff)
     except Exception:
         raise UnifiedPilotStartupError() from None
     finally:

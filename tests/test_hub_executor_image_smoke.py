@@ -30,7 +30,7 @@ def runtime(owner):
             'MemorySwap': 256 * 1024**2, 'NanoCpus': 1_000_000_000, 'PidsLimit': 64}}
 
 
-def fake_cli(monkeypatch, *, alter=None, fail_start=False):
+def fake_cli(monkeypatch, *, alter=None, fail_start=False, missing_reservation=False):
     calls, cleanup = [], []
     owner = []
     def run(*args, **kwargs):
@@ -43,8 +43,11 @@ def fake_cli(monkeypatch, *, alter=None, fail_start=False):
         if args[1:3] == ('container', 'start'):
             if fail_start:
                 raise RuntimeError('fixture start failed')
-            return json.dumps({'source_commit': COMMIT, 'installed_artifact': 'passed',
-                               'private_unix_client': True})
+            report = {'source_commit': COMMIT, 'installed_artifact': 'passed',
+                      'private_unix_client': True, 'drain_reservation_api': True}
+            if missing_reservation:
+                del report['drain_reservation_api']
+            return json.dumps(report)
         if args[1:3] == ('container', 'inspect'):
             info = runtime(owner[0])
             if alter:
@@ -142,3 +145,37 @@ def test_subprocess_failure_does_not_reflect_output(monkeypatch):
     with pytest.raises(RuntimeError) as error:
         MODULE.run('docker', 'fixture')
     assert 'private-engine-output' not in str(error.value)
+
+
+@pytest.mark.parametrize('core_variant', ['matching', 'old-missing', 'old-partial'])
+def test_reservation_probe_accepts_matching_core_and_rejects_older_core(tmp_path, core_variant):
+    # Run the exact embedded fixed probe with an isolated synthetic site-packages.
+    # This is an import/contract test, not a packaged image build or attestation.
+    import sys
+    root = tmp_path / 'site-packages'
+    package = root / 'engineering_hub'
+    package.mkdir(parents=True)
+    (package / '__init__.py').write_text('')
+    if core_variant == 'matching':
+        source = Path(__file__).resolve().parents[1] / 'src/engineering_hub/unproved_drain.py'
+        (package / 'unproved_drain.py').write_bytes(source.read_bytes())
+    elif core_variant == 'old-partial':
+        (package / 'unproved_drain.py').write_text('def acquire_reservation(): pass\n')
+    program = "import importlib, pathlib, sys; root=pathlib.Path(sys.argv[1]); sys.path.insert(0,str(root))\n" + MODULE.CORE_RESERVATION_PROBE
+    result = subprocess.run([sys.executable, '-I', '-B', '-c', program, str(root)],
+        capture_output=True, text=True, timeout=10)
+    assert (result.returncode == 0) is (core_variant == 'matching'), result.stderr
+
+
+def test_docker_build_guard_requires_same_reservation_api():
+    dockerfile = (Path(__file__).resolve().parents[1] / 'docker/Dockerfile.hub-executor').read_text()
+    assert 'engineering_hub.unproved_drain' in dockerfile
+    for name in ('acquire_reservation', 'validate_reservation', 'release_reservation', 'OwnedDrainHandoff'):
+        assert name in MODULE.CORE_RESERVATION_PROBE and name in dockerfile
+
+
+def test_smoke_rejects_older_report_without_reservation_probe(monkeypatch):
+    _, cleanup = fake_cli(monkeypatch, missing_reservation=True)
+    with pytest.raises(RuntimeError):
+        MODULE.smoke(IMAGE, COMMIT)
+    assert len(cleanup) == 1
