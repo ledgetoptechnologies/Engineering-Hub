@@ -155,7 +155,6 @@ function machineRoute(group: MachineGroup, groups: MachineGroup[], inventoryRead
 
 interface Reorder {
   dragging: boolean; onPointerDown: (event: PointerEvent<HTMLButtonElement>) => void;
-  onPointerMove: (event: PointerEvent<HTMLButtonElement>) => void; onPointerUp: () => void;
   onKeyDown: (event: KeyboardEvent<HTMLButtonElement>) => void;
 }
 function MachineCard({ group, destination, reorder }: { group: MachineGroup; destination: MachineDetailRoute; reorder: Reorder }) {
@@ -165,8 +164,7 @@ function MachineCard({ group, destination, reorder }: { group: MachineGroup; des
     : `↓ ${formatRate(stats.down)} · ↑ ${formatRate(stats.up)}`;
   return <li className={reorder.dragging ? "machine-card dragging" : "machine-card"} data-machine-key={group.key}>
     <button type="button" className="machine-card-handle" data-handle={group.key} aria-label={`Reorder ${group.title}`}
-      title="Drag, or use the arrow keys, to reorder" onPointerDown={reorder.onPointerDown} onPointerMove={reorder.onPointerMove}
-      onPointerUp={reorder.onPointerUp} onPointerCancel={reorder.onPointerUp} onKeyDown={reorder.onKeyDown}>
+      title="Drag, or use the arrow keys, to reorder" onPointerDown={reorder.onPointerDown} onKeyDown={reorder.onKeyDown}>
       <svg viewBox="0 0 12 18" width="12" height="18" aria-hidden="true">{[3, 9].flatMap(cx => [3, 9, 15].map(cy => <circle key={`${cx}${cy}`} cx={cx} cy={cy} r={1.6} />))}</svg>
     </button>
     <a className="machine-card-link" draggable={false} href={href(destination)} aria-label={`View ${group.title} machine details`}>
@@ -233,6 +231,16 @@ export function MachineHealth({ hub, reading, inventoryReadAvailable }: {
   const groups = groupMachines(metrics?.targets ?? []);
   const shown = sortMachineGroups(groups, order);
   useCardSlide(list, shown.map(group => group.key).join("\n"));
+  // The dragged card's node moves while dragging, so follow the pointer on the window, not the handle.
+  const dragMove = useRef<(event: globalThis.PointerEvent) => void>(() => {});
+  useEffect(() => {
+    if (!dragging) return;
+    const follow = (event: globalThis.PointerEvent) => dragMove.current(event);
+    const end = () => setDragging(null);
+    const events = [["pointermove", follow], ["pointerup", end], ["pointercancel", end], ["blur", end]] as const;
+    for (const [name, handler] of events) window.addEventListener(name, handler as EventListener);
+    return () => { for (const [name, handler] of events) window.removeEventListener(name, handler as EventListener); };
+  }, [dragging]);
   if (load.state === "hidden") return null;
   const save = (next: string[]) => { writeMachineOrder(next, scope); setSavedOrder({ scopeKey, order: next }); };
   const move = (key: string, index: number) => {
@@ -243,15 +251,21 @@ export function MachineHealth({ hub, reading, inventoryReadAvailable }: {
     setMoved(`${shown[from].title} moved to position ${to + 1} of ${shown.length}.`);
     return true;
   };
+  dragMove.current = event => {
+    if (!dragging || !event.buttons) { setDragging(null); return; }
+    // While cards slide, they are drawn away from their slots; hit-testing then would swap them straight back.
+    if (list.current?.getAnimations?.({ subtree: true }).length) return;
+    const over = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-machine-key]")?.dataset.machineKey;
+    if (over && over !== dragging) move(dragging, shown.findIndex(item => item.key === over));
+  };
   const reorder = (group: MachineGroup): Reorder => ({
     dragging: dragging === group.key,
-    onPointerDown: event => { if (event.button) return; event.currentTarget.setPointerCapture?.(event.pointerId); setDragging(group.key); },
-    onPointerMove: event => {
-      if (dragging !== group.key) return;
-      const over = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-machine-key]")?.dataset.machineKey;
-      if (over && over !== group.key) move(group.key, shown.findIndex(item => item.key === over));
+    onPointerDown: event => {
+      if (event.button) return;
+      event.preventDefault();
+      event.currentTarget.releasePointerCapture?.(event.pointerId);
+      setDragging(group.key);
     },
-    onPointerUp: () => setDragging(null),
     onKeyDown: event => {
       const step = MOVE_KEYS[event.key];
       if (!step) return;
@@ -357,7 +371,7 @@ export function MachineWorkspace({ hub, route, reading, inventoryReadAvailable, 
             <span id="machine-range-label">Time range</span>
             <div className="machine-range" role="group" aria-labelledby="machine-range-label">
               {HISTORY_RANGES.map(item => <button key={item} type="button" aria-pressed={item === range} title={RANGE_TEXT[item]}
-                aria-label={RANGE_TEXT[item]} disabled={!canChart} onClick={() => navigate({ ...route, range: item })}>{item}</button>)}
+                disabled={!canChart} onClick={() => navigate({ ...route, range: item })}>{item}</button>)}
             </div>
           </div>
         </div>

@@ -14,7 +14,7 @@ from urllib.parse import urlencode
 import httpx
 
 from .infrastructure_discovery import normalize_targets
-from .infrastructure_metrics import (DEADLINE_SECONDS, MAX_DISKS, _NODE_FS, _Budget, _Exhausted,
+from .infrastructure_metrics import (DEADLINE_SECONDS, MAX_DISKS, MAX_GPUS, _NODE_FS, _Budget, _Exhausted,
                                      _iso, _number, _plain)
 from .infrastructure_prometheus import TARGET_PATH, _need
 from .repository import HubError
@@ -111,6 +111,8 @@ def _clean(value, unit):
         return None
     if unit == 'ratio':
         return min(max(value, 0.0), 1.0) if -0.05 <= value <= 1.05 else None
+    if unit == 'celsius' and value > 150:
+        return None
     return value if 0 <= value < 2 ** 53 else None
 
 
@@ -199,7 +201,8 @@ async def read_history(reader, actor, host_key, span, targets_parser):
             if (key, label) not in seen and any(value is not None for value in samples.values()):
                 rows.append((label, samples))
         # More disks than the cap: keep the fullest by latest reading, then list them by name.
-        kept = sorted(rows, key=lambda row: (-_latest(row[1]), row[0] or ''))[:MAX_DISKS]
+        cap = MAX_GPUS if key.startswith('gpu_') else MAX_DISKS
+        kept = sorted(rows, key=lambda row: (-_latest(row[1]), row[0] or ''))[:cap]
         for label, samples in sorted(kept, key=lambda row: row[0] or ''):
             seen.add((key, label))
             series.append({'key': key, 'label': label, 'unit': unit, 'points': _points(samples, unit, start, end, step)})

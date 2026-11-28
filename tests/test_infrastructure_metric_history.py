@@ -245,3 +245,14 @@ async def test_dcgm_exporter_history_is_split_per_gpu_with_units():
     }
     dcgm = [query for query in calls if 'DCGM_' in query]
     assert len(dcgm) == 5 and all('job="nvidia-gpu",instance="nas:9400"' in query for query in dcgm)
+    # DCGM reports percent, MiB and MHz; Prometheus converts them before the Hub reads them.
+    by_metric = {name: next(query for query in dcgm if name in query)
+                 for name in ('GPU_UTIL', 'FB_USED', 'GPU_TEMP', 'POWER_USAGE', 'SM_CLOCK')}
+    assert by_metric['GPU_UTIL'].endswith('/ 100') and by_metric['FB_USED'].endswith('* 1048576')
+    assert by_metric['SM_CLOCK'].endswith('* 1000000')
+    assert all('by (gpu)' in query for query in dcgm)
+
+
+def test_impossible_gpu_temperature_is_a_gap_not_a_bad_response():
+    from engineering_hub.infrastructure_metric_history import _clean
+    assert _clean(151.0, 'celsius') is None and _clean(54.0, 'celsius') == 54.0

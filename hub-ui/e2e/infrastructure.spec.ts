@@ -410,7 +410,7 @@ test("metrics-only matched and orphaned groups keep opaque details and history w
   await expect(page.getByRole("region", { name: "Current readings" })).toContainText("Not a recognized exporter");
   await expect(page.getByRole("link", { name: /Machine health/ })).toBeVisible();
   await expect.poll(() => historyReads.length).toBe(2);
-  await page.getByRole("group", { name: "Time range" }).getByRole("button", { name: "Last 7 days" }).click();
+  await page.getByRole("group", { name: "Time range" }).getByRole("button", { name: "7d", exact: true }).click();
   await page.getByRole("combobox", { name: "Machine" }).selectOption({ label: "demo-workstation" });
   await expect(page).toHaveURL(/\/infrastructure\/machines\/host:[a-f0-9]{64}\?range=7d$/);
   await expect(page.getByRole("heading", { name: "demo-workstation" })).toBeVisible();
@@ -449,14 +449,14 @@ test("a device page charts history, keeps gaps, and changes range on request", a
   });
   await page.goto("/#/infrastructure/build-pc");
   const cpu = page.getByRole("img", { name: /^CPU:/ });
-  await expect(cpu).toHaveAttribute("aria-label", "CPU: latest 40%, peak 60%");
+  await expect(cpu).toHaveAttribute("aria-label", "CPU: latest 40.0%, peak 60.0%");
   await expect(page.getByRole("img", { name: /^Network:/ })).toBeVisible();
   await expect(page.getByRole("img", { name: /^Memory:/ })).toHaveCount(0);
   await cpu.focus();
   await page.keyboard.press("ArrowLeft");
   await page.keyboard.press("ArrowLeft");
   await expect(page.locator(".history-tip")).toContainText("No data");
-  await page.getByRole("group", { name: "Time range" }).getByRole("button", { name: "Last 7 days" }).click();
+  await page.getByRole("group", { name: "Time range" }).getByRole("button", { name: "7d", exact: true }).click();
   await expect.poll(() => ranges.at(-1)).toBe("7d");
   expect(ranges[0]).toBe("24h");
   await page.setViewportSize({ width: 375, height: 812 });
@@ -580,7 +580,7 @@ test("registered and discovered pages share graphs-first controls and keep the r
   expect((await history.boundingBox())!.y).toBeLessThan((await page.getByRole("region", { name: "Declared details" }).boundingBox())!.y);
   const mainKey = `host:${"1".padStart(64, "0")}`, clusterKey = `host:${"2".padStart(64, "0")}`;
   expect(historyReads).toEqual([`${mainKey}|7d`]);
-  await time.getByRole("button", { name: "Last 6 hours" }).click();
+  await time.getByRole("button", { name: "6h", exact: true }).click();
   await expect(page).toHaveURL(/\/infrastructure\/build-pc\?range=6h$/);
   await machine.selectOption({ label: "Cluster PC" });
   await expect(page).toHaveURL(/\/infrastructure\/machines\/host:[a-f0-9]{64}\?range=6h$/);
@@ -780,18 +780,27 @@ test("card stats keep their labels clear of their values at desktop and phone wi
   }
 });
 
-test("dragging a card's handle onto another card moves it there", async ({ page }) => {
+test("dragging a card's handle onto a neighbour moves it earlier or later and persists", async ({ page }) => {
+  // One column, all cards on screen: a straight drag between neighbours crosses no other card.
+  await page.setViewportSize({ width: 375, height: 3000 });
+  await page.emulateMedia({ reducedMotion: "reduce" });
   await fixture(page, { metrics: [{ status: 200, body: prioritizedMetrics() }] });
   await page.goto("/#/infrastructure");
   const panel = healthPanel(page);
-  const handle = panel.getByRole("button", { name: "Reorder Zeta" });
-  const target = panel.getByRole("listitem").filter({ hasText: "Main PC" });
-  await handle.hover();
-  await page.mouse.down();
-  const box = (await target.boundingBox())!;
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 8 });
-  await page.mouse.up();
-  await expect(panel.locator(".machine-card-title").first()).toHaveText("Zeta");
+  const titles = () => panel.locator(".machine-card-title").evaluateAll(nodes => nodes.map(node => node.textContent?.trim()));
+  const drag = async (name: string, onto: string) => {
+    await panel.getByRole("button", { name: `Reorder ${name}` }).hover();
+    await page.mouse.down();
+    const box = (await panel.getByRole("listitem").filter({ hasText: onto }).boundingBox())!;
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 8 });
+    await page.mouse.up();
+  };
+  await drag("Zeta", "DNS");
+  await expect.poll(titles).toEqual(["Main PC", "Cluster PC", "Hermes", "Staging", "Sync Pi", "Zeta", "DNS"]);
+  await drag("Staging", "Sync Pi");
+  await expect.poll(titles).toEqual(["Main PC", "Cluster PC", "Hermes", "Sync Pi", "Staging", "Zeta", "DNS"]);
+  await expect(panel.getByRole("list")).not.toHaveClass(/reordering/);
   await page.reload();
-  await expect(healthPanel(page).locator(".machine-card-title").first()).toHaveText("Zeta");
+  await expect.poll(() => healthPanel(page).locator(".machine-card-title").evaluateAll(nodes => nodes.map(node => node.textContent?.trim())))
+    .toEqual(["Main PC", "Cluster PC", "Hermes", "Sync Pi", "Staging", "Zeta", "DNS"]);
 });
