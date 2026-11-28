@@ -84,37 +84,100 @@ def clean_env(monkeypatch, tmp_path):
     monkeypatch.setenv("HUB_DB", str(tmp_path / "env.db"))
 
 
-def test_environment_default_and_explicit_flags(clean_env, monkeypatch):
-    default = Settings.from_env()
-    assert (default.registry_enabled, default.registry_events_enabled, default.registry_origin) == (False, False, None)
-    monkeypatch.setenv("HUB_REGISTRY_ENABLED", "1")
-    monkeypatch.setenv("HUB_REGISTRY_ORIGIN", ORIGIN)
-    assert Settings.from_env().registry_enabled is True
-    assert Settings.from_env().registry_events_enabled is False
-    monkeypatch.setenv("HUB_REGISTRY_EVENTS_ENABLED", "1")
-    assert Settings.from_env().registry_events_enabled is True
+# Origin unset / set x flag unset / true / false / garbage, for both switches.
+# Each case: (origin, HUB_REGISTRY_ENABLED, HUB_REGISTRY_EVENTS_ENABLED) -> (registry, events, status).
+TRUTH_TABLE = [
+    (None, None, None, (False, False, "no origin")),
+    (None, "0", None, (False, False, "no origin")),
+    (None, "false", None, (False, False, "no origin")),
+    (None, None, "0", (False, False, "no origin")),
+    (None, None, "false", (False, False, "no origin")),
+    (None, "0", "0", (False, False, "no origin")),
+    (ORIGIN, None, None, (True, True, "origin configured")),
+    (ORIGIN, "1", None, (True, True, "origin configured")),
+    (ORIGIN, "true", None, (True, True, "origin configured")),
+    (ORIGIN, "TRUE", "True", (True, True, "origin configured")),
+    (ORIGIN, None, "1", (True, True, "origin configured")),
+    (ORIGIN, "1", "1", (True, True, "origin configured")),
+    (ORIGIN, None, "0", (True, False, "origin configured")),
+    (ORIGIN, "1", "false", (True, False, "origin configured")),
+    (ORIGIN, "0", None, (False, False, "explicitly disabled")),
+    (ORIGIN, "false", None, (False, False, "explicitly disabled")),
+    (ORIGIN, "False", "0", (False, False, "explicitly disabled")),
+]
 
 
+def set_registry_env(monkeypatch, origin, registry, events):
+    for name, value in (("HUB_REGISTRY_ORIGIN", origin), ("HUB_REGISTRY_ENABLED", registry),
+                        ("HUB_REGISTRY_EVENTS_ENABLED", events)):
+        if value is not None:
+            monkeypatch.setenv(name, value)
+
+
+@pytest.mark.parametrize("origin,registry,events,expected", TRUTH_TABLE)
+def test_registry_switch_truth_table(clean_env, monkeypatch, origin, registry, events, expected):
+    set_registry_env(monkeypatch, origin, registry, events)
+    settings = Settings.from_env()
+    assert (settings.registry_enabled, settings.registry_events_enabled, settings.registry_status) == expected
+    assert settings.registry_origin == origin
+
+
+@pytest.mark.parametrize("origin,registry,events", [
+    (None, "1", None), (None, "true", None),            # enable without an origin
+    (None, None, "1"), (None, "0", "1"),                 # events without a registry
+    (ORIGIN, "0", "1"), (ORIGIN, "false", "true"),       # events on, registry explicitly off
+])
+def test_explicit_on_without_registry_fails_startup(clean_env, monkeypatch, origin, registry, events):
+    set_registry_env(monkeypatch, origin, registry, events)
+    with pytest.raises(ValueError):
+        Settings.from_env()
+
+
+@pytest.mark.parametrize("origin", [None, ORIGIN])
 @pytest.mark.parametrize("name", ["HUB_REGISTRY_ENABLED", "HUB_REGISTRY_EVENTS_ENABLED"])
-@pytest.mark.parametrize("value", ["", "true", "false", "2", " 1", "01"])
-def test_environment_flags_fail_closed(clean_env, monkeypatch, name, value):
+@pytest.mark.parametrize("value", ["", "yes", "off", "2", " 1", "01", "0 "])
+def test_garbage_flags_fail_closed(clean_env, monkeypatch, origin, name, value):
+    set_registry_env(monkeypatch, origin, None, None)
     monkeypatch.setenv(name, value)
     with pytest.raises(ValueError):
         Settings.from_env()
 
 
-def test_environment_dependencies_and_origin_are_validated(clean_env, monkeypatch):
-    monkeypatch.setenv("HUB_REGISTRY_ENABLED", "1")
-    with pytest.raises(ValueError):
-        Settings.from_env()
-    monkeypatch.setenv("HUB_REGISTRY_ORIGIN", "http://192.168.50.80")
-    with pytest.raises(ValueError):
-        Settings.from_env()
+def test_environment_origin_is_validated(clean_env, monkeypatch):
+    for bad in ("", "http://192.168.50.80"):
+        monkeypatch.setenv("HUB_REGISTRY_ORIGIN", bad)
+        with pytest.raises(ValueError):
+            Settings.from_env()
+        monkeypatch.setenv("HUB_REGISTRY_ENABLED", "0")
+        with pytest.raises(ValueError):  # Explicitly disabled still validates the origin.
+            Settings.from_env()
+        monkeypatch.delenv("HUB_REGISTRY_ENABLED")
+
+
+def test_settings_status_reasons(tmp_path):
+    assert config(tmp_path).registry_status == "no origin"
+    assert config(tmp_path, registry_origin=ORIGIN).registry_status == "explicitly disabled"
+    assert config(tmp_path, registry_enabled=True, registry_origin=ORIGIN).registry_status == "origin configured"
+
+
+def test_environment_without_origin_wires_nothing(clean_env, monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("registry without an origin constructed/opened a transport")
+    monkeypatch.setattr("engineering_hub.registry_client.RegistryClient", forbidden)
+    monkeypatch.setattr("engineering_hub.registry_stream.RegistryStream", forbidden)
+    monkeypatch.setattr(httpx.AsyncClient, "send", forbidden)
+    app = create_app(Settings.from_env())
+    assert app.state.registry_bridge is None and app.state.registry_status == "no origin"
+
+
+def test_environment_origin_turns_registry_on_lazily(clean_env, monkeypatch, factories):
+    made, calls, _ = factories
     monkeypatch.setenv("HUB_REGISTRY_ORIGIN", ORIGIN)
-    monkeypatch.setenv("HUB_REGISTRY_ENABLED", "0")
-    monkeypatch.setenv("HUB_REGISTRY_EVENTS_ENABLED", "1")
-    with pytest.raises(ValueError):
-        Settings.from_env()
+    app = create_app(Settings.from_env())
+    assert type(app.state.registry_bridge) is CanonicalRegistryBridge
+    assert app.state.registry_bridge.stream is not None
+    assert app.state.registry_status == "origin configured"
+    assert made == [("client", ORIGIN), ("stream", ORIGIN)] and calls == []
 
 
 def test_default_does_not_construct_clients_or_open_network(tmp_path, monkeypatch):

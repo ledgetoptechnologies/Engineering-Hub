@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import logging
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
@@ -33,6 +34,7 @@ from .sse_keepalive import with_keepalive
 from .autonomy import StagingRuntime
 from .container_pilot import ContainerPilotWorkflow
 from .registry_bridge import CanonicalRegistryBridge
+from .registry_config import registry_reason, registry_switches
 from .registry_client import (
     RegistryAccessDenied, RegistrySourceUnavailable, RegistryPointer,
     RegistrySnapshotRequired, validate_topic as validate_registry_topic,
@@ -87,7 +89,7 @@ class Settings:
         if self.registry_enabled and self.registry_origin is None:
             raise ValueError('Configured registry origin required')
         if self.registry_events_enabled and not self.registry_enabled:
-            raise ValueError('Registry events require explicit registry enablement')
+            raise ValueError('Registry events require an enabled registry')
         from .ingress import validate_agent_hosts
         validate_agent_hosts(self.agent_allowed_hosts)
         if self.ingress_mode not in {"combined", "agents", "browser"}:
@@ -102,15 +104,17 @@ class Settings:
             if value and value.startswith("REPLACE_WITH_"):
                 raise ValueError("Replace agent-token placeholders before starting Hub")
 
+    @property
+    def registry_status(self) -> str:
+        """Why the registry is on or off: origin configured, explicitly disabled, no origin."""
+        return registry_reason(self.registry_enabled, self.registry_origin)
+
     @classmethod
     def from_env(cls, deployment=None):
         work_queue_flag = os.environ.get("HUB_WORK_QUEUE_ENABLED", "0")
         if work_queue_flag not in {"0", "1"}:
             raise ValueError("HUB_WORK_QUEUE_ENABLED must be 0 or 1")
-        registry_flag = os.environ.get('HUB_REGISTRY_ENABLED', '0')
-        registry_events_flag = os.environ.get('HUB_REGISTRY_EVENTS_ENABLED', '0')
-        if registry_flag not in {'0', '1'} or registry_events_flag not in {'0', '1'}:
-            raise ValueError('Hub registry flags must be 0 or 1')
+        registry = registry_switches(os.environ)
         path = (deployment.hub_database if deployment is not None else
                 Path(os.environ.get("HUB_DB", "data/hub.sqlite3")))
         bus_path = (deployment.bus_paths['AGENT_BUS_DB'] if deployment is not None else
@@ -142,9 +146,9 @@ class Settings:
                              os.environ.get("HUB_AGENT_ALLOWED_HOSTS", "").split(",") if value.strip())),
                    work_queue_enabled=work_queue_flag == "1",
                    staging_machine_id=os.environ.get("HUB_STAGING_MACHINE_ID", "staging-pc"),
-                   registry_enabled=registry_flag == '1',
-                   registry_origin=os.environ.get('HUB_REGISTRY_ORIGIN'),
-                   registry_events_enabled=registry_events_flag == '1',
+                   registry_enabled=registry.enabled,
+                   registry_origin=registry.origin,
+                   registry_events_enabled=registry.events_enabled,
                    require_owned_ledger=deployment.protected_ledger if deployment is not None else False,
                    staging_config_path=(deployment.state_root / 'staging-service.json'
                                         if deployment is not None else path.parent / 'staging-service.json'),
@@ -346,6 +350,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                          if connection_config.environment == 'staging'
                          else 'production_agent_connections_origin_and_storage_binding_required')
                 raise ValueError(error)
+    logging.getLogger(__name__).info(
+        'Hub registry %s (%s); registry events %s',
+        'on' if settings.registry_enabled else 'off', settings.registry_status,
+        'on' if settings.registry_events_enabled else 'off')
     if settings.registry_enabled:
         if registry_bridge is not None or reachability_provider is not None:
             raise ValueError('Choose one explicit registry configuration source')
@@ -719,6 +727,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         queued_pilot_runtime._application = app
     app.state.owned_pilot_service = owned_pilot_service
     app.state.registry_bridge = registry_bridge
+    app.state.registry_status = settings.registry_status
     # Explicit read-only capability; caller owns its lifetime. No environment
     # discovery, archive adoption or automatic close/ownership transfer.
     app.state.archive_reader = archive_reader

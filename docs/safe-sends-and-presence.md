@@ -104,13 +104,18 @@ deadline; new authoritative evidence is required to turn it green again.
 
 ### Current operational gap
 
-Packaged startup now supports explicit, default-off canonical registry wiring:
-`HUB_REGISTRY_ENABLED=1` plus `HUB_REGISTRY_ORIGIN` selects the existing read-only
-snapshot adapter. `HUB_REGISTRY_EVENTS_ENABLED=1` separately permits on-demand
-native event streams; it requires registry enablement. Flags accept only `0`
-or `1`. The origin must be HTTPS except literal loopback HTTP, with no userinfo,
-path prefix, query or fragment. Existing deployments/Compose files are not
-changed by this source feature, and the defaults still inject no bridge.
+Packaged startup wires the canonical registry when its origin is configured:
+setting `HUB_REGISTRY_ORIGIN` selects the existing read-only snapshot adapter
+and permits on-demand native event streams. No separate enable switch is
+needed. Operators who want it off while an origin is set can set
+`HUB_REGISTRY_ENABLED=0` (registry and events off) or
+`HUB_REGISTRY_EVENTS_ENABLED=0` (events off only); these flags accept `0`,
+`1`, `false` or `true`, and anything else fails startup. `1` without an origin
+also fails startup. The origin must be HTTPS except literal loopback HTTP, with
+no userinfo, path prefix, query or fragment. Without an origin nothing is
+wired: no bridge, no registry client and no outbound call. Startup logs whether
+the registry is on and why (`origin configured`, `explicitly disabled` or
+`no origin`).
 
 Construction and startup make no registry request or background subscription.
 Authenticated agent reads preserve each request's original bearer; there is no
