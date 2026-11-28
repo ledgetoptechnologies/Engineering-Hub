@@ -4,6 +4,7 @@ The steps are extracted from the workflow YAML, so this exercises the exact
 shell that GitHub would run, with a fake registry. Live registry wording,
 GitHub APIs and token permissions are not covered here.
 """
+import json
 import os
 import shutil
 import subprocess
@@ -92,7 +93,8 @@ def _promote(root, before_move=None, **extra):
     if previous.returncode:
         return result
     outputs = dict(line.split('=', 1) for line in (root / 'github_output').read_text().splitlines())
-    extra = {**extra, 'PREVIOUS_DIGEST': outputs['digest'], 'PROMOTION_MODE': outputs['mode']}
+    extra = {**extra, 'PREVIOUS_DIGEST': outputs['digest'], 'PROMOTION_MODE': outputs['mode'],
+             'APPROVERS': 'Bkoltz (id 148508330)'}
     result['receipt'] = _run(root, steps['Persist the rollback receipt before moving latest'], extra)
     if result['receipt'].returncode == 0:
         if before_move:
@@ -214,14 +216,97 @@ def test_latest_unreadable_before_write_aborts(registry):
     assert '"status": "aborted-latest-changed"' in _result(registry)
 
 
-def test_receipt_records_approver_and_reference_as_unenforced(registry):
+def test_receipt_records_reviewed_identity_and_typed_note(registry):
     _tag(registry, f'{PACKAGE}:latest', OLD)
     r = _promote(registry)
     receipt = _receipt(registry)
     assert r['move'].returncode == 0
-    for text in ['"approvedBy": "release owner"', '"approvalReference": "hub-decision:1234"',
-                 '"dispatchedBy": "dispatcher"', '"approvalEnforced": false']:
+    for text in ['"approvedBy": "Bkoltz (id 148508330)"', '"approvalEnvironment": "image-promotion"',
+                 '"typedApprovedBy": "release owner"', '"approvalReference": "hub-decision:1234"',
+                 '"dispatchedBy": "dispatcher"', '"approvalEnforced": true']:
         assert text in receipt
+
+
+def _run_gate(root, *, approver='148508330', environment=None, branches=None, history=None,
+              attempt='1', event='workflow_dispatch'):
+    env_json = environment if environment is not None else {
+        'can_admins_bypass': False,
+        'protection_rules': [{'type': 'required_reviewers', 'reviewers': [
+            {'type': 'User', 'reviewer': {'login': 'OwnerA', 'id': 148508330}}]}],
+        'deployment_branch_policy': {'protected_branches': False, 'custom_branch_policies': True},
+    }
+    branch_json = branches if branches is not None else {'total_count': 1, 'branch_policies': [{'name': 'main', 'type': 'branch'}]}
+    approval_history = history if history is not None else [{
+        'state': 'approved', 'environments': [{'name': 'image-promotion'}],
+        'user': {'login': 'OwnerA', 'id': 148508330},
+    }]
+    env_path, branch_path, history_path = root / 'environment.json', root / 'branches.json', root / 'history.json'
+    env_path.write_text(json.dumps(env_json), encoding='utf-8')
+    branch_path.write_text(json.dumps(branch_json), encoding='utf-8')
+    history_path.write_text(json.dumps(approval_history), encoding='utf-8')
+    stub = r'''gh() {
+  case "$2" in
+    */deployment-branch-policies) jq -r "$4" "$TEST_BRANCHES";;
+    */approvals) cat "$TEST_HISTORY";;
+    */environments/*) cat "$TEST_ENVIRONMENT";;
+    *) echo "unexpected read endpoint: $2" >&2; return 2;;
+  esac
+}
+'''
+    script = _steps('hub-promote.yml', 'promote')['Require the protected promotion environment and its recorded approval']
+    output = root / 'gate-output'
+    output.write_text('', encoding='utf-8')
+    env = {
+        'PATH': os.environ['PATH'], 'GH_TOKEN': 'test-only', 'GITHUB_REPOSITORY': 'o/r',
+        'GITHUB_RUN_ID': '22', 'GITHUB_RUN_ATTEMPT': attempt, 'GITHUB_EVENT_NAME': event,
+        'GITHUB_OUTPUT': str(output), 'PROMOTION_ENVIRONMENT': 'image-promotion',
+        'PROMOTION_APPROVER_ID': approver, 'PINNED_APPROVER_ID': '148508330',
+        'TEST_ENVIRONMENT': str(env_path), 'TEST_BRANCHES': str(branch_path), 'TEST_HISTORY': str(history_path),
+    }
+    return subprocess.run(['bash', '-e', '-c', stub + script], cwd=root, env=env,
+                          capture_output=True, text=True), output.read_text(encoding='utf-8')
+
+
+@pytest.mark.parametrize('options, reason', [
+    ({'approver': '1002',
+      'environment': {'can_admins_bypass': False,
+       'protection_rules': [{'type': 'required_reviewers', 'reviewers': [
+        {'type': 'User', 'reviewer': {'login': 'OwnerB', 'id': 1002}}]}],
+       'deployment_branch_policy': {'protected_branches': False, 'custom_branch_policies': True}},
+      'history': [{'state': 'approved', 'environments': [{'name': 'image-promotion'}],
+                  'user': {'login': 'OwnerB', 'id': 1002}}]}, 'different account cannot authorize'),
+    ({'attempt': '2'}, 'rerun is refused'),
+    ({'event': 'push'}, 'non-manual event is refused'),
+    ({'environment': {'can_admins_bypass': True,
+      'protection_rules': [{'type': 'required_reviewers', 'reviewers': [
+       {'type': 'User', 'reviewer': {'login': 'OwnerA', 'id': 148508330}}]}],
+      'deployment_branch_policy': {'protected_branches': False, 'custom_branch_policies': True}}}, 'admin bypass is refused'),
+    ({'environment': {'can_admins_bypass': False,
+      'protection_rules': [{'type': 'required_reviewers', 'reviewers': [
+       {'type': 'User', 'reviewer': {'login': 'OwnerA', 'id': 148508330}},
+       {'type': 'User', 'reviewer': {'login': 'OwnerB', 'id': 1002}}]}],
+      'deployment_branch_policy': {'protected_branches': False, 'custom_branch_policies': True}}}, 'second reviewer is refused'),
+    ({'branches': {'total_count': 2, 'branch_policies': [{'name': 'main', 'type': 'branch'}, {'name': 'dev', 'type': 'branch'}]}}, 'extra branch is refused'),
+    ({'branches': {'total_count': 1, 'branch_policies': [{'name': 'main'}]}}, 'missing branch discriminator is refused'),
+    ({'branches': {'total_count': 1, 'branch_policies': [{'name': 'main', 'type': 'tag'}]}}, 'main tag is refused'),
+    ({'branches': {'total_count': 2, 'branch_policies': [{'name': 'main', 'type': 'branch'}]}}, 'incomplete policy list is refused'),
+    ({'history': []}, 'missing approval is refused'),
+    ({'history': [{'state': 'rejected', 'environments': [{'name': 'image-promotion'}],
+                   'user': {'login': 'OwnerA', 'id': 148508330}}]}, 'rejected approval is refused'),
+])
+def test_approval_gate_stops_invalid_environment_or_run(registry, options, reason):
+    if os.name == 'nt' or not shutil.which('jq'):
+        pytest.skip('requires POSIX bash and jq')
+    result, _ = _run_gate(registry, **options)
+    assert result.returncode == 1, (reason, result.stdout, result.stderr)
+
+
+def test_approval_gate_accepts_only_fixed_user_and_emits_identity(registry):
+    if os.name == 'nt' or not shutil.which('jq'):
+        pytest.skip('requires POSIX bash and jq')
+    result, output = _run_gate(registry)
+    assert result.returncode == 0, result.stderr
+    assert output.strip() == 'approvers=OwnerA (id 148508330)'
 
 
 def test_failed_read_back_says_latest_was_not_restored(registry):

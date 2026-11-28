@@ -5,10 +5,15 @@ name: Promote Engineering Hub control candidate to latest
 # else moves it. It does not rebuild or deploy. Rollback is a promotion of an
 # older candidate.
 #
-# Approval: the approved_by and approval_reference inputs are written into the
-# rollback receipt as a RECORD of who authorized the promotion. They do not
-# enforce anything. The enforcing mechanism is a GitHub Environment with required
-# reviewers, which is an owner repository setting and is not created here.
+# Approval (enforced): the job runs in the protected GitHub Environment
+# `image-promotion`, so GitHub holds it until a required reviewer approves.
+# Before any other step or registry write, the job verifies through the API that
+# this is the first attempt of a manual run, that admins cannot bypass the
+# environment, that its ONE required reviewer is the fixed numeric user id
+# 148508330, that only `main` may deploy to it, and that this run has exactly one
+# approval by that user id. The reviewer is recorded as approvedBy; the typed
+# approved_by / approval_reference inputs remain notes only. The environment and
+# repository variable are owner-managed settings; this workflow never changes them.
 #
 # Exclusion: this is the only workflow that writes `latest` (a test fails if
 # another writer appears). The `hub-promote-latest` concurrency group stops two
@@ -50,6 +55,7 @@ jobs:
     if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    environment: image-promotion
     permissions:
       contents: read
       actions: read
@@ -61,6 +67,43 @@ jobs:
       APPROVED_BY: ${{ inputs.approved_by }}
       APPROVAL_REFERENCE: ${{ inputs.approval_reference }}
     steps:
+      - name: Require the protected promotion environment and its recorded approval
+        id: approval
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROMOTION_ENVIRONMENT: image-promotion
+          # Set by the repository owner; the immutable numeric account ID is checked below.
+          PROMOTION_APPROVER_ID: ${{ vars.PROMOTION_APPROVER_ID }}
+          # The single authorized approver: Beau's account bkoltz, GitHub user ID 148508330.
+          PINNED_APPROVER_ID: "148508330"
+        run: |
+          set -euo pipefail
+          # Fail closed before checkout, registry access, receipts, or any registry write.
+          fail() { echo "::error::$1 Nothing was changed."; exit 1; }
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]] || fail "Promotion runs only from a manual workflow_dispatch."
+          [[ "$GITHUB_RUN_ATTEMPT" == 1 ]] || fail "Reruns are refused; start a new promotion run so it gets its own approval."
+          [[ "$PROMOTION_APPROVER_ID" =~ ^[1-9][0-9]{0,19}$ ]] || fail "The repository variable PROMOTION_APPROVER_ID is not set to one numeric GitHub user id."
+          [[ "$PINNED_APPROVER_ID" == 148508330 && "$PROMOTION_APPROVER_ID" == "$PINNED_APPROVER_ID" ]] ||
+            fail "The repository variable PROMOTION_APPROVER_ID must be the pinned approver id."
+          ENVIRONMENT="$(gh api "repos/$GITHUB_REPOSITORY/environments/$PROMOTION_ENVIRONMENT")" || fail "The '$PROMOTION_ENVIRONMENT' environment is missing or unreadable."
+          [[ "$(jq -r '.can_admins_bypass == false' <<<"$ENVIRONMENT")" == true ]] ||
+            fail "The '$PROMOTION_ENVIRONMENT' environment must not let administrators bypass its protection rules."
+          REVIEWERS="$(jq -r '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]? | if .type == "User" then (.reviewer.id | tostring) else "non-user-reviewer" end] | join(",")' <<<"$ENVIRONMENT")"
+          [[ "$REVIEWERS" == "$PINNED_APPROVER_ID" ]] || fail "The '$PROMOTION_ENVIRONMENT' required reviewer must be exactly the one user PROMOTION_APPROVER_ID."
+          [[ "$(jq -r '.deployment_branch_policy.custom_branch_policies == true and .deployment_branch_policy.protected_branches == false' <<<"$ENVIRONMENT")" == true ]] ||
+            fail "The '$PROMOTION_ENVIRONMENT' deployment branch policy must be 'Selected branches and tags' with only main."
+          BRANCHES="$(gh api "repos/$GITHUB_REPOSITORY/environments/$PROMOTION_ENVIRONMENT/deployment-branch-policies" \
+            --jq '.total_count == 1 and (.branch_policies | length == 1 and .[0].type == "branch" and .[0].name == "main")')" ||
+            fail "The '$PROMOTION_ENVIRONMENT' branch policies are unreadable."
+          [[ "$BRANCHES" == true ]] || fail "The '$PROMOTION_ENVIRONMENT' deployment branch policy must allow only the branch main."
+          HISTORY="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals")" || fail "This run's review history is unreadable."
+          REVIEWS="$(jq -r --arg env "$PROMOTION_ENVIRONMENT" '[.[] | select((.environments // []) | map(.name) | index($env)) | "\(.state):\(.user.id)"] | join(",")' <<<"$HISTORY")"
+          [[ "$REVIEWS" == "approved:$PINNED_APPROVER_ID" ]] || fail "This run must have exactly one approval for '$PROMOTION_ENVIRONMENT', by PROMOTION_APPROVER_ID."
+          LOGIN="$(jq -r --arg env "$PROMOTION_ENVIRONMENT" '[.[] | select((.environments // []) | map(.name) | index($env)) | .user.login][0]' <<<"$HISTORY")"
+          [[ "$LOGIN" =~ ^[A-Za-z0-9](-?[A-Za-z0-9]){0,38}$ ]] || fail "The approving account's login is unreadable."
+          echo "approvers=$LOGIN (id $PINNED_APPROVER_ID)" >> "$GITHUB_OUTPUT"
+
       - name: Validate requested candidate
         shell: bash
         run: |
@@ -199,20 +242,22 @@ jobs:
           PREVIOUS_DIGEST: ${{ steps.previous.outputs.digest }}
           PROMOTION_MODE: ${{ steps.previous.outputs.mode }}
           CANDIDATE_RUN_ID: ${{ steps.run.outputs.id }}
+          APPROVERS: ${{ steps.approval.outputs.approvers }}
         run: |
           set -euo pipefail
+          [[ -n "$APPROVERS" ]]
           [[ ( "$PROMOTION_MODE" == initialize && "$PREVIOUS_DIGEST" == absent ) || ( "$PROMOTION_MODE" == replace && "$PREVIOUS_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ) ]]
           [[ "$CANDIDATE_RUN_ID" =~ ^[0-9]+$ ]]
           DIR="$RUNNER_TEMP/hub-promotion-receipt"
           mkdir -p "$DIR"
-          printf '{\n  "receiptSchemaVersion": 2,\n  "mode": "%s",\n  "image": "%s",\n  "previousDigest": "%s",\n  "newDigest": "%s",\n  "commit": "%s",\n  "candidateRunId": "%s",\n  "promotionRunId": "%s",\n  "promotionRunAttempt": "%s",\n  "dispatchedBy": "%s",\n  "approvedBy": "%s",\n  "approvalReference": "%s",\n  "approvalEnforced": false,\n  "recordedAt": "%s"\n}\n' \
+          printf '{\n  "receiptSchemaVersion": 2,\n  "mode": "%s",\n  "image": "%s",\n  "previousDigest": "%s",\n  "newDigest": "%s",\n  "commit": "%s",\n  "candidateRunId": "%s",\n  "promotionRunId": "%s",\n  "promotionRunAttempt": "%s",\n  "dispatchedBy": "%s",\n  "approvedBy": "%s",\n  "approvalEnvironment": "image-promotion",\n  "typedApprovedBy": "%s",\n  "approvalReference": "%s",\n  "approvalEnforced": true,\n  "recordedAt": "%s"\n}\n' \
             "$PROMOTION_MODE" "$PACKAGE" "$PREVIOUS_DIGEST" "$PROMOTE_DIGEST" "$PROMOTE_COMMIT" "$CANDIDATE_RUN_ID" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
-            "$GITHUB_ACTOR" "$APPROVED_BY" "$APPROVAL_REFERENCE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$DIR/hub-promotion-receipt.json"
+            "$GITHUB_ACTOR" "$APPROVERS" "$APPROVED_BY" "$APPROVAL_REFERENCE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$DIR/hub-promotion-receipt.json"
           {
             printf 'Rollback receipt (recorded before `latest` is changed)\n\n'
             printf -- '- Mode: %s (initialize = first-time creation of latest, explicitly requested)\n' "$PROMOTION_MODE"
             printf -- '- Previous latest (rollback target): `%s`\n- New digest: `%s`\n- Commit: `%s`\n' "$PREVIOUS_DIGEST" "$PROMOTE_DIGEST" "$PROMOTE_COMMIT"
-            printf -- '- Approved by: %s; approval reference: %s (a record, not enforced by this workflow)\n' "$APPROVED_BY" "$APPROVAL_REFERENCE"
+            printf -- '- Approved in environment image-promotion by: %s (from the deployment review); typed note: %s / %s\n' "$APPROVERS" "$APPROVED_BY" "$APPROVAL_REFERENCE"
             printf -- '- Candidate build run: %s/%s/actions/runs/%s\n\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$CANDIDATE_RUN_ID"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload the rollback receipt
